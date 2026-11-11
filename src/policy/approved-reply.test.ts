@@ -62,14 +62,13 @@ async function setup(
   // The dial is not written: a fresh install reads `off`. Asserted, because
   // the whole file is about what happens under it.
   expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off');
-  const rampLevel = await loadRampLevel('email.reply', { businessId: BUSINESS });
+  const rampLevel = await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'));
   expect(rampLevel).toBe('draft_only');
 
-  const job = await createJob({
-    businessId: BUSINESS,
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'unknown_external',
-  });
+  }));
   // A mailbox reply job: a mail row names it as its reply job (R20). Every
   // test here runs on one unless it says otherwise.
   if (options.mailboxReplyJob !== false) {
@@ -288,11 +287,10 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
 
   it('approval of another job is denied draft_only', async () => {
     const s = await setup();
-    const other = await createJob({
-      businessId: BUSINESS,
+    const other = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: s.bundle.charterVersion,
       provenance: 'unknown_external',
-    });
+    }));
     const approvalId = await approvedCard(s, { jobId: other.jobId });
 
     const decision = await evaluateFor('mail.send', REPLY, {

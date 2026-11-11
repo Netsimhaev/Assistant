@@ -91,17 +91,16 @@ async function aReadingFor(
 }
 
 async function aJob(provenance: TrustLevel, title: string) {
-  return createJob({
+  return withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance,
-    businessId: BUSINESS,
     title,
-  });
+  }));
 }
 
 beforeEach(async () => {
   await resetDatabase();
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
 });
 afterAll(async () => {
   await closePool();
@@ -113,10 +112,7 @@ describe('proposeForReading', () => {
     const job = await aJob('unknown_external', 'טיפול בהצעת מחיר');
     const { proposer } = stubProposer({ status: 'proposed', proposal: ACTING_PROPOSAL, raw: '{}' });
 
-    const result = await proposeForReading(
-      { documentId, jobId: job.jobId, bundle },
-      { businessId: BUSINESS, proposer },
-    );
+    const result = await withBusiness(BUSINESS, (db) => proposeForReading(db, { documentId, jobId: job.jobId, bundle }, { proposer }));
 
     expect(result.status).toBe('proposed');
     if (result.status !== 'proposed') throw new Error('expected proposed');
@@ -134,10 +130,7 @@ describe('proposeForReading', () => {
     const job = await aJob('unknown_external', 'משימה בלי פעולה');
     const { proposer } = stubProposer({ status: 'proposed', proposal: NO_ACTION_PROPOSAL, raw: '{}' });
 
-    const result = await proposeForReading(
-      { documentId, jobId: job.jobId, bundle },
-      { businessId: BUSINESS, proposer },
-    );
+    const result = await withBusiness(BUSINESS, (db) => proposeForReading(db, { documentId, jobId: job.jobId, bundle }, { proposer }));
 
     expect(result.status).toBe('proposed');
     if (result.status !== 'proposed') throw new Error('expected proposed');
@@ -154,10 +147,7 @@ describe('proposeForReading', () => {
       raw: 'איזה בלגן',
     });
 
-    const result = await proposeForReading(
-      { documentId, jobId: job.jobId, bundle },
-      { businessId: BUSINESS, proposer },
-    );
+    const result = await withBusiness(BUSINESS, (db) => proposeForReading(db, { documentId, jobId: job.jobId, bundle }, { proposer }));
 
     expect(result.status).toBe('unproposable');
     if (result.status !== 'unproposable') throw new Error('expected unproposable');
@@ -170,10 +160,7 @@ describe('proposeForReading', () => {
     const job = await aJob('unknown_external', 'משימה בלי קריאה');
     const { proposer, calls } = stubProposer({ status: 'proposed', proposal: ACTING_PROPOSAL, raw: '{}' });
 
-    const result = await proposeForReading(
-      { documentId: `DOC-${ulid()}`, jobId: job.jobId, bundle },
-      { businessId: BUSINESS, proposer },
-    );
+    const result = await withBusiness(BUSINESS, (db) => proposeForReading(db, { documentId: `DOC-${ulid()}`, jobId: job.jobId, bundle }, { proposer }));
 
     expect(result.status).toBe('no_reading');
     expect(calls).toHaveLength(0);
@@ -187,10 +174,7 @@ describe('proposeForReading', () => {
     const job = await aJob('unknown_external', 'מסמך שהגיע מבחוץ');
     const { proposer, calls } = stubProposer({ status: 'proposed', proposal: ACTING_PROPOSAL, raw: '{}' });
 
-    const result = await proposeForReading(
-      { documentId, jobId: job.jobId, bundle },
-      { businessId: BUSINESS, proposer },
-    );
+    const result = await withBusiness(BUSINESS, (db) => proposeForReading(db, { documentId, jobId: job.jobId, bundle }, { proposer }));
 
     expect(result.status).toBe('no_reading');
     expect(calls).toHaveLength(0);
@@ -201,10 +185,7 @@ describe('proposeForReading', () => {
     const { proposer } = stubProposer({ status: 'proposed', proposal: ACTING_PROPOSAL, raw: '{}' });
 
     await expect(
-      proposeForReading(
-        { documentId, jobId: `J-${ulid()}`, bundle },
-        { businessId: BUSINESS, proposer },
-      ),
+      withBusiness(BUSINESS, (db) => proposeForReading(db, { documentId, jobId: `J-${ulid()}`, bundle }, { proposer })),
     ).rejects.toThrow();
   });
 
@@ -213,7 +194,7 @@ describe('proposeForReading', () => {
     const job = await aJob('boss', 'הצעה לבוס');
     const { proposer, calls } = stubProposer({ status: 'proposed', proposal: ACTING_PROPOSAL, raw: '{}' });
 
-    await proposeForReading({ documentId, jobId: job.jobId, bundle }, { businessId: BUSINESS, proposer });
+    await withBusiness(BUSINESS, (db) => proposeForReading(db, { documentId, jobId: job.jobId, bundle }, { proposer }));
 
     expect(calls).toHaveLength(1);
     expect(calls[0]?.provenance).toBe('boss');
@@ -226,10 +207,7 @@ describe('proposeForReading', () => {
     const job = await aJob('unknown_external', 'בדיקת התמדה');
     const { proposer } = stubProposer({ status: 'proposed', proposal: ACTING_PROPOSAL, raw: '{}' });
 
-    const result = await proposeForReading(
-      { documentId, jobId: job.jobId, bundle },
-      { businessId: BUSINESS, proposer },
-    );
+    const result = await withBusiness(BUSINESS, (db) => proposeForReading(db, { documentId, jobId: job.jobId, bundle }, { proposer }));
     if (result.status !== 'proposed') throw new Error('expected proposed');
 
     const { rows } = await getPool().query<{ proposal_id: string }>(

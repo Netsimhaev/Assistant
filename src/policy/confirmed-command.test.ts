@@ -91,17 +91,16 @@ function planOf(
 async function setup(options: SetupOptions = {}): Promise<Setup> {
   const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter(options.charter ?? {})));
   expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off');
-  const rampLevel = await loadRampLevel('email.initiate', { businessId: BUSINESS });
+  const rampLevel = await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.initiate'));
   expect(rampLevel).toBe('draft_only');
   if (options.jobBusiness !== undefined && options.jobBusiness !== BUSINESS) {
     await withBusiness(options.jobBusiness, (bdb) => installCharter(bdb, buildCharter(options.charter ?? {})));
   }
 
-  const job = await createJob({
-    businessId: options.jobBusiness ?? BUSINESS,
+  const job = await withBusiness(options.jobBusiness ?? BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: options.provenance ?? 'boss',
-  });
+  }));
   if (options.instruction !== false) {
     await saveInstruction(
       { jobId: job.jobId, text: 'תשלחי לדנה את ההצעה', textOrigin: 'typed' },
@@ -110,7 +109,7 @@ async function setup(options: SetupOptions = {}): Promise<Setup> {
   }
   const plan = planOf(options.toolName ?? 'mail.send', options.input ?? SEND, undefined, options.stepAgent);
   const planHash = planHashOf(plan);
-  await bindPlanToJob(job.jobId, plan, { businessId: options.planBusiness ?? BUSINESS });
+  await withBusiness(options.planBusiness ?? BUSINESS, (db) => bindPlanToJob(db, job.jobId, plan));
 
   const confirmationBusiness = options.confirmationBusiness ?? BUSINESS;
   await createConfirmation(
@@ -305,7 +304,7 @@ describe('each condition, flipped alone, falls to the normal path', () => {
     // Same step, same tool, same bytes — only the plan around it differs, so
     // the bound hash is no longer the one the owner chose.
     const other = planOf('mail.send', SEND, 'מטרה אחרת');
-    const binding = await bindPlanToJob(s.jobId, other, { businessId: BUSINESS });
+    const binding = await withBusiness(BUSINESS, (db) => bindPlanToJob(db, s.jobId, other));
     expect(binding.status).toBe('replaced');
     await expectNormalPathDraftOnly(await evaluateFor('mail.send', SEND, s.ctx), s.jobId);
   });

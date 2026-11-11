@@ -75,11 +75,10 @@ async function loginWithPassword(baseUrl: string): Promise<string> {
 /** A job at a given trust level, so `writeMemory` can stamp its provenance. */
 async function jobWithProvenance(provenance: 'boss' | 'unknown_external'): Promise<{ jobId: string }> {
   const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `memory-screen-${provenance}` }))); // TENANCY-TODO(task 10)
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance,
-    businessId: BUSINESS,
-  });
+  }));
   return { jobId: job.jobId };
 }
 

@@ -1,3 +1,4 @@
+import { withBusiness } from '../db/pool.js';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePlatformPool } from '../db/platform-pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
@@ -62,17 +63,15 @@ describe('businesses registry', () => {
          policy_bundle, content_hash, signed_by, signed_at, signature_method)
        VALUES ('v1', 'alpha-shop', now(), '{}', '{}', repeat('a', 64), 'p', now(), 'test')`,
     );
-    const job = await createJob({
-      businessId: 'alpha-shop',
+    const job = await withBusiness('alpha-shop', (db) => createJob(db, {
       charterVersion: 'v1',
       provenance: 'boss',
-    });
-    await transition(job.jobId, {
+    }));
+    await withBusiness('alpha-shop', (db) => transition(db, job.jobId, {
       to: 'understand',
       actor: 'system',
       reason: 'test',
-      businessId: 'alpha-shop',
-    });
+    }));
     const { rows } = await testDb().query<{ business_id: string }>(
       'SELECT business_id FROM job_steps WHERE job_id = $1',
       [job.jobId],

@@ -90,16 +90,15 @@ function registry(): AdapterRegistry {
 
 /** A job walked from `intake` to `execute`, the way `run-plan` requires. */
 async function jobInExecute(bundle: PolicyBundle) {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
     title: 'notify wiring',
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  const loaded = await loadJob(job.jobId, { businessId: BUSINESS });
+  const loaded = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
   if (loaded === null) throw new Error('job vanished');
   return loaded;
 }
@@ -114,7 +113,7 @@ describe('approval notification wiring', () => {
   });
 
   it('notifies the owner when the gate queues an approval', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ connections: [MAIL_CONNECTION], autonomyBase: { 'email.initiate': 'approve_required' } })
     ));
@@ -122,7 +121,7 @@ describe('approval notification wiring', () => {
 
     const { calls, notifier } = recordingNotifier();
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: PLAN,
@@ -133,7 +132,7 @@ describe('approval notification wiring', () => {
       rampLevel: 'approve_required',
       now: NOON,
       notify: { notifier, dashboardBaseUrl: 'http://127.0.0.1:8787' },
-    });
+    }));
 
     expect(result.status).toBe('halted');
     expect(calls).toHaveLength(1);
@@ -141,13 +140,13 @@ describe('approval notification wiring', () => {
   });
 
   it('runs unchanged when no notifier is supplied', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ connections: [MAIL_CONNECTION], autonomyBase: { 'email.initiate': 'approve_required' } })
     ));
     const job = await jobInExecute(bundle);
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: PLAN,
@@ -157,7 +156,7 @@ describe('approval notification wiring', () => {
       counterpartyTags: [],
       rampLevel: 'approve_required',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('halted');
   });
@@ -194,7 +193,7 @@ describe('approval notification wiring', () => {
    * vacuously.
    */
   it('carries a real secret from the store to the transport, for a plan-driven send', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'example.com' })
     ));
@@ -251,7 +250,7 @@ describe('approval notification wiring', () => {
       ],
     });
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: replyPlan,
@@ -261,7 +260,7 @@ describe('approval notification wiring', () => {
       counterpartyTags: [],
       rampLevel: 'auto_notify',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('done');
     expect(captured).toEqual(['סוד-מהמאגר']);
@@ -289,7 +288,7 @@ describe('approval notification wiring', () => {
    */
   it('keeps the resolved secret out of the audit row a failed notification writes', async () => {
     const secret = 'סוד-התראה-שאסור-להופיע';
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ connections: [MAIL_CONNECTION], autonomyBase: { 'email.initiate': 'approve_required' } })
     ));
@@ -333,7 +332,7 @@ describe('approval notification wiring', () => {
       }),
     });
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: PLAN,
@@ -344,7 +343,7 @@ describe('approval notification wiring', () => {
       rampLevel: 'approve_required',
       now: NOON,
       notify: { notifier, dashboardBaseUrl: 'http://127.0.0.1:8787' },
-    });
+    }));
 
     // Positive half, three facts, all required before the absence below means
     // anything: the approval queued, the notifier ran, and the value it

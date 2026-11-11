@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { PolicyBundle } from '../domain/policy.js';
@@ -12,17 +12,16 @@ import { resumeDelegatedJobs } from './resume-delegated.js';
 const BUSINESS = 'test-business';
 
 async function openParentJob(): Promise<{ job: Job; bundle: PolicyBundle }> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `parent-${ulid()}` }))); // TENANCY-TODO(task 4)
-  const created = await createJob({
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `parent-${ulid()}` })));
+  const created = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
     title: 'delegating job',
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(created.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, created.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  const job = await loadJob(created.jobId, { businessId: BUSINESS });
+  const job = await withBusiness(BUSINESS, (db) => loadJob(db, created.jobId));
   if (job === null) throw new Error('parent job vanished');
   return { job, bundle };
 }
@@ -41,7 +40,6 @@ function baseRequest(
     contextRefs: [{ kind: 'document', documentId: `doc-${ulid()}` }],
     bundle,
     parentEnvelope: null,
-    businessId: BUSINESS,
     ...overrides,
   };
 }
@@ -53,7 +51,7 @@ async function openDelegation(): Promise<{
   envelopeId: string;
 }> {
   const { job, bundle } = await openParentJob();
-  const result = await requestHelp(baseRequest(job, bundle));
+  const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle)));
   if (result.status !== 'opened') throw new Error(`expected opened, got ${result.status}`);
   return { parentJobId: job.jobId, childJobId: result.childJobId, envelopeId: result.envelopeId };
 }
@@ -61,12 +59,12 @@ async function openDelegation(): Promise<{
 /** Walk a child all the way to `closed`, the only legal route from `verify`. */
 async function closeChild(jobId: string): Promise<void> {
   for (const to of ['verify', 'remember', 'closed'] as const) {
-    await transition(jobId, { to, actor: 'orchestrator', reason: 'test setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, { to, actor: 'orchestrator', reason: 'test setup' }));
   }
 }
 
 async function failChild(jobId: string): Promise<void> {
-  await transition(jobId, { to: 'failed', actor: 'orchestrator', reason: 'test setup', businessId: BUSINESS });
+  await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'failed', actor: 'orchestrator', reason: 'test setup' }));
 }
 
 async function latestResultPayload(): Promise<{ outcome: string; note: string }> {
@@ -93,12 +91,12 @@ describe('resumeDelegatedJobs', () => {
     const { parentJobId, childJobId } = await openDelegation();
     await closeChild(childJobId);
 
-    const result = await resumeDelegatedJobs({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => resumeDelegatedJobs(db));
     expect(result.resumed).toEqual([parentJobId]);
     expect(result.timedOut).toEqual([]);
     expect(result.errored).toEqual([]);
 
-    const parent = await loadJob(parentJobId, { businessId: BUSINESS });
+    const parent = await withBusiness(BUSINESS, (db) => loadJob(db, parentJobId));
     expect(parent?.phase).toBe('execute');
     expect(parent?.awaitingEnvelopeId).toBeNull();
 
@@ -110,10 +108,10 @@ describe('resumeDelegatedJobs', () => {
     const { parentJobId, childJobId } = await openDelegation();
     await failChild(childJobId);
 
-    const result = await resumeDelegatedJobs({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => resumeDelegatedJobs(db));
     expect(result.resumed).toEqual([parentJobId]);
 
-    const parent = await loadJob(parentJobId, { businessId: BUSINESS });
+    const parent = await withBusiness(BUSINESS, (db) => loadJob(db, parentJobId));
     // The parent does not fail on its own account of its helper failing —
     // that is a decision for its own plan to make on the next pass.
     expect(parent?.phase).toBe('execute');
@@ -127,17 +125,17 @@ describe('resumeDelegatedJobs', () => {
     // The child is deliberately left running — never closed, never failed.
     const wellPastTheDefaultWindow = new Date(Date.now() + 25 * 60 * 60 * 1000);
 
-    const result = await resumeDelegatedJobs({ businessId: BUSINESS, now: wellPastTheDefaultWindow });
+    const result = await withBusiness(BUSINESS, (db) => resumeDelegatedJobs(db, { now: wellPastTheDefaultWindow }));
     expect(result.timedOut).toEqual([parentJobId]);
     expect(result.resumed).toEqual([]);
     expect(result.errored).toEqual([]);
 
-    const parent = await loadJob(parentJobId, { businessId: BUSINESS });
+    const parent = await withBusiness(BUSINESS, (db) => loadJob(db, parentJobId));
     expect(parent?.phase).toBe('execute');
     expect(parent?.awaitingEnvelopeId).toBeNull();
 
     // The stuck child itself is untouched — only the parent is freed.
-    const child = await loadJob(childJobId, { businessId: BUSINESS });
+    const child = await withBusiness(BUSINESS, (db) => loadJob(db, childJobId));
     expect(child?.phase).toBe('execute');
 
     const payload = await latestResultPayload();
@@ -147,12 +145,12 @@ describe('resumeDelegatedJobs', () => {
   it('leaves a parent alone while its child is still inside the deadline', async () => {
     const { parentJobId } = await openDelegation();
 
-    const result = await resumeDelegatedJobs({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => resumeDelegatedJobs(db));
     expect(result.resumed).toEqual([]);
     expect(result.timedOut).toEqual([]);
     expect(result.errored).toEqual([]);
 
-    const parent = await loadJob(parentJobId, { businessId: BUSINESS });
+    const parent = await withBusiness(BUSINESS, (db) => loadJob(db, parentJobId));
     expect(parent?.phase).toBe('followup');
   });
 
@@ -166,28 +164,26 @@ describe('resumeDelegatedJobs', () => {
     // back to `execute` first and re-parked with the bogus id — the same
     // shape a real crash between `writeEnvelope` and `attachChildJob` could
     // leave behind, engineered directly rather than raced for.
-    await transition(bad.parentJobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, bad.parentJobId, {
       to: 'execute',
       actor: 'orchestrator',
       reason: 'test corruption',
-      businessId: BUSINESS,
-    });
-    await transition(bad.parentJobId, {
+    }));
+    await withBusiness(BUSINESS, (db) => transition(db, bad.parentJobId, {
       to: 'followup',
       actor: 'orchestrator',
       reason: 'test corruption',
       awaitingEnvelopeId: 'ENV-does-not-exist',
-      businessId: BUSINESS,
-    });
+    }));
 
-    const result = await resumeDelegatedJobs({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => resumeDelegatedJobs(db));
     expect(result.resumed).toEqual([good.parentJobId]);
     expect(result.errored).toEqual([{ jobId: bad.parentJobId, error: expect.any(String) }]);
     expect(result.errored[0]?.error).toContain('does not exist');
 
     // The good parent actually woke, despite running in the same pass as the
     // corrupted one.
-    const goodParent = await loadJob(good.parentJobId, { businessId: BUSINESS });
+    const goodParent = await withBusiness(BUSINESS, (db) => loadJob(db, good.parentJobId));
     expect(goodParent?.phase).toBe('execute');
 
     // The bad parent is not left parked forever: `wakeDueJobs` never looks at
@@ -195,7 +191,7 @@ describe('resumeDelegatedJobs', () => {
     // left merely `errored`, it would sort first under `ORDER BY updated_at
     // ASC` on every subsequent pass and eventually starve the whole window
     // (the same fix `run-due.ts` already makes for an unbound job).
-    const badParent = await loadJob(bad.parentJobId, { businessId: BUSINESS });
+    const badParent = await withBusiness(BUSINESS, (db) => loadJob(db, bad.parentJobId));
     expect(badParent?.phase).toBe('failed');
   });
 
@@ -211,21 +207,21 @@ describe('resumeDelegatedJobs', () => {
     const { parentJobId } = await openDelegation();
     // The child is left running — the branch this bug hides in only matters
     // when there is no terminal phase to decide the outcome outright.
-    const parent = await loadJob(parentJobId, { businessId: BUSINESS });
+    const parent = await withBusiness(BUSINESS, (db) => loadJob(db, parentJobId));
     if (parent?.awaitingEnvelopeId == null) throw new Error('expected an awaiting envelope id');
-    await getPool().query(
+    await testDb().query(
       `UPDATE agent_envelopes SET constraints = jsonb_set(constraints, '{deadlineAt}', '"not-a-date"')
         WHERE business_id = $1 AND envelope_id = $2`,
       [BUSINESS, parent.awaitingEnvelopeId],
     );
 
-    const result = await resumeDelegatedJobs({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => resumeDelegatedJobs(db));
     expect(result.errored).toEqual([{ jobId: parentJobId, error: expect.any(String) }]);
     expect(result.errored[0]?.error).toContain('unreadable deadline');
     expect(result.timedOut).toEqual([]);
     expect(result.resumed).toEqual([]);
 
-    const failedParent = await loadJob(parentJobId, { businessId: BUSINESS });
+    const failedParent = await withBusiness(BUSINESS, (db) => loadJob(db, parentJobId));
     expect(failedParent?.phase).toBe('failed');
   });
 
@@ -244,19 +240,19 @@ describe('resumeDelegatedJobs', () => {
     const { parentJobId, envelopeId } = await openDelegation();
     // Undo the attach, leaving exactly what a crash between `writeEnvelope`
     // and `attachChildJob` leaves: an envelope with no child.
-    await getPool().query(
+    await testDb().query(
       'UPDATE agent_envelopes SET child_job_id = NULL WHERE business_id = $1 AND envelope_id = $2',
       [BUSINESS, envelopeId],
     );
 
-    const result = await resumeDelegatedJobs({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => resumeDelegatedJobs(db));
     expect(result.resumed).toEqual([]);
     expect(result.timedOut).toEqual([]);
     expect(result.errored).toEqual([{ jobId: parentJobId, error: expect.any(String) }]);
     expect(result.errored[0]?.error).toContain('no child job attached');
     expect(result.errored[0]?.error).toContain(envelopeId);
 
-    const failedParent = await loadJob(parentJobId, { businessId: BUSINESS });
+    const failedParent = await withBusiness(BUSINESS, (db) => loadJob(db, parentJobId));
     expect(failedParent?.phase).toBe('failed');
   });
 
@@ -274,22 +270,22 @@ describe('resumeDelegatedJobs', () => {
    */
   it("fails a parent whose envelope points at a child job row that does not exist", async () => {
     const { parentJobId, childJobId, envelopeId } = await openDelegation();
-    await getPool().query(
+    await testDb().query(
       'UPDATE agent_envelopes SET child_job_id = $3 WHERE business_id = $1 AND envelope_id = $2',
       [BUSINESS, envelopeId, 'JOB-never-created'],
     );
 
-    const result = await resumeDelegatedJobs({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => resumeDelegatedJobs(db));
     expect(result.resumed).toEqual([]);
     expect(result.timedOut).toEqual([]);
     expect(result.errored).toEqual([{ jobId: parentJobId, error: expect.any(String) }]);
     expect(result.errored[0]?.error).toContain("child JOB-never-created does not exist");
 
-    const failedParent = await loadJob(parentJobId, { businessId: BUSINESS });
+    const failedParent = await withBusiness(BUSINESS, (db) => loadJob(db, parentJobId));
     expect(failedParent?.phase).toBe('failed');
 
     // The real child is untouched — only the envelope's pointer was corrupted.
-    const child = await loadJob(childJobId, { businessId: BUSINESS });
+    const child = await withBusiness(BUSINESS, (db) => loadJob(db, childJobId));
     expect(child?.phase).toBe('execute');
   });
 });

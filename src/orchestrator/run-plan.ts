@@ -37,7 +37,7 @@ import { runLocalTool, type LocalToolContext } from './local-tools.js';
 import { ATTACHMENT_TOOL, ATTACHMENTS_KEY, AttachmentRefs } from '../domain/attachment-ref.js';
 import { deliveryVersionOf, resolveAttachments, type ResolvedAttachment } from '../production/attachments.js';
 import type { Job } from './jobs.js';
-import { withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 /**
  * How long one external call may take before it is abandoned.
@@ -246,8 +246,14 @@ export type RunPlanResult =
  * limit and why no transaction can remove it. `AdapterCall.idempotencyKey` is
  * the only defence past that point, and only for a far end that honours it.
  */
-export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
+export async function runPlan(db: BusinessDb, request: RunPlanRequest): Promise<RunPlanResult> {
   const { job, bundle, plan } = request;
+  // One source of truth for the business: the connection's. A job of another
+  // business run on this connection would bind, record and audit under the
+  // wrong one.
+  if (job.businessId !== db.businessId) {
+    throw new Error(`runPlan: job ${job.jobId} is not of the connection's business`);
+  }
 
   // The phase, before anything is written down.
   //
@@ -358,7 +364,7 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
   // is refused rather than half-applied on top of work already done. A re-plan
   // over a job that has executed *nothing* is not that, and is allowed —
   // `bindPlanToJob` draws the line.
-  const binding = await bindPlanToJob(job.jobId, plan, { businessId: job.businessId });
+  const binding = await bindPlanToJob(db, job.jobId, plan);
   if (binding.status === 'conflict') {
     return {
       status: 'rejected',
@@ -370,9 +376,7 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
     };
   }
   const planHash = binding.planHash;
-  const alreadyDone = await completedSteps(job.jobId, planHash, {
-    businessId: job.businessId,
-  });
+  const alreadyDone = await completedSteps(db, job.jobId, planHash);
 
   // The three conditions of the spec, combined positively. Computed once for
   // the whole plan rather than per step: a plan that reads anything was
@@ -407,16 +411,16 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
     // `unspentApprovalFor` for why a step id cannot be the join key, and why
     // this deliberately does not look at any edit — that substitution is
     // `executeStep`'s job, after the approval has been found.
-    const approvalId = await withBusiness(current.businessId, (bdb) => unspentApprovalFor(bdb, { jobId: current.jobId, inputHash: canonicalHash(step.input) })); // TENANCY-TODO(task 4)
+    const approvalId = await unspentApprovalFor(db, { jobId: current.jobId, inputHash: canonicalHash(step.input) });
 
-    const outcome = await executeStep({
+    const outcome = await executeStep(db, {
       job: current,
       stepId: step.id,
       agent: step.agent,
       bundle,
       toolName: step.toolName,
       toolInput: step.input,
-      perform: async (redacted, effective) => performStep(request, step, redacted, effective),
+      perform: async (redacted, effective) => performStep(db, request, step, redacted, effective),
       counterpartyTags: request.counterpartyTags,
       rampLevel: request.rampLevel,
       planHash,
@@ -448,16 +452,15 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
     // executeStep moves the job to `verify` after each step. A plan with more
     // steps to run has to come back to `execute`, and that transition is
     // recorded like every other.
-    const reloaded = await loadJob(current.jobId, { businessId: current.businessId });
+    const reloaded = await loadJob(db, current.jobId);
     if (reloaded === null) return { status: 'halted', steps: records, at: step.id, reason: 'job vanished' };
     current = reloaded;
 
     if (records.length < plan.steps.length && current.phase === 'verify') {
-      current = await transition(current.jobId, {
+      current = await transition(db, current.jobId, {
         to: 'execute',
         actor: 'orchestrator',
         reason: `next step after ${step.id}`,
-        businessId: current.businessId,
       });
     }
   }
@@ -468,11 +471,10 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
   // caller acting on this `done` would throw on the next move. Advance it here
   // instead, exactly as a step that actually ran would have.
   if (current.phase === 'execute') {
-    current = await transition(current.jobId, {
+    current = await transition(db, current.jobId, {
       to: 'verify',
       actor: 'orchestrator',
       reason: 'plan complete — every step already recorded',
-      businessId: current.businessId,
     });
   }
 
@@ -489,9 +491,12 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
  */
 export type RunPlanForJobRequest = Omit<RunPlanRequest, 'bindings'>;
 
-export async function runPlanForJob(request: RunPlanForJobRequest): Promise<RunPlanResult> {
-  const bindings = await loadBindings({ businessId: request.job.businessId });
-  return runPlan({ ...request, bindings });
+export async function runPlanForJob(
+  db: BusinessDb,
+  request: RunPlanForJobRequest,
+): Promise<RunPlanResult> {
+  const bindings = await loadBindings(db);
+  return runPlan(db, { ...request, bindings });
 }
 
 /**
@@ -563,6 +568,7 @@ function mapOAuthTokenError(error: unknown): unknown {
  * be mistaken for a completed action.
  */
 async function performStep(
+  db: BusinessDb,
   request: RunPlanRequest,
   step: PlanStep,
   redactedInput: unknown,
@@ -593,8 +599,8 @@ async function performStep(
     // of the fact. The gate has already permitted this exact payload, which is
     // the same reason `performStep` routes the outbound case by it.
     const output = await runLocalTool(step.toolName, effectiveInput, {
+      db,
       jobId: request.job.jobId,
-      businessId: request.job.businessId,
       // Only `doc.fetch` reads `bundle` and `reader` today (readDocument
       // needs the active charter to build its prompt, and `reader` is the
       // seam a test drives instead of a live model call); `judge` is
@@ -774,8 +780,7 @@ async function performStep(
   // fixes that without also running on the happy path this call already
   // covers; a connection that only ever times out is a gap this function does
   // not close.
-  await recordBindingOutcome({
-    businessId: request.job.businessId,
+  await recordBindingOutcome(db, {
     system: resolution.system,
     ok: result.ok,
     ...(result.ok ? {} : { errorCode: result.code, errorMessage: result.message }),

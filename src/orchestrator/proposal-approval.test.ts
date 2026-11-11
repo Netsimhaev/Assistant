@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { raiseProposalApproval, RAMP_HONESTY } from './proposal-approval.js';
@@ -35,11 +35,8 @@ describe('raiseProposalApproval', () => {
   });
 
   it('raises a pending approval carrying the action headline', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
-    const approvalId = await raiseProposalApproval(
-      { jobId: null, proposal: aProposal(), bundle },
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+    const approvalId = await withBusiness(BUSINESS, (db) => raiseProposalApproval(db, { jobId: null, proposal: aProposal(), bundle }));
 
     expect(approvalId).not.toBeNull();
     const { rows } = await getPool().query<{ state: string; summary: string; detail: string }>(
@@ -51,11 +48,8 @@ describe('raiseProposalApproval', () => {
   });
 
   it('says plainly that approving will not make it happen', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
-    const approvalId = await raiseProposalApproval(
-      { jobId: null, proposal: aProposal(), bundle },
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+    const approvalId = await withBusiness(BUSINESS, (db) => raiseProposalApproval(db, { jobId: null, proposal: aProposal(), bundle }));
     const { rows } = await getPool().query<{ detail: string }>(
       `SELECT detail FROM approval_requests WHERE approval_id = $1`,
       [approvalId],
@@ -64,45 +58,36 @@ describe('raiseProposalApproval', () => {
   });
 
   it('returns null and writes nothing when the proposal carries no action', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
-    const approvalId = await raiseProposalApproval(
-      {
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+    const approvalId = await withBusiness(BUSINESS, (db) => raiseProposalApproval(db, {
         jobId: null,
         proposal: aProposal({ stance: 'no_action', action: null }),
         bundle,
-      },
-      { businessId: BUSINESS },
-    );
+      }));
 
     expect(approvalId).toBeNull();
-    const { rows } = await getPool().query(`SELECT 1 FROM approval_requests`);
+    const { rows } = await testDb().query(`SELECT 1 FROM approval_requests`);
     expect(rows).toHaveLength(0);
   });
 
   it('returns null for a read-only action rather than throwing', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const proposal = aProposal();
     const readOnly = {
       ...proposal,
       action: { ...proposal.action!, toolName: 'crm.read', expectedActionClass: null },
     } as Proposal;
 
-    const approvalId = await raiseProposalApproval(
-      { jobId: null, proposal: readOnly, bundle },
-      { businessId: BUSINESS },
-    );
+    const approvalId = await withBusiness(BUSINESS, (db) => raiseProposalApproval(db, { jobId: null, proposal: readOnly, bundle }));
 
     expect(approvalId).toBeNull();
-    const { rows } = await getPool().query(`SELECT 1 FROM approval_requests`);
+    const { rows } = await testDb().query(`SELECT 1 FROM approval_requests`);
     expect(rows).toHaveLength(0);
   });
 
   it('stamps the approval\'s risk with external provenance', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
-    const approvalId = await raiseProposalApproval(
-      { jobId: null, proposal: aProposal(), bundle },
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+    const approvalId = await withBusiness(BUSINESS, (db) => raiseProposalApproval(db, { jobId: null, proposal: aProposal(), bundle }));
     const { rows } = await getPool().query<{ risk: { dimensions: { provenance: { level: string; chainDepth: number } } } }>(
       `SELECT risk FROM approval_requests WHERE approval_id = $1`,
       [approvalId],

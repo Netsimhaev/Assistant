@@ -60,29 +60,27 @@ export async function seedMailJob(
     ],
   });
 
-  const job = await createJob({
+  const job = await withBusiness(businessId, (db) => createJob(db, { // TENANCY-TODO(task 7)
     charterVersion,
     // The owner ran this command; nothing untrusted contributed to it.
     provenance: 'boss',
-    businessId,
     title: `live thread: mail to ${options.to}`,
-  });
+  }));
 
   // `intake → understand → plan → execute`. There is no `intake → plan`
   // edge (LEGAL_TRANSITIONS, src/domain/job.ts) — every phase in between must
   // be walked. `actor` is a `JobActor` ('orchestrator' | 'human' | 'system' |
   // AgentId); the person running this command by hand is 'human'.
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, {
+    await withBusiness(businessId, (db) => transition(db, job.jobId, { // TENANCY-TODO(task 7)
       to,
       actor: 'human',
       reason: 'seeded by job:seed',
-      businessId,
-    });
+    }));
   }
 
-  await bindPlanToJob(job.jobId, plan, { businessId });
-  await setRampLevel('email.initiate', 'approve_required', { businessId });
+  await withBusiness(businessId, (db) => bindPlanToJob(db, job.jobId, plan)); // TENANCY-TODO(task 7)
+  await withBusiness(businessId, (db) => setRampLevel(db, 'email.initiate', 'approve_required')); // TENANCY-TODO(task 7)
 
   return { jobId: job.jobId, planHash: planHashOf(plan) };
 }

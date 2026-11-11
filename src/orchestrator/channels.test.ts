@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { queryAudit } from '../audit/log.js';
 import { resetDatabase } from '../test/db.js';
 import { loadBindings, upsertBinding } from './bindings.js';
@@ -23,8 +23,7 @@ afterAll(async () => {
 
 describe('connection bindings', () => {
   it('stores a binding and reads it back', async () => {
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'office-mail',
         status: 'live',
         endpoint: 'smtp.example.com:587',
@@ -36,11 +35,9 @@ describe('connection bindings', () => {
         provider: 'google',
         lastOkAt: null,
         lastError: null,
-      },
-      { businessId: BUSINESS, by: BY },
-    );
+      }, { by: BY }));
 
-    const bindings = await loadBindings({ businessId: BUSINESS });
+    const bindings = await withBusiness(BUSINESS, (db) => loadBindings(db));
     expect(bindings).toHaveLength(1);
     expect(bindings[0]?.status).toBe('live');
     expect(bindings[0]?.credentialRef).toBe('OFFICE_MAIL');
@@ -49,8 +46,7 @@ describe('connection bindings', () => {
 
   it('reads back a non-null lastOkAt as an ISO string', async () => {
     const lastOkAt = '2026-08-19T08:00:00.000Z';
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'office-mail',
         status: 'live',
         endpoint: null,
@@ -58,11 +54,9 @@ describe('connection bindings', () => {
         provider: null,
         lastOkAt,
         lastError: null,
-      },
-      { businessId: BUSINESS, by: BY },
-    );
+      }, { by: BY }));
 
-    const bindings = await loadBindings({ businessId: BUSINESS });
+    const bindings = await withBusiness(BUSINESS, (db) => loadBindings(db));
     expect(bindings[0]?.lastOkAt).toBe(lastOkAt);
   });
 
@@ -76,20 +70,18 @@ describe('connection bindings', () => {
       lastOkAt: null,
       lastError: null,
     };
-    await upsertBinding(base, { businessId: BUSINESS, by: BY });
-    await upsertBinding({ ...base, status: 'error', lastError: 'auth failed' }, {
-      businessId: BUSINESS,
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, base, { by: BY }));
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, { ...base, status: 'error', lastError: 'auth failed' }, {
       by: BY,
-    });
+    }));
 
-    const bindings = await loadBindings({ businessId: BUSINESS });
+    const bindings = await withBusiness(BUSINESS, (db) => loadBindings(db));
     expect(bindings).toHaveLength(1);
     expect(bindings[0]?.status).toBe('error');
   });
 
   it('keeps one business out of another business bindings', async () => {
-    await upsertBinding(
-      {
+    await withBusiness('other-business', (db) => upsertBinding(db, {
         system: 'office-mail',
         status: 'live',
         endpoint: null,
@@ -97,16 +89,13 @@ describe('connection bindings', () => {
         provider: null,
         lastOkAt: null,
         lastError: null,
-      },
-      { businessId: 'other-business', by: BY },
-    );
-    expect(await loadBindings({ businessId: BUSINESS })).toEqual([]);
+      }, { by: BY }));
+    expect(await withBusiness(BUSINESS, (db) => loadBindings(db))).toEqual([]);
   });
 
   it('rejects an invalid binding at write time and writes nothing', async () => {
     await expect(
-      upsertBinding(
-        {
+      withBusiness(BUSINESS, (db) => upsertBinding(db, {
           system: '',
           status: 'live',
           endpoint: null,
@@ -114,12 +103,10 @@ describe('connection bindings', () => {
           provider: null,
           lastOkAt: null,
           lastError: null,
-        },
-        { businessId: BUSINESS, by: BY },
-      ),
+        }, { by: BY })),
     ).rejects.toThrow();
 
-    expect(await loadBindings({ businessId: BUSINESS })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (db) => loadBindings(db))).toEqual([]);
   });
 
   it('rejects a malformed credentialRef at write time and writes nothing', async () => {
@@ -130,8 +117,7 @@ describe('connection bindings', () => {
     // credentialled and failing later with nothing distinguishing "the ref
     // is misspelled" from "the environment variable is missing".
     await expect(
-      upsertBinding(
-        {
+      withBusiness(BUSINESS, (db) => upsertBinding(db, {
           system: 'office-mail',
           status: 'live',
           endpoint: null,
@@ -139,17 +125,14 @@ describe('connection bindings', () => {
           provider: null,
           lastOkAt: null,
           lastError: null,
-        },
-        { businessId: BUSINESS, by: BY },
-      ),
+        }, { by: BY })),
     ).rejects.toThrow();
 
-    expect(await loadBindings({ businessId: BUSINESS })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (db) => loadBindings(db))).toEqual([]);
   });
 
   it('audits a mutation with exactly one entry naming the system and the actor', async () => {
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'office-mail',
         status: 'live',
         endpoint: null,
@@ -157,11 +140,9 @@ describe('connection bindings', () => {
         provider: null,
         lastOkAt: null,
         lastError: null,
-      },
-      { businessId: BUSINESS, by: BY },
-    );
+      }, { by: BY }));
 
-    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'connection_binding' })); // TENANCY-TODO(task 4)
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'connection_binding' }));
     expect(entries).toHaveLength(1);
     expect(entries[0]?.reason).toContain('office-mail');
     expect(entries[0]?.onBehalfOf).toBe(BY);
@@ -180,8 +161,7 @@ describe('connection bindings', () => {
    * about the two fields that actually moved trust.
    */
   it('names both credentialRef and provider in the audit reason, not only status', async () => {
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'office-mail',
         status: 'live',
         endpoint: null,
@@ -189,11 +169,9 @@ describe('connection bindings', () => {
         provider: 'google',
         lastOkAt: null,
         lastError: null,
-      },
-      { businessId: BUSINESS, by: BY },
-    );
+      }, { by: BY }));
 
-    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'connection_binding' })); // TENANCY-TODO(task 4)
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'connection_binding' }));
     expect(entries).toHaveLength(1);
     // Positive half: `status` is still named (unchanged behaviour) ...
     expect(entries[0]?.reason).toContain('status "live"');
@@ -204,8 +182,7 @@ describe('connection bindings', () => {
 
   it('rejects an empty "by" and writes nothing', async () => {
     await expect(
-      upsertBinding(
-        {
+      withBusiness(BUSINESS, (db) => upsertBinding(db, {
           system: 'office-mail',
           status: 'live',
           endpoint: null,
@@ -213,21 +190,18 @@ describe('connection bindings', () => {
           provider: null,
           lastOkAt: null,
           lastError: null,
-        },
-        { businessId: BUSINESS, by: '' },
-      ),
+        }, { by: '' })),
     ).rejects.toThrow();
 
-    expect(await loadBindings({ businessId: BUSINESS })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (db) => loadBindings(db))).toEqual([]);
   });
 
   it('keeps the audit append inside the same transaction as the write', async () => {
-    const client = await getPool().connect();
-    try {
-      await client.query('BEGIN');
+    await withBusiness(BUSINESS, async (db) => {
+      await db.query('BEGIN');
+      const tx = { ...db, inTransaction: true };
 
-      await upsertBinding(
-        {
+      await upsertBinding(tx, {
           system: 'office-mail',
           status: 'live',
           endpoint: null,
@@ -235,9 +209,7 @@ describe('connection bindings', () => {
           provider: null,
           lastOkAt: null,
           lastError: null,
-        },
-        { businessId: BUSINESS, by: BY, db: { businessId: BUSINESS, inTransaction: true, query: client.query.bind(client) } }, // TENANCY-TODO(task 4)
-      );
+        }, { by: BY });
 
       // Force this transaction to abort *after* the write and the audit
       // append have both run, then roll it back. If the append shares this
@@ -246,19 +218,16 @@ describe('connection bindings', () => {
       // append instead ran on its own connection (the round-1/round-2
       // regression), it already committed independently and survives this
       // rollback, and only the audit assertion below fails.
-      await expect(client.query('SELECT 1/0')).rejects.toThrow();
-      await client.query('ROLLBACK');
-    } finally {
-      client.release();
-    }
+      await expect(db.query('SELECT 1/0')).rejects.toThrow();
+      await db.query('ROLLBACK');
+    });
 
-    expect(await loadBindings({ businessId: BUSINESS })).toEqual([]);
-    expect(await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'connection_binding' }))).toEqual([]); // TENANCY-TODO(task 4)
+    expect(await withBusiness(BUSINESS, (db) => loadBindings(db))).toEqual([]);
+    expect(await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'connection_binding' }))).toEqual([]);
   });
 
   it('preserves endpoint and credentialRef across a read-modify-write status change', async () => {
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'office-mail',
         status: 'live',
         endpoint: 'smtp.example.com:587',
@@ -266,24 +235,19 @@ describe('connection bindings', () => {
         provider: null,
         lastOkAt: null,
         lastError: null,
-      },
-      { businessId: BUSINESS, by: BY },
-    );
+      }, { by: BY }));
 
     // Real read-modify-write: load the current row, change only `status`, and
     // write the whole thing back — `upsertBinding` has no partial-update path,
     // so any test that re-supplies the same endpoint/credentialRef proves
     // nothing about whether they were preserved by the code under test.
-    const before = await loadBindings({ businessId: BUSINESS });
+    const before = await withBusiness(BUSINESS, (db) => loadBindings(db));
     const current = before[0];
     if (current === undefined) throw new Error('expected a binding to exist');
 
-    await upsertBinding(
-      { ...current, status: 'error', lastError: 'auth failed' },
-      { businessId: BUSINESS, by: BY },
-    );
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, { ...current, status: 'error', lastError: 'auth failed' }, { by: BY }));
 
-    const after = await loadBindings({ businessId: BUSINESS });
+    const after = await withBusiness(BUSINESS, (db) => loadBindings(db));
     expect(after).toHaveLength(1);
     expect(after[0]?.status).toBe('error');
     expect(after[0]?.endpoint).toBe('smtp.example.com:587');

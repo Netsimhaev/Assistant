@@ -18,6 +18,7 @@
  * Read-only. Each reader decides what "more than one" means for its own
  * words; this module only makes sure they all count the same things.
  */
+import type { BusinessDb } from '../db/pool.js';
 import type { InstructionConfirmation } from '../governance/instruction-confirmations.js';
 import type { InstructionRecord } from '../governance/instructions.js';
 import type { DocumentCard } from '../production/card.js';
@@ -33,8 +34,7 @@ export interface OpenOnWhatsApp {
   documentCards: DocumentCard[];
 }
 
-export async function openOnWhatsApp(input: {
-  businessId: string;
+export async function openOnWhatsApp(db: BusinessDb, input: {
   /** The inbound message being routed — never counted as a later closure of its own card. */
   excludeMessageId: string;
   /** The message's provider timestamp. Unreadable → nothing time-gated is open for it. */
@@ -44,20 +44,18 @@ export async function openOnWhatsApp(input: {
   const windowOverride = input.windowMinutes !== undefined ? { windowMinutes: input.windowMinutes } : {};
   const inbound = new Date(input.inboundAt);
   const [confirmations, mailCards, questions, documentCards] = await Promise.all([
-    openConfirmations({
-      businessId: input.businessId,
+    openConfirmations(db, {
       channel: 'whatsapp',
       inboundAt: Number.isNaN(inbound.getTime()) ? null : inbound,
       ...windowOverride,
     }),
-    openMailCards({
-      businessId: input.businessId,
+    openMailCards(db, {
       excludeMessageId: input.excludeMessageId,
       inboundAt: input.inboundAt,
       ...windowOverride,
     }),
-    answerableWhatsAppQuestions({ businessId: input.businessId, ...windowOverride }),
-    openDocumentCards({ businessId: input.businessId, inboundAt: input.inboundAt, ...windowOverride }),
+    answerableWhatsAppQuestions(db, { ...windowOverride }),
+    openDocumentCards(db, { inboundAt: input.inboundAt, ...windowOverride }),
   ]);
   return { confirmations, mailCards, questions, documentCards };
 }

@@ -75,8 +75,7 @@
  * a sentence anywhere — comment, document or dashboard — that promises
  * otherwise.
  */
-import { config } from '../config.js';
-import { getPool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { loadActiveCharter } from '../charter/store.js';
 import type { ActionClass } from '../domain/action.js';
 import { planProblems, type Plan } from '../domain/plan.js';
@@ -167,7 +166,6 @@ export interface RunInstructionOptions {
    * leave the question with nowhere to be answered.
    */
   channel: ConfirmationChannel;
-  businessId?: string;
   /** The one step that costs money, injectable so the pipeline can be tested without an API key. */
   planner?: (request: PlanRequest) => Promise<PlanOutcome>;
   /**
@@ -346,10 +344,11 @@ export type InstructionOutcome =
   | { status: 'refused'; reason: string };
 
 export async function runInstruction(
+  db: BusinessDb,
   input: { text: string },
   options: RunInstructionOptions,
 ): Promise<InstructionOutcome> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const planner = options.planner ?? makePlan;
   // Read once, used for the stored row and for the grant, so the bytes that
   // were saved and the bytes that were weighed for authority can never be
@@ -368,7 +367,7 @@ export async function runInstruction(
     };
   }
 
-  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+  const active = await loadActiveCharter(db);
   if (active === null) {
     return { status: 'refused', reason: 'אין תקנון פעיל — המתכנן נשען על הקטלוג והתקרות שבו.' };
   }
@@ -389,15 +388,14 @@ export async function runInstruction(
     if (schedule !== null) return { status: 'answered', text: schedule.answered };
   }
 
-  const job = await createJob({
+  const job = await createJob(db, {
     charterVersion: active.charter.charterVersion,
     // Not a parameter. See this module's header.
     provenance: 'boss',
-    businessId,
     title: input.text.slice(0, 80),
   });
 
-  const attachedDocuments = await attachedDocumentsOf(businessId, options.attachedDocumentIds ?? []);
+  const attachedDocuments = await attachedDocumentsOf(db, options.attachedDocumentIds ?? []);
 
   let instruction: InstructionRecord;
   try {
@@ -412,11 +410,10 @@ export async function runInstruction(
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await transition(job.jobId, {
+    await transition(db, job.jobId, {
       to: 'failed',
       actor: 'human',
       reason: `instruction door: instruction could not be stored (${message})`,
-      businessId,
     });
     // Fixed Hebrew for the owner; the raw error — Hebrew from saveInstruction's
     // own guard, or an English Postgres string otherwise — stays only in the
@@ -424,15 +421,14 @@ export async function runInstruction(
     return { status: 'refused', reason: 'לא הצלחתי לשמור את ההוראה.' };
   }
 
-  await transition(job.jobId, {
+  await transition(db, job.jobId, {
     to: 'understand',
     actor: 'human',
     reason: `instruction door: ${instruction.instructionId}`,
-    businessId,
   });
 
   const door: DoorContext = {
-    businessId,
+    db,
     jobId: job.jobId,
     instruction,
     planner,
@@ -610,7 +606,8 @@ export async function runInstruction(
 
 /** Everything one instruction's planning passes share. Exported for the meeting door (`meetings/door.ts`). */
 export interface DoorContext {
-  businessId: string;
+  /** The business is `db.businessId` — one source of truth for every pass of the instruction. */
+  db: BusinessDb;
   jobId: string;
   instruction: InstructionRecord;
   planner: (request: PlanRequest) => Promise<PlanOutcome>;
@@ -635,15 +632,15 @@ export { finishSingle as finishSinglePlan };
  * second layer that keeps it so.
  */
 async function attachedDocumentsOf(
-  businessId: string,
+  db: BusinessDb,
   ids: readonly string[],
 ): Promise<{ documentId: string; name: string }[]> {
   if (ids.length === 0) return [];
-  const { rows } = await getPool().query<{ document_id: string; original_name: string }>(
+  const { rows } = await db.query<{ document_id: string; original_name: string }>(
     `SELECT document_id, original_name FROM documents
       WHERE business_id = $1 AND document_id = ANY($2::text[])
       ORDER BY array_position($2::text[], document_id)`,
-    [businessId, [...new Set(ids)]],
+    [db.businessId, [...new Set(ids)]],
   );
   return rows.map((r) => ({ documentId: r.document_id, name: r.original_name }));
 }
@@ -684,7 +681,7 @@ async function planAndCheck(
   // this one has a safe fallback and takes it instead.
   let memoryBlock = '';
   try {
-    memoryBlock = await recallForPlanning(subjects, { businessId: door.businessId });
+    memoryBlock = await recallForPlanning(subjects, { businessId: door.db.businessId });
   } catch {
     memoryBlock = '';
   }
@@ -693,7 +690,7 @@ async function planAndCheck(
   // having it, but not planning because a read failed is worse still.
   let ledgerBlock = '';
   try {
-    const items = await listLedgerItems({ businessId: door.businessId, statuses: ['open', 'stuck'] });
+    const items = await listLedgerItems({ businessId: door.db.businessId, statuses: ['open', 'stuck'] });
     ledgerBlock = renderLedgerBlock({ now: new Date(), timeZone: door.timeZone, items });
   } catch {
     ledgerBlock = '';
@@ -840,7 +837,7 @@ async function ledgerStepProblem(
   if (step.toolName === 'ledger.update') {
     const parsed = LedgerUpdateInput.safeParse(step.input);
     if (!parsed.success) return invalid(parsed.error.issues[0]?.message ?? 'schema');
-    const item = await loadLedgerItem(parsed.data.itemId, { businessId: door.businessId });
+    const item = await loadLedgerItem(parsed.data.itemId, { businessId: door.db.businessId });
     if (item === null) {
       return {
         reason: 'התוכנית מעדכנת שורה בפנקס שאינה קיימת, ולכן לא רצה.',
@@ -867,7 +864,7 @@ async function sourceQuestionFor(door: DoorContext, plan: Plan): Promise<string 
     if (!parsed.success || (parsed.data.sourceHints ?? []).length === 0) continue;
     let resolution: SourceResolution;
     try {
-      resolution = await resolveSourceDocuments(door.businessId, parsed.data.sourceHints ?? [], [], getPool(), {
+      resolution = await resolveSourceDocuments(door.db.businessId, parsed.data.sourceHints ?? [], [], door.db, {
         timeZone: door.timeZone,
       });
     } catch {
@@ -898,7 +895,7 @@ export function renderSourceQuestion(
 /** What a plan's ledger steps will record, as the owner reads it (future tense, F-I4). */
 function ledgerEchoOf(door: DoorContext, plan: Plan): Promise<string | null> {
   return ledgerEchoForSteps(plan.steps, {
-    businessId: door.businessId,
+    businessId: door.db.businessId,
     timeZone: door.timeZone,
     currency: door.bundle.ceilings.currency,
     instructionText: door.instruction.text,
@@ -908,11 +905,10 @@ function ledgerEchoOf(door: DoorContext, plan: Plan): Promise<string | null> {
 }
 
 async function failJob(door: DoorContext, reason: string): Promise<void> {
-  await transition(door.jobId, {
+  await transition(door.db, door.jobId, {
     to: 'failed',
     actor: 'orchestrator',
     reason,
-    businessId: door.businessId,
   });
 }
 
@@ -1071,11 +1067,10 @@ async function planPerCandidate(
 
   // Parked in `plan` (spec §10.1) with NOTHING bound: the plan that runs is
   // the one the owner picks, bound only after the pick (spec §4.4).
-  await transition(door.jobId, {
+  await transition(door.db, door.jobId, {
     to: 'plan',
     actor: 'orchestrator',
     reason: `instruction door: ${options.length} candidate plans await the owner's choice`,
-    businessId: door.businessId,
   });
   return askAndPark(door, options, rendered.text, null);
 }
@@ -1088,7 +1083,7 @@ async function planPerCandidate(
  */
 async function askOwner(door: DoorContext, question: string): Promise<InstructionOutcome> {
   try {
-    await recordQuestion(door.instruction.instructionId, question, { businessId: door.businessId });
+    await recordQuestion(door.instruction.instructionId, question, { businessId: door.db.businessId });
   } catch {
     // Swallowed by design — see above.
   }
@@ -1153,17 +1148,16 @@ async function finishSingle(
     door.instruction.text,
     door.textOrigin,
     door.bundle.knownCounterparties,
-    door.businessId,
+    door.db,
   );
 
-  await transition(door.jobId, {
+  await transition(door.db, door.jobId, {
     to: 'plan',
     actor: 'orchestrator',
     reason: 'instruction door: plan accepted',
-    businessId: door.businessId,
   });
 
-  const binding = await bindPlanToJob(door.jobId, plan, { businessId: door.businessId });
+  const binding = await bindPlanToJob(door.db, door.jobId, plan);
   if (binding.status === 'conflict') {
     // Cannot happen for a job this function just created — this is the first
     // plan ever offered for it — but `bindPlanToJob` returns a result rather
@@ -1184,11 +1178,10 @@ async function finishSingle(
     return askAndPark(door, [option], question, single.identityNote);
   }
 
-  await transition(door.jobId, {
+  await transition(door.db, door.jobId, {
     to: 'execute',
     actor: 'orchestrator',
     reason: 'instruction door: bound and ready',
-    businessId: door.businessId,
   });
 
   return {
@@ -1217,7 +1210,7 @@ async function askAndPark(
   try {
     await createConfirmation(
       { jobId: door.jobId, options, presentedText: question, channel: door.channel },
-      { businessId: door.businessId },
+      { businessId: door.db.businessId },
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -1344,7 +1337,7 @@ async function grantForPlan(
   instruction: string,
   textOrigin: InstructionTextOrigin,
   known: Parameters<typeof authorisedRecipients>[0]['known'],
-  businessId: string,
+  db: BusinessDb,
 ): Promise<GrantForPlanResult> {
   const byClass = new Map<ActionClass, Set<string>>();
   // Accumulated across every step, independently of whether that step
@@ -1423,7 +1416,7 @@ async function grantForPlan(
   const granted: GrantedAuthorization[] = [];
   for (const [actionClass, addresses] of byClass) {
     const recipients = [...addresses].sort();
-    await withBusiness(businessId, (bdb) => grantAuthorization(bdb, { jobId, actionClass, recipients })); // TENANCY-TODO(task 4)
+    await grantAuthorization(db, { jobId, actionClass, recipients });
     granted.push({ actionClass, recipients });
   }
   return { granted, grantNote: null, recordingNote };

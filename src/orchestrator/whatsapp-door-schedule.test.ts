@@ -83,7 +83,7 @@ function recordingMessenger(): { messenger: BossMessenger; jobIds: (string | nul
 }
 
 async function expectedSchedule(text: string): Promise<string> {
-  const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+  const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
   if (active === null) throw new Error('no charter');
   const r = await answerScheduleQuery({
     text, businessId: BUSINESS, timeZone: active.charter.identity.timezone, operations: active.charter.operations,
@@ -108,11 +108,8 @@ const clarifyingPlan: Plan = {
 
 beforeEach(async () => {
   await resetDatabase();
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
-  await upsertBinding(
-    { system: CALENDAR_SYSTEM, status: 'live', endpoint: null, credentialRef: 'OAUTH_CALENDAR', provider: 'google', lastOkAt: null, lastError: null },
-    { businessId: BUSINESS, by: 'test' },
-  );
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+  await withBusiness(BUSINESS, (db) => upsertBinding(db, { system: CALENDAR_SYSTEM, status: 'live', endpoint: null, credentialRef: 'OAUTH_CALENDAR', provider: 'google', lastOkAt: null, lastError: null }, { by: 'test' }));
 });
 afterAll(async () => {
   await closePool();
@@ -125,7 +122,7 @@ describe('WhatsApp door: schedule question', () => {
     const msg = owner('מה יש לי מחר?');
     gateway.enqueue(msg);
 
-    const result = await runWhatsAppDoor({ gateway, messenger, businessId: BUSINESS, calendar: CALENDAR });
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, { gateway, messenger, calendar: CALENDAR }));
 
     const expected = await expectedSchedule('מה יש לי מחר?');
     expect(expected).toContain('*10:00–11:00 · דני כהן*');
@@ -144,7 +141,7 @@ describe('WhatsApp door: schedule question', () => {
 
   it('is neither counted against nor refused by the daily instruction cap', async () => {
     for (let i = 0; i < config.whatsappInstructionsPerDay; i += 1) {
-      await withBusiness(BUSINESS, (bdb) => appendAudit( // TENANCY-TODO(task 4)
+      await withBusiness(BUSINESS, (bdb) => appendAudit(
         bdb,
         {
           actor: 'orchestrator', kind: 'whatsapp_instruction', charterVersion: 'n/a', provenance: 'boss',
@@ -156,7 +153,7 @@ describe('WhatsApp door: schedule question', () => {
     const gateway = createFakeGateway();
     const { messenger, texts } = recordingMessenger();
     gateway.enqueue(owner('מה יש לי מחר'));
-    await runWhatsAppDoor({ gateway, messenger, businessId: BUSINESS, calendar: CALENDAR });
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, { gateway, messenger, calendar: CALENDAR }));
     expect(texts).toEqual([await expectedSchedule('מה יש לי מחר')]);
     expect(await count("SELECT count(*)::text AS n FROM audit_log WHERE kind = 'whatsapp_instruction'")).toBe(before);
   });
@@ -165,21 +162,21 @@ describe('WhatsApp door: schedule question', () => {
     const gateway = createFakeGateway();
     const { messenger, texts } = recordingMessenger();
     gateway.enqueue(owner('תשלחי לרונית מחר'));
-    await runWhatsAppDoor({
-      gateway, messenger, businessId: BUSINESS, calendar: CALENDAR,
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
+      gateway, messenger, calendar: CALENDAR,
       planner: async () => ({ status: 'planned', plan: clarifyingPlan }),
-    });
+    }));
     const parked = await getPool().query<{ job_id: string }>('SELECT job_id FROM boss_instructions');
     expect(parked.rows).toHaveLength(1);
     const jobsBefore = await count('SELECT count(*)::text AS n FROM jobs');
 
     gateway.enqueue(owner('מה יש לי ביום שלישי'));
-    await runWhatsAppDoor({
-      gateway, messenger, businessId: BUSINESS, calendar: CALENDAR,
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
+      gateway, messenger, calendar: CALENDAR,
       planner: async () => {
         throw new Error('planner must not run for a schedule question');
       },
-    });
+    }));
 
     expect(texts[1]).toBe(await expectedSchedule('מה יש לי ביום שלישי'));
     expect(texts[1]).not.toContain('הוספתי את זה לבקשה הקודמת');

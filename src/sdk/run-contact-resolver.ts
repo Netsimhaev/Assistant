@@ -123,12 +123,11 @@ async function seedContact(
   person: { entityId: string; email: string; name: string; company: string },
   charterVersion: string,
 ): Promise<void> {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, { // TENANCY-TODO(task 7)
     charterVersion,
     provenance: 'boss',
     title: `seed ${person.name}`,
-    businessId: BUSINESS,
-  });
+  }));
   created.push(job.jobId);
 
   await writeMemory(
@@ -249,10 +248,7 @@ async function main(): Promise<void> {
   // `textOrigin: 'typed'` — this script types its own instructions, exactly
   // as the dashboard box does. The option is required and has no default
   // (see `RunInstructionOptions`), so a script is made to state it too.
-  const outA = await runInstruction(
-    { text: textA },
-    { businessId: BUSINESS, textOrigin: 'typed', channel: 'dashboard', planner: spyA.planner },
-  );
+  const outA = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: textA }, { textOrigin: 'typed', channel: 'dashboard', planner: spyA.planner })); // TENANCY-TODO(task 7)
   console.log(`\n(${((Date.now() - startedA) / 1000).toFixed(1)}s)`);
   reportOutcome(outA);
   reportPrompt(spyA.seen(), spyA.calls());
@@ -265,10 +261,7 @@ async function main(): Promise<void> {
   const resB = resolveContacts(textB, contacts);
   console.log(`הפותר: subjects=${JSON.stringify(resB.subjects)} ambiguities=${resB.ambiguities.length}`);
 
-  const outB = await runInstruction(
-    { text: textB },
-    { businessId: BUSINESS, textOrigin: 'typed', channel: 'dashboard', planner: forbiddenPlanner },
-  );
+  const outB = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: textB }, { textOrigin: 'typed', channel: 'dashboard', planner: forbiddenPlanner })); // TENANCY-TODO(task 7)
   reportOutcome(outB);
   console.log('');
   console.log('המתכנן לא נקרא — ההוראה נעצרה לפניו, ולכן ההרצה הזו לא עלתה כלום.');
@@ -284,10 +277,7 @@ async function main(): Promise<void> {
 
   const spyC = spyPlanner();
   const startedC = Date.now();
-  const outC = await runInstruction(
-    { text: textC },
-    { businessId: BUSINESS, textOrigin: 'typed', channel: 'dashboard', identityAsked: true, planner: spyC.planner },
-  );
+  const outC = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: textC }, { textOrigin: 'typed', channel: 'dashboard', identityAsked: true, planner: spyC.planner })); // TENANCY-TODO(task 7)
   console.log(`\n(${((Date.now() - startedC) / 1000).toFixed(1)}s)`);
   reportOutcome(outC);
   reportPrompt(spyC.seen(), spyC.calls());
@@ -318,12 +308,11 @@ async function cleanup(): Promise<void> {
   banner('ניקוי');
   for (const jobId of created) {
     try {
-      await transition(jobId, {
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { // TENANCY-TODO(task 7)
         to: 'failed',
         actor: 'human',
         reason: 'live contact-resolver probe: parked so nothing executes',
-        businessId: BUSINESS,
-      });
+      }));
     } catch (err) {
       console.error(`  לא הצלחתי לעצור את ${jobId}: ${err instanceof Error ? err.message : String(err)}`);
     }

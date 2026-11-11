@@ -27,11 +27,11 @@
  * Everything else — the phase machine, the gate, `runDueJobs`, the envelope
  * store, `resumeDelegatedJobs`, `closeVerifiedJobs` — is production code.
  */
+import { config } from '../config.js';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { config } from '../config.js';
 import { getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -117,7 +117,7 @@ async function envelopes(): Promise<Envelope[]> {
 describe('the verification loop, end to end through schedulerPass', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
   });
 
   it('cards a document, delegates, parks, wakes, judges, and closes', async () => {
@@ -212,15 +212,15 @@ describe('the verification loop, end to end through schedulerPass', () => {
 
       // Parked, not failed: this is the exact state the unconditional
       // `transition(..., 'failed')` used to destroy.
-      expect((await loadJob(verifyJobId, { businessId: BUSINESS }))?.phase).toBe('followup');
+      expect((await withBusiness(BUSINESS, (db) => loadJob(db, verifyJobId)))?.phase).toBe('followup');
       // The helper ran and closed inside this same pass — the ordering
       // `schedulerPass` documents (`runDueJobs` after the conductor,
       // `closeVerifiedJobs` after the plans) is what buys that.
-      expect((await loadJob(helperJobId, { businessId: BUSINESS }))?.phase).toBe('closed');
+      expect((await withBusiness(BUSINESS, (db) => loadJob(db, helperJobId)))?.phase).toBe('closed');
       // Nothing judged yet, and the absence says "still running" — the one
       // meaning `verification_verdicts` reserves for a missing row.
       expect(judgeCalls).toBe(0);
-      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toBeNull(); // TENANCY-TODO(task 4)
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toBeNull();
 
       // ---- Pass 2 -------------------------------------------------------
       // `resumeDelegatedJobs` writes the `result` envelope and wakes the
@@ -233,10 +233,10 @@ describe('the verification loop, end to end through schedulerPass', () => {
       expect(pass2.delegated.errored).toEqual([]);
       expect(judgeCalls).toBe(1);
 
-      const finished = await loadJob(verifyJobId, { businessId: BUSINESS });
+      const finished = await withBusiness(BUSINESS, (db) => loadJob(db, verifyJobId));
       expect(finished?.phase).toBe('closed');
 
-      const outcome = await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId)); // TENANCY-TODO(task 4)
+      const outcome = await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId));
       expect(outcome?.status).toBe('judged');
       if (outcome === null || outcome.status !== 'judged') throw new Error('expected a verdict');
       expect(outcome.verdict.criteria).toHaveLength(1);
@@ -336,7 +336,7 @@ describe('the verification loop, end to end through schedulerPass', () => {
       expect(rows.filter((row) => row.kind === 'help_request')).toHaveLength(1);
       const request = rows[0];
       if (request === undefined) throw new Error('the delegation never happened');
-      expect((await loadJob(request.parent_job_id, { businessId: BUSINESS }))?.phase).toBe(
+      expect((await withBusiness(BUSINESS, (db) => loadJob(db, request.parent_job_id)))?.phase).toBe(
         'followup',
       );
       // And the judge genuinely was not reached on this pass, so the green

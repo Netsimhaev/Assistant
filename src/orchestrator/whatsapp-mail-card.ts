@@ -55,7 +55,7 @@
  * the ordinary instruction door. The dashboard is always the other exit.
  */
 import { config } from '../config.js';
-import { getPool, withBusiness, withBusinessTransaction, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import {
   ApprovalNotDecidableError,
   cancelPendingApproval,
@@ -142,12 +142,12 @@ export function replacementBody(text: string): string | null {
  * throwing is left to the caller — the card is on the dashboard either way.
  */
 export async function presentMailCard(
+  db: BusinessDb,
   approvalId: string,
   send: (text: string, jobId: string | null) => Promise<void>,
-  options: { businessId?: string; lead?: string } = {},
+  options: { lead?: string } = {},
 ): Promise<boolean> {
-  const businessId = options.businessId ?? config.businessId;
-  const approval = await withBusiness(businessId, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 4)
+  const approval = await getApproval(db, approvalId);
   if (approval === null || approval.jobId === null || approval.state !== 'pending') return false;
   if (mailboxReplyRecipient(approval.proposedInput) === null) return false;
   const payload = approval.editedInput ?? approval.proposedInput;
@@ -182,8 +182,7 @@ interface OpenRow {
  * the window alone — `decide` still checks the card's own `expires_at` in SQL.
  * `windowMinutes <= 0` means no card is ever open.
  */
-export async function openMailCards(input: {
-  businessId?: string;
+export async function openMailCards(db: BusinessDb, input: {
   excludeMessageId: string;
   /**
    * When the message being routed was sent (its provider timestamp). Only a
@@ -193,15 +192,13 @@ export async function openMailCards(input: {
   inboundAt: string;
   now?: number;
   windowMinutes?: number;
-  db?: Queryable;
 }): Promise<OpenMailCard[]> {
-  const businessId = input.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const windowMinutes = input.windowMinutes ?? config.whatsappQuestionWindowMinutes;
   if (windowMinutes <= 0) return [];
   const nowMs = input.now ?? Date.now();
   const inboundMs = Date.parse(input.inboundAt);
   if (Number.isNaN(inboundMs)) return [];
-  const db = input.db ?? getPool();
 
   const { rows } = await db.query<OpenRow>(
     `SELECT a.approval_id, p.presented_at,
@@ -251,7 +248,7 @@ export async function openMailCards(input: {
     // answer to it — it goes to the ordinary door instead.
     if (!(inboundMs > presentedMs)) continue;
     if (row.later_texts.some((text) => isClosureCommand(text))) continue;
-    const approval = await withBusiness(businessId, (bdb) => getApproval(bdb, row.approval_id)); // TENANCY-TODO(task 4)
+    const approval = await getApproval(db, row.approval_id);
     if (approval === null || mailboxReplyRecipient(approval.proposedInput) === null) continue;
     open.push({ approval, presentedAt: row.presented_at });
   }
@@ -288,14 +285,12 @@ export function isMailCardAction(text: string): boolean {
  * is decided, so a redelivered or raced copy of the same "שלח" cannot decide
  * twice.
  */
-export async function handleMailCardMessage(input: {
-  msg: NormalizedInboundMessage;
-  storedId: string;
-  cards: readonly OpenMailCard[];
-  messenger: BossMessenger;
-  businessId: string;
-}): Promise<MailCardOutcome> {
-  const { msg, storedId, cards, messenger, businessId } = input;
+export async function handleMailCardMessage(
+  db: BusinessDb,
+  input: { msg: NormalizedInboundMessage; storedId: string; cards: readonly OpenMailCard[]; messenger: BossMessenger },
+): Promise<MailCardOutcome> {
+  const { msg, storedId, cards, messenger } = input;
+  const { businessId } = db;
   if (msg.mediaKind !== null) return 'passthrough';
   const text = msg.body ?? '';
   if (!isMailCardAction(text)) return 'passthrough';
@@ -314,7 +309,7 @@ export async function handleMailCardMessage(input: {
   if (isApproveWord(text)) {
     const only = cards.length === 1 ? cards[0] : undefined;
     if (only === undefined) return refuse(MULTIPLE_MAIL_CARDS_REFUSAL);
-    return approveCard(only.approval, { by, storedId, messenger, businessId, refuse });
+    return approveCard(only.approval, { by, storedId, messenger, db, refuse });
   }
 
   if (isClosureCommand(text)) {
@@ -328,13 +323,13 @@ export async function handleMailCardMessage(input: {
   if (newBody === '') return refuse(EMPTY_REPLACEMENT);
   const only = cards.length === 1 ? cards[0] : undefined;
   if (only === undefined) return refuse(MULTIPLE_MAIL_CARDS_REFUSAL);
-  return replaceBody(only.approval, newBody, { storedId, messenger, businessId, refuse });
+  return replaceBody(only.approval, newBody, { storedId, messenger, db, refuse });
 }
 
 interface StepContext {
   storedId: string;
   messenger: BossMessenger;
-  businessId: string;
+  db: BusinessDb;
   refuse: (text: string) => Promise<'refused'>;
 }
 
@@ -356,12 +351,12 @@ async function approveCard(
 
   let decided: ApprovalRequest;
   try {
-    decided = await withBusiness(ctx.businessId, (bdb) => decide( // TENANCY-TODO(task 4)
-      bdb,
+    decided = await decide(
+      ctx.db,
       card.approvalId,
       'approved',
-      { by: ctx.by, channel: 'whatsapp', ...(staged !== undefined ? { editedInput: staged } : {}) }
-    ));
+      { by: ctx.by, channel: 'whatsapp', ...(staged !== undefined ? { editedInput: staged } : {}) },
+    );
   } catch (error) {
     if (error instanceof ApprovalNotDecidableError) return ctx.refuse(MAIL_CARD_GONE);
     throw error;
@@ -373,7 +368,7 @@ async function approveCard(
   // that is already decided — and the message is still settled.
   let resumed = true;
   try {
-    await resumeAfterDecision(decided, ctx.by, { businessId: ctx.businessId });
+    await resumeAfterDecision(ctx.db, decided, ctx.by);
   } catch {
     resumed = false;
   }
@@ -388,7 +383,7 @@ async function approveCard(
     ctx.storedId,
     'handled',
     card.jobId !== null ? { jobId: card.jobId } : {},
-    { businessId: ctx.businessId },
+    { businessId: ctx.db.businessId },
   );
   return 'decided';
 }
@@ -420,7 +415,7 @@ async function replaceBody(
   const edited: Record<string, unknown> = { ...proposed, body: newBody };
   if (!mailReplyEditAllowed(proposed, edited)) return ctx.refuse(MAIL_CARD_GONE);
 
-  const freshId = await withBusinessTransaction(ctx.businessId, async (tx) => { // TENANCY-TODO(task 4)
+  const freshId = await transaction(ctx.db, async (tx) => {
     if (!(await cancelPendingApproval(tx, card.approvalId))) {
       return null;
     }
@@ -450,15 +445,11 @@ async function replaceBody(
   });
   if (freshId === null) return ctx.refuse(MAIL_CARD_GONE);
 
-  await presentMailCard(
-    freshId,
-    async (cardText, cardJobId) => {
+  await presentMailCard(ctx.db, freshId, async (cardText, cardJobId) => {
       // `send` never throws; a failed send leaves an outbound row the window
       // does not count, so the fresh card is simply not open on WhatsApp.
       await ctx.messenger.send({ text: cardText, jobId: cardJobId });
-    },
-    { businessId: ctx.businessId, lead: REPLACEMENT_LEAD },
-  );
-  await settleMessage(ctx.storedId, 'handled', { jobId }, { businessId: ctx.businessId });
+    }, { lead: REPLACEMENT_LEAD });
+  await settleMessage(ctx.storedId, 'handled', { jobId }, { businessId: ctx.db.businessId });
   return 'replaced';
 }

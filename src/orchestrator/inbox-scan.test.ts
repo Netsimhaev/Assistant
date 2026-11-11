@@ -3,8 +3,8 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { getPool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { scanInbox } from './inbox-scan.js';
 
 // Module-boundary stub for the single "filing an ingested document fails"
@@ -47,7 +47,7 @@ describe('scanInbox', () => {
     const { inbox, documentRoot } = await anInbox();
     await writeFile(join(inbox, 'hello.txt'), 'שלום עולם', 'utf8');
 
-    const result = await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+    const result = await withBusiness(BUSINESS, (db) => scanInbox(db, { inbox, documentRoot }));
 
     expect(result.ingested).toBe(1);
     expect(await readdir(join(inbox, 'processed'))).toEqual(['hello.txt']);
@@ -79,7 +79,7 @@ describe('scanInbox', () => {
       Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('not really a zip')]),
     );
 
-    const result = await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+    const result = await withBusiness(BUSINESS, (db) => scanInbox(db, { inbox, documentRoot }));
 
     expect(result.rejected).toBe(1);
     expect(result.ingested, 'a rejected document is never also an ingested one').toBe(0);
@@ -107,7 +107,7 @@ describe('scanInbox', () => {
       Buffer.concat([Buffer.from('%PDF-1.4\n%'), Buffer.from([0xe2, 0xe3, 0xcf, 0xd3]), Buffer.from('\n1 0 obj\n')]),
     );
 
-    const result = await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+    const result = await withBusiness(BUSINESS, (db) => scanInbox(db, { inbox, documentRoot }));
 
     expect(result.rejected).toBe(1);
     expect(result.ingested).toBe(0);
@@ -125,10 +125,10 @@ describe('scanInbox', () => {
   it('leaves the subdirectories themselves alone', async () => {
     const { inbox, documentRoot } = await anInbox();
     await writeFile(join(inbox, 'a.txt'), 'א', 'utf8');
-    await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+    await withBusiness(BUSINESS, (db) => scanInbox(db, { inbox, documentRoot }));
     await writeFile(join(inbox, 'b.txt'), 'ב', 'utf8');
 
-    const result = await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+    const result = await withBusiness(BUSINESS, (db) => scanInbox(db, { inbox, documentRoot }));
 
     expect(result.ingested, 'the second pass must not re-ingest a.txt').toBe(1);
     expect((await readdir(join(inbox, 'processed'))).sort()).toEqual(['a.txt', 'b.txt']);
@@ -137,10 +137,10 @@ describe('scanInbox', () => {
   it('does not collide when the same name arrives twice', async () => {
     const { inbox, documentRoot } = await anInbox();
     await writeFile(join(inbox, 'same.txt'), 'ראשון', 'utf8');
-    await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+    await withBusiness(BUSINESS, (db) => scanInbox(db, { inbox, documentRoot }));
     await writeFile(join(inbox, 'same.txt'), 'שני', 'utf8');
 
-    await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+    await withBusiness(BUSINESS, (db) => scanInbox(db, { inbox, documentRoot }));
 
     const processed = await readdir(join(inbox, 'processed'));
     expect(processed).toHaveLength(2);
@@ -149,7 +149,7 @@ describe('scanInbox', () => {
 
   it('creates its subdirectories on a bare folder', async () => {
     const { inbox, documentRoot } = await anInbox();
-    const result = await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+    const result = await withBusiness(BUSINESS, (db) => scanInbox(db, { inbox, documentRoot }));
     expect(result).toEqual({ ingested: 0, rejected: 0, failed: 0, deferred: 0, skipped: 0 });
     expect((await readdir(inbox)).sort()).toEqual(['failed', 'processed', 'rejected', 'working']);
   });
@@ -169,7 +169,7 @@ describe('scanInbox', () => {
     // row instead of creating a new one — the same thing a second real
     // arrival of these bytes would see.
     const sha256 = createHash('sha256').update(bytes).digest('hex');
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO documents
          (document_id, business_id, source, original_name, media_type, sha256, byte_size, stored_path, status)
        VALUES ($1, $2, 'manual', 'stuck.txt', 'text/plain', $3, $4, $5, 'pending')`,
@@ -182,7 +182,7 @@ describe('scanInbox', () => {
       ],
     );
 
-    const result = await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+    const result = await withBusiness(BUSINESS, (db) => scanInbox(db, { inbox, documentRoot }));
 
     expect(result.failed).toBe(1);
     expect(result.ingested, 'a pending document is stuck, never a success').toBe(0);
@@ -198,7 +198,7 @@ describe('scanInbox', () => {
     await writeFile(join(inbox, 'jammed.txt'), 'ראשון', 'utf8');
     await writeFile(join(inbox, 'clean.txt'), 'שני', 'utf8');
 
-    const result = await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+    const result = await withBusiness(BUSINESS, (db) => scanInbox(db, { inbox, documentRoot }));
 
     // The document behind jammed.txt was genuinely ingested — only the move
     // into processed/ failed — so the counters must describe the file, not
@@ -229,11 +229,11 @@ describe('scanInbox', () => {
     const { inbox, documentRoot } = await anInbox();
     // Create the subdirectories, then strand a file inside working/ by hand,
     // exactly as an interrupted earlier pass would have left one.
-    await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+    await withBusiness(BUSINESS, (db) => scanInbox(db, { inbox, documentRoot }));
     await writeFile(join(inbox, 'working', 'stranded.txt'), 'התקוע מאתמול', 'utf8');
 
     await writeFile(join(inbox, 'stranded.txt'), 'החדש של היום', 'utf8');
-    const result = await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+    const result = await withBusiness(BUSINESS, (db) => scanInbox(db, { inbox, documentRoot }));
 
     // The new file went through as usual.
     expect(result.ingested).toBe(1);

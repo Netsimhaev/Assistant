@@ -1,5 +1,4 @@
-import { config } from '../config.js';
-import { getPool, withBusiness, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { ActionClass } from '../domain/action.js';
 import type { Plan } from '../domain/plan.js';
 import { AutonomyLevel, mostRestrictiveAutonomy, permits } from '../domain/trust.js';
@@ -29,14 +28,13 @@ interface RampRow {
  * to read it rather than a second copy of this query.
  */
 async function fetchStoredLevel(
+  db: BusinessDb,
   actionClass: ActionClass,
-  options: { businessId?: string; db?: Queryable },
 ): Promise<AutonomyLevel | null> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<RampRow>(
     `SELECT level FROM autonomy_ramp
       WHERE business_id = $1 AND action_class = $2`,
-    [options.businessId ?? config.businessId, actionClass],
+    [db.businessId, actionClass],
   );
   const stored = rows[0]?.level;
   if (stored === undefined) return null;
@@ -61,10 +59,10 @@ async function fetchStoredLevel(
  * this system promises not to tell one.
  */
 export async function loadStoredRampLevel(
+  db: BusinessDb,
   actionClass: ActionClass,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<AutonomyLevel | null> {
-  return fetchStoredLevel(actionClass, options);
+  return fetchStoredLevel(db, actionClass);
 }
 
 /**
@@ -77,11 +75,10 @@ export async function loadStoredRampLevel(
  * production caller yet.
  */
 export async function loadRampLevel(
+  db: BusinessDb,
   actionClass: ActionClass,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<AutonomyLevel> {
-  const db = options.db ?? getPool();
-  const stored = await fetchStoredLevel(actionClass, { ...options, db });
+  const stored = await fetchStoredLevel(db, actionClass);
 
   // The owner's dial decides the window this may sit in (spec §3.1), and the
   // stored level is CLAMPED into it — raised to the floor, and lowered to the
@@ -105,7 +102,7 @@ export async function loadRampLevel(
   // promoted. Neither drops the charter's cap, which is why that one is the
   // invariant this relaxation leans on.
   const bounds = rampBoundsForMode(
-    await withBusiness(options.businessId ?? config.businessId, (bdb) => loadAutonomyMode(bdb)), // TENANCY-TODO(task 4)
+    await loadAutonomyMode(db),
   );
   return clampToDial(stored, bounds);
 }
@@ -136,17 +133,16 @@ export function clampToDial(
  * the only thing that should move this row is a person running a command.
  */
 export async function setRampLevel(
+  db: BusinessDb,
   actionClass: ActionClass,
   level: AutonomyLevel,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
-  const db = options.db ?? getPool();
   await db.query(
     `INSERT INTO autonomy_ramp (business_id, action_class, level, updated_at)
      VALUES ($1, $2, $3, now())
      ON CONFLICT (business_id, action_class)
      DO UPDATE SET level = EXCLUDED.level, updated_at = now()`,
-    [options.businessId ?? config.businessId, actionClass, level],
+    [db.businessId, actionClass, level],
   );
 }
 
@@ -186,8 +182,8 @@ export async function setRampLevel(
  * membership of a positive list, never the absence of a class.
  */
 export async function rampLevelForPlan(
+  db: BusinessDb,
   plan: Plan,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<AutonomyLevel> {
   const levels: AutonomyLevel[] = [];
   // Tracks *why* a step contributed nothing to `levels`, because the two
@@ -207,7 +203,7 @@ export async function rampLevelForPlan(
       levels.push(RAMP_FLOOR);
       continue;
     }
-    levels.push(await loadRampLevel(step.expectedActionClass, options));
+    levels.push(await loadRampLevel(db, step.expectedActionClass));
   }
   if (levels.length === 0) {
     // Two different reasons land here, and they are not the same answer.

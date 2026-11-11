@@ -151,35 +151,33 @@ function twoStepPlan(body = 'שלום'): Plan {
  * `new@example.com` are the ones whose second step is *supposed* to queue.
  */
 async function install(connections: CharterConnection[]): Promise<PolicyBundle> {
-  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections, knownCounterpartyEmailDomain: 'b.com' }))); // TENANCY-TODO(task 4)
+  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections, knownCounterpartyEmailDomain: 'b.com' })));
 }
 
 async function jobInExecute(bundle: PolicyBundle): Promise<Job> {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
   return reload(job.jobId);
 }
 
 async function reload(jobId: string): Promise<Job> {
-  const loaded = await loadJob(jobId, { businessId: BUSINESS });
+  const loaded = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
   if (loaded === null) throw new Error('job vanished');
   return loaded;
 }
 
 /** What the scheduler does to a job whose wake time has come. */
 async function wake(jobId: string): Promise<Job> {
-  await transition(jobId, {
+  await withBusiness(BUSINESS, (db) => transition(db, jobId, {
     to: 'execute',
     actor: 'system',
     reason: 'wake_at reached',
-    businessId: BUSINESS,
-  });
+  }));
   return reload(jobId);
 }
 
@@ -202,7 +200,7 @@ describe('a resumed plan does not re-run what already ran', () => {
     const { sent, wa, registry } = world();
     const bindings = [MAIL_LIVE, WA_LIVE];
     const run = (j: Job, now: Date): Promise<RunPlanResult> =>
-      runPlan({
+      withBusiness(j.businessId, (db) => runPlan(db, {
         job: j,
         bundle,
         plan: twoStepPlan(),
@@ -212,7 +210,7 @@ describe('a resumed plan does not re-run what already ran', () => {
         counterpartyTags: [],
         rampLevel: 'auto',
         now,
-      });
+      }));
 
     // Run 1, in daylight: the mail goes out, the WhatsApp bridge is down and
     // the failure is retryable, so the job sleeps.
@@ -285,7 +283,7 @@ describe('a resumed plan does not re-run what already ran', () => {
     });
 
     const run = (j: Job): Promise<RunPlanResult> =>
-      runPlan({
+      withBusiness(j.businessId, (db) => runPlan(db, {
         job: j,
         bundle,
         plan,
@@ -295,7 +293,7 @@ describe('a resumed plan does not re-run what already ran', () => {
         counterpartyTags: [],
         rampLevel: 'auto',
         now: NOON,
-      });
+      }));
 
     const first = await run(job);
     expect(first.status).toBe('halted');
@@ -308,12 +306,7 @@ describe('a resumed plan does not re-run what already ran', () => {
       : null;
     if (approvalId === null) throw new Error('expected s2 to queue an approval');
 
-    const decided = await applyDecision(
-      approvalId,
-      'approved',
-      { by: 'p_boss', channel: 'dashboard' },
-      { businessId: BUSINESS },
-    );
+    const decided = await withBusiness(BUSINESS, (db) => applyDecision(db, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
     expect(decided.jobPhase).toBe('execute');
 
     const second = await run(await reload(job.jobId));
@@ -331,7 +324,7 @@ describe('a resumed plan does not re-run what already ran', () => {
     expect(second.status).toBe('done');
     expect(second.steps[1]?.outcome.status).toBe('done');
     expect(mailsTo(sent, 'new@example.com')).toBe(1);
-    const queuedTwice = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb)); // TENANCY-TODO(task 4)
+    const queuedTwice = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb));
     expect(queuedTwice).toHaveLength(0);
   });
 
@@ -341,7 +334,7 @@ describe('a resumed plan does not re-run what already ran', () => {
     const { sent, wa, registry } = world();
     const bindings = [MAIL_LIVE, WA_LIVE];
 
-    const first = await runPlan({
+    const first = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: twoStepPlan('שלום'),
@@ -351,12 +344,12 @@ describe('a resumed plan does not re-run what already ran', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
     expect(first.status).toBe('halted');
     expect(sent).toHaveLength(1);
 
     wa.reachable = true;
-    const replanned = await runPlan({
+    const replanned = await withBusiness(BUSINESS, async (db) => runPlan(db, {
       job: await wake(job.jobId),
       bundle,
       // Same step ids, different content: a re-plan, not a resume.
@@ -367,7 +360,7 @@ describe('a resumed plan does not re-run what already ran', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(replanned.status).toBe('rejected');
     if (replanned.status !== 'rejected') throw new Error('unreachable');
@@ -384,7 +377,7 @@ describe('a resumed plan does not re-run what already ran', () => {
     const { wa, registry } = world();
     const bindings = [MAIL_LIVE, WA_LIVE];
 
-    const first = await runPlan({
+    const first = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: twoStepPlan(),
@@ -394,7 +387,7 @@ describe('a resumed plan does not re-run what already ran', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
     expect(first.status).toBe('halted');
     if (first.status !== 'halted') throw new Error('unreachable');
     expect(first.steps[0]?.externalId).toBe('MSG-1');
@@ -407,7 +400,7 @@ describe('a resumed plan does not re-run what already ran', () => {
     expect(rows).toEqual([{ step_id: 's1', external_id: 'MSG-1' }]);
 
     wa.reachable = true;
-    const second = await runPlan({
+    const second = await withBusiness(BUSINESS, async (db) => runPlan(db, {
       job: await wake(job.jobId),
       bundle,
       plan: twoStepPlan(),
@@ -417,7 +410,7 @@ describe('a resumed plan does not re-run what already ran', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(second.status).toBe('done');
     if (second.status !== 'done') throw new Error('unreachable');
@@ -436,7 +429,7 @@ describe('the real entry point closes the approval loop, not only runPlan called
     // `approvalId` through, so this exact path queued a second approval
     // forever no matter how many times a human said yes.
     const bundle = await install([MAIL_CONNECTION]);
-    await upsertBinding(MAIL_LIVE, { businessId: BUSINESS, by: 'p_boss' });
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, MAIL_LIVE, { by: 'p_boss' }));
     const job = await jobInExecute(bundle);
     const { sent, registry } = world();
 
@@ -456,7 +449,7 @@ describe('the real entry point closes the approval loop, not only runPlan called
     });
 
     const run = (j: Job): Promise<RunPlanResult> =>
-      runPlanForJob({
+      withBusiness(j.businessId, (db) => runPlanForJob(db, {
         job: j,
         bundle,
         plan,
@@ -465,7 +458,7 @@ describe('the real entry point closes the approval loop, not only runPlan called
         counterpartyTags: [],
         rampLevel: 'auto',
         now: NOON,
-      });
+      }));
 
     const first = await run(job);
     expect(first.status).toBe('halted');
@@ -479,12 +472,7 @@ describe('the real entry point closes the approval loop, not only runPlan called
         : null;
     if (approvalId === null) throw new Error('expected s1 to queue an approval');
 
-    const decided = await applyDecision(
-      approvalId,
-      'approved',
-      { by: 'p_boss', channel: 'dashboard' },
-      { businessId: BUSINESS },
-    );
+    const decided = await withBusiness(BUSINESS, (db) => applyDecision(db, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
     expect(decided.jobPhase).toBe('execute');
 
     const second = await run(await reload(job.jobId));
@@ -496,7 +484,7 @@ describe('the real entry point closes the approval loop, not only runPlan called
     expect(sent).toHaveLength(1);
     expect(mailsTo(sent, 'new@example.com')).toBe(1);
     // And nothing asked the boss again.
-    expect(await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb))).toHaveLength(0); // TENANCY-TODO(task 4)
+    expect(await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb))).toHaveLength(0);
   });
 });
 
@@ -511,15 +499,14 @@ describe('nothing is bound until the job can actually run', () => {
     const { sent, wa, registry } = world();
     const bindings = [MAIL_LIVE, WA_LIVE];
 
-    await transition(job.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'followup',
       actor: 'system',
       reason: 'parked a moment before the run arrived',
       wakeAt: NOON,
-      businessId: BUSINESS,
-    });
+    }));
 
-    const parked = await runPlan({
+    const parked = await withBusiness(BUSINESS, async (db) => runPlan(db, {
       job: await reload(job.jobId),
       bundle,
       plan: twoStepPlan('תוכנית שלא רצה מעולם'),
@@ -529,7 +516,7 @@ describe('nothing is bound until the job can actually run', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(parked.status).toBe('rejected');
     if (parked.status !== 'rejected') throw new Error('unreachable');
@@ -537,14 +524,14 @@ describe('nothing is bound until the job can actually run', () => {
     expect(sent).toEqual([]);
 
     // Nothing was written down, so the job is not tied to anything.
-    const { rows } = await getPool().query('SELECT 1 FROM job_plans WHERE job_id = $1', [
+    const { rows } = await testDb().query('SELECT 1 FROM job_plans WHERE job_id = $1', [
       job.jobId,
     ]);
     expect(rows).toHaveLength(0);
 
     // The job then wakes legitimately and runs its real plan.
     wa.reachable = true;
-    const real = await runPlan({
+    const real = await withBusiness(BUSINESS, async (db) => runPlan(db, {
       job: await wake(job.jobId),
       bundle,
       plan: twoStepPlan(),
@@ -554,7 +541,7 @@ describe('nothing is bound until the job can actually run', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
     expect(real.status).toBe('done');
     expect(sent).toHaveLength(1);
   });
@@ -589,7 +576,7 @@ describe('re-planning is refused only over work that happened', () => {
     });
 
     // The bridge is down, so the only step defers and records nothing.
-    const first = await runPlan({
+    const first = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: waOnly,
@@ -599,9 +586,9 @@ describe('re-planning is refused only over work that happened', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
     expect(first.status).toBe('halted');
-    const { rows: none } = await getPool().query(
+    const { rows: none } = await testDb().query(
       'SELECT 1 FROM job_step_results WHERE job_id = $1',
       [job.jobId],
     );
@@ -621,7 +608,7 @@ describe('re-planning is refused only over work that happened', () => {
       ],
     });
 
-    const second = await runPlan({
+    const second = await withBusiness(BUSINESS, async (db) => runPlan(db, {
       job: await wake(job.jobId),
       bundle,
       plan: mailOnly,
@@ -631,7 +618,7 @@ describe('re-planning is refused only over work that happened', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(second.status).toBe('done');
     expect(sent).toHaveLength(1);
@@ -653,7 +640,7 @@ describe('a run that performs nothing still leaves a phase a caller can act on',
     wa.reachable = true;
     const bindings = [MAIL_LIVE, WA_LIVE];
     const run = (j: Job): Promise<RunPlanResult> =>
-      runPlan({
+      withBusiness(j.businessId, (db) => runPlan(db, {
         job: j,
         bundle,
         plan: twoStepPlan(),
@@ -663,18 +650,17 @@ describe('a run that performs nothing still leaves a phase a caller can act on',
         counterpartyTags: [],
         rampLevel: 'auto',
         now: NOON,
-      });
+      }));
 
     expect((await run(job)).status).toBe('done');
     expect((await reload(job.jobId)).phase).toBe('verify');
 
     // The same plan handed back once more — every step is on record.
-    await transition(job.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'execute',
       actor: 'orchestrator',
       reason: 'handed the same plan again',
-      businessId: BUSINESS,
-    });
+    }));
     const again = await run(await reload(job.jobId));
     expect(again.status).toBe('done');
     if (again.status !== 'done') throw new Error('unreachable');
@@ -685,12 +671,11 @@ describe('a run that performs nothing still leaves a phase a caller can act on',
     // throw on its next move.
     expect((await reload(job.jobId)).phase).toBe('verify');
     await expect(
-      transition(job.jobId, {
+      withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
         to: 'remember',
         actor: 'orchestrator',
         reason: 'the caller carries on',
-        businessId: BUSINESS,
-      }),
+      })),
     ).resolves.toBeTruthy();
   });
 });
@@ -706,7 +691,7 @@ describe('a completion belongs to one job and one plan', () => {
     const { sent, registry } = world();
     const bindings = [MAIL_LIVE, WA_LIVE];
     const run = (job: Job): Promise<RunPlanResult> =>
-      runPlan({
+      withBusiness(job.businessId, (db) => runPlan(db, {
         job,
         bundle,
         plan: twoStepPlan(),
@@ -716,7 +701,7 @@ describe('a completion belongs to one job and one plan', () => {
         counterpartyTags: [],
         rampLevel: 'auto',
         now: NOON,
-      });
+      }));
 
     await run(await jobInExecute(bundle));
     expect(sent).toHaveLength(1);
@@ -736,13 +721,13 @@ describe('a completion belongs to one job and one plan', () => {
     const job = await jobInExecute(bundle);
     const { sent, registry } = world();
 
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id)
        VALUES ($1, $2, 'a-hash-from-some-other-plan', 's1', 'MSG-STALE')`,
       [BUSINESS, job.jobId],
     );
 
-    await runPlan({
+    await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: twoStepPlan(),
@@ -752,7 +737,7 @@ describe('a completion belongs to one job and one plan', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     // The stale row belongs to a different plan, so `s1` is still this plan's
     // work to do.
@@ -780,7 +765,7 @@ describe('the completion and the transition it belongs to are one write', () => 
 
     try {
       await expect(
-        runPlan({
+        withBusiness(job.businessId, (db) => runPlan(db, {
           job,
           bundle,
           plan: Plan.parse({
@@ -807,7 +792,7 @@ describe('the completion and the transition it belongs to are one write', () => 
           counterpartyTags: [],
           rampLevel: 'auto',
           now: NOON,
-        }),
+        })),
       ).rejects.toThrow(/injected failure/);
 
       // The mail did go out — nothing can undo that, and the docblock on
@@ -815,7 +800,7 @@ describe('the completion and the transition it belongs to are one write', () => 
       // claiming progress the results table does not carry.
       expect(sent).toHaveLength(1);
       expect((await reload(job.jobId)).phase).toBe('execute');
-      const { rows } = await getPool().query('SELECT 1 FROM job_step_results WHERE job_id = $1', [
+      const { rows } = await testDb().query('SELECT 1 FROM job_step_results WHERE job_id = $1', [
         job.jobId,
       ]);
       expect(rows).toHaveLength(0);
@@ -886,7 +871,7 @@ describe('a dispatched call whose outcome nobody knows is not "nothing ran"', ()
     const job = await jobInExecute(bundle);
     const { dispatched, state, registry } = stalling();
 
-    const first = await runPlan({
+    const first = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: orderPlan('הזמנה ראשונה'),
@@ -897,7 +882,7 @@ describe('a dispatched call whose outcome nobody knows is not "nothing ran"', ()
       rampLevel: 'auto',
       now: NOON,
       adapterTimeoutMs: 25,
-    });
+    }));
 
     expect(first.status).toBe('halted');
     if (first.status !== 'halted') throw new Error('unreachable');
@@ -926,7 +911,7 @@ describe('a dispatched call whose outcome nobody knows is not "nothing ran"', ()
 
     // The far end can answer now.
     state.hang = false;
-    const second = await runPlan({
+    const second = await withBusiness(BUSINESS, async (db) => runPlan(db, {
       job: await wake(job.jobId),
       bundle,
       plan: orderPlan('הזמנה ראשונה'),
@@ -937,7 +922,7 @@ describe('a dispatched call whose outcome nobody knows is not "nothing ran"', ()
       rampLevel: 'auto',
       now: NOON,
       adapterTimeoutMs: 25,
-    });
+    }));
 
     expect(second.status).toBe('done');
     if (second.status !== 'done') throw new Error('unreachable');
@@ -966,7 +951,7 @@ describe('a dispatched call whose outcome nobody knows is not "nothing ran"', ()
     const { job, bundle, dispatched, state, registry } = await timedOut();
     state.hang = false;
 
-    const replanned = await runPlan({
+    const replanned = await withBusiness(BUSINESS, async (db) => runPlan(db, {
       job: await wake(job.jobId),
       bundle,
       // The planner reworded the order. Different input, therefore a different
@@ -980,7 +965,7 @@ describe('a dispatched call whose outcome nobody knows is not "nothing ran"', ()
       rampLevel: 'auto',
       now: NOON,
       adapterTimeoutMs: 25,
-    });
+    }));
 
     expect(replanned.status).toBe('rejected');
     if (replanned.status !== 'rejected') throw new Error('unreachable');

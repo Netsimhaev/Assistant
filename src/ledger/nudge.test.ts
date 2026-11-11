@@ -141,19 +141,19 @@ describe('act mode: the nudge goes through the gate', () => {
     expect(drafter.calls[0]?.description).toBe('חשבונית 123 של דנה');
     expect(drafter.calls[0]?.nudgeNumber).toBe(1);
     const jobId = await nudgeJobId(item.itemId);
-    const job = await loadJob(jobId, { businessId: B });
+    const job = await withBusiness(B, (db) => loadJob(db, jobId));
     expect(job?.provenance).toBe('boss');
     expect(job?.phase).toBe('execute');
     // The slot is claimed, but its body is not a "draft" signal (F-I3); the draft rides the job's plan.
     expect((await nudgeReminders(item.itemId)).map((r) => r.body)).toEqual(['']);
-    expect((await loadPlanBody(jobId, { businessId: B }))?.plan.steps[0]?.input['body']).toBe(DRAFT);
+    expect((await withBusiness(B, (db) => loadPlanBody(db, jobId)))?.plan.steps[0]?.input['body']).toBe(DRAFT);
 
     const { client, sent, sentNew } = fakeMailboxClient();
-    await runDueJobs({ businessId: B, runtime: mailboxRuntime(client), now: NOW });
+    await withBusiness(B, (db) => runDueJobs(db, { runtime: mailboxRuntime(client), now: NOW }));
 
     expect(sent).toHaveLength(0);
     expect(sentNew).toHaveLength(0);
-    expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('await_approval');
+    expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('await_approval');
     const cards = await getPool().query(`SELECT 1 FROM approval_requests WHERE job_id = $1 AND state = 'pending'`, [jobId]);
     expect(cards.rowCount).toBe(1);
     // The job reached the gate: stage 5 wrote its intent.
@@ -172,7 +172,7 @@ describe('act mode: the nudge goes through the gate', () => {
     await runLedgerPass({ businessId: B, now: NOW, drafter: stubDrafter().fn, sendAlert: recordingAlert([]) });
     const jobId = await nudgeJobId(item.itemId);
     const { client, sentNew } = fakeMailboxClient();
-    await runDueJobs({ businessId: B, runtime: mailboxRuntime(client), now: NOW });
+    await withBusiness(B, (db) => runDueJobs(db, { runtime: mailboxRuntime(client), now: NOW }));
 
     const { rows } = await getPool().query<{ approval_id: string }>(
       `SELECT approval_id FROM approval_requests WHERE job_id = $1 AND state = 'pending'`,
@@ -181,11 +181,11 @@ describe('act mode: the nudge goes through the gate', () => {
     const approvalId = rows[0]?.approval_id;
     if (approvalId === undefined) throw new Error('expected a card');
     const decided = await withBusiness(B, (bdb) => decide(bdb, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' })); // TENANCY-TODO(task 5)
-    await resumeAfterDecision(decided, 'p_boss', { businessId: B });
-    await runDueJobs({ businessId: B, runtime: mailboxRuntime(client), now: NOW });
+    await withBusiness(B, (db) => resumeAfterDecision(db, decided, 'p_boss'));
+    await withBusiness(B, (db) => runDueJobs(db, { runtime: mailboxRuntime(client), now: NOW }));
     expect(sentNew).toEqual([{ to: ['dana@acme.co.il'], subject: 'תזכורת לגבי תשלום — INV-123', body: DRAFT }]);
-    await closeVerifiedJobs({ businessId: B });
-    expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('closed');
+    await withBusiness(B, (db) => closeVerifiedJobs(db));
+    expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('closed');
 
     const observed = await observeNudges({ businessId: B });
     expect(observed.sent).toEqual([item.itemId]);
@@ -210,13 +210,13 @@ describe('act mode: the nudge goes through the gate', () => {
     await runLedgerPass({ businessId: B, now: NOW, drafter: stubDrafter().fn, sendAlert: recordingAlert([]) });
     const jobId = await nudgeJobId(item.itemId);
     const { client, sentNew } = fakeMailboxClient();
-    await runDueJobs({ businessId: B, runtime: mailboxRuntime(client), now: NOW });
+    await withBusiness(B, (db) => runDueJobs(db, { runtime: mailboxRuntime(client), now: NOW }));
 
     expect(sentNew).toHaveLength(0);
     // The gate refused at stage 8 — this is the refusal the fallback reads.
     const denials = (await auditRows(jobId)).filter((r) => r.kind === 'policy_denial');
     expect(denials.some((r) => r.reason.startsWith('draft_only') && r.reason.endsWith('email.initiate'))).toBe(true);
-    expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('failed');
+    expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
 
     const sent: Sent[] = [];
     const later = new Date(NOW.getTime() + 5 * 60 * 1000);
@@ -273,7 +273,7 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
     await runLedgerPass({ businessId: B, now: NOW, drafter: stubDrafter().fn, sendAlert: recordingAlert([]) });
     const jobId = await nudgeJobId(item.itemId);
     const { client, sentNew } = fakeMailboxClient();
-    await runDueJobs({ businessId: B, runtime: mailboxRuntime(client), now: NOW });
+    await withBusiness(B, (db) => runDueJobs(db, { runtime: mailboxRuntime(client), now: NOW }));
     const approvalId = await pendingCard(jobId);
 
     // The counterparty paid: the item is closed by evidence while the card waits.
@@ -298,7 +298,7 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
     await expect(
       withBusiness(B, (bdb) => decide(bdb, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' })), // TENANCY-TODO(task 5)
     ).rejects.toThrow();
-    expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('closed');
+    expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('closed');
     expect((await loadLedgerItem(item.itemId, { businessId: B }))?.nudgeCount).toBe(0); // never counted
     const { rows: link } = await getPool().query(`SELECT nudge_job_id FROM ledger_items WHERE item_id = $1`, [
       item.itemId,
@@ -310,7 +310,7 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
     ]);
     expect(events.some((e) => e.kind === 'nudged')).toBe(false);
 
-    await runDueJobs({ businessId: B, runtime: mailboxRuntime(client), now: NOW });
+    await withBusiness(B, (db) => runDueJobs(db, { runtime: mailboxRuntime(client), now: NOW }));
     expect(sentNew).toHaveLength(0);
   });
 
@@ -321,7 +321,7 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
     await runLedgerPass({ businessId: B, now: NOW, drafter: stubDrafter().fn, sendAlert: recordingAlert([]) });
     const jobId = await nudgeJobId(item.itemId);
     const { client } = fakeMailboxClient();
-    await runDueJobs({ businessId: B, runtime: mailboxRuntime(client), now: NOW });
+    await withBusiness(B, (db) => runDueJobs(db, { runtime: mailboxRuntime(client), now: NOW }));
     const approvalId = await pendingCard(jobId);
     await observeNudges({ businessId: B, now: NOW });
     const { rows } = await getPool().query<{ state: string }>(
@@ -329,7 +329,7 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
       [approvalId],
     );
     expect(rows[0]?.state).toBe('pending');
-    expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('await_approval');
+    expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('await_approval');
   });
 
   it('T10: a linked job stuck in plan over 15 minutes fails and falls back to the owner; a young one is left alone', async () => {
@@ -344,14 +344,14 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
     ]);
     const young = await observeNudges({ businessId: B, now: NOW });
     expect(young.fallback).toEqual([]);
-    expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('plan');
+    expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('plan');
 
     await getPool().query(`UPDATE jobs SET created_at = $2 WHERE job_id = $1`, [
       jobId,
       new Date(NOW.getTime() - 16 * 60 * 1000),
     ]);
     const observed = await observeNudges({ businessId: B, now: NOW });
-    expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('failed');
+    expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
     expect(observed.fallback.map((f) => f.itemId)).toEqual([item.itemId]);
     expect(observed.fallback[0]?.draft).toBe(DRAFT);
     expect(observed.reminders).toHaveLength(1);
@@ -369,15 +369,15 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
     await runLedgerPass({ businessId: B, now: NOW, drafter: stubDrafter().fn, sendAlert: recordingAlert([]) });
     const jobId = await nudgeJobId(item.itemId);
     const { client } = fakeMailboxClient();
-    await runDueJobs({ businessId: B, runtime: mailboxRuntime(client), now: NOW });
+    await withBusiness(B, (db) => runDueJobs(db, { runtime: mailboxRuntime(client), now: NOW }));
     const decided = await withBusiness(B, async (bdb) => decide( // TENANCY-TODO(task 5)
       bdb,
       await pendingCard(jobId),
       'denied',
       { by: 'p_boss', channel: 'dashboard' }
     ));
-    await resumeAfterDecision(decided, 'p_boss', { businessId: B });
-    expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('closed');
+    await withBusiness(B, (db) => resumeAfterDecision(db, decided, 'p_boss'));
+    expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('closed');
 
     await observeNudges({ businessId: B, now: NOW });
     const events = await listLedgerEvents(item.itemId, { businessId: B });
@@ -480,7 +480,7 @@ describe('the nudge job carries no exemption', () => {
     const auth = await getPool().query(`SELECT 1 FROM job_authorizations WHERE job_id = $1`, [jobId]);
     expect(auth.rowCount).toBe(0);
 
-    const stored = await loadPlanBody(jobId, { businessId: B });
+    const stored = await withBusiness(B, (db) => loadPlanBody(db, jobId));
     const plan = stored?.plan ?? Plan.parse(null);
     const step = plan.steps[0];
     if (step === undefined) throw new Error('no step');
@@ -513,7 +513,7 @@ describe('the nudge job carries no exemption', () => {
     const item = await createLedgerItem(base(), { businessId: B, by: 'boss' });
     await runLedgerPass({ businessId: B, now: NOW, drafter: stubDrafter().fn, sendAlert: recordingAlert([]) });
     const jobId = await nudgeJobId(item.itemId);
-    const stored = await loadPlanBody(jobId, { businessId: B });
+    const stored = await withBusiness(B, (db) => loadPlanBody(db, jobId));
     const plan = stored?.plan ?? Plan.parse(null);
     expect(plan.steps).toHaveLength(1);
     const step = plan.steps[0];

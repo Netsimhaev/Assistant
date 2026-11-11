@@ -55,16 +55,15 @@ function isAwaitingDelegation(result: VerifyDraftResult): result is AwaitingDele
 
 async function openVerifyJob(): Promise<{ job: Job; bundle: PolicyBundle }> {
   const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `verify-${ulid()}` }))); // TENANCY-TODO(task 7)
-  const created = await createJob({
+  const created = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'unknown_external',
-    businessId: BUSINESS,
     title: 'verify a draft',
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(created.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, created.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  const job = await loadJob(created.jobId, { businessId: BUSINESS });
+  const job = await withBusiness(BUSINESS, (db) => loadJob(db, created.jobId));
   if (job === null) throw new Error('verify job vanished');
   return { job, bundle };
 }
@@ -169,12 +168,12 @@ describe('verifyDraft — the cheap check runs alone', () => {
     expect(stored?.envelope.intent).toBe('read_for_question');
     expect(stored?.childJobId).toBe(result.childJobId);
 
-    const parent = await loadJob(job.jobId, { businessId: BUSINESS });
+    const parent = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(parent?.phase).toBe('followup');
 
     const childJobId = result.childJobId;
     if (childJobId === null) throw new Error('expected a child job id');
-    const child = await loadJob(childJobId, { businessId: BUSINESS });
+    const child = await withBusiness(BUSINESS, (db) => loadJob(db, childJobId));
     expect(child).not.toBeNull();
     expect(child?.phase).toBe('execute');
 
@@ -248,12 +247,11 @@ describe('verifyDraft — the cheap check runs alone', () => {
     // need to be in `execute` (in production it is typically sitting in
     // `await_approval` by the time verification runs), which is exactly why
     // it cannot be the same row as the delegating job.
-    const subjectJob = await createJob({
+    const subjectJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'unknown_external',
-      businessId: BUSINESS,
       title: 'the document job whose draft is under review',
-    });
+    }));
 
     const stubJudge: Judge = async () => ({
       status: 'judged',
@@ -438,14 +436,13 @@ describe('verifyDraft — the cheap check runs alone', () => {
    */
   it('throws when the delegation itself is refused', async () => {
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `verify-refused-${ulid()}` }))); // TENANCY-TODO(task 7)
-    const created = await createJob({
+    const created = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'unknown_external',
-      businessId: BUSINESS,
       title: 'never reaches execute',
-    });
+    }));
     // Left in `intake` — `requestHelp` requires `execute`.
-    const job = await loadJob(created.jobId, { businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => loadJob(db, created.jobId));
     if (job === null) throw new Error('job vanished');
 
     await expect(verifyDraft(baseInput(job, { judge: throwingJudge }))).rejects.toThrow(

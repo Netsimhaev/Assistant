@@ -786,18 +786,17 @@ async function finish(ctx: Ctx, p: Production): Promise<void> {
   const versionId = await finishedVersionId(ctx, p);
   const reason = stage === 'failed' ? (p.work.reason ?? RENDER_ERROR_HE.render_failed) : null;
 
-  if ((await loadJob(p.originJobId, { businessId: p.businessId, db: ctx.db })) === null) {
+  if ((await withBusiness(p.businessId, (bdb) => loadJob(bdb, p.originJobId))) === null) { // TENANCY-TODO(task 5)
     // Deterministic: reported once, never retried into an endless `errored`.
     ctx.result.originJobMissing.push(p.productionId);
   } else {
     try {
-      await transition(p.originJobId, {
+      await withBusiness(p.businessId, (db) => transition(db, p.originJobId, { // TENANCY-TODO(task 5)
         to: stage === 'failed' ? 'failed' : 'closed',
         expectFrom: 'followup',
         actor: 'orchestrator',
         reason: stage === 'failed' ? `הפקת המסמך נכשלה: ${reason}` : `הפקת המסמך הסתיימה: ${productionStageLabel[stage]}`,
-        businessId: p.businessId,
-      });
+      }));
     } catch (err) {
       if (!(err instanceof PhaseMovedError)) throw err;
       ctx.result.skipped += 1;

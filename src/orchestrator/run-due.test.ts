@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
@@ -83,14 +83,13 @@ async function jobInExecute(
   title: string,
   businessId: string = BUSINESS,
 ): Promise<string> {
-  const job = await createJob({
+  const job = await withBusiness(businessId, (db) => createJob(db, {
     charterVersion,
     provenance: 'boss',
-    businessId,
     title,
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId });
+    await withBusiness(businessId, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
   return job.jobId;
 }
@@ -109,7 +108,7 @@ async function seedExecutableJob(businessId: string = BUSINESS): Promise<string>
   // between draft_only and a real send" actually true in the "honours the
   // ramp" test below: with this override in place, `setRampLevel(..., 'auto')`
   // is the ONLY thing that changes between that test and this one.
-  const bundle = await withBusiness(businessId, (bdb) => installCharter( // TENANCY-TODO(task 4)
+  const bundle = await withBusiness(businessId, (bdb) => installCharter(
     bdb,
     buildCharter({
       // `charter_versions` keys on `charter_version` alone, globally, not
@@ -122,8 +121,7 @@ async function seedExecutableJob(businessId: string = BUSINESS): Promise<string>
     })
   ));
   const jobId = await jobInExecute(bundle.charterVersion, 'run-due', businessId);
-  await upsertBinding(
-    {
+  await withBusiness(businessId, (db) => upsertBinding(db, {
       system: 'office-mail',
       status: 'live',
       endpoint: null,
@@ -131,10 +129,8 @@ async function seedExecutableJob(businessId: string = BUSINESS): Promise<string>
       provider: null,
       lastOkAt: null,
       lastError: null,
-    },
-    { businessId, by: 'test' },
-  );
-  await bindPlanToJob(jobId, PLAN, { businessId });
+    }, { by: 'test' }));
+  await withBusiness(businessId, (db) => bindPlanToJob(db, jobId, PLAN));
   return jobId;
 }
 
@@ -148,7 +144,7 @@ describe('runDueJobs', () => {
   });
 
   it('does nothing when no job is in execute', async () => {
-    const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith([]), now: NOON });
+    const result = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith([]), now: NOON }));
     expect(result.ran).toEqual([]);
   });
 
@@ -157,16 +153,16 @@ describe('runDueJobs', () => {
     // The owner's dial (Task 2) defaults to `off`, which clamps
     // `loadRampLevel` to `draft_only` regardless of what is stored — open it
     // first so the promotion below is actually honoured.
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
 
     const sent: MailMessage[] = [];
-    const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    const result = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
 
     expect(result.ran.map((r) => r.jobId)).toEqual([jobId]);
     expect(result.ran[0]?.status).toBe('done');
     expect(sent).toHaveLength(1);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('verify');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('verify');
   });
 
   it('forwards runtime.notify into runPlanForJob, so a queued approval actually notifies the owner', async () => {
@@ -181,7 +177,7 @@ describe('runDueJobs', () => {
     // `runtimeWith` above never sets `notify` either — deleting the
     // forwarding line in `run-due.ts` leaves every other test in this file
     // green.
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         version: `2026-08-15.notify-forward`,
@@ -191,8 +187,7 @@ describe('runDueJobs', () => {
       })
     ));
     const jobId = await jobInExecute(bundle.charterVersion, 'notify-forward');
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'office-mail',
         status: 'live',
         endpoint: null,
@@ -200,12 +195,10 @@ describe('runDueJobs', () => {
         provider: null,
         lastOkAt: null,
         lastError: null,
-      },
-      { businessId: BUSINESS, by: 'test' },
-    );
-    await bindPlanToJob(jobId, PLAN, { businessId: BUSINESS });
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.initiate', 'approve_required', { businessId: BUSINESS });
+      }, { by: 'test' }));
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN));
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'approve_required'));
 
     const notified: string[] = [];
     const notifier: ApprovalNotifier = {
@@ -220,17 +213,17 @@ describe('runDueJobs', () => {
       notify: { notifier, dashboardBaseUrl: 'http://127.0.0.1:8787' },
     };
 
-    const result = await runDueJobs({ businessId: BUSINESS, runtime, now: NOON });
+    const result = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime, now: NOON }));
 
     expect(result.ran).toEqual([{ jobId, status: 'halted', detail: 'awaiting_approval' }]);
     expect(notified).toHaveLength(1);
   });
 
   it('reports a job in execute that is bound to no plan, and does not run it', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'example.com' }))); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'example.com' })));
     const jobId = await jobInExecute(bundle.charterVersion, 'unbound');
 
-    const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith([]), now: NOON });
+    const result = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith([]), now: NOON }));
     expect(result.unbound).toEqual([jobId]);
     expect(result.ran).toEqual([]);
   });
@@ -244,19 +237,19 @@ describe('runDueJobs', () => {
   // conductor card lands here — so this went from a documented hypothetical
   // to a certainty.
   it('moves an unbound job out of execute so it cannot hold the window forever', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'example.com' }))); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'example.com' })));
     const jobId = await jobInExecute(bundle.charterVersion, 'unbound-twice');
 
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith([]), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith([]), now: NOON }));
 
-    const job = await loadJob(jobId, { businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
     expect(job?.phase).toBe('failed');
     expect(job?.closedAt).not.toBeNull();
 
     // The point of the disposition, stated as behaviour: a second pass does
     // not find it at all. Without the transition this assertion fails — the
     // row is still in `execute` and still first in line.
-    const second = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith([]), now: NOON });
+    const second = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith([]), now: NOON }));
     expect(second.unbound).toEqual([]);
 
     // And the reason is on the record, not only in the returned bucket.
@@ -287,16 +280,16 @@ describe('runDueJobs', () => {
     // A charter with no connection serving `mail.send` at all — so
     // `resolveChannel` has nothing to match and `runPlan` rejects with
     // `no_channel_for_tool`, the rejection `instruct.ts` cannot pre-check.
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ version: '2026-08-15.no-channel', connections: [], autonomyBase: { 'email.initiate': 'auto' } })
     ));
     const jobId = await jobInExecute(bundle.charterVersion, 'no-channel');
-    await bindPlanToJob(jobId, PLAN, { businessId: BUSINESS });
-    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
 
     const sent: MailMessage[] = [];
-    const first = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    const first = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
 
     // The positive half first: the job really did reach `runPlan` and really
     // was rejected there. Without it the phase assertion below would hold for
@@ -304,12 +297,12 @@ describe('runDueJobs', () => {
     expect(first.ran).toEqual([{ jobId, status: 'rejected', detail: 'no_channel_for_tool' }]);
     expect(sent).toHaveLength(0);
 
-    const job = await loadJob(jobId, { businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
     expect(job?.phase).toBe('failed');
     expect(job?.closedAt).not.toBeNull();
 
     // The disposition stated as behaviour: a second pass does not find it.
-    const second = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith([]), now: NOON });
+    const second = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith([]), now: NOON }));
     expect(second.ran).toEqual([]);
 
     // And the rejection code is on the record, not only in the bucket.
@@ -329,7 +322,7 @@ describe('runDueJobs', () => {
     // credential or a channel that never resolved — is what proves the ramp
     // ceiling is the thing actually stopping the send.
     const sent: MailMessage[] = [];
-    const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    const result = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
     expect(sent).toEqual([]);
     expect(result.ran).toEqual([{ jobId, status: 'halted', detail: 'draft_only:persist_as_draft' }]);
   });
@@ -353,19 +346,18 @@ describe('runDueJobs', () => {
     // section for the exact failure this produced when verified.
     const OTHER_BUSINESS = 'other-business';
     const jobIdHome = await seedExecutableJob(BUSINESS);
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
     const jobIdOther = await seedExecutableJob(OTHER_BUSINESS);
-    await withBusiness(OTHER_BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.initiate', 'auto', { businessId: OTHER_BUSINESS });
+    await withBusiness(OTHER_BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(OTHER_BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
 
     const sent: MailMessage[] = [];
-    const result = await runDueJobs({
-      businessId: OTHER_BUSINESS,
+    const result = await withBusiness(OTHER_BUSINESS, (db) => runDueJobs(db, {
       runtime: runtimeWith(sent),
       now: NOON,
       limit: 1,
-    });
+    }));
 
     expect(result.ran.map((r) => r.jobId)).toEqual([jobIdOther]);
     expect(result.ran.map((r) => r.jobId)).not.toContain(jobIdHome);
@@ -381,7 +373,7 @@ describe('runDueJobs', () => {
     // `charter_versions` keys on `charter_version` alone, and `seedExecutableJob`
     // below installs a charter of its own — both must carry distinct
     // versions or the second `installCharter` collides on the primary key.
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         version: '2026-08-15.poison',
@@ -391,24 +383,24 @@ describe('runDueJobs', () => {
       })
     ));
     const poisonJobId = await jobInExecute(bundle.charterVersion, 'poison');
-    await bindPlanToJob(poisonJobId, PLAN, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, poisonJobId, PLAN));
     // Corrupt the stored plan directly in the database. `loadPlanBody`
     // (`plan-store.ts`) throws rather than returning null when a stored plan
     // no longer parses as a `Plan` — by design, per its own docblock — and
     // this is the only way to produce that condition from outside the
     // module.
-    await getPool().query('UPDATE job_plans SET plan = $1 WHERE business_id = $2 AND job_id = $3', [
+    await testDb().query('UPDATE job_plans SET plan = $1 WHERE business_id = $2 AND job_id = $3', [
       JSON.stringify({ goal: 'missing its steps entirely' }),
       BUSINESS,
       poisonJobId,
     ]);
 
     const healthyJobId = await seedExecutableJob();
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
 
     const sent: MailMessage[] = [];
-    const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    const result = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
 
     expect(result.errored).toEqual([{ jobId: poisonJobId, error: expect.any(String) }]);
     expect(result.errored[0]?.error).toContain('does not parse as a Plan');
@@ -430,8 +422,8 @@ describe('runDueJobs', () => {
    */
   it("holds a job at the ceiling carried by the envelope that opened it as a delegation's child", async () => {
     const jobId = await seedExecutableJob();
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
 
     const envelope: AgentEnvelope = {
       v: 1,
@@ -458,14 +450,14 @@ describe('runDueJobs', () => {
       idempotencyKey: `IDEM-${ulid()}`,
       createdAt: '2026-09-24T00:00:00.000Z',
     };
-    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, envelope, { parentJobId: 'JOB-some-other-job' })); // TENANCY-TODO(task 4)
-    await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, envelope.id, jobId)); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, envelope, { parentJobId: 'JOB-some-other-job' }));
+    await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, envelope.id, jobId));
 
     const sent: MailMessage[] = [];
-    const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    const result = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
 
     expect(result.ran).toEqual([{ jobId, status: 'halted', detail: 'draft_only:persist_as_draft' }]);
     expect(sent).toHaveLength(0);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
   });
 });

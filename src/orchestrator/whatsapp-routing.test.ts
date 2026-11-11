@@ -85,13 +85,12 @@ const asks = (question: string) => async (): Promise<PlanOutcome> => ({
 async function askOverWhatsApp(body: string, question = 'למי בדיוק?'): Promise<void> {
   const gateway = createFakeGateway();
   gateway.enqueue(textMsg(body));
-  await runWhatsAppDoor({
+  await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
     gateway,
     messenger: createFakeMessenger(),
-    businessId: BUSINESS,
     planner: asks(question),
     questionWindowMinutes: 0,
-  });
+  }));
 }
 
 async function openQuestions(): Promise<InstructionRecord[]> {
@@ -101,7 +100,7 @@ async function openQuestions(): Promise<InstructionRecord[]> {
 describe('decideWhatsAppRoute', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
   });
 
   afterAll(async () => {
@@ -109,17 +108,16 @@ describe('decideWhatsAppRoute', () => {
   });
 
   it('routes a message as a new instruction when nothing is open', async () => {
-    const route = await decideWhatsAppRoute({ text: 'תשלחי לדנה', businessId: BUSINESS });
+    const route = await withBusiness(BUSINESS, (db) => decideWhatsAppRoute(db, { text: 'תשלחי לדנה' }));
     expect(route).toEqual({ kind: 'new', staleOpen: 0 });
   });
 
   it('routes a message as the answer to the one open question inside the window', async () => {
     await askOverWhatsApp('תשלחי לרונית');
-    const route = await decideWhatsAppRoute({
+    const route = await withBusiness(BUSINESS, (db) => decideWhatsAppRoute(db, {
       text: 'רונית כהן',
-      businessId: BUSINESS,
       windowMinutes: 30,
-    });
+    }));
     expect(route.kind).toBe('answer');
     if (route.kind !== 'answer') throw new Error('unreachable');
     expect(route.instruction.text).toBe('תשלחי לרונית');
@@ -132,12 +130,11 @@ describe('decideWhatsAppRoute', () => {
    */
   it('routes a message as a new instruction once the open question is older than the window', async () => {
     await askOverWhatsApp('תשלחי לרונית');
-    const route = await decideWhatsAppRoute({
+    const route = await withBusiness(BUSINESS, (db) => decideWhatsAppRoute(db, {
       text: 'רונית כהן',
-      businessId: BUSINESS,
       windowMinutes: 30,
       now: Date.now() + 31 * 60_000,
-    });
+    }));
     // Not merely "not an answer": the question is still open and the owner
     // is told so, which is the whole point of carrying the count.
     expect(route).toEqual({ kind: 'new', staleOpen: 1 });
@@ -168,20 +165,18 @@ describe('decideWhatsAppRoute', () => {
     const windowMinutes = 30;
     const windowMs = windowMinutes * 60_000;
 
-    const atBoundary = await decideWhatsAppRoute({
+    const atBoundary = await withBusiness(BUSINESS, (db) => decideWhatsAppRoute(db, {
       text: 'רונית כהן',
-      businessId: BUSINESS,
       windowMinutes,
       now: askedMs + windowMs,
-    });
+    }));
     expect(atBoundary.kind).toBe('answer');
 
-    const oneMsPast = await decideWhatsAppRoute({
+    const oneMsPast = await withBusiness(BUSINESS, (db) => decideWhatsAppRoute(db, {
       text: 'רונית כהן',
-      businessId: BUSINESS,
       windowMinutes,
       now: askedMs + windowMs + 1,
-    });
+    }));
     expect(oneMsPast).toEqual({ kind: 'new', staleOpen: 1 });
   });
 
@@ -193,11 +188,10 @@ describe('decideWhatsAppRoute', () => {
    */
   it('reads nothing as an answer when the window is zero', async () => {
     await askOverWhatsApp('תשלחי לרונית');
-    const route = await decideWhatsAppRoute({
+    const route = await withBusiness(BUSINESS, (db) => decideWhatsAppRoute(db, {
       text: 'רונית כהן',
-      businessId: BUSINESS,
       windowMinutes: 0,
-    });
+    }));
     expect(route).toEqual({ kind: 'new', staleOpen: 1 });
   });
 
@@ -221,11 +215,10 @@ describe('decideWhatsAppRoute', () => {
   it('refuses to guess which of two open questions a message answers', async () => {
     await askOverWhatsApp('תשלחי לרונית', 'למי בדיוק?');
     await askOverWhatsApp('תזמיני ספקים', 'איזה ספק?');
-    const route = await decideWhatsAppRoute({
+    const route = await withBusiness(BUSINESS, (db) => decideWhatsAppRoute(db, {
       text: 'רונית כהן',
-      businessId: BUSINESS,
       windowMinutes: 30,
-    });
+    }));
     expect(route.kind).toBe('ambiguous');
     if (route.kind !== 'ambiguous') throw new Error('unreachable');
     expect(route.open).toHaveLength(2);
@@ -239,19 +232,18 @@ describe('decideWhatsAppRoute', () => {
    */
   it('reads a closure word as closure even when every open question has aged past the window', async () => {
     await askOverWhatsApp('תשלחי לרונית');
-    const route = await decideWhatsAppRoute({
+    const route = await withBusiness(BUSINESS, (db) => decideWhatsAppRoute(db, {
       text: 'סגרנו',
-      businessId: BUSINESS,
       windowMinutes: 30,
       now: Date.now() + 99 * 60_000,
-    });
+    }));
     expect(route.kind).toBe('closure');
     if (route.kind !== 'closure') throw new Error('unreachable');
     expect(route.open).toHaveLength(1);
   });
 
   it('reads a closure word as closure when nothing at all is open', async () => {
-    const route = await decideWhatsAppRoute({ text: 'סגרנו', businessId: BUSINESS });
+    const route = await withBusiness(BUSINESS, (db) => decideWhatsAppRoute(db, { text: 'סגרנו' }));
     expect(route).toEqual({ kind: 'closure', open: [] });
   });
 
@@ -267,20 +259,16 @@ describe('decideWhatsAppRoute', () => {
    * failed to park.
    */
   it('ignores a parked question that was never asked over WhatsApp', async () => {
-    const outcome = await runInstruction(
-      { text: 'תשלחי לרונית' },
-      { businessId: BUSINESS, textOrigin: 'typed', channel: 'dashboard', planner: asks('למי בדיוק?') },
-    );
+    const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לרונית' }, { textOrigin: 'typed', channel: 'dashboard', planner: asks('למי בדיוק?') }));
     expect(outcome.status).toBe('needs_answer');
 
     expect(await pendingQuestions({ businessId: BUSINESS })).toHaveLength(1);
     expect(await openQuestions()).toHaveLength(0);
 
-    const route = await decideWhatsAppRoute({
+    const route = await withBusiness(BUSINESS, (db) => decideWhatsAppRoute(db, {
       text: 'רונית כהן',
-      businessId: BUSINESS,
       windowMinutes: 30,
-    });
+    }));
     expect(route).toEqual({ kind: 'new', staleOpen: 0 });
   });
 });
@@ -288,7 +276,7 @@ describe('decideWhatsAppRoute', () => {
 describe('claimAsAnswer', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
   });
 
   /**
@@ -303,8 +291,8 @@ describe('claimAsAnswer', () => {
     const open = (await openQuestions())[0];
     if (open === undefined) throw new Error('unreachable');
 
-    expect(await claimAsAnswer(open, 'רונית כהן', { businessId: BUSINESS })).toBe(true);
-    expect(await claimAsAnswer(open, 'רונית לוי', { businessId: BUSINESS })).toBe(false);
+    expect(await withBusiness(BUSINESS, (db) => claimAsAnswer(db, open, 'רונית כהן'))).toBe(true);
+    expect(await withBusiness(BUSINESS, (db) => claimAsAnswer(db, open, 'רונית לוי'))).toBe(false);
 
     // The first answer stands; the loser overwrote nothing.
     const { rows } = await getPool().query<{ answer: string | null }>(
@@ -320,7 +308,7 @@ describe('claimAsAnswer', () => {
 describe('retireOpenInstruction', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
   });
 
   /**
@@ -339,11 +327,10 @@ describe('retireOpenInstruction', () => {
     const open = (await openQuestions())[0];
     if (open === undefined) throw new Error('unreachable');
 
-    await retireOpenInstruction(open, {
+    await withBusiness(BUSINESS, (db) => retireOpenInstruction(db, open, {
       to: 'closed',
       reason: REASON_CLOSED_BY_OWNER,
-      businessId: BUSINESS,
-    });
+    }));
 
     const jobRow = await getPool().query<{ phase: string; whatsapp_message_id: string | null }>(
       'SELECT phase, whatsapp_message_id FROM jobs WHERE job_id = $1',
@@ -381,14 +368,13 @@ describe('retireOpenInstruction', () => {
     const open = (await openQuestions())[0];
     if (open === undefined) throw new Error('unreachable');
 
-    await retireOpenInstruction(open, {
+    await withBusiness(BUSINESS, (db) => retireOpenInstruction(db, open, {
       to: 'closed',
       reason: REASON_CLOSED_BY_OWNER,
-      businessId: BUSINESS,
-    });
+    }));
 
     const messenger = createFakeMessenger();
-    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const report = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
 
     expect(report.reported).toBe(0);
     expect(report.errored).toEqual([]);
@@ -409,15 +395,14 @@ describe('retireOpenInstruction', () => {
     if (open === undefined) throw new Error('unreachable');
 
     // The same phase move, without the claim.
-    await transition(open.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, open.jobId, {
       to: 'closed',
       actor: 'human',
       reason: REASON_CLOSED_BY_OWNER,
-      businessId: BUSINESS,
-    });
+    }));
 
     const messenger = createFakeMessenger();
-    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const report = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
 
     expect(report.reported).toBe(1);
     expect(messenger.sentTexts).toHaveLength(1);

@@ -15,8 +15,8 @@
  * test.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { PolicyBundle } from '../domain/policy.js';
@@ -42,16 +42,15 @@ const NOTHING = { output: null, externalId: null, performed: true };
 const REPLY = { to: 'dana@example.com', inReplyTo: 'msg-1', subject: 'תיאום', body: 'שלום' };
 
 async function bossJobInExecute(bundle: PolicyBundle): Promise<Job> {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
     title: 'להשיב לדנה',
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  const loaded = await loadJob(job.jobId, { businessId: BUSINESS });
+  const loaded = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
   if (loaded === null) throw new Error('job vanished');
   return loaded;
 }
@@ -66,15 +65,15 @@ afterAll(async () => {
 
 describe('the executor consults the standing authorisation the instruction door wrote', () => {
   it('runs a covered step without asking again', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const job = await bossJobInExecute(bundle);
-    await withBusiness(BUSINESS, (bdb) => grantAuthorization( // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization(
       bdb,
       { jobId: job.jobId, actionClass: 'email.reply', recipients: ['dana@example.com'] }
     ));
 
     let performed = 0;
-    const outcome = await executeStep({
+    const outcome = await withBusiness(job.businessId, (db) => executeStep(db, {
       job,
       bundle,
       stepId: 'step-1',
@@ -92,23 +91,23 @@ describe('the executor consults the standing authorisation the instruction door 
         return NOTHING;
       },
       now: NOON,
-    });
+    }));
 
     expect(outcome.status).toBe('done');
     expect(performed).toBe(1);
-    const { rows } = await getPool().query('SELECT 1 FROM approval_requests WHERE job_id = $1', [
+    const { rows } = await testDb().query('SELECT 1 FROM approval_requests WHERE job_id = $1', [
       job.jobId,
     ]);
     expect(rows).toHaveLength(0);
   });
 
   it('still asks when no authorisation was granted for the job', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const job = await bossJobInExecute(bundle);
     // No grantAuthorization call — the single difference from the test above.
 
     let performed = 0;
-    const outcome = await executeStep({
+    const outcome = await withBusiness(job.businessId, (db) => executeStep(db, {
       job,
       bundle,
       stepId: 'step-1',
@@ -122,7 +121,7 @@ describe('the executor consults the standing authorisation the instruction door 
         return NOTHING;
       },
       now: NOON,
-    });
+    }));
 
     expect(outcome.status).toBe('awaiting_approval');
     expect(performed).toBe(0);

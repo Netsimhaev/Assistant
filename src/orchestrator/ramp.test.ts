@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { Plan } from '../domain/plan.js';
 import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import { loadRampLevel, rampLevelForPlan, setRampLevel } from './ramp.js';
@@ -31,58 +31,57 @@ describe('autonomy ramp', () => {
   });
 
   it('returns draft_only when the business has no row for the class', async () => {
-    expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe('draft_only');
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.initiate'))).toBe('draft_only');
   });
 
   it('returns the stored level once one is set', async () => {
     // `learn` opens the widest window (`approve_required`..`auto_notify`), so
     // this proves the raw round-trip rather than the dial's clamp — that
     // clamp is `ramp-floor.test.ts`'s job.
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.initiate', 'approve_required', { businessId: BUSINESS });
-    expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe('approve_required');
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'approve_required'));
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.initiate'))).toBe('approve_required');
   });
 
   it('does not read another business’s row', async () => {
-    await setRampLevel('email.initiate', 'auto', { businessId: 'other-business' });
-    expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe('draft_only');
+    await withBusiness('other-business', (db) => setRampLevel(db, 'email.initiate', 'auto'));
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.initiate'))).toBe('draft_only');
   });
 
   it('falls back to draft_only when the stored level is not a known level', async () => {
-    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
-    const { getPool } = await import('../db/pool.js');
-    await getPool().query(
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
+    await testDb().query(
       `UPDATE autonomy_ramp SET level = 'wide_open'
         WHERE business_id = $1 AND action_class = $2`,
       [BUSINESS, 'email.initiate'],
     );
-    expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe('draft_only');
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.initiate'))).toBe('draft_only');
   });
 
   it('setRampLevel overwrites rather than inserting a second row', async () => {
     // Same reason as the round-trip test above: without `learn` the dial
     // clamps both writes down to `draft_only` and the overwrite would be
     // invisible to this assertion.
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
-    await setRampLevel('email.initiate', 'approve_required', { businessId: BUSINESS });
-    expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe('approve_required');
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'approve_required'));
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.initiate'))).toBe('approve_required');
   });
 
   it('takes the most restrictive level across every class a plan declares', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
-    await setRampLevel('crm.write', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'crm.write', 'approve_required'));
     const plan = planWith(['email.initiate', 'crm.write']);
-    expect(await rampLevelForPlan(plan, { businessId: BUSINESS })).toBe('approve_required');
+    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan))).toBe('approve_required');
   });
 
   it('treats a step that declares no class as draft_only', async () => {
-    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
     // Every step here is `mail.send` — a tool that HAS a class. A `null` on
     // one of those is the planner declining to say, and still floors the plan.
     const plan = planWith(['email.initiate', null]);
-    expect(await rampLevelForPlan(plan, { businessId: BUSINESS })).toBe('draft_only');
+    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan))).toBe('draft_only');
   });
 
   /**
@@ -108,8 +107,8 @@ describe('autonomy ramp', () => {
    * would be a lie". This makes the ramp agree with it.
    */
   it('lets a read-only step contribute no ceiling, so it cannot floor the plan', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
     const plan = Plan.parse({
       goal: 'recall, draft, send',
       steps: [
@@ -119,7 +118,7 @@ describe('autonomy ramp', () => {
       ],
     });
 
-    expect(await rampLevelForPlan(plan, { businessId: BUSINESS })).toBe('auto_notify');
+    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan))).toBe('auto_notify');
   });
 
   /**
@@ -130,7 +129,7 @@ describe('autonomy ramp', () => {
    * file exists to prevent.
    */
   it('still floors the plan for a classifiable tool the planner declined to classify', async () => {
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
     const plan = Plan.parse({
       goal: 'draft then send, one unclassified',
       steps: [
@@ -140,11 +139,11 @@ describe('autonomy ramp', () => {
       ],
     });
 
-    expect(await rampLevelForPlan(plan, { businessId: BUSINESS })).toBe('draft_only');
+    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan))).toBe('draft_only');
   });
 
   it('falls to the floor for a plan that is entirely read-only', async () => {
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
     const plan = Plan.parse({
       goal: 'only look things up',
       steps: [
@@ -155,7 +154,7 @@ describe('autonomy ramp', () => {
     // No step carries a ceiling, so there is nothing to combine. The floor is
     // the safe answer and costs nothing: every step here short-circuits at the
     // gate before the autonomy stage reads this value at all.
-    expect(await rampLevelForPlan(plan, { businessId: BUSINESS })).toBe('draft_only');
+    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan))).toBe('draft_only');
   });
 
   /**
@@ -169,8 +168,8 @@ describe('autonomy ramp', () => {
    * contributes, exactly as `CEILING_EXEMPT_TOOLS`'s docblock promises.
    */
   it('lets a delegation step contribute no ceiling, so it cannot floor a plan that also acts', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
     const plan = Plan.parse({
       goal: 'ask for help, then send',
       steps: [
@@ -179,7 +178,7 @@ describe('autonomy ramp', () => {
       ],
     });
 
-    expect(await rampLevelForPlan(plan, { businessId: BUSINESS })).toBe('auto_notify');
+    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan))).toBe('auto_notify');
   });
 
   /**
@@ -205,6 +204,6 @@ describe('autonomy ramp', () => {
       ],
     });
 
-    expect(await rampLevelForPlan(plan, { businessId: BUSINESS })).toBe('auto');
+    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan))).toBe('auto');
   });
 });

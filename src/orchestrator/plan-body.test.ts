@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { Plan } from '../domain/plan.js';
@@ -31,18 +31,17 @@ const PLAN: Plan = Plan.parse({
 });
 
 async function seedJob(): Promise<string> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
-  const job = await createJob({
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
     title: 'plan body test',
-  });
+  }));
   // A job only reaches `execute` through `understand` and `plan` — there is no
   // `intake -> plan` edge, and `bindPlanToJob` is meant to be called once a
   // job has actually reached execution.
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
   return job.jobId;
 }
@@ -58,14 +57,14 @@ describe('loadPlanBody', () => {
 
   it('returns null for a job that is bound to no plan', async () => {
     const jobId = await seedJob();
-    expect(await loadPlanBody(jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => loadPlanBody(db, jobId))).toBeNull();
   });
 
   it('returns the plan a job was bound to, byte for byte', async () => {
     const jobId = await seedJob();
-    await bindPlanToJob(jobId, PLAN, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN));
 
-    const loaded = await loadPlanBody(jobId, { businessId: BUSINESS });
+    const loaded = await withBusiness(BUSINESS, (db) => loadPlanBody(db, jobId));
     expect(loaded).not.toBeNull();
     expect(loaded?.plan).toEqual(PLAN);
     expect(loaded?.planHash).toBe(planHashOf(PLAN));
@@ -76,20 +75,20 @@ describe('loadPlanBody', () => {
 
   it('does not read another business’s row', async () => {
     const jobId = await seedJob();
-    await bindPlanToJob(jobId, PLAN, { businessId: BUSINESS });
-    expect(await loadPlanBody(jobId, { businessId: 'other-business' })).toBeNull();
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN));
+    expect(await withBusiness('other-business', (db) => loadPlanBody(db, jobId))).toBeNull();
   });
 
   it('throws rather than returning a plan that no longer parses', async () => {
     const jobId = await seedJob();
-    await bindPlanToJob(jobId, PLAN, { businessId: BUSINESS });
-    await getPool().query(
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN));
+    await testDb().query(
       `UPDATE job_plans SET plan = '{"goal":"broken"}'::jsonb
         WHERE business_id = $1 AND job_id = $2`,
       [BUSINESS, jobId],
     );
 
-    await expect(loadPlanBody(jobId, { businessId: BUSINESS })).rejects.toThrow(
+    await expect(withBusiness(BUSINESS, (db) => loadPlanBody(db, jobId))).rejects.toThrow(
       /stored plan/i,
     );
   });
@@ -133,16 +132,15 @@ describe('runPlan and delegationProblems', () => {
   }
 
   async function bossJobInExecute(charterVersion: string): Promise<Job> {
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'delegation rejection test',
-    });
+    }));
     for (const to of ['understand', 'plan', 'execute'] as const) {
-      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
-    const loaded = await loadJob(job.jobId, { businessId: BUSINESS });
+    const loaded = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     if (loaded === null) throw new Error('job vanished');
     return loaded;
   }
@@ -156,14 +154,14 @@ describe('runPlan and delegationProblems', () => {
   });
 
   it('rejects the whole plan when a delegation step names a pair outside the graph', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ connections: [MAIL_CONNECTION], autonomyBase: { 'email.initiate': 'auto' } })
     ));
     const job = await bossJobInExecute(bundle.charterVersion);
     // A standing authorisation, so the first step is genuinely executable —
     // the assertion that it never ran only means something if it could have.
-    await withBusiness(BUSINESS, (bdb) => grantAuthorization( // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization(
       bdb,
       { jobId: job.jobId, actionClass: 'email.initiate', recipients: ['dana@example.com'] }
     ));
@@ -194,7 +192,7 @@ describe('runPlan and delegationProblems', () => {
     });
 
     const sent: MailMessage[] = [];
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan,
@@ -204,7 +202,7 @@ describe('runPlan and delegationProblems', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('rejected');
     if (result.status !== 'rejected') throw new Error('expected rejected');
@@ -216,7 +214,7 @@ describe('runPlan and delegationProblems', () => {
 
     // The point of the whole layer: rejection at plan validation must mean no
     // step — not even the innocuous first one — was ever performed.
-    const { rows } = await getPool().query(
+    const { rows } = await testDb().query(
       'SELECT step_id FROM job_step_results WHERE business_id = $1 AND job_id = $2',
       [BUSINESS, job.jobId],
     );

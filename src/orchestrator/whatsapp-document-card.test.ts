@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import type { DocxSpec } from '../domain/document-spec.js';
 import { CLOSURE_VERB_WORDS } from '../governance/closure-command.js';
 import { DOCUMENT_SETTINGS_DEFAULTS, saveDocumentSettings } from '../governance/document-settings.js';
@@ -18,7 +18,7 @@ import { FORGET_VERBS } from '../governance/forget-command.js';
 import { LEDGER_COMMAND_WORDS } from '../ledger/whatsapp-command.js';
 import { addTypedRecipient, approveDocumentCard, createDocumentCard, loadDocumentCard } from '../production/card.js';
 import { advanceStage, createProduction, saveVersion, type ProductionDestination } from '../production/store.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { CANCEL_WORDS, CONFIRM_WORDS, REPLY_STOPLIST } from './command-confirm.js';
@@ -117,7 +117,7 @@ async function card(destination: ProductionDestination, deliveredAgoMs: number |
   expect(await advanceStage(productionId, 'queued', 'ready', {})).toBe(true);
   const created = await createDocumentCard(versionId, { businessId: B });
   if (deliveredAgoMs !== null) {
-    await getPool().query(
+    await testDb().query(
       `UPDATE document_cards SET whatsapp_delivered_at = now() - make_interval(secs => $2::double precision / 1000)
         WHERE card_id = $1`,
       [created.cardId, deliveredAgoMs],
@@ -129,7 +129,7 @@ async function card(destination: ProductionDestination, deliveredAgoMs: number |
 describe('the WhatsApp time gate inside approveDocumentCard', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({ version: 'v-gate' }))); // TENANCY-TODO(task 4)
+    await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({ version: 'v-gate' })));
     // A save option needs somewhere to save to (M4); the gate under test is time.
     await saveDocumentSettings({ ...DOCUMENT_SETTINGS_DEFAULTS, baseFolder: tmpdir() }, { businessId: B });
   });
@@ -188,7 +188,7 @@ describe('the WhatsApp time gate inside approveDocumentCard', () => {
         return { ok: true };
       },
     } as unknown as BossMessenger;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_settings (business_id, to_whatsapp, to_email, to_screen) VALUES ($1, true, false, true)
         ON CONFLICT (business_id) DO UPDATE SET to_whatsapp = true, to_email = false, to_screen = true`,
       [B],
@@ -207,7 +207,7 @@ describe('the WhatsApp time gate inside approveDocumentCard', () => {
 
   it('a typed address with no notification seams leaves the card withdrawn and its channel states untouched', async () => {
     const cardId = await card({ mode: 'send', to: [] }, 60_000);
-    await getPool().query(`UPDATE document_cards SET email_state = 'sent', whatsapp_state = 'sent' WHERE card_id = $1`, [cardId]);
+    await testDb().query(`UPDATE document_cards SET email_state = 'sent', whatsapp_state = 'sent' WHERE card_id = $1`, [cardId]);
     const outcome = await addTypedRecipient(cardId, 'yossi@client.example', { businessId: B });
     expect(outcome).toMatchObject({ status: 'added', resend: 'skipped_no_seams' });
     const after = (await loadDocumentCard(B, cardId))!;
@@ -218,8 +218,8 @@ describe('the WhatsApp time gate inside approveDocumentCard', () => {
 
   it('a typed address is saved even when the charter cannot be read — the re-send is skipped, not guessed', async () => {
     const cardId = await card({ mode: 'send', to: [] }, 60_000);
-    await getPool().query(`UPDATE document_cards SET whatsapp_state = 'sent' WHERE card_id = $1`, [cardId]);
-    await getPool().query(
+    await testDb().query(`UPDATE document_cards SET whatsapp_state = 'sent' WHERE card_id = $1`, [cardId]);
+    await testDb().query(
       `UPDATE charter_versions SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb('0'::text))
         WHERE business_id = $1`,
       [B],

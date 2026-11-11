@@ -78,7 +78,7 @@ function accessOf(client: CalendarClient): CalendarAccess {
 let charterVersion = '';
 
 async function newJob(phase = 'plan'): Promise<string> {
-  const job = await createJob({ charterVersion, provenance: 'boss', title: 't' });
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion, provenance: 'boss', title: 't' }));
   await getPool().query('UPDATE jobs SET phase = $1 WHERE job_id = $2', [phase, job.jobId]);
   return job.jobId;
 }
@@ -232,8 +232,7 @@ describe('holds', () => {
   });
 
   it('sweep releases holds of closed jobs and stale questions but never of confirmed or executing jobs', async () => {
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: CALENDAR_SYSTEM,
         status: 'live',
         endpoint: null,
@@ -241,9 +240,7 @@ describe('holds', () => {
         provider: 'google',
         lastOkAt: null,
         lastError: null,
-      },
-      { businessId: BUSINESS, by: 'test' },
-    );
+      }, { by: 'test' }));
     const { client } = fake();
     const age = async (id: string): Promise<void> => {
       await getPool().query("UPDATE meeting_holds SET created_at = now() - interval '2 hours' WHERE hold_id = $1", [id]);
@@ -281,8 +278,7 @@ describe('holds', () => {
   });
 
   it('sweep keeps a fresh hold whose job is in plan before its question row exists (the door’s gap)', async () => {
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: CALENDAR_SYSTEM,
         status: 'live',
         endpoint: null,
@@ -290,9 +286,7 @@ describe('holds', () => {
         provider: 'google',
         lastOkAt: null,
         lastError: null,
-      },
-      { businessId: BUSINESS, by: 'test' },
-    );
+      }, { by: 'test' }));
     const { client } = fake();
     const gapJob = await newJob('plan'); // bound, moved to plan, no question yet
     const fresh = await hold(client, gapJob);

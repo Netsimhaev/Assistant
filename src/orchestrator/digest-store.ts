@@ -1,7 +1,5 @@
 import { ulid } from 'ulid';
-import { config } from '../config.js';
-import type { Queryable } from '../db/pool.js';
-import { getPool } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { DigestKind, DigestWindow } from './digest-window.js';
 import type { RenderedDigest } from './digest-render.js';
 
@@ -58,11 +56,10 @@ function toStored(row: DigestRow): StoredDigest {
  * report already chose, and for the same reason.
  */
 export async function storeDigest(
+  db: BusinessDb,
   input: { window: DigestWindow; rendered: RenderedDigest },
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<StoredDigest> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const id = `DG-${ulid()}`;
 
   const { rows } = await db.query<DigestRow>(
@@ -88,13 +85,12 @@ export async function storeDigest(
  * (`documents/read.ts`) already apply to their own UPDATEs.
  */
 export async function recordChannel(
+  db: BusinessDb,
   digestId: string,
   channel: 'email' | 'whatsapp',
   state: ChannelState,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const column = channel === 'email' ? 'email_state' : 'whatsapp_state';
 
   const { rowCount } = await db.query(
@@ -107,11 +103,10 @@ export async function recordChannel(
 }
 
 export async function lastWindowEnd(
+  db: BusinessDb,
   kind: DigestKind,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<Date | null> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   const { rows } = await db.query<{ window_end: string }>(
     `SELECT window_end::text AS window_end FROM digests
@@ -124,10 +119,10 @@ export async function lastWindowEnd(
 }
 
 export async function recentDigests(
-  options: { businessId?: string; limit?: number; db?: Queryable } = {},
+  db: BusinessDb,
+  options: { limit?: number } = {},
 ): Promise<StoredDigest[]> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const limit = options.limit ?? 30;
 
   const { rows } = await db.query<DigestRow>(

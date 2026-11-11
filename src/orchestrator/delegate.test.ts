@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase, testDb } from '../test/db.js';
+import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { config } from '../config.js';
@@ -30,17 +30,16 @@ const BUSINESS = 'test-business';
 async function openParentJob(
   options: { provenance?: TrustLevel; version?: string } = {},
 ): Promise<{ job: Job; bundle: PolicyBundle }> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: options.version ?? `parent-${ulid()}` }))); // TENANCY-TODO(task 4)
-  const created = await createJob({
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: options.version ?? `parent-${ulid()}` })));
+  const created = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: options.provenance ?? 'boss',
-    businessId: BUSINESS,
     title: 'delegating job',
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(created.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, created.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  const job = await loadJob(created.jobId, { businessId: BUSINESS });
+  const job = await withBusiness(BUSINESS, (db) => loadJob(db, created.jobId));
   if (job === null) throw new Error('parent job vanished');
   return { job, bundle };
 }
@@ -59,7 +58,6 @@ function baseRequest(
     contextRefs: [{ kind: 'document', documentId: 'doc-1' }],
     bundle,
     parentEnvelope: null,
-    businessId: BUSINESS,
     ...overrides,
   };
 }
@@ -74,7 +72,7 @@ async function countJobs(): Promise<number> {
 
 /** Move a parent back to `execute`, as if a scheduler retried its step. */
 async function retryParent(jobId: string): Promise<void> {
-  await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'retry', businessId: BUSINESS });
+  await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'execute', actor: 'orchestrator', reason: 'retry' }));
 }
 
 /** A permissive envelope, overridable, for tests that need a real, attached ancestor. */
@@ -107,8 +105,8 @@ function anAncestorEnvelope(overrides: Partial<AgentEnvelope> = {}): AgentEnvelo
 
 /** Persist an ancestor envelope and mark it as having opened `childJobId` — what `loadEnvelopeWithChild` checks. */
 async function seedAncestor(envelope: AgentEnvelope, childJobId: string): Promise<void> {
-  await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, envelope, { parentJobId: `JOB-ancestor-of-${childJobId}` })); // TENANCY-TODO(task 4)
-  await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, envelope.id, childJobId)); // TENANCY-TODO(task 4)
+  await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, envelope, { parentJobId: `JOB-ancestor-of-${childJobId}` }));
+  await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, envelope.id, childJobId));
 }
 
 async function anExtractedDocument(text: string): Promise<string> {
@@ -153,19 +151,19 @@ afterAll(async () => {
 describe('requestHelp', () => {
   it('opens a child job and parks the parent on the envelope', async () => {
     const { job, bundle } = await openParentJob();
-    const result = await requestHelp(baseRequest(job, bundle));
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle)));
     expect(result.status).toBe('opened');
     if (result.status !== 'opened') throw new Error('expected opened');
 
-    const parentAfter = await loadJob(job.jobId, { businessId: BUSINESS });
+    const parentAfter = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(parentAfter?.phase).toBe('followup');
     expect(parentAfter?.awaitingEnvelopeId).toBe(result.envelopeId);
 
-    const child = await loadJob(result.childJobId, { businessId: BUSINESS });
+    const child = await withBusiness(BUSINESS, (db) => loadJob(db, result.childJobId));
     expect(child).not.toBeNull();
     expect(child?.phase).toBe('execute');
 
-    const plan = await loadPlanBody(result.childJobId, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (db) => loadPlanBody(db, result.childJobId));
     expect(plan).not.toBeNull();
     expect(plan?.plan.steps).toHaveLength(1);
     expect(plan?.plan.steps[0]?.toolName).toBe('doc.fetch');
@@ -185,10 +183,10 @@ describe('requestHelp', () => {
   it('the child\'s constraints are tightened in every field, never loosened', async () => {
     const { job, bundle } = await openParentJob({ provenance: 'staff' });
     const now = new Date('2026-09-24T10:00:00.000Z');
-    const result = await requestHelp(baseRequest(job, bundle, { now }));
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, { now })));
     if (result.status !== 'opened') throw new Error('expected opened');
 
-    const envelope = await withBusiness(BUSINESS, (bdb) => loadEnvelope(bdb, result.envelopeId)); // TENANCY-TODO(task 4)
+    const envelope = await withBusiness(BUSINESS, (bdb) => loadEnvelope(bdb, result.envelopeId));
     expect(envelope).not.toBeNull();
     // The parent job's own provenance ('staff') is stricter than the root
     // ancestor's unrestricted baseline ('boss'), and it is the one that must
@@ -228,10 +226,10 @@ describe('requestHelp', () => {
     });
     await seedAncestor(priorEnvelope, job.jobId);
 
-    const result = await requestHelp(baseRequest(job, bundle, { parentEnvelope: priorEnvelope, now }));
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, { parentEnvelope: priorEnvelope, now })));
     if (result.status !== 'opened') throw new Error('expected opened');
 
-    const envelope = await withBusiness(BUSINESS, (bdb) => loadEnvelope(bdb, result.envelopeId)); // TENANCY-TODO(task 4)
+    const envelope = await withBusiness(BUSINESS, (bdb) => loadEnvelope(bdb, result.envelopeId));
     expect(envelope?.correlationId).toBe('JOB-root-of-the-tree');
     expect(envelope?.correlationId).not.toBe(job.jobId);
     expect(envelope?.hops).toBe(3);
@@ -262,7 +260,7 @@ describe('requestHelp', () => {
     await seedAncestor(priorEnvelope, job.jobId);
 
     const before = await countJobs();
-    const result = await requestHelp(baseRequest(job, bundle, { parentEnvelope: priorEnvelope }));
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, { parentEnvelope: priorEnvelope })));
     expect(result.status).toBe('refused');
     if (result.status !== 'refused') throw new Error('expected refused');
     expect(result.code).toBe('hop_limit');
@@ -275,7 +273,7 @@ describe('requestHelp', () => {
     const fabricated = anAncestorEnvelope();
 
     const before = await countJobs();
-    const result = await requestHelp(baseRequest(job, bundle, { parentEnvelope: fabricated }));
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, { parentEnvelope: fabricated })));
     expect(result.status).toBe('refused');
     if (result.status !== 'refused') throw new Error('expected refused');
     expect(result.code).toBe('parent_envelope_mismatch');
@@ -304,7 +302,7 @@ describe('requestHelp', () => {
     await seedAncestor(governing, job.jobId);
 
     const before = await countJobs();
-    const result = await requestHelp(baseRequest(job, bundle, { parentEnvelope: null }));
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, { parentEnvelope: null })));
     expect(result.status).toBe('refused');
     if (result.status !== 'refused') throw new Error('expected refused');
     expect(result.code).toBe('parent_envelope_omitted');
@@ -353,10 +351,10 @@ describe('requestHelp', () => {
     };
 
     const now = new Date('2026-09-24T10:00:00.000Z');
-    const result = await requestHelp(baseRequest(job, bundle, { parentEnvelope: lied, now }));
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, { parentEnvelope: lied, now })));
     if (result.status !== 'opened') throw new Error('expected opened');
 
-    const envelope = await withBusiness(BUSINESS, (bdb) => loadEnvelope(bdb, result.envelopeId)); // TENANCY-TODO(task 4)
+    const envelope = await withBusiness(BUSINESS, (bdb) => loadEnvelope(bdb, result.envelopeId));
     // The row's values win, not the lied-about ones.
     expect(envelope?.hops).toBe(4); // real.hops (3) + 1, not the claimed 0 + 1
     expect(envelope?.correlationId).toBe('JOB-real-root');
@@ -374,25 +372,23 @@ describe('requestHelp', () => {
     // called directly (not only as a gated plan step), so it must enforce
     // this itself rather than relying on the gate having already checked it.
     const before = await countJobs();
-    const result = await requestHelp(baseRequest(job, bundle, { from: 'ops.web' }));
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, { from: 'ops.web' })));
     expect(result.status).toBe('refused');
     if (result.status !== 'refused') throw new Error('expected refused');
     expect(result.code).toBe('not_permitted');
     expect(await countJobs()).toBe(before);
-    const { rows } = await getPool().query('SELECT 1 FROM agent_envelopes WHERE business_id = $1', [BUSINESS]);
+    const { rows } = await testDb().query('SELECT 1 FROM agent_envelopes WHERE business_id = $1', [BUSINESS]);
     expect(rows).toHaveLength(0);
   });
 
   it('refuses two context refs of the same required kind rather than silently using the first', async () => {
     const { job, bundle } = await openParentJob();
-    const result = await requestHelp(
-      baseRequest(job, bundle, {
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, {
         contextRefs: [
           { kind: 'document', documentId: 'doc-x' },
           { kind: 'document', documentId: 'doc-y' },
         ],
-      }),
-    );
+      })));
     expect(result.status).toBe('refused');
     if (result.status !== 'refused') throw new Error('expected refused');
     expect(result.code).toBe('ambiguous_context_ref');
@@ -401,12 +397,12 @@ describe('requestHelp', () => {
   it('refuses a second identical request and opens no second child', async () => {
     const { job, bundle } = await openParentJob();
     const request = baseRequest(job, bundle);
-    const first = await requestHelp(request);
+    const first = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, request));
     expect(first.status).toBe('opened');
     await retryParent(job.jobId);
 
     const before = await countJobs();
-    const second = await requestHelp(request);
+    const second = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, request));
     expect(second.status).not.toBe('opened');
     expect(await countJobs()).toBe(before);
   });
@@ -443,10 +439,10 @@ describe('requestHelp', () => {
       hops: 0,
       idempotencyKey,
     });
-    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, fabricated, { parentJobId: 'JOB-unrelated' })); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, fabricated, { parentJobId: 'JOB-unrelated' }));
 
     const before = await countJobs();
-    const result = await requestHelp(request);
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, request));
     expect(result.status).toBe('duplicate');
     if (result.status !== 'duplicate') throw new Error('expected duplicate');
     expect(result.envelopeId).toBe(fabricated.id);
@@ -483,11 +479,11 @@ describe('requestHelp', () => {
       hops: 0,
       idempotencyKey,
     });
-    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, fabricated, { parentJobId: 'JOB-unrelated-3' })); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, fabricated, { parentJobId: 'JOB-unrelated-3' }));
     const knownChildJobId = `J-${ulid()}`;
-    await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, fabricated.id, knownChildJobId)); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, fabricated.id, knownChildJobId));
 
-    const result = await requestHelp(request);
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, request));
     expect(result.status).toBe('duplicate');
     if (result.status !== 'duplicate') throw new Error('expected duplicate');
     expect(result.childJobId).toBe(knownChildJobId);
@@ -495,18 +491,14 @@ describe('requestHelp', () => {
 
   it('refuses a repeat of the same quadruple with no new context', async () => {
     const { job, bundle } = await openParentJob();
-    const first = await requestHelp(
-      baseRequest(job, bundle, { payload: { question: 'שאלה ראשונה על המסמך' } }),
-    );
+    const first = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, { payload: { question: 'שאלה ראשונה על המסמך' } })));
     expect(first.status).toBe('opened');
     await retryParent(job.jobId);
 
     // A DIFFERENT payload (so the idempotency key differs and guard 3 would
     // not fire) but the SAME (from, to, intent, contextRefsHash) — guard 4
     // must still refuse it.
-    const second = await requestHelp(
-      baseRequest(job, bundle, { payload: { question: 'שאלה אחרת לגמרי על אותו מסמך' } }),
-    );
+    const second = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, { payload: { question: 'שאלה אחרת לגמרי על אותו מסמך' } })));
     expect(second.status).toBe('refused');
     if (second.status !== 'refused') throw new Error('expected refused');
     expect(second.code).toBe('no_new_information');
@@ -515,35 +507,29 @@ describe('requestHelp', () => {
   it('fails the parent job on the third exchange between the same pair', async () => {
     const { job, bundle } = await openParentJob();
 
-    const first = await requestHelp(
-      baseRequest(job, bundle, { contextRefs: [{ kind: 'document', documentId: 'doc-a' }] }),
-    );
+    const first = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, { contextRefs: [{ kind: 'document', documentId: 'doc-a' }] })));
     expect(first.status).toBe('opened');
     await retryParent(job.jobId);
 
-    const second = await requestHelp(
-      baseRequest(job, bundle, { contextRefs: [{ kind: 'document', documentId: 'doc-b' }] }),
-    );
+    const second = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, { contextRefs: [{ kind: 'document', documentId: 'doc-b' }] })));
     expect(second.status).toBe('opened');
     await retryParent(job.jobId);
 
-    const third = await requestHelp(
-      baseRequest(job, bundle, { contextRefs: [{ kind: 'document', documentId: 'doc-c' }] }),
-    );
+    const third = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, { contextRefs: [{ kind: 'document', documentId: 'doc-c' }] })));
     expect(third.status).toBe('refused');
     if (third.status !== 'refused') throw new Error('expected refused');
     expect(third.code).toBe('oscillation');
     expect(third.reason).toContain('comms.email');
     expect(third.reason).toContain('know.reader');
 
-    const parentAfter = await loadJob(job.jobId, { businessId: BUSINESS });
+    const parentAfter = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(parentAfter?.phase).toBe('failed');
   });
 
   it('refuses when the daily cap is used up', async () => {
     const { job, bundle } = await openParentJob();
     for (let i = 0; i < config.delegationsPerDay; i++) {
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO audit_log (
            business_id, actor, kind, charter_version, provenance, input_hash, reason, prev_hash, hash
          ) VALUES ($1, 'orchestrator', 'delegation', $2, 'boss', 'seed', 'seed row', $3, $4)`,
@@ -551,12 +537,12 @@ describe('requestHelp', () => {
       );
     }
 
-    const result = await requestHelp(baseRequest(job, bundle));
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle)));
     expect(result.status).toBe('refused');
     if (result.status !== 'refused') throw new Error('expected refused');
     expect(result.code).toBe('daily_cap');
 
-    const { rows } = await getPool().query('SELECT 1 FROM agent_envelopes WHERE business_id = $1', [BUSINESS]);
+    const { rows } = await testDb().query('SELECT 1 FROM agent_envelopes WHERE business_id = $1', [BUSINESS]);
     expect(rows).toHaveLength(0);
   });
 
@@ -576,14 +562,14 @@ describe('requestHelp', () => {
     const { job, bundle } = await openParentJob();
     const request = baseRequest(job, bundle);
 
-    const first = await requestHelp(request);
+    const first = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, request));
     if (first.status !== 'opened') throw new Error('expected opened');
 
     // Exhaust the cap with unrelated rows, on top of the one real row the
     // successful call above just wrote — an ordinary operational state, not
     // corruption.
     for (let i = 0; i < config.delegationsPerDay; i++) {
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO audit_log (
            business_id, actor, kind, charter_version, provenance, input_hash, reason, prev_hash, hash
          ) VALUES ($1, 'orchestrator', 'delegation', $2, 'boss', 'seed', 'seed row', $3, $4)`,
@@ -592,7 +578,7 @@ describe('requestHelp', () => {
     }
 
     await retryParent(job.jobId);
-    const resumed = await requestHelp(request);
+    const resumed = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, request));
     expect(resumed.status).toBe('duplicate');
     if (resumed.status !== 'duplicate') throw new Error('expected duplicate');
     expect(resumed.envelopeId).toBe(first.envelopeId);
@@ -614,18 +600,17 @@ describe('requestHelp', () => {
     // actually satisfy the foreign key for, and `openParentJob` (which
     // installs a fresh, uniquely-versioned charter per call) would give the
     // two jobs two different ones.
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `siblings-${ulid()}` }))); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `siblings-${ulid()}` })));
     async function jobUnderSharedCharter(): Promise<Job> {
-      const created = await createJob({
+      const created = await withBusiness(BUSINESS, (db) => createJob(db, {
         charterVersion: bundle.charterVersion,
         provenance: 'boss',
-        businessId: BUSINESS,
         title: 'sibling job',
-      });
+      }));
       for (const to of ['understand', 'plan', 'execute'] as const) {
-        await transition(created.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+        await withBusiness(BUSINESS, (db) => transition(db, created.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
       }
-      const loaded = await loadJob(created.jobId, { businessId: BUSINESS });
+      const loaded = await withBusiness(BUSINESS, (db) => loadJob(db, created.jobId));
       if (loaded === null) throw new Error('job vanished');
       return loaded;
     }
@@ -653,7 +638,7 @@ describe('requestHelp', () => {
     });
     await seedAncestor(ancestorForB, jobB.jobId);
 
-    const openedA = await requestHelp(baseRequest(jobA, bundle, { parentEnvelope: ancestorForA }));
+    const openedA = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(jobA, bundle, { parentEnvelope: ancestorForA })));
     expect(openedA.status).toBe('opened');
 
     const before = await getPool().query<{ n: string }>(
@@ -661,7 +646,7 @@ describe('requestHelp', () => {
       [BUSINESS],
     );
 
-    const resultB = await requestHelp(baseRequest(jobB, bundle, { parentEnvelope: ancestorForB }));
+    const resultB = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(jobB, bundle, { parentEnvelope: ancestorForB })));
     expect(resultB.status).toBe('refused');
     if (resultB.status !== 'refused') throw new Error('expected refused');
     expect(resultB.code).toBe('no_new_information');
@@ -677,7 +662,7 @@ describe('requestHelp', () => {
 
   it('refuses an unregistered intent', async () => {
     const { job, bundle } = await openParentJob();
-    const result = await requestHelp(baseRequest(job, bundle, { intent: 'no_such_intent' }));
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, { intent: 'no_such_intent' })));
     expect(result.status).toBe('refused');
     if (result.status !== 'refused') throw new Error('expected refused');
     expect(result.code).toBe('unknown_intent');
@@ -685,7 +670,7 @@ describe('requestHelp', () => {
 
   it('refuses a missing required context ref', async () => {
     const { job, bundle } = await openParentJob();
-    const result = await requestHelp(baseRequest(job, bundle, { contextRefs: [] }));
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, { contextRefs: [] })));
     expect(result.status).toBe('refused');
     if (result.status !== 'refused') throw new Error('expected refused');
     expect(result.code).toBe('missing_context_ref');
@@ -695,12 +680,10 @@ describe('requestHelp', () => {
     const { job, bundle } = await openParentJob();
     const secretQuestion = 'מה הסכום החייב בחשבונית מספר 88421?';
     const secretDocumentId = 'DOC-secret-88421';
-    const result = await requestHelp(
-      baseRequest(job, bundle, {
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, {
         payload: { question: secretQuestion },
         contextRefs: [{ kind: 'document', documentId: secretDocumentId }],
-      }),
-    );
+      })));
     expect(result.status).toBe('opened');
     if (result.status !== 'opened') throw new Error('expected opened');
 
@@ -720,21 +703,20 @@ describe('requestHelp', () => {
 
   it('refuses to delegate from a job that is not in execute', async () => {
     const { job, bundle } = await openParentJob();
-    await transition(job.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'verify',
       actor: 'orchestrator',
       reason: 'no longer executing',
-      businessId: BUSINESS,
-    });
+    }));
 
     const before = await countJobs();
-    const result = await requestHelp(baseRequest(job, bundle));
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle)));
     expect(result.status).toBe('refused');
     if (result.status !== 'refused') throw new Error('expected refused');
     expect(result.code).toBe('job_not_executable');
     expect(await countJobs()).toBe(before);
 
-    const { rows } = await getPool().query('SELECT 1 FROM agent_envelopes WHERE business_id = $1', [BUSINESS]);
+    const { rows } = await testDb().query('SELECT 1 FROM agent_envelopes WHERE business_id = $1', [BUSINESS]);
     expect(rows).toHaveLength(0);
   });
 
@@ -749,7 +731,7 @@ describe('requestHelp', () => {
    */
   it("the child's plan computes its own ramp level, independently of the parent's", async () => {
     const { job, bundle } = await openParentJob();
-    const result = await requestHelp(baseRequest(job, bundle));
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle)));
     if (result.status !== 'opened') throw new Error('expected opened');
 
     const parentPlan = Plan.parse({
@@ -765,14 +747,14 @@ describe('requestHelp', () => {
         },
       ],
     });
-    const parentRamp = await rampLevelForPlan(parentPlan, { businessId: BUSINESS });
+    const parentRamp = await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, parentPlan));
     // The exemption's whole point: a delegation carries no outbound authority
     // of its own and must not floor the plan that contains it.
     expect(parentRamp).toBe('auto');
 
-    const childPlanBody = await loadPlanBody(result.childJobId, { businessId: BUSINESS });
+    const childPlanBody = await withBusiness(BUSINESS, (db) => loadPlanBody(db, result.childJobId));
     if (childPlanBody === null) throw new Error('expected the child\'s bound plan');
-    const childRamp = await rampLevelForPlan(childPlanBody.plan, { businessId: BUSINESS });
+    const childRamp = await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, childPlanBody.plan));
     // `doc.fetch` is read-only and NOT ceiling-exempt, so it floors at the
     // ramp floor — genuinely computed from the child's own plan, not carried
     // over from the parent's.
@@ -799,9 +781,7 @@ describe('requestHelp', () => {
   it('the child actually runs to completion through the real scheduler entry point (run-due.ts)', async () => {
     const { job, bundle } = await openParentJob();
     const documentId = await anExtractedDocument('מה המחיר לאספקה?');
-    const result = await requestHelp(
-      baseRequest(job, bundle, { contextRefs: [{ kind: 'document', documentId }] }),
-    );
+    const result = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle, { contextRefs: [{ kind: 'document', documentId }] })));
     if (result.status !== 'opened') throw new Error('expected opened');
 
     const { reader, callCount } = stubReader(
@@ -825,13 +805,13 @@ describe('requestHelp', () => {
       warnings: [],
     };
 
-    const due = await runDueJobs({ businessId: BUSINESS, runtime, reader });
+    const due = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime, reader }));
 
     const childOutcome = due.ran.find((r) => r.jobId === result.childJobId);
     expect(childOutcome?.status).toBe('done');
     expect(callCount()).toBe(1);
 
-    const childAfter = await loadJob(result.childJobId, { businessId: BUSINESS });
+    const childAfter = await withBusiness(BUSINESS, (db) => loadJob(db, result.childJobId));
     expect(childAfter?.phase).toBe('verify');
   });
 });
@@ -875,7 +855,7 @@ describe('appendAudit failure after the delegation has already committed', () =>
 
     let caught: unknown;
     try {
-      await requestHelp(baseRequest(job, bundle));
+      await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(job, bundle)));
     } catch (error) {
       caught = error;
     }
@@ -890,9 +870,9 @@ describe('appendAudit failure after the delegation has already committed', () =>
     // The delegation IS in effect despite the failed audit row: the child
     // exists and the parent is parked, exactly as a successful call would
     // leave them.
-    const child = await loadJob(typed.outcome.childJobId, { businessId: BUSINESS });
+    const child = await withBusiness(BUSINESS, (db) => loadJob(db, typed.outcome.childJobId));
     expect(child).not.toBeNull();
-    const parentAfter = await loadJob(job.jobId, { businessId: BUSINESS });
+    const parentAfter = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(parentAfter?.phase).toBe('followup');
   });
 });

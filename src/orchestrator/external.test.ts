@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
@@ -101,15 +101,14 @@ function mailPlan(): Plan {
 }
 
 async function jobInExecute(bundle: PolicyBundle) {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  const loaded = await loadJob(job.jobId, { businessId: BUSINESS });
+  const loaded = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
   if (loaded === null) throw new Error('job vanished');
   return loaded;
 }
@@ -124,11 +123,11 @@ afterAll(async () => {
 
 describe('a plan reaches a real external system', () => {
   it('sends through the adapter the registry resolved', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }))); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' })));
     const job = await jobInExecute(bundle);
     const { sent, registry } = recording();
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: mailPlan(),
@@ -138,7 +137,7 @@ describe('a plan reaches a real external system', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('done');
     if (result.status !== 'done') throw new Error('unreachable');
@@ -153,11 +152,11 @@ describe('a plan reaches a real external system', () => {
     // `endpoint` is validated on write and audited as a trust-relocating
     // change. Until it reached the transport, that audit entry described a
     // field nothing read.
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }))); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' })));
     const job = await jobInExecute(bundle);
     const { endpoints, registry } = recording();
 
-    await runPlan({
+    await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: mailPlan(),
@@ -167,17 +166,17 @@ describe('a plan reaches a real external system', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(endpoints).toEqual(['smtp://mail.example.co.il:587']);
   });
 
   it('hands the adapter the redacted payload, not the one the plan proposed', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }))); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' })));
     const job = await jobInExecute(bundle);
     const { sent, registry } = recording();
 
-    await runPlan({
+    await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: mailPlan(),
@@ -187,7 +186,7 @@ describe('a plan reaches a real external system', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     // The charter redacts a bare nine-digit number. The adapter must never see
     // the original.
@@ -197,12 +196,12 @@ describe('a plan reaches a real external system', () => {
   });
 
   it('loads the bindings from the store when nobody injects them', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }))); // TENANCY-TODO(task 4)
-    await upsertBinding(LIVE, { businessId: BUSINESS, by: 'p_boss' });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' })));
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, LIVE, { by: 'p_boss' }));
     const job = await jobInExecute(bundle);
     const { sent, registry } = recording();
 
-    const result = await runPlanForJob({
+    const result = await withBusiness(job.businessId, (db) => runPlanForJob(db, {
       job,
       bundle,
       plan: mailPlan(),
@@ -211,18 +210,18 @@ describe('a plan reaches a real external system', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('done');
     expect(sent).toHaveLength(1);
   });
 
   it('rejects the whole plan when the charter declares no channel for a tool', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const job = await jobInExecute(bundle);
     const { sent, registry } = recording();
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: mailPlan(),
@@ -232,7 +231,7 @@ describe('a plan reaches a real external system', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     // Refusal, not a fall back to the browser: an unknown system reached by
     // falling back is exactly the route an attacker would choose.
@@ -241,17 +240,17 @@ describe('a plan reaches a real external system', () => {
     expect(result.reason).toContain('no_channel_for_tool');
     expect(sent).toEqual([]);
     // Rejected before anything ran: the job never left `execute`.
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('execute');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.phase).toBe('execute');
   });
 
   it('rejects a whole multi-step plan on the LAST step lacking a channel', async () => {
     // The step without a channel is the second one. A plan validated lazily
     // would have sent the first mail before discovering it.
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }))); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' })));
     const job = await jobInExecute(bundle);
     const { sent, registry } = recording();
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: Plan.parse({
@@ -280,7 +279,7 @@ describe('a plan reaches a real external system', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('rejected');
     if (result.status !== 'rejected') throw new Error('unreachable');
@@ -290,14 +289,14 @@ describe('a plan reaches a real external system', () => {
   });
 
   it('rejects a declared connection that no adapter implements', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ connections: [{ ...MAIL_CONNECTION, system: 'ghost-mail' }] })
     ));
     const job = await jobInExecute(bundle);
     const { sent, registry } = recording();
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: mailPlan(),
@@ -307,7 +306,7 @@ describe('a plan reaches a real external system', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('rejected');
     if (result.status !== 'rejected') throw new Error('unreachable');
@@ -316,7 +315,7 @@ describe('a plan reaches a real external system', () => {
   });
 
   it('sleeps the job when the adapter says the failure is retryable', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }))); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' })));
     const job = await jobInExecute(bundle);
     const failing = createMailAdapter({
       system: 'office-mail',
@@ -328,7 +327,7 @@ describe('a plan reaches a real external system', () => {
       },
     });
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: mailPlan(),
@@ -338,21 +337,21 @@ describe('a plan reaches a real external system', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('halted');
-    const after = await loadJob(job.jobId, { businessId: BUSINESS });
+    const after = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     // Back to followup with a wake time — the loop the scheduler already runs.
     expect(after?.phase).toBe('followup');
     expect(after?.wakeAt).not.toBeNull();
   });
 
   it('sleeps the step when the binding is not live, after the gate has run', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }))); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' })));
     const job = await jobInExecute(bundle);
     const { sent, registry } = recording();
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: mailPlan(),
@@ -362,30 +361,30 @@ describe('a plan reaches a real external system', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('halted');
     expect(sent).toEqual([]);
 
     // Not rejected at validation: the step reached the gate, and the failure
     // is on the record rather than having vanished with the plan.
-    const history = await jobHistory(job.jobId);
+    const history = await withBusiness(TEST_BUSINESS, (db) => jobHistory(db, job.jobId));
     expect(history.some((h) => h.reason.includes('channel_unavailable'))).toBe(true);
 
     // A binding that is down is transient — it may be live again in five
     // minutes — so the job sleeps to followup rather than failing terminally
     // and throwing away work that nothing was wrong with.
-    const after = await loadJob(job.jobId, { businessId: BUSINESS });
+    const after = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(after?.phase).toBe('followup');
     expect(after?.wakeAt).not.toBeNull();
   });
 
   it('refuses when the binding names a credential the source cannot resolve', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }))); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' })));
     const job = await jobInExecute(bundle);
     const { sent, registry } = recording();
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: mailPlan(),
@@ -395,7 +394,7 @@ describe('a plan reaches a real external system', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('halted');
     if (result.status !== 'halted') throw new Error('unreachable');
@@ -444,7 +443,7 @@ function recordingCredentials(): {
 
 describe("a credential is resolved under the job's own business", () => {
   it("passes the job's businessId to the credential source, not a default", async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' })
     ));
@@ -452,7 +451,7 @@ describe("a credential is resolved under the job's own business", () => {
     const { sent, registry } = recording();
     const { calls, source } = recordingCredentials();
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: mailPlan(),
@@ -462,7 +461,7 @@ describe("a credential is resolved under the job's own business", () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     // The step must actually have run. A plan the gate refused earlier would
     // resolve no credential at all, and `calls` would be empty for a reason
@@ -483,10 +482,10 @@ describe('only a step that goes somewhere needs a channel', () => {
     // `crm.read`, `memory.recall` and `escalate_to_human` reach nothing
     // outside the instance. Demanding a signed connection for them rejected
     // plans the planner's own catalogue says are valid.
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const job = await jobInExecute(bundle);
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: Plan.parse({
@@ -509,7 +508,7 @@ describe('only a step that goes somewhere needs a channel', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('done');
     if (result.status !== 'done') throw new Error('unreachable');
@@ -519,10 +518,10 @@ describe('only a step that goes somewhere needs a channel', () => {
   });
 
   it('still demands a channel for the outbound step in a mostly-local plan', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const job = await jobInExecute(bundle);
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: Plan.parse({
@@ -545,7 +544,7 @@ describe('only a step that goes somewhere needs a channel', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('rejected');
     if (result.status !== 'rejected') throw new Error('unreachable');
@@ -556,7 +555,7 @@ describe('only a step that goes somewhere needs a channel', () => {
 
 describe('the adapter deadline is enforced, not merely announced', () => {
   it('sleeps the job when an adapter never answers', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }))); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' })));
     const job = await jobInExecute(bundle);
 
     // An adapter that ignores the AbortSignal entirely, which is the case the
@@ -572,7 +571,7 @@ describe('the adapter deadline is enforced, not merely announced', () => {
       },
     };
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: mailPlan(),
@@ -583,17 +582,17 @@ describe('the adapter deadline is enforced, not merely announced', () => {
       rampLevel: 'auto',
       now: NOON,
       adapterTimeoutMs: 25,
-    });
+    }));
 
     expect(result.status).toBe('halted');
     if (result.status !== 'halted') throw new Error('unreachable');
     expect(result.reason).toBe('deferred');
 
-    const after = await loadJob(job.jobId, { businessId: BUSINESS });
+    const after = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     // Retryable: a call that timed out may or may not have landed, which is
     // exactly what the idempotency key is for.
     expect(after?.phase).toBe('followup');
-    const history = await jobHistory(job.jobId);
+    const history = await withBusiness(TEST_BUSINESS, (db) => jobHistory(db, job.jobId));
     expect(history.some((h) => h.reason.includes('adapter_timeout'))).toBe(true);
   });
 });
@@ -651,13 +650,13 @@ describe('a failed adapter is a failed step, not a completed one', () => {
   }
 
   it('records no spend and never reaches verify when the adapter refuses', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ connections: [BOOKS], autonomyBase: { 'accounting.write': 'auto' } })
     ));
     const job = await jobInExecute(bundle);
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: spendPlan(),
@@ -667,7 +666,7 @@ describe('a failed adapter is a failed step, not a completed one', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('halted');
     if (result.status !== 'halted') throw new Error('unreachable');
@@ -675,11 +674,11 @@ describe('a failed adapter is a failed step, not a completed one', () => {
 
     // Money that was never moved must not be on the ledger, and a step that
     // did not happen must not be waiting to be verified.
-    const { rows } = await getPool().query('SELECT * FROM spend_ledger WHERE business_id = $1', [
+    const { rows } = await testDb().query('SELECT * FROM spend_ledger WHERE business_id = $1', [
       BUSINESS,
     ]);
     expect(rows).toHaveLength(0);
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.phase).toBe('failed');
   });
 
   it('treats the unbuilt browser driver as a refusal, not as a completed step', async () => {
@@ -690,7 +689,7 @@ describe('a failed adapter is a failed step, not a completed one', () => {
     // Resolved through the browser CHANNEL DEFAULT, not by system name: no
     // charter ever names a system `browser`, so an adapter reachable only
     // under its own name would be unreachable here.
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         connections: [
@@ -707,7 +706,7 @@ describe('a failed adapter is a failed step, not a completed one', () => {
     ));
     const job = await jobInExecute(bundle);
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: Plan.parse({
@@ -738,11 +737,11 @@ describe('a failed adapter is a failed step, not a completed one', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('halted');
     if (result.status !== 'halted') throw new Error('unreachable');
     expect(result.reason).toBe('browser_not_implemented');
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.phase).toBe('failed');
   });
 });

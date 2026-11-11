@@ -64,12 +64,12 @@ const recallPlan: Plan = {
 };
 
 async function ownerJob(text: string, attached: string[]): Promise<Job> {
-  const job = await createJob({ charterVersion: 'v-owner', provenance: 'boss', businessId: B });
+  const job = await withBusiness(B, (db) => createJob(db, { charterVersion: 'v-owner', provenance: 'boss' }));
   await saveInstruction({ jobId: job.jobId, text, textOrigin: 'typed', attachedDocumentIds: attached }, { businessId: B });
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: B });
+    await withBusiness(B, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  return (await loadJob(job.jobId, { businessId: B }))!;
+  return (await withBusiness(B, (db) => loadJob(db, job.jobId)))!;
 }
 
 beforeEach(async () => {
@@ -85,10 +85,7 @@ describe('owner-attached sources', () => {
     const mine = await doc(B, 'מחירון אלפא.xlsx');
     const theirs = await doc(OTHER, 'זר.xlsx');
     const seen: PlanRequest[] = [];
-    const outcome = await runInstruction(
-      { text: 'תכיני טבלת רווח לפי המחירון המצורף' },
-      {
-        businessId: B,
+    const outcome = await withBusiness(B, (db) => runInstruction(db, { text: 'תכיני טבלת רווח לפי המחירון המצורף' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
         attachedDocumentIds: [mine, theirs],
@@ -96,8 +93,7 @@ describe('owner-attached sources', () => {
           seen.push(request);
           return { status: 'planned', plan: recallPlan };
         },
-      },
-    );
+      }));
     expect(outcome.status).toBe('planned');
     expect(seen[0]?.attachedDocuments).toEqual([{ documentId: mine, name: 'מחירון אלפא.xlsx' }]);
     if (outcome.status !== 'planned') return;
@@ -125,11 +121,7 @@ describe('owner-attached sources', () => {
   it('doc.produce adds the attached ids to the sources and records them as owner sources', async () => {
     const mine = await doc(B, 'מחירון.xlsx');
     const job = await ownerJob('תכיני מכתב לפי המחירון', [mine]);
-    const result = await runLocalTool(
-      'doc.produce',
-      { format: 'docx', kind: 'letter', request: 'מכתב', destination: { mode: 'save', folder: null } },
-      { jobId: job.jobId, businessId: B, production: AVAILABLE },
-    );
+    const result = await withBusiness(B, (db) => runLocalTool('doc.produce', { format: 'docx', kind: 'letter', request: 'מכתב', destination: { mode: 'save', folder: null } }, { ...{ jobId: job.jobId, production: AVAILABLE }, db }));
     const productionId = (result as unknown as { productionId: string }).productionId;
     const production = await loadProduction(B, productionId);
     expect(production?.sourceDocumentIds).toEqual([mine]);
@@ -140,17 +132,13 @@ describe('owner-attached sources', () => {
     const mine = await doc(B, 'mine.xlsx');
     const inbox = await doc(B, 'inbox.xlsx');
     const job = await ownerJob('תכיני מכתב', [mine]);
-    const result = await runLocalTool(
-      'doc.produce',
-      {
+    const result = await withBusiness(B, (db) => runLocalTool('doc.produce', {
         format: 'docx',
         kind: 'letter',
         request: 'מכתב',
         destination: { mode: 'save', folder: null },
         sources: [{ documentId: inbox }],
-      },
-      { jobId: job.jobId, businessId: B, production: AVAILABLE },
-    );
+      }, { ...{ jobId: job.jobId, production: AVAILABLE }, db }));
     const production = await loadProduction(B, (result as unknown as { productionId: string }).productionId);
     expect([...(production?.sourceDocumentIds ?? [])].sort()).toEqual([mine, inbox].sort());
     expect(production?.work.ownerSourceIds).toEqual([mine]);

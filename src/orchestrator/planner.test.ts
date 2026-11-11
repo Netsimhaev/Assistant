@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
 import { buildCharter, type CharterOverrides } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan, planProblems, topologicalOrder } from '../domain/plan.js';
@@ -66,19 +66,18 @@ function stubRegistry(): { calls: string[]; registry: AdapterRegistry } {
 }
 
 async function install(overrides: CharterOverrides = {}): Promise<PolicyBundle> {
-  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [OFFICE], ...overrides }))); // TENANCY-TODO(task 4)
+  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [OFFICE], ...overrides })));
 }
 
 async function jobInExecute(bundle: PolicyBundle) {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  const loaded = await loadJob(job.jobId, { businessId: BUSINESS });
+  const loaded = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
   if (loaded === null) throw new Error('job vanished');
   return loaded;
 }
@@ -260,7 +259,7 @@ describe('running a plan', () => {
     const job = await jobInExecute(bundle);
     const { calls, registry } = stubRegistry();
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: plan(),
@@ -270,7 +269,7 @@ describe('running a plan', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('done');
     if (result.status !== 'done') throw new Error('unreachable');
@@ -281,7 +280,7 @@ describe('running a plan', () => {
     expect(calls).toEqual(['mail.send', 'crm.write']);
 
     // Every step transition is in the history; nothing advanced silently.
-    const history = await jobHistory(job.jobId);
+    const history = await withBusiness(TEST_BUSINESS, (db) => jobHistory(db, job.jobId));
     expect(history.filter((h) => h.reason.includes('s1')).length).toBeGreaterThan(0);
     expect(history.filter((h) => h.reason.includes('s2')).length).toBeGreaterThan(0);
   });
@@ -293,7 +292,7 @@ describe('running a plan', () => {
 
     // ops.web may never send mail. The step is the *second* one, so a plan
     // validated lazily would have run the first before discovering it.
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: plan({
@@ -308,7 +307,7 @@ describe('running a plan', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('rejected');
     if (result.status !== 'rejected') throw new Error('unreachable');
@@ -325,7 +324,7 @@ describe('running a plan', () => {
 
     // The planner thought this was a reply; with no thread it is a first
     // contact, which is a different autonomy level entirely.
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: plan({
@@ -347,7 +346,7 @@ describe('running a plan', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('rejected');
     if (result.status !== 'rejected') throw new Error('unreachable');
@@ -359,7 +358,7 @@ describe('running a plan', () => {
     const job = await jobInExecute(bundle);
     const { calls, registry } = stubRegistry();
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: plan({
@@ -390,13 +389,13 @@ describe('running a plan', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('halted');
     if (result.status !== 'halted') throw new Error('unreachable');
     expect(result.at).toBe('s1');
     // Neither step reached an adapter, and the job says what happens next.
     expect(calls).toEqual([]);
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.phase).toBe('await_approval');
   });
 });

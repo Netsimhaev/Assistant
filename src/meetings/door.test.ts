@@ -201,8 +201,7 @@ async function setup(): Promise<void> {
     bdb,
     buildCharter({ version: 'meeting-door', connections: [calendarConnection('google')] })
   ));
-  await upsertBinding(
-    {
+  await withBusiness(BUSINESS, (db) => upsertBinding(db, {
       system: CALENDAR_SYSTEM,
       status: 'live',
       endpoint: null,
@@ -210,9 +209,7 @@ async function setup(): Promise<void> {
       provider: 'google',
       lastOkAt: null,
       lastError: null,
-    },
-    { businessId: BUSINESS, by: 'test' },
-  );
+    }, { by: 'test' }));
   const saved = await saveMeetingSettings(
     { ...MEETING_DEFAULTS, locationKind: 'travel', workStart: '09:00', workEnd: '18:00', gapMinutes: 30 },
     { businessId: BUSINESS },
@@ -232,10 +229,7 @@ async function instruct(
     answerTo?: { jobId: string; answer: string };
   } = {},
 ): Promise<InstructionOutcome> {
-  return runInstruction(
-    { text },
-    {
-      businessId: BUSINESS,
+  return withBusiness(BUSINESS, (db) => runInstruction(db, { text }, {
       textOrigin: extra.textOrigin ?? 'typed',
       channel: 'dashboard',
       planner: extra.planner ?? NO_PLANNER,
@@ -244,8 +238,7 @@ async function instruct(
       ...(extra.answerTo !== undefined
         ? { answerTo: extra.answerTo, scheduleRouting: false, identityAsked: true, sourceAsked: true }
         : {}),
-    },
-  );
+    }));
 }
 
 /** The answer route's join: the parked instruction, a blank line, the answer. */
@@ -318,13 +311,13 @@ describe('runMeetingOperation through runInstruction', () => {
     expect(hold?.job_id).toBe(outcome.jobId);
 
     // The bound plan carries the hold id in the create step — and the internal note nowhere.
-    const stored = await loadPlanBody(outcome.jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (db) => loadPlanBody(db, outcome.jobId));
     const step = stored?.plan.steps[0];
     expect(step?.input['holdEventId']).toBe(hold?.event_id);
     expect(step?.input['attendees']).toEqual(['dani@example.com']);
     expect(JSON.stringify(stored?.plan)).not.toContain('לא-לשכוח-לגבות-חוב');
 
-    const job = await loadJob(outcome.jobId, { businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => loadJob(db, outcome.jobId));
     expect(job?.phase).toBe('plan');
     const confirmation = await loadConfirmation(outcome.jobId, { businessId: BUSINESS });
     expect(confirmation?.state).toBe('pending');
@@ -353,9 +346,9 @@ describe('runMeetingOperation through runInstruction', () => {
     const [hold] = await holds();
 
     expect(
-      await applyConfirmation(outcome.jobId, { kind: 'confirm', planHash }, 'dashboard:owner', { businessId: BUSINESS }),
+      await withBusiness(BUSINESS, (db) => applyConfirmation(db, outcome.jobId, { kind: 'confirm', planHash }, 'dashboard:owner')),
     ).toBe('executing');
-    const ran = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(cal.client) });
+    const ran = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(cal.client) }));
     expect(ran.ran).toEqual([{ jobId: outcome.jobId, status: 'done', detail: null }]);
 
     const updates = cal.calls.filter((c) => c.op === 'update');
@@ -374,7 +367,7 @@ describe('runMeetingOperation through runInstruction', () => {
     const outcome = await instruct(`תקבעי פגישה עם דני כהן ביום ${day}`, cal.client, extractor);
     if (outcome.status !== 'needs_confirmation') throw new Error(`expected a confirmation, got ${outcome.status}`);
 
-    expect(await applyConfirmation(outcome.jobId, { kind: 'cancel' }, 'dashboard:owner', { businessId: BUSINESS })).toBe(
+    expect(await withBusiness(BUSINESS, (db) => applyConfirmation(db, outcome.jobId, { kind: 'cancel' }, 'dashboard:owner'))).toBe(
       'cancelled',
     );
     expect(await sweepHolds({ businessId: BUSINESS, runtime: { credentials: CREDENTIALS }, client: cal.client })).toEqual({
@@ -415,7 +408,7 @@ describe('runMeetingOperation through runInstruction', () => {
     expect(outcome.question).toContain('10:00–11:00');
     expect(outcome.question).toContain('📍 הרצל 5');
     expect(await holds()).toEqual([]);
-    expect((await loadJob(outcome.jobId, { businessId: BUSINESS }))?.phase).toBe('understand');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, outcome.jobId)))?.phase).toBe('understand');
   });
 
   it('answers no_slot with the day listing and alternatives', async () => {
@@ -539,12 +532,12 @@ describe('runMeetingOperation through runInstruction', () => {
 
     // The old question is gone and its hold released.
     expect((await loadConfirmation(first.jobId, { businessId: BUSINESS }))?.state).toBe('cancelled');
-    expect((await loadJob(first.jobId, { businessId: BUSINESS }))?.phase).toBe('closed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, first.jobId)))?.phase).toBe('closed');
     const rows = await holds();
     expect(rows.find((h) => h.hold_id === firstHold?.hold_id)?.state).toBe('released');
     // The original text was extracted again, and the next slot is after the turned-down one.
     expect(texts).toEqual([original, original]);
-    const stored = await loadPlanBody(second.jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (db) => loadPlanBody(db, second.jobId));
     expect(stored?.plan.steps[0]?.input['start']).toBe(at(day, '10:00'));
     const live = rows.filter((h) => h.state === 'held');
     expect(live).toHaveLength(1);
@@ -553,7 +546,7 @@ describe('runMeetingOperation through runInstruction', () => {
     // A second "תני אחר" keeps turning down every slot so far, from the original text.
     const third = await instruct('תני מועד אחר', cal.client, extractor);
     if (third.status !== 'needs_confirmation') throw new Error(`expected a confirmation, got ${third.status}`);
-    const thirdPlan = await loadPlanBody(third.jobId, { businessId: BUSINESS });
+    const thirdPlan = await withBusiness(BUSINESS, (db) => loadPlanBody(db, third.jobId));
     expect(thirdPlan?.plan.steps[0]?.input['start']).toBe(at(day, '11:00'));
     expect(texts).toEqual([original, original, original]);
   });
@@ -590,9 +583,9 @@ describe('runMeetingOperation through runInstruction', () => {
     if (outcome.status !== 'needs_confirmation') throw new Error(`expected a confirmation, got ${outcome.status}`);
     const planHash = (await loadConfirmation(outcome.jobId, { businessId: BUSINESS }))?.options[0]?.planHash as string;
     expect(
-      await applyConfirmation(outcome.jobId, { kind: 'confirm', planHash }, 'dashboard:owner', { businessId: BUSINESS }),
+      await withBusiness(BUSINESS, (db) => applyConfirmation(db, outcome.jobId, { kind: 'confirm', planHash }, 'dashboard:owner')),
     ).toBe('executing');
-    const ran = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(cal.client) });
+    const ran = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(cal.client) }));
     expect(ran.ran).toEqual([{ jobId: outcome.jobId, status: 'done', detail: null }]);
 
     const { rows } = await getPool().query<{ kind: string; reason: string }>(
@@ -602,7 +595,7 @@ describe('runMeetingOperation through runInstruction', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]?.kind).toBe('intent_to_act');
     expect(rows[0]?.reason.endsWith(` ${CONFIRMED_COMMAND_EXEMPTION_MARKER}`)).toBe(true);
-    expect((await loadJob(outcome.jobId, { businessId: BUSINESS }))?.phase).not.toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, outcome.jobId)))?.phase).not.toBe('failed');
   });
 });
 
@@ -642,7 +635,7 @@ describe('runMeetingOperation — fix round 1', () => {
 
     expect(outcome).toEqual({ status: 'refused', reason: ALREADY_CONFIRMED_REPLY });
     expect((await loadConfirmation(first.jobId, { businessId: BUSINESS }))?.state).toBe('confirmed');
-    expect((await loadJob(first.jobId, { businessId: BUSINESS }))?.phase).toBe('plan');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, first.jobId)))?.phase).toBe('plan');
     expect((await holds()).map((h) => h.state)).toEqual(['held']);
     expect(cal.calls.filter((c) => c.op === 'delete')).toHaveLength(0);
     expect(texts).toHaveLength(1); // nothing re-extracted
@@ -695,7 +688,7 @@ describe('runMeetingOperation — fix round 1', () => {
     if (outcome.status !== 'needs_confirmation') throw new Error(`expected a confirmation, got ${outcome.status}`);
     const creates = cal.calls.filter((c) => c.op === 'create');
     expect(creates.map((c) => c.args[0])).toEqual(['team']);
-    const stored = await loadPlanBody(outcome.jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (db) => loadPlanBody(db, outcome.jobId));
     expect(stored?.plan.steps[0]?.input['calendarId']).toBe('team');
   });
 
@@ -724,7 +717,7 @@ describe('runMeetingOperation — fix round 1', () => {
     expect(outcome.status).toBe('needs_confirmation');
     if (outcome.status !== 'needs_confirmation') return;
     expect(texts[1]).toBe('תזיזי את הפגישה עם דני כהן\n\n2');
-    const stored = await loadPlanBody(outcome.jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (db) => loadPlanBody(db, outcome.jobId));
     expect(stored?.plan.steps[0]?.input).toMatchObject({ operation: 'move', eventId: 'b' });
   });
 
@@ -757,7 +750,7 @@ describe('runMeetingOperation — fix round 1', () => {
     expect(outcome.status).toBe('needs_confirmation');
     if (outcome.status !== 'needs_confirmation') return;
     expect(texts[1]).toBe(`${original}\n\nתזיזי את רונית לוי`);
-    const stored = await loadPlanBody(outcome.jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (db) => loadPlanBody(db, outcome.jobId));
     expect(stored?.plan.steps.map((s) => s.input['operation'])).toEqual(['move', 'create']);
     expect(outcome.question).toContain('הזזה: רונית לוי');
     expect(outcome.question).toContain('קביעה: דני כהן');
@@ -822,7 +815,7 @@ describe('runMeetingOperation — fix round 1', () => {
     expect(outcome.status).toBe('needs_confirmation');
     if (outcome.status !== 'needs_confirmation') return;
     expect(texts[2]).toBe(`${original}\n\nגם מחרתיים בסדר`);
-    const stored = await loadPlanBody(outcome.jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (db) => loadPlanBody(db, outcome.jobId));
     // Not 09:00 on `day` (turned down — its hold was released, so only the exclusion keeps it out).
     expect(stored?.plan.steps[0]?.input['start']).toBe(at(day2, '09:00'));
   });

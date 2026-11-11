@@ -90,8 +90,13 @@ describe('the WhatsApp door cannot widen its own authority', () => {
    * it into this argument would weaken that test, not strengthen this one.
    */
   it('passes only { text } into runInstruction — nothing that identifies the sender', () => {
+    // The leading argument is the door's own connection, `ctx.db` — exactly
+    // that expression: the business comes from the door, never from the
+    // message. The INPUT is the argument after it.
     const block = callBlock(source, 'runInstruction');
-    expect(firstArgument(block, 'runInstruction')).toMatch(/^\{\s*text\s*\}$/);
+    expect(firstArgument(block, 'runInstruction')).toBe('ctx.db');
+    const afterDb = block.replace(/runInstruction\(\s*ctx\.db\s*,\s*/, 'runInstruction(');
+    expect(firstArgument(afterDb, 'runInstruction')).toMatch(/^\{\s*text\s*\}$/);
     expect(source.match(/runInstruction\(/g)).toHaveLength(1);
   });
 

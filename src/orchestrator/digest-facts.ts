@@ -1,7 +1,5 @@
-import { config } from '../config.js';
-import type { Queryable } from '../db/pool.js';
+import type { Queryable, BusinessDb } from '../db/pool.js';
 import { actionClassLabel, autonomyLevelLabel } from '../domain/labels.js';
-import { getPool } from '../db/pool.js';
 import type { DigestWindow } from './digest-window.js';
 import { isLedgerOverdue } from '../domain/ledger.js';
 import { failedText, isGateDenialCode, leadingCode, NOT_PERMITTED_TEXT } from './whatsapp-report.js';
@@ -245,12 +243,12 @@ function reasonInHebrew(rawReason: string | null): string {
  * stay read-only and throw-free.
  */
 export async function collectDigestFacts(
+  db: BusinessDb,
   window: DigestWindow,
   ceilings: { monthlyMinor: number; currency: string; timeZone: string },
-  options: { businessId?: string; db?: Queryable; now?: Date } = {},
+  options: { now?: Date } = {},
 ): Promise<DigestFacts> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { start, end } = window;
 
   // ---- §3.1 waiting: point-in-time, deliberately NOT bounded by the window.

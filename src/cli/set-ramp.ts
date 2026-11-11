@@ -89,7 +89,7 @@ export async function runSetRampCli(argv: string[], deps: SetRampCliDeps): Promi
     );
   }
 
-  await setRampLevel(actionClass, level, { businessId });
+  await withBusiness(businessId, (db) => setRampLevel(db, actionClass, level)); // TENANCY-TODO(task 7)
 
   // The dial that clamps everything `loadRampLevel` returns to the gate.
   // Read AFTER the write, same as the charter above, so what gets printed

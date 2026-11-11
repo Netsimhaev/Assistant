@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { evaluateFor } from '../test/gate.js';
@@ -28,34 +28,30 @@ const NIGHT = new Date('2026-08-18T00:00:00.000Z');
 const NOON = new Date('2026-08-18T09:00:00.000Z');
 
 async function install(overrides = {}): Promise<PolicyBundle> {
-  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter(overrides))); // TENANCY-TODO(task 4)
+  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter(overrides)));
 }
 
 async function jobInExecute(bundle: PolicyBundle) {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
     title: 'מבחן',
-  });
-  await transition(job.jobId, {
+  }));
+  await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
     to: 'understand',
     actor: 'orchestrator',
     reason: 'התקבל',
-    businessId: BUSINESS,
-  });
-  await transition(job.jobId, {
+  }));
+  await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
     to: 'plan',
     actor: 'orchestrator',
     reason: 'הובן',
-    businessId: BUSINESS,
-  });
-  return transition(job.jobId, {
+  }));
+  return withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
     to: 'execute',
     actor: 'orchestrator',
     reason: 'תוכנן',
-    businessId: BUSINESS,
-  });
+  }));
 }
 
 beforeEach(async () => {
@@ -69,31 +65,29 @@ afterAll(async () => {
 describe('the job state machine', () => {
   it('rejects a transition the table does not allow', async () => {
     const bundle = await install();
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
 
     // intake → closed skips every step that makes a job auditable.
     expect(canTransition('intake', 'closed')).toBe(false);
     await expect(
-      transition(job.jobId, {
+      withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
         to: 'closed',
         actor: 'orchestrator',
         reason: 'קיצור דרך',
-        businessId: BUSINESS,
-      }),
+      })),
     ).rejects.toThrow(/illegal job transition/);
 
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('intake');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.phase).toBe('intake');
   });
 
   it('reconstructs the whole run from the database alone', async () => {
     const bundle = await install();
     const job = await jobInExecute(bundle);
 
-    const history = await jobHistory(job.jobId);
+    const history = await withBusiness(TEST_BUSINESS, (db) => jobHistory(db, job.jobId));
     expect(history.map((step) => `${step.from}→${step.to}`)).toEqual([
       'intake→understand',
       'understand→plan',
@@ -107,12 +101,11 @@ describe('the job state machine', () => {
     const bundle = await install();
     const job = await jobInExecute(bundle);
 
-    const failed = await transition(job.jobId, {
+    const failed = await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'failed',
       actor: 'orchestrator',
       reason: 'נכשל',
-      businessId: BUSINESS,
-    });
+    }));
     expect(failed.closedAt).not.toBeNull();
     expect(canTransition('failed', 'execute')).toBe(false);
   });
@@ -122,19 +115,17 @@ describe('the job state machine', () => {
     const job = await jobInExecute(bundle);
     const wakeAt = new Date(NOON.getTime() + 60 * 60 * 1000);
 
-    await transition(job.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'followup',
       actor: 'orchestrator',
       reason: 'ממתין',
       wakeAt,
-      businessId: BUSINESS,
-    });
+    }));
 
-    expect(await dueJobs({ businessId: BUSINESS, now: NOON })).toEqual([]);
-    const due = await dueJobs({
-      businessId: BUSINESS,
+    expect(await withBusiness(BUSINESS, (db) => dueJobs(db, { now: NOON }))).toEqual([]);
+    const due = await withBusiness(BUSINESS, (db) => dueJobs(db, {
       now: new Date(wakeAt.getTime() + 1000),
-    });
+    }));
     expect(due.map((j) => j.jobId)).toEqual([job.jobId]);
   });
 });
@@ -197,7 +188,7 @@ describe('quiet hours', () => {
     const job = await jobInExecute(bundle);
     let performed = false;
 
-    const outcome = await executeStep({
+    const outcome = await withBusiness(job.businessId, (db) => executeStep(db, {
       job,
       stepId: 'step-1',
       agent: 'comms.email',
@@ -211,12 +202,12 @@ describe('quiet hours', () => {
         return NOTHING;
       },
       now: NIGHT,
-    });
+    }));
 
     expect(outcome.status).toBe('deferred');
     expect(performed).toBe(false);
 
-    const after = await loadJob(job.jobId, { businessId: BUSINESS });
+    const after = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(after?.phase).toBe('followup');
     // Woken at the end of the window, not failed and not left for a human.
     expect(after?.wakeAt).not.toBeNull();
@@ -279,7 +270,7 @@ describe('spend accounting', () => {
     const bundle = await install();
     const job = await jobInExecute(bundle);
 
-    const outcome = await executeStep({
+    const outcome = await withBusiness(job.businessId, (db) => executeStep(db, {
       job,
       stepId: 'step-1',
       agent: 'comms.email',
@@ -290,12 +281,12 @@ describe('spend accounting', () => {
       toolInput: { counterpartyId: 'c_812', amountMinor: 120_000, inReplyTo: 'm1' },
       perform: async () => ({ output: { ok: true }, externalId: null, performed: true }),
       now: NOON,
-    });
+    }));
 
     // quote.issue is approve_required in the fixture, so this queues rather
     // than spending — the ledger must stay empty.
     expect(outcome.status).toBe('awaiting_approval');
-    const { rows } = await getPool().query('SELECT * FROM spend_ledger WHERE business_id = $1', [
+    const { rows } = await testDb().query('SELECT * FROM spend_ledger WHERE business_id = $1', [
       BUSINESS,
     ]);
     expect(rows).toHaveLength(0);
@@ -318,24 +309,23 @@ describe('spend accounting', () => {
       now: NOON,
     };
 
-    const first = await executeStep(step);
+    const first = await withBusiness(TEST_BUSINESS, (db) => executeStep(db, step));
     expect(first.status).toBe('done');
     if (first.status !== 'done') throw new Error('unreachable');
     expect(first.spendRecorded).toBe(true);
 
     // A retry after an uncertain timeout must not count the same money twice.
-    await transition(job.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'execute',
       actor: 'orchestrator',
       reason: 'ניסיון חוזר',
-      businessId: BUSINESS,
-    });
-    const second = await executeStep(step);
+    }));
+    const second = await withBusiness(TEST_BUSINESS, (db) => executeStep(db, step));
     expect(second.status).toBe('done');
     if (second.status !== 'done') throw new Error('unreachable');
     expect(second.spendRecorded).toBe(false);
 
-    const { rows } = await getPool().query(
+    const { rows } = await testDb().query(
       'SELECT amount_minor FROM spend_ledger WHERE business_id = $1',
       [BUSINESS],
     );
@@ -357,7 +347,7 @@ describe('spend accounting', () => {
     });
     const job = await jobInExecute(bundle);
 
-    const first = await executeStep({
+    const first = await withBusiness(job.businessId, (db) => executeStep(db, {
       job,
       stepId: 'step-1',
       agent: 'ops.systems',
@@ -368,17 +358,16 @@ describe('spend accounting', () => {
       toolInput: { entityId: 'c_812', amountMinor: 45_000 },
       perform: async () => NOTHING,
       now: NOON,
-    });
+    }));
     expect(first.status).toBe('done');
 
-    await transition(job.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'execute',
       actor: 'orchestrator',
       reason: 'צעד שני',
-      businessId: BUSINESS,
-    });
+    }));
 
-    const second = await executeStep({
+    const second = await withBusiness(job.businessId, (db) => executeStep(db, {
       job,
       stepId: 'step-2',
       agent: 'ops.systems',
@@ -389,7 +378,7 @@ describe('spend accounting', () => {
       toolInput: { entityId: 'c_812', amountMinor: 60_000 },
       perform: async () => NOTHING,
       now: NOON,
-    });
+    }));
 
     expect(second.status).toBe('refused');
     if (second.status !== 'refused') throw new Error('unreachable');
@@ -401,7 +390,7 @@ describe('spend accounting', () => {
     const job = await jobInExecute(bundle);
     let performed = false;
 
-    const outcome = await executeStep({
+    const outcome = await withBusiness(job.businessId, (db) => executeStep(db, {
       job,
       stepId: 'step-1',
       agent: 'ops.systems',
@@ -415,11 +404,11 @@ describe('spend accounting', () => {
         return NOTHING;
       },
       now: NOON,
-    });
+    }));
 
     expect(outcome.status).toBe('refused');
     expect(performed).toBe(false);
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.phase).toBe('failed');
   });
 
   it('hands the step the redacted payload, not the one it proposed', async () => {
@@ -429,7 +418,7 @@ describe('spend accounting', () => {
     const job = await jobInExecute(bundle);
     let sent: unknown = null;
 
-    await executeStep({
+    await withBusiness(job.businessId, (db) => executeStep(db, {
       job,
       stepId: 'step-1',
       agent: 'comms.email',
@@ -443,7 +432,7 @@ describe('spend accounting', () => {
         return NOTHING;
       },
       now: NOON,
-    });
+    }));
 
     // The step cannot accidentally send what it proposed — it never sees it.
     expect((sent as { body: string }).body).toContain('[הוסר]');

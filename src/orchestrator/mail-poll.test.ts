@@ -36,7 +36,7 @@ import { executeErasure } from '../governance/erasure.js';
 import { runDueJobs } from './run-due.js';
 import type { Triage, TriageOutcome, TriageRequest } from '../sdk/mail-triage.js';
 import { renderTriageBrief } from '../mail/triage-brief.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import {
   DRAFT_BODY,
   NOON,
@@ -172,7 +172,7 @@ function notifier(): { notify: (text: string, jobId: string | null) => Promise<v
 async function mailRows(): Promise<
   { provider_message_id: string; state: string; categories: string[]; labels_applied: string[]; notified_at: Date | null; job_id: string | null; reply_job_id: string | null }[]
 > {
-  const { rows } = await getPool().query(
+  const { rows } = await testDb().query(
     `SELECT provider_message_id, state, categories, labels_applied, notified_at, job_id, reply_job_id
        FROM mail_messages WHERE business_id = $1 ORDER BY received_at, provider_message_id`,
     [BUSINESS],
@@ -207,10 +207,10 @@ describe('pollMailbox', () => {
   it('no mailbox connection returns null', async () => {
     const fake = fakeClient([]);
     // Nothing installed at all.
-    expect(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client }))).toBeNull();
     // Charter, amendment and live binding — but no cursor: still not connected.
     await installMailboxCharter(BUSINESS);
-    expect(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client }))).toBeNull();
     expect(fake.listCalls).toHaveLength(0);
   });
 
@@ -222,8 +222,7 @@ describe('pollMailbox', () => {
     const n = notifier();
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator,
-        businessId: BUSINESS,
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator,
         runtime: mailboxRuntime(fake.client),
         client: fake.client,
         triage,
@@ -231,7 +230,7 @@ describe('pollMailbox', () => {
         documentRoot,
         notifyBoss: n.notify,
         now: NOON,
-      }),
+      })),
     );
 
     expect(result).toMatchObject({ status: 'ok', recorded: 1, triaged: 1, labelled: 1, notified: 1, overCap: 0, failed: 0, drafts: 0 });
@@ -247,12 +246,12 @@ describe('pollMailbox', () => {
     expect(row?.notified_at).not.toBeNull();
 
     // The triage job: the literal provenance, closed through the legal path.
-    const job = await loadJob(row?.job_id ?? '', { businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => loadJob(db, row?.job_id ?? ''));
     expect(job?.provenance).toBe('unknown_external');
     expect(job?.phase).toBe('closed');
     expect(job?.title).toBe(`מייל: ${mail.subject}`);
 
-    const { rows: invoices } = await getPool().query(
+    const { rows: invoices } = await testDb().query(
       'SELECT supplier_address, invoice_number, amount_text, document_id FROM mail_invoices WHERE business_id = $1',
       [BUSINESS],
     );
@@ -293,15 +292,14 @@ describe('pollMailbox', () => {
     const n = notifier();
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator,
-        businessId: BUSINESS,
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator,
         runtime: mailboxRuntime(fake.client),
         client: fake.client,
         triage,
         drafter: stubDrafter(),
         documentRoot,
         notifyBoss: n.notify,
-      }),
+      })),
     );
 
     expect(triage.calls).toBe(1);
@@ -311,7 +309,7 @@ describe('pollMailbox', () => {
     const [row] = await mailRows();
     expect(row?.state).toBe('triaged');
     expect(row?.categories).toEqual(['other']);
-    const { rows: invoices } = await getPool().query('SELECT 1 FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
+    const { rows: invoices } = await testDb().query('SELECT 1 FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
     expect(invoices).toHaveLength(0);
   });
 
@@ -323,14 +321,13 @@ describe('pollMailbox', () => {
     const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }]);
 
     expectOk(
-      await pollMailbox({ curator: stubCurator,
-        businessId: BUSINESS,
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator,
         runtime: mailboxRuntime(fake.client),
         client: fake.client,
         triage: stubTriage(INVOICE_TRIAGE),
         drafter: stubDrafter(),
         documentRoot,
-      }),
+      })),
     );
 
     // The image is not a type ingest supports: never fetched.
@@ -359,14 +356,13 @@ describe('pollMailbox', () => {
     const documentTriage: MailTriage = { categories: ['document'], summary: 'הצעה ותנאים', isPerson: false, invoice: null, replyGist: null, attachments: [] };
 
     expectOk(
-      await pollMailbox({ curator: stubCurator,
-        businessId: BUSINESS,
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator,
         runtime: mailboxRuntime(fake.client),
         client: fake.client,
         triage: stubTriage(documentTriage),
         drafter: stubDrafter(),
         documentRoot,
-      }),
+      })),
     );
 
     const { rows } = await getPool().query<{ attachments: MailAttachment[] }>(
@@ -395,15 +391,14 @@ describe('pollMailbox', () => {
     const triage = stubTriage(OTHER_TRIAGE);
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator,
-        businessId: BUSINESS,
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator,
         runtime: mailboxRuntime(fake.client),
         client: fake.client,
         triage,
         drafter: stubDrafter(),
         documentRoot,
         readsPerDay: 2,
-      }),
+      })),
     );
 
     expect(triage.calls).toBe(2);
@@ -420,7 +415,7 @@ describe('pollMailbox', () => {
     const drafter = stubDrafter();
     const n = notifier();
     const run = () =>
-      pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter, documentRoot, notifyBoss: n.notify, now: NOON });
+      withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter, documentRoot, notifyBoss: n.notify, now: NOON }));
 
     const first = expectOk(await run());
     expect(first).toMatchObject({ labelled: 2, notified: 1, drafts: 1 });
@@ -428,7 +423,7 @@ describe('pollMailbox', () => {
 
     // The crash: state back to `received`, but `notified_at`, `labels_applied`
     // and `reply_job_id` were already written.
-    await getPool().query("UPDATE mail_messages SET state = 'received', triaged_at = NULL WHERE business_id = $1", [BUSINESS]);
+    await testDb().query("UPDATE mail_messages SET state = 'received', triaged_at = NULL WHERE business_id = $1", [BUSINESS]);
 
     const second = expectOk(await run());
     expect(triage.calls).toBe(2); // it really was handled a second time
@@ -438,9 +433,9 @@ describe('pollMailbox', () => {
     expect(n.sent).toHaveLength(2);
     expect(n.sent[1]?.text.endsWith(MAIL_CARD_INSTRUCTION)).toBe(true);
     expect(drafter.calls).toBe(1);
-    const { rows: invoices } = await getPool().query('SELECT 1 FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
+    const { rows: invoices } = await testDb().query('SELECT 1 FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
     expect(invoices).toHaveLength(1);
-    const { rows: labelAudits } = await getPool().query(
+    const { rows: labelAudits } = await testDb().query(
       "SELECT 1 FROM audit_log WHERE business_id = $1 AND reason LIKE 'mail_label:%'",
       [BUSINESS],
     );
@@ -453,14 +448,14 @@ describe('pollMailbox', () => {
     const drafter = stubDrafter();
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(QUESTION_TRIAGE), drafter, documentRoot, now: NOON }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(QUESTION_TRIAGE), drafter, documentRoot, now: NOON })),
     );
 
     expect(result).toMatchObject({ drafts: 1, labelled: 1, unnotified: 1 });
     expect(drafter.calls).toBe(1);
     const [row] = await mailRows();
     expect(row?.reply_job_id).not.toBeNull();
-    expect((await loadJob(row?.reply_job_id ?? '', { businessId: BUSINESS }))?.phase).toBe('await_approval');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, row?.reply_job_id ?? '')))?.phase).toBe('await_approval');
   });
 
   it('a question presents its reply card on WhatsApp, against the reply job, right after the notice', async () => {
@@ -469,7 +464,7 @@ describe('pollMailbox', () => {
     const n = notifier();
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(QUESTION_TRIAGE), drafter: stubDrafter(), documentRoot, notifyBoss: n.notify, now: NOON }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(QUESTION_TRIAGE), drafter: stubDrafter(), documentRoot, notifyBoss: n.notify, now: NOON })),
     );
 
     expect(result).toMatchObject({ drafts: 1, notified: 1 });
@@ -487,7 +482,7 @@ describe('pollMailbox', () => {
     const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-Q' })], nextCursor: 'C-1' }]);
     const n = notifier();
     const run = () =>
-      pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(QUESTION_TRIAGE), drafter: stubDrafter(), documentRoot, notifyBoss: n.notify, now: NOON });
+      withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(QUESTION_TRIAGE), drafter: stubDrafter(), documentRoot, notifyBoss: n.notify, now: NOON }));
 
     expectOk(await run());
     const [row] = await mailRows();
@@ -496,11 +491,11 @@ describe('pollMailbox', () => {
       'SELECT approval_id FROM approval_requests WHERE business_id = $1 AND job_id = $2',
       [BUSINESS, replyJobId],
     );
-    const decided = await withBusiness(BUSINESS, (bdb) => decide(bdb, rows[0]?.approval_id ?? '', 'approved', { by: 'p', channel: 'dashboard' })); // TENANCY-TODO(task 4)
-    await resumeAfterDecision(decided, 'p', { businessId: BUSINESS });
+    const decided = await withBusiness(BUSINESS, (bdb) => decide(bdb, rows[0]?.approval_id ?? '', 'approved', { by: 'p', channel: 'dashboard' }));
+    await withBusiness(BUSINESS, (db) => resumeAfterDecision(db, decided, 'p'));
     const failing = fakeMailboxClient([{ failure: 'rejected', status: 400, message: 'bad request' }]);
-    await runDueJobs({ businessId: BUSINESS, runtime: mailboxRuntime(failing.client), now: NOON });
-    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: mailboxRuntime(failing.client), now: NOON }));
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, replyJobId)))?.phase).toBe('failed');
 
     const before = n.sent.length;
     const second = expectOk(await run());
@@ -518,11 +513,11 @@ describe('pollMailbox', () => {
     const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-Q' })], nextCursor: 'C-1' }]);
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(QUESTION_TRIAGE), drafter: stubDrafter(), documentRoot, now: NOON }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(QUESTION_TRIAGE), drafter: stubDrafter(), documentRoot, now: NOON })),
     );
 
     expect(result).toMatchObject({ drafts: 1, notified: 0, unnotified: 1 });
-    const { rows } = await getPool().query(
+    const { rows } = await testDb().query(
       "SELECT 1 FROM whatsapp_messages WHERE business_id = $1 AND direction = 'outbound'",
       [BUSINESS],
     );
@@ -535,7 +530,7 @@ describe('pollMailbox', () => {
     const n = notifier();
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(INVOICE_TRIAGE), drafter: stubDrafter(), documentRoot, notifyBoss: n.notify }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(INVOICE_TRIAGE), drafter: stubDrafter(), documentRoot, notifyBoss: n.notify })),
     );
 
     expect(result).toMatchObject({ triaged: 1, notified: 0 });
@@ -552,7 +547,7 @@ describe('pollMailbox', () => {
     const triage = stubTriage({ 'PM-GOOD': OTHER_TRIAGE });
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })),
     );
 
     expect(triage.calls).toBe(2);
@@ -562,7 +557,7 @@ describe('pollMailbox', () => {
       ['PM-BAD', 'failed'],
       ['PM-GOOD', 'triaged'],
     ]);
-    expect((await loadJob(rows[0]?.job_id ?? '', { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, rows[0]?.job_id ?? '')))?.phase).toBe('failed');
   });
 
   it('revoked grant gives needs_reauth and does not throw', async () => {
@@ -594,7 +589,7 @@ describe('pollMailbox', () => {
       credentials: oauthCredentials({ key, fallback: envCredentials({}, 'TEST_CRED_'), http: neverCalled }),
     };
 
-    const result = await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime, client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot });
+    const result = await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime, client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot }));
 
     expect(result?.status).toBe('needs_reauth');
     expect(fake.listCalls).toHaveLength(0);
@@ -617,7 +612,7 @@ describe('pollMailbox', () => {
     const triage = stubTriage(OTHER_TRIAGE);
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })),
     );
 
     expect(result.status).toBe('error');
@@ -640,7 +635,7 @@ describe('pollMailbox', () => {
     });
     const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-OK' }), broken], nextCursor: 'C-1' }]);
     const run = () =>
-      pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot });
+      withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot }));
 
     for (const _ of [1, 2]) {
       expect(expectOk(await run()).status).toBe('error');
@@ -661,7 +656,7 @@ describe('pollMailbox', () => {
     const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }]);
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot })),
     );
 
     expect(result).toMatchObject({ status: 'ok', recorded: 1, triaged: 1 });
@@ -678,14 +673,14 @@ describe('pollMailbox', () => {
     const both: MailTriage = { ...QUESTION_TRIAGE, categories: ['invoice', 'question'], invoice: INVOICE_TRIAGE.invoice };
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(both), drafter: stubDrafter(), documentRoot, notifyBoss: n.notify, now: NOON }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(both), drafter: stubDrafter(), documentRoot, notifyBoss: n.notify, now: NOON })),
     );
 
     expect(fake.fetched).toEqual(['PM-AF/A-1']);
     expect(result).toMatchObject({ failed: 0, notified: 1, drafts: 1 });
     const { rows } = await getPool().query<{ state: string; error: string | null }>("SELECT state, error FROM mail_messages WHERE provider_message_id = 'PM-AF'");
     expect(rows).toEqual([{ state: 'triaged', error: 'attachment_failed' }]);
-    const { rows: invoices } = await getPool().query('SELECT document_id FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
+    const { rows: invoices } = await testDb().query('SELECT document_id FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
     expect(invoices).toEqual([{ document_id: null }]);
   });
 
@@ -707,7 +702,7 @@ describe('pollMailbox', () => {
     );
 
     expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot })),
     );
 
     expect(fake.fetched.filter((f) => f.startsWith('PM-BIG'))).toEqual([]);
@@ -723,7 +718,7 @@ describe('pollMailbox', () => {
     const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-OCT', attachments: [attachment, other] })], nextCursor: 'C-1' }]);
 
     expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot })),
     );
 
     expect(fake.fetched).toEqual(['PM-OCT/A-1']);
@@ -735,10 +730,10 @@ describe('pollMailbox', () => {
     const { bundle, documentRoot } = await setup();
     const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-STALE' })], nextCursor: 'C-1' }]);
     // A first pass whose triage is never reached: simulate the crash by hand.
-    await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot, readsPerDay: 1 });
-    const orphan = await createJob({ charterVersion: bundle.charterVersion, provenance: 'unknown_external', businessId: BUSINESS, title: 'orphan' });
-    await transition(orphan.jobId, { to: 'understand', actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
-    await getPool().query(
+    await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot, readsPerDay: 1 }));
+    const orphan = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'unknown_external', title: 'orphan' }));
+    await withBusiness(BUSINESS, (db) => transition(db, orphan.jobId, { to: 'understand', actor: 'orchestrator', reason: 'test' }));
+    await testDb().query(
       `UPDATE mail_messages SET state = 'claimed', triaged_at = NULL, job_id = $2, claimed_at = now() - interval '31 minutes'
         WHERE business_id = $1`,
       [BUSINESS, orphan.jobId],
@@ -746,12 +741,12 @@ describe('pollMailbox', () => {
     const triage = stubTriage(OTHER_TRIAGE);
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })),
     );
 
     expect(triage.calls).toBe(1);
     expect(result.triaged).toBe(1);
-    expect((await loadJob(orphan.jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, orphan.jobId)))?.phase).toBe('failed');
     const [row] = await mailRows();
     expect(row?.state).toBe('triaged');
     expect(row?.job_id).not.toBe(orphan.jobId);
@@ -769,21 +764,21 @@ describe('pollMailbox', () => {
     const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-ORPH', subject })], nextCursor: 'C-1' }]);
     // Records the mail without triaging it (no reads left), so the orphan
     // below is the ONLY job the crashed handling made — as in production.
-    await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot, readsPerDay: 0 });
+    await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot, readsPerDay: 0 }));
     // The crashed handling's triage job, titled exactly as `handleMail` titles it.
-    const orphan = await createJob({ charterVersion: bundle.charterVersion, provenance: 'unknown_external', businessId: BUSINESS, title: `מייל: ${subject}` });
-    await transition(orphan.jobId, { to: 'understand', actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
-    await getPool().query(
+    const orphan = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'unknown_external', title: `מייל: ${subject}` }));
+    await withBusiness(BUSINESS, (db) => transition(db, orphan.jobId, { to: 'understand', actor: 'orchestrator', reason: 'test' }));
+    await testDb().query(
       `UPDATE mail_messages SET state = 'claimed', triaged_at = NULL, job_id = $2, claimed_at = now() - interval '31 minutes'
         WHERE business_id = $1`,
       [BUSINESS, orphan.jobId],
     );
 
     expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot })),
     );
 
-    const failed = await loadJob(orphan.jobId, { businessId: BUSINESS });
+    const failed = await withBusiness(BUSINESS, (db) => loadJob(db, orphan.jobId));
     expect(failed?.phase).toBe('failed');
     expect(failed?.title).toBe('מייל נכנס (טיפול שנקטע)');
 
@@ -815,11 +810,11 @@ describe('pollMailbox', () => {
   it('a fresh claim (under 30 minutes) is left alone', async () => {
     const { documentRoot } = await setup();
     const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-FRESH' })], nextCursor: 'C-1' }]);
-    await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot, readsPerDay: 1 });
-    await getPool().query("UPDATE mail_messages SET state = 'claimed', triaged_at = NULL, claimed_at = now() - interval '5 minutes' WHERE business_id = $1", [BUSINESS]);
+    await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot, readsPerDay: 1 }));
+    await testDb().query("UPDATE mail_messages SET state = 'claimed', triaged_at = NULL, claimed_at = now() - interval '5 minutes' WHERE business_id = $1", [BUSINESS]);
     const triage = stubTriage(OTHER_TRIAGE);
 
-    await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot });
+    await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
 
     expect(triage.calls).toBe(0);
     expect((await mailRows())[0]?.state).toBe('claimed');
@@ -834,7 +829,7 @@ describe('pollMailbox', () => {
     const triage = stubTriage(OTHER_TRIAGE);
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })),
     );
 
     expect(triage.calls).toBe(20);
@@ -853,12 +848,12 @@ describe('pollMailbox', () => {
       );
       const jobId = rows[0]?.job_id;
       if (jobId === undefined) throw new Error('no triage job');
-      await transition(jobId, { to: 'failed', actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'failed', actor: 'orchestrator', reason: 'test' }));
       return { status: 'read', triage: OTHER_TRIAGE };
     };
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })),
     );
 
     expect(result.failed).toBe(0);
@@ -872,7 +867,7 @@ describe('pollMailbox', () => {
     const fake = fakeClient([{ failure: 'transient', status: 503, message: 'mailbox provider unavailable (503)' }]);
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot })),
     );
 
     expect(result.status).toBe('error');
@@ -884,7 +879,7 @@ describe('pollMailbox', () => {
     const { documentRoot } = await setup();
     const fake = fakeClient([{ failure: 'auth', status: 401, message: 'mailbox auth rejected (401)' }]);
 
-    const result = await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot });
+    const result = await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot }));
 
     expect(result?.status).toBe('needs_reauth');
     expect((await getCursor({ businessId: BUSINESS }))?.cursor).toBe('C-0');
@@ -896,7 +891,7 @@ describe('pollMailbox', () => {
     const triage = stubTriage(OTHER_TRIAGE);
 
     const result = expectOk(
-      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }),
+      await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })),
     );
 
     expect(result).toMatchObject({ status: 'ok', gap: true, recorded: 0 });
@@ -947,7 +942,7 @@ describe('pollMailbox', () => {
         attachments: [{ index: 1, docType: 'quote', summary: 'הצעת מחיר Q-55 על 900', invoice: null }],
       });
 
-      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+      expectOk(await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })));
 
       expect(triage.requests).toHaveLength(1);
       const seen = triage.requests[0]?.attachments ?? [];
@@ -962,7 +957,7 @@ describe('pollMailbox', () => {
       expect(stored[0]).toEqual(png);
       expect(stored[1]).toMatchObject({ attachmentId: 'A-1', docType: 'quote', summary: 'הצעת מחיר Q-55 על 900', scanned: false });
       expect(typeof stored[1]?.documentId).toBe('string');
-      const { rows: invoices } = await getPool().query('SELECT 1 FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
+      const { rows: invoices } = await testDb().query('SELECT 1 FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
       expect(invoices).toHaveLength(0);
     });
 
@@ -978,7 +973,7 @@ describe('pollMailbox', () => {
         attachments: [{ index: 0, docType: 'invoice', summary: 'חשבונית INV-9', invoice: { number: 'INV-9', amountText: '500', dateText: null } }],
       });
 
-      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+      expectOk(await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })));
 
       expect(triage.requests).toHaveLength(1);
       const [row] = await mailRows();
@@ -987,7 +982,7 @@ describe('pollMailbox', () => {
       expect(row?.labels_applied).toEqual([MAIL_LABELS.invoice]);
       expect(fake.labelled).toEqual([{ providerMessageId: 'PM-PI', label: MAIL_LABELS.invoice }]);
       const docId = (await storedAttachments('PM-PI'))[0]?.documentId;
-      const { rows: invoices } = await getPool().query(
+      const { rows: invoices } = await testDb().query(
         'SELECT document_id, invoice_number, amount_text, file_name FROM mail_invoices WHERE business_id = $1',
         [BUSINESS],
       );
@@ -1008,7 +1003,7 @@ describe('pollMailbox', () => {
         ],
       });
 
-      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+      expectOk(await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })));
 
       const docs = (await storedAttachments('PM-2I')).map((x) => x.documentId);
       const { rows: invoices } = await getPool().query<{ document_id: string; invoice_number: string | null }>(
@@ -1032,10 +1027,10 @@ describe('pollMailbox', () => {
         attachments: [{ index: 0, docType: 'invoice', summary: 'חשבונית INV-9', invoice: { number: 'INV-9', amountText: '500', dateText: null } }],
       });
 
-      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+      expectOk(await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })));
 
       const docId = (await storedAttachments('PM-BD'))[0]?.documentId;
-      const { rows } = await getPool().query(
+      const { rows } = await testDb().query(
         'SELECT document_id, invoice_number, amount_text FROM mail_invoices WHERE business_id = $1',
         [BUSINESS],
       );
@@ -1053,9 +1048,9 @@ describe('pollMailbox', () => {
         attachments: [{ index: 0, docType: 'invoice', summary: 'חשבונית', invoice: { number: 'OTHER', amountText: '500', dateText: null } }],
       });
 
-      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+      expectOk(await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })));
 
-      const { rows } = await getPool().query('SELECT invoice_number, amount_text FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
+      const { rows } = await testDb().query('SELECT invoice_number, amount_text FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
       expect(rows).toEqual([{ invoice_number: 'INV-17', amount_text: '500' }]);
     });
 
@@ -1076,7 +1071,7 @@ describe('pollMailbox', () => {
       const drafter = stubDrafter();
       const n = notifier();
 
-      const result = expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter, documentRoot, notifyBoss: n.notify, now: NOON }));
+      const result = expectOk(await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter, documentRoot, notifyBoss: n.notify, now: NOON })));
 
       expect(triage.requests).toHaveLength(1);
       expect(result).toMatchObject({ triaged: 1, failed: 0, labelled: 1, notified: 0, unnotified: 0, drafts: 0 });
@@ -1086,7 +1081,7 @@ describe('pollMailbox', () => {
       expect(row?.reply_job_id).toBeNull();
       expect(n.sent).toHaveLength(0);
       expect(drafter.calls).toBe(0);
-      const { rows: invoices } = await getPool().query('SELECT invoice_number, amount_text FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
+      const { rows: invoices } = await testDb().query('SELECT invoice_number, amount_text FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
       expect(invoices).toEqual([{ invoice_number: 'INV-5', amount_text: '80' }]);
     });
 
@@ -1098,7 +1093,7 @@ describe('pollMailbox', () => {
       const drafter = stubDrafter();
       const n = notifier();
 
-      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter, documentRoot, notifyBoss: n.notify, now: NOON }));
+      expectOk(await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter, documentRoot, notifyBoss: n.notify, now: NOON })));
 
       expect(triage.requests).toHaveLength(1);
       const [row] = await mailRows();
@@ -1122,7 +1117,7 @@ describe('pollMailbox', () => {
         ],
       });
 
-      const result = expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+      const result = expectOk(await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })));
 
       expect(triage.requests).toHaveLength(1);
       expect(result).toMatchObject({ triaged: 1, failed: 0 });
@@ -1132,7 +1127,7 @@ describe('pollMailbox', () => {
       );
       expect(rows).toEqual([{ state: 'triaged', categories: ['document'], error: 'attachment_reading_dropped' }]);
       expect((await storedAttachments('PM-BAD'))[0]).toMatchObject({ docType: 'quote', summary: 'הצעת מחיר' });
-      const { rows: invoices } = await getPool().query('SELECT 1 FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
+      const { rows: invoices } = await testDb().query('SELECT 1 FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
       expect(invoices).toHaveLength(0);
     });
 
@@ -1143,7 +1138,7 @@ describe('pollMailbox', () => {
       const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: () => bytes });
       const triage = capturingTriage({ ...OTHER_TRIAGE, categories: ['document'] });
 
-      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+      expectOk(await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })));
 
       expect(triage.requests).toHaveLength(1);
       const seen = triage.requests[0]?.attachments ?? [];
@@ -1162,7 +1157,7 @@ describe('pollMailbox', () => {
       const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: () => bytes });
       const triage = capturingTriage({ ...OTHER_TRIAGE, categories: ['document'] });
 
-      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+      expectOk(await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })));
 
       expect(triage.requests).toHaveLength(1);
       const seen = triage.requests[0]?.attachments ?? [];
@@ -1186,13 +1181,13 @@ describe('pollMailbox', () => {
       const path = join(tmp, 'old.pdf');
       await writeFile(path, bytes);
       const legacy = await ingestDocument({ path, source: 'mail', originalName: 'old.pdf' }, { businessId: BUSINESS, documentRoot });
-      await getPool().query('DELETE FROM document_artifacts WHERE business_id = $1 AND document_id = $2', [BUSINESS, legacy.documentId]);
-      await getPool().query("UPDATE documents SET status = 'stored', reason = NULL WHERE business_id = $1 AND document_id = $2", [BUSINESS, legacy.documentId]);
+      await testDb().query('DELETE FROM document_artifacts WHERE business_id = $1 AND document_id = $2', [BUSINESS, legacy.documentId]);
+      await testDb().query("UPDATE documents SET status = 'stored', reason = NULL WHERE business_id = $1 AND document_id = $2", [BUSINESS, legacy.documentId]);
       const mail = incomingMail({ providerMessageId: 'PM-LG', attachments: [pdfAttachment(bytes, 'A-1', 'old.pdf')] });
       const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: () => bytes });
       const triage = capturingTriage({ ...OTHER_TRIAGE, categories: ['document'] });
 
-      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+      expectOk(await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })));
 
       const seen = triage.requests[0]?.attachments ?? [];
       expect(seen).toEqual([{ filename: 'old.pdf', text: null, notRead: 'stored_before_reading', truncated: false }]);
@@ -1213,12 +1208,12 @@ describe('pollMailbox', () => {
         attachments: [{ index: 0, docType: 'quote', summary: 'הצעת מחיר Q-77', invoice: null }],
       });
       const run = (triage: Triage) =>
-        pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot });
+        withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
 
       expectOk(await run(first));
       expect((await storedAttachments('PM-RH'))[0]).toMatchObject({ docType: 'quote', summary: 'הצעת מחיר Q-77' });
 
-      await getPool().query("UPDATE mail_messages SET state = 'received', triaged_at = NULL WHERE business_id = $1", [BUSINESS]);
+      await testDb().query("UPDATE mail_messages SET state = 'received', triaged_at = NULL WHERE business_id = $1", [BUSINESS]);
       const second = capturingTriage({ ...OTHER_TRIAGE, categories: ['document'], attachments: [] });
       expectOk(await run(second));
 
@@ -1245,7 +1240,7 @@ describe('pollMailbox', () => {
       const triage = capturingTriage({ ...OTHER_TRIAGE, categories: ['document'] });
 
       const result = expectOk(
-        await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot, attachmentBudgetMs: 200 }),
+        await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot, attachmentBudgetMs: 200 })),
       );
 
       expect(result).toMatchObject({ triaged: 1, failed: 0 });
@@ -1270,7 +1265,7 @@ describe('pollMailbox', () => {
       const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: (id) => bytes[Number(id.slice(2))]! });
       const triage = capturingTriage({ ...OTHER_TRIAGE, categories: ['document'] });
 
-      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+      expectOk(await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })));
 
       expect(fake.fetched).toHaveLength(3);
       expect((triage.requests[0]?.attachments ?? []).map((a) => a.notRead)).toEqual([null, null, null]);

@@ -66,7 +66,7 @@ async function recipientOfStep(
 ): Promise<string | null> {
   if (!messagesAPerson(actionClass)) return null;
 
-  const stored = await loadPlanBody(jobId, { businessId: db.businessId, db });
+  const stored = await loadPlanBody(db, jobId);
   if (stored === null) return null;
   const step = stored.plan.steps.find((candidate) => candidate.id === stepId);
   if (step === undefined) return null;
@@ -123,11 +123,10 @@ export async function recordCorrection(
   // choice in the opposite direction (a stranger's job may never borrow the
   // owner's authority; here the owner's own act must never inherit a
   // stranger's).
-  const job = await createJob({
+  const job = await createJob(db, {
     charterVersion: active.bundle.charterVersion,
     provenance: 'boss',
     title: `תיקון של הבוס — ${input.actionClass}`,
-    businessId,
   });
 
   await writeMemory(

@@ -17,7 +17,7 @@ vi.mock('./resume.js', async (importOriginal) => {
   };
 });
 
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { QUESTION_TRIAGE, installMailboxCharter, storedMail, stubDrafter } from '../test/mailbox.js';
 import { createFakeGateway } from '../whatsapp/fake-gateway.js';
@@ -42,16 +42,9 @@ describe('approve-by-WhatsApp when the resume fails', () => {
     const gateway = createFakeGateway();
     const messenger = createBossMessenger({ gateway, contactId: PRINCIPAL, businessId: BUSINESS });
     const mail = await storedMail(BUSINESS);
-    const raised = await raiseMailReply(
-      { mail, triage: QUESTION_TRIAGE, bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: QUESTION_TRIAGE, bundle, drafter: stubDrafter() }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-    await presentMailCard(
-      raised.approvalId,
-      async (text, jobId) => void (await messenger.send({ text, jobId })),
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (db) => presentMailCard(db, raised.approvalId!, async (text, jobId) => void (await messenger.send({ text, jobId }))));
 
     gateway.enqueue({
       providerMessageId: 'wamid.resume-1',
@@ -60,7 +53,7 @@ describe('approve-by-WhatsApp when the resume fails', () => {
       mediaKind: null,
       providerTimestamp: new Date(Date.now() + 1_000).toISOString(),
     });
-    const result = await runWhatsAppDoor({ gateway, messenger, businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, { gateway, messenger }));
 
     expect(result.mailCardReplies).toBe(1);
     expect(gateway.sent.at(-1)?.body).toBe(DECIDED_RESUME_FAILED);

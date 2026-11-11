@@ -3,8 +3,8 @@
  * closes, and reports what it did; a throw inside it is isolated.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { installMailboxCharter } from '../test/mailbox.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { createJob } from './jobs.js';
@@ -32,18 +32,18 @@ afterAll(async () => {
 describe('schedulerPass meetings sweep', () => {
   it('scheduler pass runs the sweep and reports it', async () => {
     const charterVersion = (await installMailboxCharter(B)).charterVersion;
-    const job = await createJob({ charterVersion, provenance: 'boss', title: 'פגישה', businessId: B });
-    await getPool().query(`UPDATE jobs SET phase = 'closed' WHERE job_id = $1`, [job.jobId]);
-    await getPool().query(
+    const job = await withBusiness(B, (db) => createJob(db, { charterVersion, provenance: 'boss', title: 'פגישה' }));
+    await testDb().query(`UPDATE jobs SET phase = 'closed' WHERE job_id = $1`, [job.jobId]);
+    await testDb().query(
       `INSERT INTO job_plans (business_id, job_id, plan_hash, plan) VALUES ($1, $2, 'h', '{}'::jsonb)`,
       [B, job.jobId],
     );
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id, status, performed)
        VALUES ($1, $2, 'h', 's1', 'ev-1', 'completed', true)`,
       [B, job.jobId],
     );
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO meetings (meeting_id, business_id, job_id, step_id, calendar_id, event_id, operation, client_name,
           client_email, start_at, end_at)
        VALUES ('M-1', $1, $2, 's1', 'cal-1', NULL, 'create', 'דני', 'dani@acme.co.il', $3, $4)`,

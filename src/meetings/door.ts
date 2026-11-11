@@ -193,18 +193,17 @@ function unavailableReply(kind: Unavailable): string {
 }
 
 async function failMeetingJob(door: DoorContext, audit: string, reason: string): Promise<InstructionOutcome> {
-  await transition(door.jobId, {
+  await transition(door.db, door.jobId, {
     to: 'failed',
     actor: 'orchestrator',
     reason: `meeting door: ${audit}`,
-    businessId: door.businessId,
   });
   return { status: 'refused', reason };
 }
 
 async function askMeetingQuestion(door: DoorContext, question: string): Promise<InstructionOutcome> {
   try {
-    await recordQuestion(door.instruction.instructionId, question, { businessId: door.businessId });
+    await recordQuestion(door.instruction.instructionId, question, { businessId: door.db.businessId });
   } catch {
     // Best effort, exactly as the instruction door's own questions are.
   }
@@ -352,11 +351,11 @@ async function pendingMeetingQuestion(door: DoorContext): Promise<{ jobId: strin
         AND EXISTS (SELECT 1 FROM meetings m WHERE m.business_id = c.business_id AND m.job_id = c.job_id)
       ORDER BY c.presented_at DESC
       LIMIT 1`,
-    [door.businessId, door.channel, door.jobId, windowMinutes],
+    [door.db.businessId, door.channel, door.jobId, windowMinutes],
   );
   const jobId = rows[0]?.job_id;
   if (jobId === undefined) return null;
-  const confirmation = await loadConfirmation(jobId, { businessId: door.businessId });
+  const confirmation = await loadConfirmation(jobId, { businessId: door.db.businessId });
   const option = confirmation?.options[0];
   if (confirmation === null || option === undefined || confirmation.options.length !== 1) return null;
   return { jobId, plan: option.plan };
@@ -375,11 +374,11 @@ async function turnedDownBy(door: DoorContext, jobId: string): Promise<{ jobId: 
       WHERE business_id = $1 AND state = 'cancelled' AND decided_by = $2
       ORDER BY decided_at DESC
       LIMIT 1`,
-    [door.businessId, `${OTHER_SLOT_DECIDED_BY}${jobId}`],
+    [door.db.businessId, `${OTHER_SLOT_DECIDED_BY}${jobId}`],
   );
   const turnedDown = rows[0]?.job_id;
   if (turnedDown === undefined) return null;
-  const confirmation = await loadConfirmation(turnedDown, { businessId: door.businessId });
+  const confirmation = await loadConfirmation(turnedDown, { businessId: door.db.businessId });
   const option = confirmation?.options[0];
   if (confirmation === null || option === undefined || confirmation.options.length !== 1) return null;
   return { jobId: turnedDown, plan: option.plan };
@@ -418,7 +417,7 @@ async function abandonProposed(door: DoorContext): Promise<void> {
     await getPool().query(
       `UPDATE meetings SET state = 'abandoned', updated_at = now()
         WHERE business_id = $1 AND job_id = $2 AND state = 'proposed'`,
-      [door.businessId, door.jobId],
+      [door.db.businessId, door.jobId],
     );
   } catch {
     // best effort
@@ -480,7 +479,7 @@ export async function runMeetingOperation(
 
   const resolveAccess = (): Promise<CalendarAccess | { unavailable: Unavailable }> =>
     resolveCalendarAccess({
-      businessId: door.businessId,
+      businessId: door.db.businessId,
       runtime: o.runtime,
       ...(o.client !== undefined ? { client: o.client } : {}),
     });
@@ -500,7 +499,7 @@ export async function runMeetingOperation(
     }
     let loaded: MeetingSettings;
     try {
-      loaded = await loadMeetingSettings({ businessId: door.businessId });
+      loaded = await loadMeetingSettings({ businessId: door.db.businessId });
     } catch (err) {
       return {
         refusal: {
@@ -521,7 +520,7 @@ export async function runMeetingOperation(
     if (n !== null) choose = (_name, candidates) => candidates[n - 1] ?? null;
   }
   const parked =
-    o.answerTo !== undefined ? await loadInstructionForJob(o.answerTo.jobId, { businessId: door.businessId }) : null;
+    o.answerTo !== undefined ? await loadInstructionForJob(o.answerTo.jobId, { businessId: door.db.businessId }) : null;
 
   if (o.request !== undefined) {
     // The dashboard's meeting form: every field was typed by the owner into the
@@ -537,7 +536,7 @@ export async function runMeetingOperation(
     const markers = markersOf(prior.plan);
     sourceJobId = markers.sourceJobId ?? prior.jobId;
     exclude = [...markers.exclude, ...slotsOf(prior.plan)];
-    const source = await loadInstructionForJob(sourceJobId, { businessId: door.businessId });
+    const source = await loadInstructionForJob(sourceJobId, { businessId: door.db.businessId });
     if (source === null) return failMeetingJob(door, 'source instruction not found', OTHER_SLOT_FAILED_REPLY);
     sourceText = `${source.text}\n\n${o.answerTo.answer}`;
     sourceOrigin = source.textOrigin === 'typed' && door.textOrigin === 'typed' ? 'typed' : 'transcribed';
@@ -560,27 +559,26 @@ export async function runMeetingOperation(
     // owner confirmed meanwhile (the dashboard, a second channel) is about to
     // run: its job and its hold are not ours to touch.
     const cancelled = await cancelConfirmation(previous.jobId, `${OTHER_SLOT_DECIDED_BY}${door.jobId}`, {
-      businessId: door.businessId,
+      businessId: door.db.businessId,
     });
     if (!cancelled) return failMeetingJob(door, 'the turned-down question was already decided', ALREADY_CONFIRMED_REPLY);
     try {
-      await transition(previous.jobId, {
+      await transition(door.db, previous.jobId, {
         to: 'closed',
         actor: 'human',
         reason: 'meeting door: the owner asked for another slot',
-        businessId: door.businessId,
         expectFrom: 'plan',
       });
     } catch (err) {
       // Moved on by someone else (the settle sweep closes a cancelled question too).
       if (!(err instanceof PhaseMovedError)) throw err;
     }
-    await releaseJobHolds(access, door.businessId, previous.jobId);
+    await releaseJobHolds(access, door.db.businessId, previous.jobId);
 
     const markers = markersOf(previous.plan);
     sourceJobId = markers.sourceJobId ?? previous.jobId;
     exclude = [...markers.exclude, ...slotsOf(previous.plan)];
-    const source = await loadInstructionForJob(sourceJobId, { businessId: door.businessId });
+    const source = await loadInstructionForJob(sourceJobId, { businessId: door.db.businessId });
     if (source === null) return failMeetingJob(door, 'source instruction not found', OTHER_SLOT_FAILED_REPLY);
     sourceText = source.text;
     // The SOURCE instruction's origin, not this message's: "תני אחר" typed under a
@@ -628,7 +626,7 @@ export async function runMeetingOperation(
   try {
     snapshot = await loadCalendarRange({
       access: calendar,
-      businessId: door.businessId,
+      businessId: door.db.businessId,
       settings,
       timeZone: door.timeZone,
       fromIso: range.fromIso,
@@ -649,7 +647,7 @@ export async function runMeetingOperation(
   // A failed contact read degrades to no memory, like the instruction door's.
   let contacts: Contact[] = [];
   try {
-    contacts = await listContacts({ businessId: door.businessId });
+    contacts = await listContacts({ businessId: door.db.businessId });
   } catch {
     contacts = [];
   }
@@ -732,7 +730,7 @@ export async function runMeetingOperation(
       try {
         hold = await createHold({
           access: calendar,
-          businessId: door.businessId,
+          businessId: door.db.businessId,
           jobId: door.jobId,
           calendarId: change.calendarId,
           start: change.start,
@@ -745,7 +743,7 @@ export async function runMeetingOperation(
       }
     }
     if (step === undefined || hold === null || isCalendarFailure(hold)) {
-      await releaseHoldIds(calendar, door.businessId, placed);
+      await releaseHoldIds(calendar, door.db.businessId, placed);
       return failMeetingJob(door, 'hold could not be placed', HOLD_FAILED_REPLY);
     }
     placed.push(hold.holdId);
@@ -753,7 +751,7 @@ export async function runMeetingOperation(
   }
 
   const undo = async (audit: string): Promise<InstructionOutcome> => {
-    await releaseHoldIds(calendar, door.businessId, placed);
+    await releaseHoldIds(calendar, door.db.businessId, placed);
     await abandonProposed(door);
     return failMeetingJob(door, audit, MEETING_PREPARE_FAILED_REPLY);
   };
@@ -761,7 +759,7 @@ export async function runMeetingOperation(
   let plan: Plan;
   try {
     plan = withHoldIds(built, holdByStepId);
-    await recordProposedMeetings({ businessId: door.businessId, jobId: door.jobId, plan, changes: result.changes });
+    await recordProposedMeetings({ businessId: door.db.businessId, jobId: door.jobId, plan, changes: result.changes });
   } catch (err) {
     return undo(`could not record the proposal (${err instanceof Error ? err.message : String(err)})`);
   }
@@ -780,7 +778,7 @@ export async function runMeetingOperation(
   }
   if (outcome.status === 'refused') {
     // `finishSingle` already failed the job; the holds and rows are ours to undo.
-    await releaseHoldIds(calendar, door.businessId, placed);
+    await releaseHoldIds(calendar, door.db.businessId, placed);
     await abandonProposed(door);
   }
   return outcome;

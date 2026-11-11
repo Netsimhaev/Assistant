@@ -182,7 +182,7 @@ import {
   STILL_NEEDS_ANSWER_HINT,
   type WhatsAppRoute,
 } from './whatsapp-routing.js';
-import { withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 export interface DoorResult {
   /** However many messages `pollOnce` delivered to this pass, redeliveries included. */
@@ -442,7 +442,8 @@ export function compareInbound(a: NormalizedInboundMessage, b: NormalizedInbound
 }
 
 interface ProcessContext {
-  businessId: string;
+  /** The business is `db.businessId` — one source of truth. */
+  db: BusinessDb;
   charter: BusinessCharter;
   messenger: BossMessenger;
   provider?: TranscriptionProvider;
@@ -519,7 +520,7 @@ async function tellOwnerAndSettle(
   text: string,
 ): Promise<void> {
   await ctx.messenger.send({ text, jobId: null });
-  await settleMessage(messageId, 'failed', {}, { businessId: ctx.businessId });
+  await settleMessage(messageId, 'failed', {}, { businessId: ctx.db.businessId });
 }
 
 /**
@@ -576,8 +577,7 @@ async function handleConfirmationMessage(input: {
 
   // Everything open, by the one shared definition (`openOnWhatsApp`) the
   // document-card and mail-card readers also count from.
-  const open = await openOnWhatsApp({
-    businessId: ctx.businessId,
+  const open = await openOnWhatsApp(ctx.db, {
     excludeMessageId: storedId,
     inboundAt: msg.providerTimestamp,
     ...windowOverride,
@@ -588,7 +588,7 @@ async function handleConfirmationMessage(input: {
   const readings: ConfirmReading[] = confirmations.map((c) => readConfirmation(text, c.options));
   if (readings.every((r) => r.kind === 'none')) return 'passthrough';
 
-  const claimed = await claimMessage(storedId, { businessId: ctx.businessId });
+  const claimed = await claimMessage(storedId, { businessId: ctx.db.businessId });
   if (!claimed) return 'skipped';
 
   const reply = async (
@@ -600,7 +600,7 @@ async function handleConfirmationMessage(input: {
     // held command it answered.
     await ctx.messenger.send({ text: replyText, jobId });
     await settleMessage(storedId, state, jobId !== null ? { jobId } : {}, {
-      businessId: ctx.businessId,
+      businessId: ctx.db.businessId,
     });
   };
 
@@ -624,8 +624,7 @@ async function handleConfirmationMessage(input: {
   const by = `whatsapp:${authorityNumberKey(msg.senderNumber) ?? msg.senderNumber}`;
   let outcome: ConfirmOutcome;
   try {
-    outcome = await applyConfirmation(only.jobId, reading, by, {
-      businessId: ctx.businessId,
+    outcome = await applyConfirmation(ctx.db, only.jobId, reading, by, {
       whatsappInboundAt: new Date(msg.providerTimestamp),
     });
   } catch (error) {
@@ -699,7 +698,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         mediaKind: msg.mediaKind,
         providerTimestamp: msg.providerTimestamp,
       },
-      { businessId: ctx.businessId },
+      { businessId: ctx.db.businessId },
     );
     // A redelivery of a message already recorded — the unique index decided,
     // not a prior read (`recordInbound`'s own docblock). Nothing to settle:
@@ -726,7 +725,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       // or spend anything, and no reply, ever. `established` stays `false`:
       // even if the settle below throws, a stranger gets no message from
       // this assistant, full stop.
-      await settleMessage(stored.id, 'handled', {}, { businessId: ctx.businessId });
+      await settleMessage(stored.id, 'handled', {}, { businessId: ctx.db.businessId });
       return 'recordedOnly';
     }
 
@@ -759,7 +758,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
             text: msg.body,
             messageId: stored.id,
             inboundAt: new Date(msg.providerTimestamp),
-            businessId: ctx.businessId,
+            businessId: ctx.db.businessId,
             by: principalActor(msg.senderNumber),
             now: new Date(),
             timeZone: ctx.charter.identity.timezone,
@@ -800,8 +799,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     if (msg.mediaKind === null && msg.body !== null && isDocumentCardAction(msg.body)) {
       const windowOverride =
         ctx.questionWindowMinutes !== undefined ? { windowMinutes: ctx.questionWindowMinutes } : {};
-      const open = await openOnWhatsApp({
-        businessId: ctx.businessId,
+      const open = await openOnWhatsApp(ctx.db, {
         excludeMessageId: stored.id,
         inboundAt: msg.providerTimestamp,
         ...windowOverride,
@@ -816,7 +814,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
           cards: open.documentCards,
           othersOpen: open.mailCards.length + open.questions.length + open.confirmations.length,
           messenger: ctx.messenger,
-          businessId: ctx.businessId,
+          businessId: ctx.db.businessId,
           production: ctx.production,
           ...windowOverride,
         });
@@ -834,8 +832,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // below, and the card stays open.
     if (msg.mediaKind === null && msg.body !== null && isMailCardAction(msg.body)) {
       const cards = (
-        await openOnWhatsApp({
-          businessId: ctx.businessId,
+        await openOnWhatsApp(ctx.db, {
           excludeMessageId: stored.id,
           inboundAt: msg.providerTimestamp,
           ...(ctx.questionWindowMinutes !== undefined
@@ -844,12 +841,11 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         })
       ).mailCards;
       if (cards.length > 0) {
-        const handled = await handleMailCardMessage({
+        const handled = await handleMailCardMessage(ctx.db, {
           msg,
           storedId: stored.id,
           cards,
           messenger: ctx.messenger,
-          businessId: ctx.businessId,
         });
         if (handled === 'decided' || handled === 'replaced') return 'mailCard';
         if (handled !== 'passthrough') return handled;
@@ -862,7 +858,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         return 'refused';
       }
       const transcribed = await transcribeInbound(msg, senderKind, {
-        businessId: ctx.businessId,
+        businessId: ctx.db.businessId,
         provider: ctx.provider,
       });
       if (transcribed.status === 'too_long') {
@@ -892,7 +888,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
 
     // The line that matters for crash safety — see the module docblock.
     // Nothing above this can open a job; everything below it can.
-    const claimed = await claimMessage(stored.id, { businessId: ctx.businessId });
+    const claimed = await claimMessage(stored.id, { businessId: ctx.db.businessId });
     if (!claimed) return 'skipped'; // raced by another runner on this message.
 
     // A schedule question ("מה יש לי מחר?") is a READ, judged on THIS message
@@ -906,7 +902,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     if (ctx.calendar !== undefined) {
       const schedule = await answerScheduleQuery({
         text: heard,
-        businessId: ctx.businessId,
+        businessId: ctx.db.businessId,
         timeZone: ctx.charter.identity.timezone,
         operations: ctx.charter.operations,
         runtime: ctx.calendar.runtime,
@@ -918,7 +914,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
           stored.id,
           'handled',
           isAudio ? { transcript: heard } : {},
-          { businessId: ctx.businessId },
+          { businessId: ctx.db.businessId },
         );
         return 'instructed';
       }
@@ -937,9 +933,8 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // is still subject to the cap: it does re-run the planner, and the
     // refusal leaves the question open (nothing is claimed below), so his
     // answer works tomorrow.
-    const route: WhatsAppRoute = await decideWhatsAppRoute({
+    const route: WhatsAppRoute = await decideWhatsAppRoute(ctx.db, {
       text: heard,
-      businessId: ctx.businessId,
       ...(ctx.questionWindowMinutes !== undefined
         ? { windowMinutes: ctx.questionWindowMinutes }
         : {}),
@@ -958,10 +953,9 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       // happened yet is worse than a message that never arrived. There is no
       // running job here for Important 5 to protect.
       for (const open of route.open) {
-        await retireOpenInstruction(open, {
+        await retireOpenInstruction(ctx.db, open, {
           to: 'closed',
           reason: REASON_CLOSED_BY_OWNER,
-          businessId: ctx.businessId,
         });
       }
       const confirmation =
@@ -974,7 +968,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         stored.id,
         'handled',
         isAudio ? { transcript: heard } : {},
-        { businessId: ctx.businessId },
+        { businessId: ctx.db.businessId },
       );
       return 'closed';
     }
@@ -991,12 +985,12 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         stored.id,
         'failed',
         isAudio ? { transcript: heard } : {},
-        { businessId: ctx.businessId },
+        { businessId: ctx.db.businessId },
       );
       return 'refused';
     }
 
-    const usedToday = await whatsappInstructionsToday(ctx.businessId);
+    const usedToday = await whatsappInstructionsToday(ctx.db.businessId);
     if (usedToday >= config.whatsappInstructionsPerDay) {
       await ctx.messenger.send({
         text: withTranscriptEcho(isAudio, heard, INSTRUCTION_CAP_REACHED),
@@ -1006,7 +1000,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         stored.id,
         'failed',
         isAudio ? { transcript: heard } : {},
-        { businessId: ctx.businessId },
+        { businessId: ctx.db.businessId },
       );
       return 'refused';
     }
@@ -1019,7 +1013,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // match what actually happened.
     let answered: InstructionRecord | null = null;
     if (route.kind === 'answer') {
-      const won = await claimAsAnswer(route.instruction, heard, { businessId: ctx.businessId });
+      const won = await claimAsAnswer(ctx.db, route.instruction, heard);
       if (won) answered = route.instruction;
     }
 
@@ -1064,13 +1058,10 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
           ].join('\n\n');
 
     attemptedInstruction = true;
-    const outcome = await runInstruction(
-      { text },
-      {
-        businessId: ctx.businessId,
-        // Required, no default — see this module's docblock and the option's
-        // own. Computed above, from the media kind and the joined half's
-        // stored origin.
+    // Required, no default — see this module's docblock and the option's
+    // own. Computed above, from the media kind and the joined half's
+    // stored origin.
+    const outcome = await runInstruction(ctx.db, { text }, {
         textOrigin,
         // The door this message came through: a confirmation question is
         // answered where it was asked (boss command, spec §4).
@@ -1092,8 +1083,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         ...(answered !== null
           ? { scheduleRouting: false, answerTo: { jobId: answered.jobId, answer: heard } }
           : {}),
-      },
-    );
+      });
 
     // Every attempt this door makes, whatever came of it — see
     // `recordWhatsAppInstructionAttempt`'s own docblock on why a refusal
@@ -1102,7 +1092,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // write must agree on which business's ledger they touch, or the cap
     // this pair exists to enforce means nothing for any business this door
     // is explicitly given.
-    await recordWhatsAppInstructionAttempt(ctx.businessId, {
+    await recordWhatsAppInstructionAttempt(ctx.db.businessId, {
       status: outcome.status,
       textLength: text.length,
     });
@@ -1130,10 +1120,9 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // type.
     const extra: string[] = [];
     if (answered !== null && outcome.status === 'refused') {
-      await retireOpenInstruction(answered, {
+      await retireOpenInstruction(ctx.db, answered, {
         to: 'closed',
         reason: REASON_ANSWER_REFUSED,
-        businessId: ctx.businessId,
       });
       extra.push(CLOSED_AFTER_REFUSAL);
     }
@@ -1170,7 +1159,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // Only an `ok` send stamps the question: a failed send left the owner
     // with nothing to answer, and a later "כן" must not confirm it.
     if (questionSent && sent.ok && jobId !== null) {
-      await markConfirmationDelivered(jobId, { businessId: ctx.businessId });
+      await markConfirmationDelivered(jobId, { businessId: ctx.db.businessId });
     }
 
     // The answered question's own job is retired only now, for the
@@ -1181,10 +1170,9 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // pass telling him his answered instruction "failed"; see that
     // function's own docblock.
     if (answered !== null && outcome.status !== 'refused' && outcome.status !== 'answered') {
-      await retireOpenInstruction(answered, {
+      await retireOpenInstruction(ctx.db, answered, {
         to: 'failed',
         reason: reasonForSupersededByWhatsAppAnswer(outcome.jobId),
-        businessId: ctx.businessId,
       });
     }
 
@@ -1192,7 +1180,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       // A crash here loses the link, never a second job: the message is
       // already claimed, and nothing re-offers a claimed message for
       // planning again.
-      await linkWhatsAppMessage(jobId, stored.id, { businessId: ctx.businessId });
+      await linkWhatsAppMessage(ctx.db, jobId, stored.id);
     }
 
     // 'handled' for a job that now exists (`planned`/`needs_answer`),
@@ -1207,7 +1195,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         ...(isAudio ? { transcript: heard } : {}),
         ...(jobId !== null ? { jobId } : {}),
       },
-      { businessId: ctx.businessId },
+      { businessId: ctx.db.businessId },
     );
 
     // A schedule answer counts as instructed: the owner's request was served,
@@ -1236,13 +1224,13 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     //      own settle failing) stays silent — Decision 4 again: a stranger
     //      gets no reply, ever, not even an apology for a crash.
     if (attemptedInstruction && !instructionRecorded) {
-      await recordWhatsAppInstructionAttempt(ctx.businessId, {
+      await recordWhatsAppInstructionAttempt(ctx.db.businessId, {
         status: 'refused',
         textLength: text.length,
       });
     }
     if (stored !== null) {
-      await settleMessage(stored.id, 'failed', {}, { businessId: ctx.businessId }).catch(() => {
+      await settleMessage(stored.id, 'failed', {}, { businessId: ctx.db.businessId }).catch(() => {
         // Best-effort: the message is already unrecoverable from this pass's
         // point of view, and a second failure here must not take the rest of
         // the batch down with it.
@@ -1258,10 +1246,9 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
   }
 }
 
-export async function runWhatsAppDoor(options: {
+export async function runWhatsAppDoor(db: BusinessDb, options: {
   gateway: WhatsAppGateway;
   messenger: BossMessenger;
-  businessId?: string;
   provider?: TranscriptionProvider;
   /** Test seam only; production leaves it unset and `runInstruction` uses the real planner. */
   planner?: RunInstructionOptions['planner'];
@@ -1297,7 +1284,7 @@ export async function runWhatsAppDoor(options: {
   /** Calendar access for the schedule answer ("מה יש לי מחר?"); absent: no schedule routing. */
   calendar?: RunInstructionOptions['calendar'];
 }): Promise<DoorResult> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const { gateway, messenger } = options;
 
   // Loaded once, before the queue is touched at all — see the module
@@ -1312,7 +1299,7 @@ export async function runWhatsAppDoor(options: {
   if (options.charter !== undefined) {
     charter = options.charter;
   } else {
-    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+    const active = await loadActiveCharter(db);
     if (active === null) {
       throw new Error(
         `runWhatsAppDoor: no active charter for business ${businessId} — refusing to guess who the owner is`,
@@ -1346,7 +1333,7 @@ export async function runWhatsAppDoor(options: {
   };
 
   const ctx: ProcessContext = {
-    businessId,
+    db,
     charter,
     messenger,
     // Mutates `result` directly rather than a second accumulator — see

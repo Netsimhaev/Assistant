@@ -53,7 +53,8 @@ export async function installMailboxCharter(
     }),
   );
   const bundle = await withBusiness(businessId, (db) => installCharter(db, signed));
-  await upsertBinding(
+  await withBusiness(businessId, (db) => upsertBinding(
+    db,
     {
       system: 'mailbox',
       status: 'live',
@@ -63,8 +64,8 @@ export async function installMailboxCharter(
       lastOkAt: null,
       lastError: null,
     },
-    { businessId, by: 'test' },
-  );
+    { by: 'test' },
+  ));
   expect(await withBusiness(businessId, (db) => loadAutonomyMode(db))).toBe('off');
   return bundle;
 }

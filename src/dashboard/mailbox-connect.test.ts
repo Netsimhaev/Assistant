@@ -281,7 +281,7 @@ describe('POST /connections/mailbox/sign', () => {
 
     // Signing binds nothing: no grant, no binding, no cursor — nothing reads
     // or sends through the mailbox until the ceremony completes.
-    expect((await loadBindings({ businessId: BUSINESS })).some((b) => b.system === 'mailbox')).toBe(false);
+    expect((await withBusiness(BUSINESS, (db) => loadBindings(db))).some((b) => b.system === 'mailbox')).toBe(false);
     expect(await getCursor({ businessId: BUSINESS })).toBeNull();
 
     const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'charter_change' })); // TENANCY-TODO(task 10)
@@ -364,7 +364,7 @@ describe('the OAuth ceremony for the signed mailbox', () => {
     expect(cursor?.cursor).toBe('cursor-microsoft');
     expect(Date.parse(cursor?.connectedAt ?? '')).toBeGreaterThanOrEqual(before - 1000);
 
-    const binding = (await loadBindings({ businessId: BUSINESS })).find((b) => b.system === 'mailbox');
+    const binding = (await withBusiness(BUSINESS, (db) => loadBindings(db))).find((b) => b.system === 'mailbox');
     expect(binding).toEqual({
       system: 'mailbox',
       status: 'live',
@@ -385,7 +385,7 @@ describe('the OAuth ceremony for the signed mailbox', () => {
     const res = await fetch(`${baseUrl}/oauth/callback?state=${state}&code=c`, { headers: { cookie } });
     expect(res.status).toBe(502);
     expect(await readGrantBySystem('mailbox', BUSINESS, key)).toBeNull();
-    expect((await loadBindings({ businessId: BUSINESS })).some((b) => b.system === 'mailbox')).toBe(false);
+    expect((await withBusiness(BUSINESS, (db) => loadBindings(db))).some((b) => b.system === 'mailbox')).toBe(false);
     expect(await getCursor({ businessId: BUSINESS })).toBeNull();
   });
 });
@@ -639,7 +639,7 @@ describe('fix round 1: callback', () => {
     const res = await fetch(`${baseUrl}/oauth/callback?state=${state}&code=c`, { headers: { cookie } });
     expect(res.status).toBe(400);
     expect(await readGrantBySystem('mailbox', BUSINESS, key)).toBeNull();
-    expect((await loadBindings({ businessId: BUSINESS })).some((b) => b.system === 'mailbox')).toBe(false);
+    expect((await withBusiness(BUSINESS, (db) => loadBindings(db))).some((b) => b.system === 'mailbox')).toBe(false);
     expect(await getCursor({ businessId: BUSINESS })).toBeNull();
   });
 

@@ -210,10 +210,8 @@ async function decide(
       // name would either never match (wrong name) or mark on every call
       // (`ingestsExternalContent` defaults unknown names to `true`).
       if (binding.jobId !== null && ingestsExternalContent(translated.internal)) {
-        const matched = await markContentIngested(binding.jobId, {
-          ...(binding.businessId !== undefined ? { businessId: binding.businessId } : {}),
-          ...(binding.db !== undefined ? { db: binding.db } : {}),
-        });
+        const ingestingJobId = binding.jobId;
+        const matched = await withBusiness(binding.businessId ?? config.businessId, (db) => markContentIngested(db, ingestingJobId)); // TENANCY-TODO(task 7)
         // `jobId` and `businessId` reach this hook as two independent
         // caller-supplied fields — unlike `executeStep`, nothing here loaded
         // a job row to derive them from. A stale id, a typo, or a jobId that

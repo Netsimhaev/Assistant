@@ -164,6 +164,6 @@ describe('calendar OAuth ceremony and the signed provider', () => {
     expect(res.status).toBe(400);
     expect(calls).toEqual([]);
     expect(await readGrantBySystem('calendar', BUSINESS, key)).toBeNull();
-    expect((await loadBindings({ businessId: BUSINESS })).some((b) => b.system === 'calendar')).toBe(false);
+    expect((await withBusiness(BUSINESS, (db) => loadBindings(db))).some((b) => b.system === 'calendar')).toBe(false);
   });
 });

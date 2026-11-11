@@ -250,7 +250,7 @@ export async function mailboxBannerStatus(businessId: string): Promise<MailboxBa
 
 /** Working = a live binding AND a live grant that does not need reauth. Anything else is "not working". */
 async function mailboxIsWorking(businessId: string): Promise<{ working: boolean; grant: GrantSummary | null }> {
-  const [bindings, grants] = await Promise.all([loadBindings({ businessId }), listGrants(businessId)]);
+  const [bindings, grants] = await Promise.all([withBusiness(businessId, (db) => loadBindings(db)), listGrants(businessId)]); // TENANCY-TODO(task 10)
   const binding = bindings.find((b) => b.system === MAILBOX_SYSTEM) ?? null;
   const grant = grants.find((g) => g.system === MAILBOX_SYSTEM && g.revokedAt === null) ?? null;
   return { working: binding?.status === 'live' && grant !== null && grant.needsReauthAt === null, grant };

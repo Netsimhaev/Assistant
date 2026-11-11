@@ -300,24 +300,22 @@ export async function openNudge(
   let jobId: string | null = null;
   let linked = false;
   try {
-    const job = await createJob({
+    const job = await withBusiness(businessId, (db) => createJob(db, { // TENANCY-TODO(task 5)
       charterVersion: active.bundle.charterVersion,
       // A literal, not a parameter: the item was born from an owner
       // instruction. No boss_instructions row is written for this job, ever.
       provenance: 'boss',
-      businessId,
       title: `פולואפ: ${toOneLine(item.description).slice(0, 80)}`,
-    });
+    }));
     jobId = job.jobId;
     for (const to2 of ['understand', 'plan'] as const) {
-      await transition(job.jobId, {
+      await withBusiness(businessId, (db) => transition(db, job.jobId, { // TENANCY-TODO(task 5)
         to: to2,
         actor: 'orchestrator',
         reason: 'ledger nudge: following up on a ledger item',
-        businessId,
-      });
+      }));
     }
-    const bound = await bindPlanToJob(job.jobId, plan, { businessId });
+    const bound = await withBusiness(businessId, (db) => bindPlanToJob(db, job.jobId, plan)); // TENANCY-TODO(task 5)
     if (bound.status === 'conflict') throw new Error(`ledger nudge: plan conflict on fresh job ${job.jobId}`);
 
     const link = await atomically(o.db, async (tx) => {
@@ -333,21 +331,21 @@ export async function openNudge(
       return (set.rowCount ?? 0) > 0;
     });
     if (!link) {
-      await transition(job.jobId, { to: 'closed', actor: 'orchestrator', reason: 'ledger nudge: item moved on', businessId });
+      await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'closed', actor: 'orchestrator', reason: 'ledger nudge: item moved on' })); // TENANCY-TODO(task 5)
       return { outcome: 'claimed_elsewhere', reminder: null };
     }
     linked = true;
-    await transition(job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'ledger nudge: to the gate', businessId });
+    await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'ledger nudge: to the gate' })); // TENANCY-TODO(task 5)
     return { outcome: 'opened', reminder: null };
   } catch (err) {
     if (jobId !== null) {
+      const openedJobId = jobId;
       try {
-        await transition(jobId, {
+        await withBusiness(businessId, (db) => transition(db, openedJobId, { // TENANCY-TODO(task 5)
           to: 'failed',
           actor: 'orchestrator',
           reason: `ledger_nudge_open_failed — ${err instanceof Error ? err.message : String(err)}`,
-          businessId,
-        });
+        }));
       } catch {
         // Already terminal or unreachable; observeNudges reads whatever it is.
       }
@@ -442,13 +440,12 @@ export async function observeNudges(o: { businessId: string; db?: Queryable; now
       );
       for (const card of cards) await withBusiness(businessId, (bdb) => cancelPendingApproval(bdb, card.approval_id)); // TENANCY-TODO(task 5)
       try {
-        await transition(row.job_id, {
+        await withBusiness(businessId, (db) => transition(db, row.job_id, { // TENANCY-TODO(task 5)
           to: canTransition(phase, 'closed') ? 'closed' : 'failed',
           actor: 'orchestrator',
           reason: 'ledger nudge: item no longer open — nudge cancelled',
-          businessId,
           expectFrom: phase,
-        });
+        }));
       } catch (err) {
         if (err instanceof PhaseMovedError) continue;
         throw err;
@@ -474,13 +471,12 @@ export async function observeNudges(o: { businessId: string; db?: Queryable; now
     let observedPhase: string = row.phase;
     if (STALLABLE_PHASES.has(phase) && row.created_at.getTime() < now.getTime() - STALLED_AFTER_MS) {
       try {
-        await transition(row.job_id, {
+        await withBusiness(businessId, (db) => transition(db, row.job_id, { // TENANCY-TODO(task 5)
           to: 'failed',
           actor: 'orchestrator',
           reason: 'ledger_nudge_stalled — the linked nudge job never reached execute',
-          businessId,
           expectFrom: phase,
-        });
+        }));
         observedPhase = 'failed';
       } catch (err) {
         if (err instanceof PhaseMovedError) continue;
@@ -522,7 +518,7 @@ export async function observeNudges(o: { businessId: string; db?: Queryable; now
     const reason = code !== null && isGateDenialCode(code) ? GATE_REFUSED_REASON : SEND_FAILED_REASON;
     let draft = '';
     try {
-      const body = (await loadPlanBody(row.job_id, { businessId, db }))?.plan.steps[0]?.input['body'];
+      const body = (await withBusiness(businessId, (bdb) => loadPlanBody(bdb, row.job_id)))?.plan.steps[0]?.input['body']; // TENANCY-TODO(task 5)
       if (typeof body === 'string') draft = body;
     } catch {
       // An unreadable stored plan: the owner is still told, without the draft.

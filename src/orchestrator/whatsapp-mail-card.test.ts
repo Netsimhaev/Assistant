@@ -9,7 +9,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import {
   NOON,
   QUESTION_TRIAGE,
@@ -105,24 +105,17 @@ async function raiseAndPresent(h: Harness, n = 1): Promise<{ replyJobId: string;
     internetMessageId: `<q-${n}@client.example>`,
     threadId: `TH-${n}`,
   });
-  const raised = await raiseMailReply(
-    { mail, triage: QUESTION_TRIAGE, bundle: h.bundle, drafter: stubDrafter() },
-    { businessId: BUSINESS },
-  );
+  const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: QUESTION_TRIAGE, bundle: h.bundle, drafter: stubDrafter() }));
   if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-  await presentMailCard(
-    raised.approvalId,
-    async (text, jobId) => {
+  await withBusiness(BUSINESS, (db) => presentMailCard(db, raised.approvalId!, async (text, jobId) => {
       const sent = await h.messenger.send({ text, jobId });
       if (!sent.ok) throw new Error(sent.error ?? 'send failed');
-    },
-    { businessId: BUSINESS },
-  );
+    }));
   return { replyJobId: raised.replyJobId, approvalId: raised.approvalId };
 }
 
 function door(h: Harness, planner: (r: PlanRequest) => Promise<PlanOutcome> = neverPlanned) {
-  return runWhatsAppDoor({ gateway: h.gateway, messenger: h.messenger, businessId: BUSINESS, planner });
+  return withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, { gateway: h.gateway, messenger: h.messenger, planner }));
 }
 
 async function approvalsFor(jobId: string) {
@@ -151,7 +144,7 @@ describe('presentMailCard', () => {
     expect(h.gateway.sent).toHaveLength(1);
     expect(lastSent(h)).toContain('dana@client.example');
     expect(lastSent(h).endsWith(MAIL_CARD_INSTRUCTION)).toBe(true);
-    const { rows } = await getPool().query(
+    const { rows } = await testDb().query(
       "SELECT 1 FROM whatsapp_messages WHERE business_id = $1 AND direction = 'outbound' AND job_id = $2",
       [BUSINESS, raised.replyJobId],
     );
@@ -172,7 +165,7 @@ describe('approve-by-WhatsApp', () => {
     const [only] = await approvalsFor(raised.replyJobId);
     expect(only?.state).toBe('approved');
     expect(only?.decided_channel).toBe('whatsapp');
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('execute');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('execute');
   });
 
   it('"שלחי" approves too', async () => {
@@ -186,7 +179,7 @@ describe('approve-by-WhatsApp', () => {
   it('replacement text creates a new pending approval with the edited body and does not send', async () => {
     const h = await harness();
     const raised = await raiseAndPresent(h);
-    const original = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId)); // TENANCY-TODO(task 4)
+    const original = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId));
 
     h.gateway.enqueue(textMsg(PRINCIPAL, '‏נוסח: שלום דנה, ההצעה תגיע ביום ראשון.'));
     const result = await door(h);
@@ -208,9 +201,9 @@ describe('approve-by-WhatsApp', () => {
     expect(lastSent(h)).toContain('שלום דנה, ההצעה תגיע ביום ראשון.');
     expect(lastSent(h).endsWith(MAIL_CARD_INSTRUCTION)).toBe(true);
 
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('await_approval');
     const mailbox = fakeMailboxClient();
-    await runDueJobs({ businessId: BUSINESS, runtime: mailboxRuntime(mailbox.client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: mailboxRuntime(mailbox.client), now: NOON }));
     expect(mailbox.sent).toHaveLength(0);
   });
 
@@ -227,7 +220,7 @@ describe('approve-by-WhatsApp', () => {
     expect(rows.map((r) => r.state)).toEqual(['cancelled', 'approved_with_edit']);
 
     const mailbox = fakeMailboxClient();
-    await runDueJobs({ businessId: BUSINESS, runtime: mailboxRuntime(mailbox.client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: mailboxRuntime(mailbox.client), now: NOON }));
     expect(mailbox.sent).toHaveLength(1);
     expect(mailbox.sent[0]?.body).toBe('נוסח חדש לגמרי');
     expect(mailbox.sent[0]?.to).toEqual(['dana@client.example']);
@@ -260,7 +253,7 @@ describe('approve-by-WhatsApp', () => {
     expect(result.mailCardReplies).toBe(0);
     expect(h.gateway.sent).toHaveLength(before);
     expect((await approvalsFor(raised.replyJobId)).map((r) => r.state)).toEqual(['pending']);
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('await_approval');
   });
 
   it('a voice note inside the window goes to the ordinary door and never approves', async () => {
@@ -269,13 +262,12 @@ describe('approve-by-WhatsApp', () => {
     let planned = 0;
 
     h.gateway.enqueue(audioMsg(PRINCIPAL));
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway: h.gateway,
       messenger: h.messenger,
-      businessId: BUSINESS,
       planner: plannerReached(() => (planned += 1)),
       provider: async () => ({ text: 'שלח' }),
-    });
+    }));
 
     expect(planned).toBe(1);
     expect(result.mailCardReplies).toBe(0);
@@ -322,7 +314,7 @@ describe('approve-by-WhatsApp', () => {
     const a = await raiseAndPresent(h, 1);
     const beforeB = new Date(Date.now() - 1_000).toISOString();
     // Card A is decided on the dashboard; card B is then presented.
-    await getPool().query(
+    await testDb().query(
       "UPDATE approval_requests SET state = 'denied', decided_by = 'p', decided_at = now(), input_hash_at_decision = input_hash WHERE job_id = $1",
       [a.replyJobId],
     );
@@ -359,7 +351,7 @@ describe('approve-by-WhatsApp', () => {
   it('past the window the card is not consumed: "שלח" goes to the instruction door', async () => {
     const h = await harness();
     const raised = await raiseAndPresent(h);
-    await getPool().query(
+    await testDb().query(
       "UPDATE whatsapp_messages SET created_at = now() - interval '31 minutes' WHERE business_id = $1 AND direction = 'outbound'",
       [BUSINESS],
     );
@@ -377,10 +369,7 @@ describe('approve-by-WhatsApp', () => {
   it('a card never presented on WhatsApp opens no window', async () => {
     const h = await harness();
     const mail = await storedMail(BUSINESS);
-    const raised = await raiseMailReply(
-      { mail, triage: QUESTION_TRIAGE, bundle: h.bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: QUESTION_TRIAGE, bundle: h.bundle, drafter: stubDrafter() }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
 
     let planned = 0;

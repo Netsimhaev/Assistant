@@ -182,15 +182,14 @@ async function main(): Promise<void> {
   // intake → understand → plan → execute with NO plan bound, exactly the
   // shape `conduct.ts`'s `beginVerification` uses and for the same reason:
   // `verifyDraft` calls `requestHelp` directly, never through a plan step.
-  const parent = await createJob({
+  const parent = await withBusiness(BUSINESS, (db) => createJob(db, { // TENANCY-TODO(task 7)
     charterVersion: bundle.charterVersion,
     provenance: 'unknown_external',
     title: `${PROBE}: gov.verify מאצילה ל-know.reader`,
-    businessId: BUSINESS,
-  });
+  }));
   openedJobs.push(parent.jobId);
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(parent.jobId, { to, actor: 'orchestrator', reason: `${PROBE}: הכנה`, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, parent.jobId, { to, actor: 'orchestrator', reason: `${PROBE}: הכנה` })); // TENANCY-TODO(task 7)
   }
   console.log(`הורה (gov.verify): ${parent.jobId} · provenance=${parent.provenance}`);
 
@@ -198,15 +197,14 @@ async function main(): Promise<void> {
   // (`VerifyDraftInput.subjectJobId`'s own docblock). Parked in
   // `await_approval`, mirroring the real shape: a card is already up when
   // verification runs.
-  const subject = await createJob({
+  const subject = await withBusiness(BUSINESS, (db) => createJob(db, { // TENANCY-TODO(task 7)
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
     title: `${PROBE}: הנושא שהטיוטה שלו נבדקת`,
-    businessId: BUSINESS,
-  });
+  }));
   openedJobs.push(subject.jobId);
   for (const to of ['understand', 'plan', 'await_approval'] as const) {
-    await transition(subject.jobId, { to, actor: 'orchestrator', reason: `${PROBE}: הכנה`, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, subject.jobId, { to, actor: 'orchestrator', reason: `${PROBE}: הכנה` })); // TENANCY-TODO(task 7)
   }
   console.log(`נושא (הטיוטה שנבדקת): ${subject.jobId}`);
 
@@ -292,13 +290,13 @@ async function main(): Promise<void> {
   }
   // This runs the business's whole `execute` queue — see this file's own
   // docblock. Not scoped to the probe child alone.
-  const due = await runDueJobs({ businessId: BUSINESS, limit: QUEUE_LIMIT });
+  const due = await withBusiness(BUSINESS, (db) => runDueJobs(db, { limit: QUEUE_LIMIT })); // TENANCY-TODO(task 7)
   console.log(`due.ran: ${JSON.stringify(due.ran)}`);
   if (due.errored.length > 0) console.log(`due.errored: ${JSON.stringify(due.errored)}`);
   const childRan = due.ran.find((r) => r.jobId === childJobId);
   check("הילד רץ עד done דרך runDueJobs — לא halted ולא rejected", childRan?.status === 'done');
 
-  const afterRun = await loadJob(childJobId, { businessId: BUSINESS });
+  const afterRun = await withBusiness(BUSINESS, (db) => loadJob(db, childJobId)); // TENANCY-TODO(task 7)
   check("שלב הילד עבר ל-verify אחרי הריצה", afterRun?.phase === 'verify');
 
   banner('שלב 3: סגירת הילד — closeVerifiedJobs, בלי אוצר מוזרק');
@@ -309,23 +307,23 @@ async function main(): Promise<void> {
   // unrelated job sitting in `verify`/`remember` right now. The real,
   // default curator runs for all of them, exactly as production's own
   // scheduler pass would.
-  const verified = await closeVerifiedJobs({ businessId: BUSINESS, limit: QUEUE_LIMIT });
+  const verified = await withBusiness(BUSINESS, (db) => closeVerifiedJobs(db, { limit: QUEUE_LIMIT })); // TENANCY-TODO(task 7)
   console.log(`verified.closed: ${JSON.stringify(verified.closed)}`);
   if (verified.failed.length > 0) console.log(`verified.failed: ${JSON.stringify(verified.failed)}`);
   check('הילד נמצא ברשימת verified.closed', verified.closed.includes(childJobId));
 
-  const closedChild = await loadJob(childJobId, { businessId: BUSINESS });
+  const closedChild = await withBusiness(BUSINESS, (db) => loadJob(db, childJobId)); // TENANCY-TODO(task 7)
   check("שלב הילד הוא closed", closedChild?.phase === 'closed');
 
   // ------------------------------------------------------------ WAKE THE PARENT
   banner('שלב 4: resumeDelegatedJobs — האם ואם מתעוררת');
-  const delegatedResult = await resumeDelegatedJobs({ businessId: BUSINESS, limit: QUEUE_LIMIT });
+  const delegatedResult = await withBusiness(BUSINESS, (db) => resumeDelegatedJobs(db, { limit: QUEUE_LIMIT })); // TENANCY-TODO(task 7)
   console.log(`resumed: ${JSON.stringify(delegatedResult.resumed)}`);
   console.log(`timedOut: ${JSON.stringify(delegatedResult.timedOut)}`);
   if (delegatedResult.errored.length > 0) console.log(`errored: ${JSON.stringify(delegatedResult.errored)}`);
   check('ההורה נמצא ברשימת resumed (לא timedOut, לא errored)', delegatedResult.resumed.includes(parent.jobId));
 
-  const wokenParent = await loadJob(parent.jobId, { businessId: BUSINESS });
+  const wokenParent = await withBusiness(BUSINESS, (db) => loadJob(db, parent.jobId)); // TENANCY-TODO(task 7)
   check("שלב ההורה חזר ל-execute", wokenParent?.phase === 'execute');
   check('awaitingEnvelopeId נוקה', wokenParent?.awaitingEnvelopeId === null);
 
@@ -362,25 +360,22 @@ async function main(): Promise<void> {
       'לא רץ עד judged בפועל היום (docs/09-roadmap.md). הסקריפט הזה סוגר את משימת\n' +
       'ההורה בעצמו, כדי להוכיח שהמנגנון עד כאן שלם — לא כדי לטעון שקורא ייצור עושה זאת.',
   );
-  await transition(parent.jobId, {
+  await withBusiness(BUSINESS, (db) => transition(db, parent.jobId, { // TENANCY-TODO(task 7)
     to: 'verify',
     actor: 'human',
     reason: `${PROBE}: הדגמה בלבד — אין עדיין קורא שממשיך את gov.verify עם התשובה`,
-    businessId: BUSINESS,
-  });
-  await transition(parent.jobId, {
+  }));
+  await withBusiness(BUSINESS, (db) => transition(db, parent.jobId, { // TENANCY-TODO(task 7)
     to: 'remember',
     actor: 'human',
     reason: `${PROBE}: אין מה לאצור — משימת ההדגמה עצמה לא קראה תוכן`,
-    businessId: BUSINESS,
-  });
-  await transition(parent.jobId, {
+  }));
+  await withBusiness(BUSINESS, (db) => transition(db, parent.jobId, { // TENANCY-TODO(task 7)
     to: 'closed',
     actor: 'human',
     reason: `${PROBE}: ההדגמה הושלמה`,
-    businessId: BUSINESS,
-  });
-  const finalParent = await loadJob(parent.jobId, { businessId: BUSINESS });
+  }));
+  const finalParent = await withBusiness(BUSINESS, (db) => loadJob(db, parent.jobId)); // TENANCY-TODO(task 7)
   // This proves `transition()` executed three calls in a row — nothing more.
   // Unlike every check above it, it is not evidence that gov.verify's own
   // flow completed on its own: this script drove the three transitions by
@@ -419,15 +414,14 @@ async function cleanup(): Promise<void> {
   banner('ניקוי');
   for (const jobId of openedJobs) {
     try {
-      const job = await loadJob(jobId, { businessId: BUSINESS });
+      const job = await withBusiness(BUSINESS, (db) => loadJob(db, jobId)); // TENANCY-TODO(task 7)
       if (job === null) continue;
       if (job.phase === 'closed' || job.phase === 'failed' || job.phase === 'halted') continue;
-      await transition(jobId, {
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { // TENANCY-TODO(task 7)
         to: 'failed',
         actor: 'human',
         reason: `${PROBE}: ניקוי הרצה חיה — לא נדרשת המשך`,
-        businessId: BUSINESS,
-      });
+      }));
       console.log(`  ${jobId}: נסגר בניקוי`);
     } catch (err) {
       console.error(`  לא הצלחתי לנקות את ${jobId}: ${err instanceof Error ? err.message : String(err)}`);

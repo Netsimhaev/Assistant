@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { getPool, withBusiness } from '../db/pool.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -27,12 +27,12 @@ describe('collectDigestFacts', () => {
     // INSERT INTO jobs without one fails the constraint, and a job for
     // ANOTHER business cannot reference this row (see the cross-business
     // test below, which installs its own).
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     charterVersion = bundle.charterVersion;
   });
 
   it('reports an empty window as empty rather than as missing', async () => {
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.done.jobsCompleted).toBe(0);
     expect(facts.exceptions).toEqual([]);
     expect(facts.waiting.approvals).toBe(0);
@@ -56,7 +56,7 @@ describe('collectDigestFacts', () => {
        VALUES ('J-bad', (SELECT business_id FROM jobs WHERE job_id = 'J-bad'), 'execute', 'failed', 'orchestrator', 'adapter_timeout')`,
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.done.jobsCompleted).toBe(1);
     expect(facts.exceptions).toHaveLength(1);
     expect(facts.exceptions[0]?.subject).toContain('עדכון המערכת');
@@ -91,7 +91,7 @@ describe('collectDigestFacts', () => {
        VALUES ('J-denied-close', (SELECT business_id FROM jobs WHERE job_id = 'J-denied-close'), 'await_approval', 'closed', 'human', 'denied:AP-1 by owner')`,
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.done.jobsCompleted).toBe(1);
   });
 
@@ -103,7 +103,7 @@ describe('collectDigestFacts', () => {
   it('counts a pending approval raised BEFORE the window as still waiting', async () => {
     // `action_class`, `risk` and `proposed_input` are all NOT NULL with no
     // default (001_spine.sql) — the brief's draft insert omitted them.
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO approval_requests
          (approval_id, business_id, action_class, proposed_tool, summary, detail,
           risk, proposed_input, state, input_hash, expires_at, created_at)
@@ -115,7 +115,7 @@ describe('collectDigestFacts', () => {
       [BUSINESS, new Date(Date.now() + 24 * 60 * 60 * 1000), new Date('2026-10-01T08:00:00+03:00')],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.waiting.approvals).toBe(1);
   });
 
@@ -125,7 +125,7 @@ describe('collectDigestFacts', () => {
    * he learns about it from the result.
    */
   it('names an autonomy promotion that happened inside the window', async () => {
-    await getPool().query(
+    await testDb().query(
       // event_id is TEXT PRIMARY KEY with no default (migration 026).
       `INSERT INTO autonomy_events
          (event_id, business_id, action_class, direction, from_level, to_level, reason, at)
@@ -133,7 +133,7 @@ describe('collectDigestFacts', () => {
       [BUSINESS, new Date('2026-10-07T06:00:00+03:00')],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.permissionChanges).toHaveLength(1);
     // The owner reads Hebrew: the class and both levels arrive translated
     // (`domain/labels.ts`), never as the identifiers stored in the row.
@@ -156,14 +156,14 @@ describe('collectDigestFacts', () => {
       start: new Date(Date.now() - 25 * 60 * 60 * 1000),
       end: new Date(Date.now() - 60 * 60 * 1000),
     };
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO spend_ledger
          (business_id, job_id, action_class, amount_minor, currency, idempotency_key, at)
        VALUES ($1, 'J-ok', 'email.reply', 1250, 'ILS', 'k1', $2)`,
       [BUSINESS, new Date(Date.now() - 2 * 60 * 60 * 1000)],
     );
 
-    const facts = await collectDigestFacts(window, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, window, CEILINGS));
     expect(facts.cost.windowMinor).toBe(1250);
     expect(facts.cost.rolling30Minor).toBe(1250);
     expect(facts.cost.ceilingMinor).toBe(CEILINGS.monthlyMinor);
@@ -192,7 +192,7 @@ describe('collectDigestFacts', () => {
   it('counts spend from before the first of the month inside the rolling window, year-round', async () => {
     const twentyFiveDaysAgo = new Date(Date.now() - 25 * 24 * 60 * 60 * 1000);
     const fortyDaysAgo = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO spend_ledger
          (business_id, job_id, action_class, amount_minor, currency, idempotency_key, at)
        VALUES ($1, 'J-old', 'email.reply', 700, 'ILS', 'k2', $2),
@@ -207,7 +207,7 @@ describe('collectDigestFacts', () => {
       start: new Date(Date.now() - 25 * 60 * 60 * 1000),
       end: new Date(Date.now() - 60 * 60 * 1000),
     };
-    const facts = await collectDigestFacts(window, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, window, CEILINGS));
     expect(facts.cost.rolling30Minor).toBe(700);
     expect(facts.cost.windowMinor).toBe(0);
   });
@@ -216,14 +216,14 @@ describe('collectDigestFacts', () => {
     // `jobs`'s FK on `charter_version` is actually composite
     // `(business_id, charter_version)` (migration 002) — a job for
     // `other-business` needs its OWN charter row, not `BUSINESS`'s.
-    const otherBundle = await withBusiness('other-business', (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
-    await getPool().query(
+    const otherBundle = await withBusiness('other-business', (bdb) => installCharter(bdb, buildCharter()));
+    await testDb().query(
       `INSERT INTO jobs (job_id, business_id, title, phase, charter_version, provenance, content_ingested, closed_at)
        VALUES ('J-other', 'other-business', 'לא שלנו', 'closed', $2, 'boss', false, $1)`,
       [new Date('2026-10-07T07:00:00+03:00'), otherBundle.charterVersion],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.done.jobsCompleted).toBe(0);
   });
 
@@ -233,13 +233,13 @@ describe('collectDigestFacts', () => {
    * counted just because it is closed.
    */
   it('does not count a job closed a week before the window', async () => {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO jobs (job_id, business_id, title, phase, charter_version, provenance, content_ingested, closed_at)
        VALUES ('J-old-close', $1, 'משימה ישנה', 'closed', $3, 'boss', false, $2)`,
       [BUSINESS, new Date('2026-09-29T07:00:00+03:00'), charterVersion],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.done.jobsCompleted).toBe(0);
   });
 
@@ -248,7 +248,7 @@ describe('collectDigestFacts', () => {
    * must not count as something the owner is still waiting on.
    */
   it('does not count an already-expired pending approval as waiting', async () => {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO approval_requests
          (approval_id, business_id, action_class, proposed_tool, summary, detail,
           risk, proposed_input, state, input_hash, expires_at, created_at)
@@ -257,7 +257,7 @@ describe('collectDigestFacts', () => {
       [BUSINESS, new Date('2026-10-01T08:00:00+03:00'), new Date('2026-09-25T08:00:00+03:00')],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.waiting.approvals).toBe(0);
   });
 
@@ -271,7 +271,7 @@ describe('collectDigestFacts', () => {
    * `state = 'expired'`, `decided_at` left NULL — and requires it to surface.
    */
   it('names an approval that expired inside the window', async () => {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO approval_requests
          (approval_id, business_id, action_class, proposed_tool, summary, detail,
           risk, proposed_input, state, input_hash, expires_at, created_at)
@@ -280,7 +280,7 @@ describe('collectDigestFacts', () => {
       [BUSINESS, new Date('2026-10-07T06:00:00+03:00'), new Date('2026-10-06T09:00:00+03:00')],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.exceptions).toHaveLength(1);
     expect(facts.exceptions[0]?.subject).toContain('הצעה לרונית');
     expect(facts.exceptions[0]?.reason).not.toMatch(/[A-Za-z]/);
@@ -311,7 +311,7 @@ describe('collectDigestFacts', () => {
                'draft_only:persist_as_draft — המחלקה עדיין בטיוטה בלבד')`,
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.exceptions).toHaveLength(1);
     expect(facts.exceptions[0]?.reason).toBe(NOT_PERMITTED_TEXT);
     expect(facts.exceptions[0]?.reason).not.toBe(FAILED_GENERIC_TEXT);
@@ -336,7 +336,7 @@ describe('collectDigestFacts', () => {
       [BUSINESS],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.waiting.openQuestions).toBe(1);
   });
 
@@ -348,13 +348,13 @@ describe('collectDigestFacts', () => {
    * directly, with no approval row at all for the job.
    */
   it('counts a job parked in await_approval with no live approval as deferred', async () => {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO jobs (job_id, business_id, title, phase, charter_version, provenance, content_ingested)
        VALUES ('J-parked', $1, 'הצעת מחיר לדנה', 'await_approval', $2, 'boss', false)`,
       [BUSINESS, charterVersion],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.waiting.deferred).toBe(1);
   });
 
@@ -363,7 +363,7 @@ describe('collectDigestFacts', () => {
    * seeded coverage.
    */
   it('names a document rejected at intake inside the window', async () => {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO documents
          (document_id, business_id, source, original_name, media_type, sha256, byte_size, stored_path, status, reason, created_at)
        VALUES ('DOC-1', $1, 'manual', 'חוזה.pdf', 'application/pdf', $3, 12, 'p/doc', 'rejected',
@@ -371,14 +371,14 @@ describe('collectDigestFacts', () => {
       [BUSINESS, new Date('2026-10-07T07:00:00+03:00'), 'a'.repeat(64)],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.exceptions).toHaveLength(1);
     expect(facts.exceptions[0]?.subject).toBe('חוזה.pdf');
     expect(facts.exceptions[0]?.reason).toBe('הקובץ פגום ולא ניתן לקריאה.');
   });
 
   it('names a PDF kept stored because it could not be decoded, but not a pre-reading stored one', async () => {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO documents
          (document_id, business_id, source, original_name, media_type, sha256, byte_size, stored_path, status, reason, created_at)
        VALUES ('DOC-U', $1, 'mail', 'נעול.pdf', 'application/pdf', $3, 12, 'p/u', 'stored', 'הפענוח נכשל: password', $2),
@@ -386,7 +386,7 @@ describe('collectDigestFacts', () => {
       [BUSINESS, new Date('2026-10-07T07:00:00+03:00'), 'b'.repeat(64), 'c'.repeat(64)],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.exceptions).toEqual([{ subject: 'נעול.pdf', reason: 'הפענוח נכשל: password' }]);
   });
 
@@ -415,7 +415,7 @@ describe('collectDigestFacts', () => {
       [BUSINESS, new Date('2026-10-07T07:00:00+03:00')],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.done.messagesSent).toBe(1);
   });
 
@@ -443,7 +443,7 @@ describe('collectDigestFacts', () => {
       [BUSINESS, new Date('2026-10-07T07:00:00+03:00'), JSON.stringify({ summary: 'תקציר' })],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.done.documentsRead).toBe(1);
   });
 
@@ -454,13 +454,13 @@ describe('collectDigestFacts', () => {
    * `provenance` is NOT NULL with no default.
    */
   it('counts a memory written inside the window', async () => {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO memories (memory_id, business_id, kind, subject_key, body, provenance, created_at)
        VALUES ('MEM-1', $1, 'chunk', 'כלשהו', $3::jsonb, 'boss', $2)`,
       [BUSINESS, new Date('2026-10-07T07:00:00+03:00'), JSON.stringify({ text: 'הערה' })],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.done.memoriesWritten).toBe(1);
   });
 
@@ -485,7 +485,7 @@ describe('collectDigestFacts', () => {
       params,
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.exceptions).toHaveLength(20);
     expect(facts.exceptionsHiddenCount).toBe(5);
   });
@@ -518,7 +518,7 @@ describe('collectDigestFacts', () => {
       [BUSINESS, new Date('2026-10-07T07:00:00+03:00'), 'c'.repeat(64)],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.exceptions.some((e) => e.subject === 'הצעת-מחיר-יחידה.pdf')).toBe(true);
     expect(facts.exceptions).toHaveLength(20);
     expect(facts.exceptionsHiddenCount).toBe(3); // 23 total − 20 named
@@ -574,10 +574,9 @@ describe('collectDigestFacts', () => {
     await item('LI-other-open', 'open', new Date('2026-10-01T08:00:00+03:00'), true, { business: 'other-business' });
     await item('LI-other-stuck', 'stuck', null, false, { business: 'other-business' });
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, {
-      businessId: BUSINESS,
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS, {
       now: new Date('2026-10-07T00:30:00+03:00'),
-    });
+    }));
 
     expect(facts.ledger.open).toBe(5);
     expect(facts.ledger.overdue).toBe(2);
@@ -588,7 +587,7 @@ describe('collectDigestFacts', () => {
   });
 
   it('reports a ledger with nothing in it as all zeros', async () => {
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.ledger).toEqual({ open: 0, overdue: 0, stuck: 0, closedByEvidence: 0, topStuck: [] });
   });
   it('counts produced documents in the window, the ones sent, and the cards still waiting', async () => {
@@ -644,7 +643,7 @@ describe('collectDigestFacts', () => {
       [BUSINESS],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.documents).toEqual({ produced: 3, sent: 1, waiting: 2 });
   });
 });

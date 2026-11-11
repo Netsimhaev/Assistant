@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { PolicyBundle } from '../domain/policy.js';
@@ -22,24 +22,22 @@ const BUSINESS = 'test-business';
 const NOON = new Date('2026-08-18T09:00:00.000Z');
 
 async function install(overrides = {}): Promise<PolicyBundle> {
-  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter(overrides))); // TENANCY-TODO(task 4)
+  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter(overrides)));
 }
 
 async function jobInExecute(bundle: PolicyBundle): Promise<Job> {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to,
       actor: 'orchestrator',
       reason: 'setup',
-      businessId: BUSINESS,
-    });
+    }));
   }
-  const loaded = await loadJob(job.jobId, { businessId: BUSINESS });
+  const loaded = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
   if (loaded === null) throw new Error('job vanished');
   return loaded;
 }
@@ -56,9 +54,9 @@ const STRANGER = {
 };
 
 async function parkOnApproval(bundle: PolicyBundle, job: Job) {
-  const queued = await executeStep({
+  const queued = await withBusiness(job.businessId, (db) => executeStep(db, {
     ...STRANGER, job, bundle, perform: async () => NOTHING, now: NOON,
-  });
+  }));
   if (queued.status !== 'awaiting_approval') {
     throw new Error(`expected awaiting_approval, got ${queued.status}`);
   }
@@ -79,17 +77,16 @@ describe('a step resumed from an approval', () => {
     const job = await jobInExecute(bundle);
     const approvalId = await parkOnApproval(bundle, job);
 
-    await applyDecision(approvalId, 'approved',
-      { by: 'p_boss', channel: 'dashboard' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => applyDecision(db, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
 
-    const resumed = await loadJob(job.jobId, { businessId: BUSINESS });
+    const resumed = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     if (resumed === null) throw new Error('job vanished');
 
     let performed = 0;
-    const outcome = await executeStep({
+    const outcome = await withBusiness(resumed.businessId, (db) => executeStep(db, {
       ...STRANGER, job: resumed, bundle, approvalId,
       perform: async () => { performed += 1; return NOTHING; }, now: NOON,
-    });
+    }));
 
     expect(outcome.status).toBe('done');
     expect(performed).toBe(1);
@@ -100,22 +97,20 @@ describe('a step resumed from an approval', () => {
     const job = await jobInExecute(bundle);
     const approvalId = await parkOnApproval(bundle, job);
 
-    await applyDecision(approvalId, 'approved',
-      {
+    await withBusiness(BUSINESS, (db) => applyDecision(db, approvalId, 'approved', {
         by: 'p_boss',
         channel: 'dashboard',
         editedInput: { ...STRANGER.toolInput, body: 'נוסח ערוך' },
-      },
-      { businessId: BUSINESS });
+      }));
 
-    const resumed = await loadJob(job.jobId, { businessId: BUSINESS });
+    const resumed = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     if (resumed === null) throw new Error('job vanished');
 
     const seen: unknown[] = [];
-    await executeStep({
+    await withBusiness(resumed.businessId, (db) => executeStep(db, {
       ...STRANGER, job: resumed, bundle, approvalId,
       perform: async (input) => { seen.push(input); return NOTHING; }, now: NOON,
-    });
+    }));
 
     expect(seen).toHaveLength(1);
     expect((seen[0] as { body: string }).body).toBe('נוסח ערוך');
@@ -139,19 +134,17 @@ describe('a step resumed from an approval', () => {
     const approvalId = await parkOnApproval(bundle, job);
     const edited = { ...STRANGER.toolInput, body: 'נוסח ערוך', counterpartyId: 'c_812' };
 
-    await applyDecision(approvalId, 'approved',
-      { by: 'p_boss', channel: 'dashboard', editedInput: edited },
-      { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => applyDecision(db, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard', editedInput: edited }));
 
-    const resumed = await loadJob(job.jobId, { businessId: BUSINESS });
+    const resumed = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     if (resumed === null) throw new Error('job vanished');
 
     let effective: unknown = null;
-    await executeStep({
+    await withBusiness(resumed.businessId, (db) => executeStep(db, {
       ...STRANGER, job: resumed, bundle, approvalId,
       perform: async (_redacted, forRouting) => { effective = forRouting; return NOTHING; },
       now: NOON,
-    });
+    }));
 
     expect(effective).toEqual(edited);
   });
@@ -164,22 +157,21 @@ describe('a step resumed from an approval', () => {
     const bundle = await install();
     const job = await jobInExecute(bundle);
     const approvalId = await parkOnApproval(bundle, job);
-    await applyDecision(approvalId, 'approved',
-      { by: 'p_boss', channel: 'dashboard' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => applyDecision(db, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
 
-    await getPool().query(
+    await testDb().query(
       `UPDATE approval_requests SET expires_at = now() - interval '1 hour'
         WHERE approval_id = $1`,
       [approvalId],
     );
 
-    const resumed = await loadJob(job.jobId, { businessId: BUSINESS });
+    const resumed = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     if (resumed === null) throw new Error('job vanished');
 
-    const outcome = await executeStep({
+    const outcome = await withBusiness(resumed.businessId, (db) => executeStep(db, {
       ...STRANGER, job: resumed, bundle, approvalId,
       perform: async () => { throw new Error('perform must not run'); }, now: NOON,
-    });
+    }));
 
     expect(outcome.status).toBe('awaiting_approval');
     if (outcome.status !== 'awaiting_approval') return;
@@ -204,28 +196,26 @@ describe('a step resumed from an approval', () => {
     const bundle = await install();
     const other = await jobInExecute(bundle);
     const foreignApprovalId = await parkOnApproval(bundle, other);
-    await applyDecision(foreignApprovalId, 'approved',
-      {
+    await withBusiness(BUSINESS, (db) => applyDecision(db, foreignApprovalId, 'approved', {
         by: 'p_boss',
         channel: 'dashboard',
         editedInput: { ...STRANGER.toolInput, body: 'טקסט של job אחר' },
-      },
-      { businessId: BUSINESS });
+      }));
 
     const mine = await jobInExecute(bundle);
-    const outcome = await executeStep({
+    const outcome = await withBusiness(mine.businessId, (db) => executeStep(db, {
       ...STRANGER, job: mine, bundle, approvalId: foreignApprovalId,
       perform: async () => { throw new Error('perform must not run'); }, now: NOON,
-    });
+    }));
 
     expect(outcome.status).toBe('awaiting_approval');
     if (outcome.status !== 'awaiting_approval') return;
-    const queued = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, outcome.approvalId)); // TENANCY-TODO(task 4)
+    const queued = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, outcome.approvalId));
     expect(queued?.jobId).toBe(mine.jobId);
     expect((queued?.proposedInput as { body: string }).body).toBe('נוסח מקורי');
 
     // And the foreign approval is still unspent — this step never touched it.
-    const foreign = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, foreignApprovalId)); // TENANCY-TODO(task 4)
+    const foreign = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, foreignApprovalId));
     expect(foreign?.state).toBe('approved_with_edit');
   });
 });

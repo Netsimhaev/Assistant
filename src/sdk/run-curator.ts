@@ -20,9 +20,8 @@
  * "the memory row exists" and "the memory reaches a prompt, labelled" are two
  * different claims and only the second one is the feature.
  */
-import pg from 'pg';
 import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, getPool, withBusiness, withBusinessTransaction } from '../db/pool.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { createJob, loadJob, transition } from '../orchestrator/jobs.js';
 import { bindPlanToJob, recordStepCompletion } from '../orchestrator/plan-store.js';
@@ -96,50 +95,38 @@ async function main(): Promise<void> {
   console.log(`זיכרונות על ${RONIT} לפני הריצה: ${before.length}`);
 
   // 1. A job the owner opened, walked to `verify` the way the engine walks it.
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, { // TENANCY-TODO(task 7)
     charterVersion: charter.bundle.charterVersion,
     provenance: 'boss',
     title: TITLE,
-    businessId: BUSINESS,
-  });
+  }));
   console.log(`נפתחה משימה ${job.jobId}`);
 
   const plan = planFor();
-  const binding = await bindPlanToJob(job.jobId, plan, { businessId: BUSINESS });
+  const binding = await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, plan)); // TENANCY-TODO(task 7)
   if (binding.status === 'conflict') throw new Error('bindPlanToJob returned conflict on a fresh job');
 
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'live curator run', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'live curator run' })); // TENANCY-TODO(task 7)
   }
 
   // The step really ran, as far as the record is concerned — `closeVerifiedJobs`
   // refuses to close a job whose plan declares a step with no row.
-  const client: pg.PoolClient = await getPool().connect();
-  try {
-    await client.query('BEGIN');
-    await recordStepCompletion(client, {
-      jobId: job.jobId,
-      businessId: BUSINESS,
-      planHash: binding.planHash,
-      stepId: 's1',
-      externalId: 'live-curator-run',
-      status: 'completed',
-      performed: true,
-    });
-    await client.query('COMMIT');
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
+  await withBusinessTransaction(BUSINESS, (tx) => recordStepCompletion(tx, { // TENANCY-TODO(task 7)
+    jobId: job.jobId,
+    planHash: binding.planHash,
+    stepId: 's1',
+    externalId: 'live-curator-run',
+    status: 'completed',
+    performed: true,
+  }));
 
-  await transition(job.jobId, { to: 'verify', actor: 'orchestrator', reason: 'live curator run', businessId: BUSINESS });
+  await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'verify', actor: 'orchestrator', reason: 'live curator run' })); // TENANCY-TODO(task 7)
   console.log('המשימה ב-verify. קורא ל-closeVerifiedJobs — כאן נופלת הקריאה למודל.');
 
   // 2. The real thing: production's own closer, which calls the curator.
   const started = Date.now();
-  const result = await closeVerifiedJobs({ businessId: BUSINESS });
+  const result = await withBusiness(BUSINESS, (db) => closeVerifiedJobs(db)); // TENANCY-TODO(task 7)
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
 
   console.log('');
@@ -150,7 +137,7 @@ async function main(): Promise<void> {
   console.log(`failed:          ${JSON.stringify(result.failed)}`);
   console.log(`errored:         ${JSON.stringify(result.errored)}`);
 
-  const closed = await loadJob(job.jobId, { businessId: BUSINESS });
+  const closed = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)); // TENANCY-TODO(task 7)
   console.log(`phase של המשימה: ${closed?.phase}`);
 
   // 3. What was actually written, read back from the table itself.

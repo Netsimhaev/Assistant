@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { getApproval, pendingApprovals } from '../governance/approvals.js';
@@ -40,24 +40,22 @@ const NIGHT = new Date('2026-08-18T00:00:00.000Z');
 const NOON = new Date('2026-08-18T09:00:00.000Z');
 
 async function install(overrides = {}): Promise<PolicyBundle> {
-  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter(overrides))); // TENANCY-TODO(task 4)
+  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter(overrides)));
 }
 
 async function jobInExecute(bundle: PolicyBundle) {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to,
       actor: 'orchestrator',
       reason: 'setup',
-      businessId: BUSINESS,
-    });
+    }));
   }
-  const loaded = await loadJob(job.jobId, { businessId: BUSINESS });
+  const loaded = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
   if (loaded === null) throw new Error('job vanished');
   return loaded;
 }
@@ -87,7 +85,7 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
 
     // Deferred at night. Before the scheduler existed this job slept forever:
     // `wakeAt` was written and nothing ever read it.
-    const deferred = await executeStep({
+    const deferred = await withBusiness(job.businessId, (db) => executeStep(db, {
       ...STEP,
       job,
       bundle,
@@ -96,11 +94,11 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
         return NOTHING;
       },
       now: NIGHT,
-    });
+    }));
     expect(deferred.status).toBe('deferred');
     expect(sent).toBe(0);
 
-    const asleep = await loadJob(job.jobId, { businessId: BUSINESS });
+    const asleep = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(asleep?.phase).toBe('followup');
 
     // Too early — the window has not closed yet.
@@ -110,7 +108,7 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
     const later = await tick({ businessId: BUSINESS, now: NOON });
     expect(later.wokenJobs).toEqual([job.jobId]);
 
-    const awake = await loadJob(job.jobId, { businessId: BUSINESS });
+    const awake = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(awake?.phase).toBe('execute');
     // Woken once, not every tick thereafter.
     expect(awake?.wakeAt).toBeNull();
@@ -127,12 +125,12 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
     const job = await jobInExecute(bundle);
     let sent = 0;
 
-    await executeStep({ ...STEP, job, bundle, perform: async () => { sent += 1; return NOTHING; }, now: NIGHT });
+    await withBusiness(job.businessId, (db) => executeStep(db, { ...STEP, job, bundle, perform: async () => { sent += 1; return NOTHING; }, now: NIGHT }));
     await tick({ businessId: BUSINESS, now: NOON });
 
-    const awake = await loadJob(job.jobId, { businessId: BUSINESS });
+    const awake = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     if (awake === null) throw new Error('job vanished');
-    const outcome = await executeStep({
+    const outcome = await withBusiness(awake.businessId, (db) => executeStep(db, {
       ...STEP,
       job: awake,
       bundle,
@@ -141,7 +139,7 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
         return NOTHING;
       },
       now: NOON,
-    });
+    }));
 
     expect(outcome.status).toBe('done');
     expect(sent).toBe(1);
@@ -151,18 +149,18 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
     const bundle = await install();
     const job = await jobInExecute(bundle);
 
-    const queued = await executeStep({
+    const queued = await withBusiness(job.businessId, (db) => executeStep(db, {
       ...STEP,
       job,
       bundle,
       toolInput: { to: 'new@example.com', body: 'פנייה ראשונה' },
       perform: async () => NOTHING,
       now: NOON,
-    });
+    }));
     expect(queued.status).toBe('awaiting_approval');
     if (queued.status !== 'awaiting_approval') throw new Error('unreachable');
 
-    await getPool().query(
+    await testDb().query(
       `UPDATE approval_requests SET expires_at = now() - interval '1 hour' WHERE approval_id = $1`,
       [queued.approvalId],
     );
@@ -170,32 +168,32 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
     const result = await tick({ businessId: BUSINESS, now: NOON });
 
     expect(result.expiredApprovals).toEqual([queued.approvalId]);
-    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, queued.approvalId)))?.state).toBe( // TENANCY-TODO(task 4)
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, queued.approvalId)))?.state).toBe(
       'expired',
     );
     // The job is freed rather than failed: nobody answering is not a rejection.
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('followup');
-    expect(await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb))).toEqual([]); // TENANCY-TODO(task 4)
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.phase).toBe('followup');
+    expect(await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb))).toEqual([]);
   });
 
   it('leaves an approval that is still within its fuse alone', async () => {
     const bundle = await install();
     const job = await jobInExecute(bundle);
 
-    const queued = await executeStep({
+    const queued = await withBusiness(job.businessId, (db) => executeStep(db, {
       ...STEP,
       job,
       bundle,
       toolInput: { to: 'new@example.com', body: 'פנייה' },
       perform: async () => NOTHING,
       now: NOON,
-    });
+    }));
     if (queued.status !== 'awaiting_approval') throw new Error('unreachable');
 
     const result = await tick({ businessId: BUSINESS, now: NOON });
 
     expect(result.expiredApprovals).toEqual([]);
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe(
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.phase).toBe(
       'await_approval',
     );
   });
@@ -242,24 +240,19 @@ describe('a human decision restarts the job it was blocking', () => {
     const bundle = await install();
     const job = await jobInExecute(bundle);
 
-    const queued = await executeStep({
+    const queued = await withBusiness(job.businessId, (db) => executeStep(db, {
       ...STEP,
       job,
       bundle,
       toolInput: { to: 'new@example.com', body: 'פנייה ראשונה' },
       perform: async () => NOTHING,
       now: NOON,
-    });
+    }));
     if (queued.status !== 'awaiting_approval') throw new Error('unreachable');
 
     // `decide` wrote the row and stopped, so the job stayed parked with
     // nothing to restart it.
-    const result = await applyDecision(
-      queued.approvalId,
-      'approved',
-      { by: 'p_boss', channel: 'dashboard' },
-      { businessId: BUSINESS },
-    );
+    const result = await withBusiness(BUSINESS, (db) => applyDecision(db, queued.approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
 
     expect(result.state).toBe('approved');
     expect(result.jobPhase).toBe('execute');
@@ -269,26 +262,21 @@ describe('a human decision restarts the job it was blocking', () => {
     const bundle = await install();
     const job = await jobInExecute(bundle);
 
-    const queued = await executeStep({
+    const queued = await withBusiness(job.businessId, (db) => executeStep(db, {
       ...STEP,
       job,
       bundle,
       toolInput: { to: 'new@example.com', body: 'פנייה ראשונה' },
       perform: async () => NOTHING,
       now: NOON,
-    });
+    }));
     if (queued.status !== 'awaiting_approval') throw new Error('unreachable');
 
-    const result = await applyDecision(
-      queued.approvalId,
-      'denied',
-      { by: 'p_boss', channel: 'dashboard', note: 'לא עכשיו' },
-      { businessId: BUSINESS },
-    );
+    const result = await withBusiness(BUSINESS, (db) => applyDecision(db, queued.approvalId, 'denied', { by: 'p_boss', channel: 'dashboard', note: 'לא עכשיו' }));
 
     // The system did what was asked and a person said no. That is an outcome.
     expect(result.jobPhase).toBe('closed');
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.closedAt).not.toBeNull();
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.closedAt).not.toBeNull();
   });
 });
 
@@ -365,7 +353,7 @@ describe('a delegation resumes in the same pass it is freed', () => {
         },
       ],
     });
-    await bindPlanToJob(job.jobId, plan, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, plan));
 
     const runtime: Runtime = {
       registry: new AdapterRegistry([]),
@@ -375,22 +363,22 @@ describe('a delegation resumes in the same pass it is freed', () => {
 
     // Sets up the state a real earlier scheduler pass would already have
     // produced: the delegation opens, and the parent parks in `followup`.
-    const opening = await runDueJobs({ businessId: BUSINESS, runtime, now: NOON });
+    const opening = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime, now: NOON }));
     const openedEntry = opening.ran.find((r) => r.jobId === job.jobId);
     if (openedEntry === undefined) throw new Error('expected the parent to have run and parked');
     expect(openedEntry.status).toBe('halted');
 
-    const parkedParent = await loadJob(job.jobId, { businessId: BUSINESS });
+    const parkedParent = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(parkedParent?.phase).toBe('followup');
     if (parkedParent?.awaitingEnvelopeId == null) throw new Error('expected an awaiting envelope id');
 
-    const stored = await withBusiness(BUSINESS, (bdb) => loadEnvelopeWithChild(bdb, parkedParent.awaitingEnvelopeId as string)); // TENANCY-TODO(task 4)
+    const stored = await withBusiness(BUSINESS, (bdb) => loadEnvelopeWithChild(bdb, parkedParent.awaitingEnvelopeId as string));
     if (stored?.childJobId == null) throw new Error('expected an attached child job');
     const childJobId = stored.childJobId;
 
     // Close the child, simulating a completed delegation.
     for (const to of ['verify', 'remember', 'closed'] as const) {
-      await transition(childJobId, { to, actor: 'orchestrator', reason: 'test setup', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, childJobId, { to, actor: 'orchestrator', reason: 'test setup' }));
     }
 
     // The critical assertion: ONE schedulerPass both wakes the parent
@@ -407,7 +395,7 @@ describe('a delegation resumes in the same pass it is freed', () => {
     }
     expect(resumedEntry.status).toBe('done');
 
-    const finalParent = await loadJob(job.jobId, { businessId: BUSINESS });
+    const finalParent = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(finalParent?.phase).not.toBe('failed');
   });
 });
@@ -475,7 +463,7 @@ describe('the mail field on SchedulerPassResult', () => {
   it('scrubs a body past its year on every pass, mailbox connected or not', async () => {
     await install();
     const old = new Date(NOON.getTime() - 400 * 24 * 3600_000);
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO mail_messages
          (mail_id, business_id, provider_message_id, thread_id, from_address, subject, received_at, body_text)
        VALUES ('M-old', $1, 'pm-old', 't', 'a@b.example', 's', $2, 'גוף ישן')`,
@@ -517,7 +505,7 @@ describe('the mail field on SchedulerPassResult', () => {
     expect(pass.mailError).toBeNull();
     expect(pass.mail).toMatchObject({ status: 'ok', recorded: 1, triaged: 1, drafts: 1 });
     expect((await getCursor({ businessId: BUSINESS }))?.cursor).toBe('C-1');
-    const pending = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb)); // TENANCY-TODO(task 4)
+    const pending = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb));
     expect(pending).toHaveLength(1);
   });
 });
@@ -531,9 +519,9 @@ describe('the document production loop runs in the pass, right after the plans',
   });
 
   async function queuedProduction(bundle: PolicyBundle): Promise<string> {
-    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
     for (const to of ['understand', 'plan', 'execute', 'followup'] as const) {
-      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
     const { createProduction } = await import('../production/store.js');
     return createProduction({

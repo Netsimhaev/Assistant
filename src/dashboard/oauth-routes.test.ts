@@ -295,7 +295,7 @@ describe('GET /oauth/:system/start', () => {
     const { rows } = await getPool().query('SELECT count(*)::text AS n FROM oauth_states');
     expect(rows[0]?.['n']).toBe('0');
     expect(await readGrantBySystem('office-mail', BUSINESS, key)).toBeNull();
-    const bindings = await loadBindings({ businessId: BUSINESS });
+    const bindings = await withBusiness(BUSINESS, (db) => loadBindings(db));
     expect(bindings.find((b) => b.system === 'office-mail')).toBeUndefined();
   });
 
@@ -398,7 +398,7 @@ describe('GET /oauth/callback', () => {
     expect(body).not.toContain('refresh-token-value');
     expect(body).not.toContain('access-token-value');
 
-    const bindings = await loadBindings({ businessId: BUSINESS });
+    const bindings = await withBusiness(BUSINESS, (db) => loadBindings(db));
     const binding = bindings.find((b) => b.system === SYSTEM);
     expect(binding?.provider).toBe('google');
     expect(binding?.status).toBe('live');
@@ -936,8 +936,7 @@ describe('GET /connections', () => {
    */
   it('shows a recorded operational error even though the binding status is still "live", and shows the last successful call', async () => {
     await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: SYSTEM,
         status: 'live',
         endpoint: null,
@@ -945,9 +944,7 @@ describe('GET /connections', () => {
         provider: 'google',
         lastOkAt: '2026-09-20T08:00:00.000Z',
         lastError: 'ERROR-SENTINEL — הספק דחה את האסימון (401)',
-      },
-      { businessId: BUSINESS, by: USERNAME },
-    );
+      }, { by: USERNAME }));
 
     const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl);
@@ -1103,7 +1100,7 @@ describe('mailbox ceremony', () => {
     expect(grant?.provider).toBe('microsoft');
     expect(grant?.account).toBe('owner@contoso.example');
     expect(grant?.refreshToken).toBe('ms-refresh');
-    const binding = (await loadBindings({ businessId: BUSINESS })).find((b) => b.system === 'mailbox');
+    const binding = (await withBusiness(BUSINESS, (db) => loadBindings(db))).find((b) => b.system === 'mailbox');
     expect(binding?.provider).toBe('microsoft');
     expect(binding?.credentialRef).toBe('OAUTH_MAILBOX');
   });

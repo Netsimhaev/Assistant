@@ -10,10 +10,10 @@ import { link, mkdir, readdir, rename, stat, unlink } from 'node:fs/promises';
 import { basename, extname, join } from 'node:path';
 import { ulid } from 'ulid';
 import { ingestDocument } from '../documents/ingest.js';
+import type { BusinessDb } from '../db/pool.js';
 
 export interface ScanInboxOptions {
   inbox: string;
-  businessId?: string;
   documentRoot?: string;
 }
 
@@ -133,10 +133,10 @@ function claimNameFor(name: string): string {
  * check would be a check with a gap after it: the file could be complete when
  * asked and half-written when read.
  */
-export async function scanInbox(options: ScanInboxOptions): Promise<ScanResult> {
+export async function scanInbox(db: BusinessDb, options: ScanInboxOptions): Promise<ScanResult> {
   const { inbox } = options;
   const scope = {
-    ...(options.businessId !== undefined ? { businessId: options.businessId } : {}),
+    businessId: db.businessId,
     ...(options.documentRoot !== undefined ? { documentRoot: options.documentRoot } : {}),
   };
 

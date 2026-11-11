@@ -59,10 +59,7 @@ afterAll(async () => {
 });
 
 async function bindCalendar(): Promise<void> {
-  await upsertBinding(
-    { system: CALENDAR_SYSTEM, status: 'live', endpoint: null, credentialRef: 'OAUTH_CALENDAR', provider: 'google', lastOkAt: null, lastError: null },
-    { businessId: BUSINESS, by: 'test' },
-  );
+  await withBusiness(BUSINESS, (db) => upsertBinding(db, { system: CALENDAR_SYSTEM, status: 'live', endpoint: null, credentialRef: 'OAUTH_CALENDAR', provider: 'google', lastOkAt: null, lastError: null }, { by: 'test' }));
 }
 
 async function start(client?: CalendarClient, credentials: CredentialSource = CREDENTIALS): Promise<string> {

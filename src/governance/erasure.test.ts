@@ -22,12 +22,11 @@ const SIGNED_SECRET = 'zz-signed-approval-content';
 
 async function seed(): Promise<{ jobId: string }> {
   const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'erase-exec' }))); // TENANCY-TODO(task 6)
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
     title: `מייל אל ${RONIT}`,
-  });
+  }));
   await getPool().query(
     `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
      VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
@@ -43,12 +42,11 @@ async function seed(): Promise<{ jobId: string }> {
 /** A bare job, a fresh charter, nothing else attached. */
 async function bareJob(title: string): Promise<string> {
   const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `er-x-${ulid()}` }))); // TENANCY-TODO(task 6)
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
     title,
-  });
+  }));
   return job.jobId;
 }
 
@@ -199,7 +197,7 @@ describe('executeErasure', () => {
   it('refuses to run a plan that carries a refusal', async () => {
     const { jobId } = await seed();
     for (const to of ['understand', 'plan', 'execute'] as const) {
-      await transition(jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
     const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
     expect(plan.refusals.length).toBeGreaterThan(0);
@@ -474,7 +472,7 @@ describe('executeErasure', () => {
        VALUES ($1, $2, '{}'::jsonb)`,
       [BUSINESS, jobId],
     );
-    await transition(jobId, { to: 'understand', actor: 'orchestrator', reason: 'seed reason', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'understand', actor: 'orchestrator', reason: 'seed reason' }));
     await getPool().query(
       `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id)
        VALUES ($1, $2, 'h1', 's1', 'ext-123')`,
@@ -632,16 +630,15 @@ describe('executeErasure', () => {
     // Legally into `followup`, parked on the envelope above — the shape
     // `requestHelp` (`orchestrator/delegate.ts`) produces for a real
     // delegation.
-    await transition(jobId, { to: 'understand', actor: 'orchestrator', reason: 'x', businessId: BUSINESS });
-    await transition(jobId, { to: 'plan', actor: 'orchestrator', reason: 'x', businessId: BUSINESS });
-    await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'x', businessId: BUSINESS });
-    await transition(jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'understand', actor: 'orchestrator', reason: 'x' }));
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'plan', actor: 'orchestrator', reason: 'x' }));
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'execute', actor: 'orchestrator', reason: 'x' }));
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, {
       to: 'followup',
       actor: 'orchestrator',
       reason: 'parked on a delegation',
       awaitingEnvelopeId: envelopeId,
-      businessId: BUSINESS,
-    });
+    }));
 
     const plan = await buildErasurePlan({ kind: 'contact', identifier }, { businessId: BUSINESS });
     expect(plan.jobIds).toContain(jobId);
@@ -717,7 +714,7 @@ describe('executeErasure', () => {
     // The scheduler wakes it into a live phase after the preview was shown
     // but before the owner confirmed the erasure.
     for (const to of ['understand', 'plan', 'execute'] as const) {
-      await transition(jobId, { to, actor: 'orchestrator', reason: 'woke mid-flight', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { to, actor: 'orchestrator', reason: 'woke mid-flight' }));
     }
 
     await expect(executeErasure(plan, { businessId: BUSINESS })).rejects.toBeInstanceOf(ErasureRefusedError);

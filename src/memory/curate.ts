@@ -102,7 +102,7 @@ export async function curateJob(
     // A mail's triage job carries no plan by design; its brief comes from the
     // stored mail row, and the caller decides which categories qualify.
     if (scope === 'default') {
-      const stored = await loadPlanBody(jobId, { businessId });
+      const stored = await withBusiness(businessId, (db) => loadPlanBody(db, jobId)); // TENANCY-TODO(task 5)
       if (stored === null) return { ...idle, skipped: 'no_plan' };
       if (!jobQualifiesForCuration(stored.plan)) return { ...idle, skipped: 'not_qualified' };
       // A document delivery job (document production §5.7, C18) is never

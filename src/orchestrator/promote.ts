@@ -11,8 +11,7 @@
  * move rather than tallies beside the truth.
  */
 import { ulid } from 'ulid';
-import { config } from '../config.js';
-import { getPool, withBusiness, withBusinessTransaction, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import { ActionClass } from '../domain/action.js';
@@ -61,15 +60,14 @@ export const DEMOTIONS_BEFORE_STOP = 2;
  * promote, or the reverse.
  */
 export async function lastEventAt(
+  db: BusinessDb,
   actionClass: ActionClass,
-  businessId: string,
-  db: Queryable,
 ): Promise<Date | null> {
   const { rows } = await db.query<{ at: Date }>(
     `SELECT at FROM autonomy_events
       WHERE business_id = $1 AND action_class = $2
       ORDER BY at DESC LIMIT 1`,
-    [businessId, actionClass],
+    [db.businessId, actionClass],
   );
   return rows[0]?.at ?? null;
 }
@@ -87,14 +85,13 @@ export async function lastEventAt(
  * into being, which is exactly the start of the period it may judge.
  */
 async function rampUpdatedAt(
+  db: BusinessDb,
   actionClass: ActionClass,
-  businessId: string,
-  db: Queryable,
 ): Promise<Date | null> {
   const { rows } = await db.query<{ updated_at: Date }>(
     `SELECT updated_at FROM autonomy_ramp
       WHERE business_id = $1 AND action_class = $2`,
-    [businessId, actionClass],
+    [db.businessId, actionClass],
   );
   return rows[0]?.updated_at ?? null;
 }
@@ -105,29 +102,27 @@ async function rampUpdatedAt(
  * this pass (a level raised by hand with `npm run ramp:set` has no event row).
  */
 export async function lastPromotionAt(
+  db: BusinessDb,
   actionClass: ActionClass,
-  businessId: string,
-  db: Queryable,
 ): Promise<Date | null> {
   const { rows } = await db.query<{ at: Date }>(
     `SELECT at FROM autonomy_events
       WHERE business_id = $1 AND action_class = $2 AND direction = 'promote'
       ORDER BY at DESC LIMIT 1`,
-    [businessId, actionClass],
+    [db.businessId, actionClass],
   );
   return rows[0]?.at ?? null;
 }
 
 /** Exported for the learning-level screen, for the same reason as `lastEventAt`. */
 export async function demotionCount(
+  db: BusinessDb,
   actionClass: ActionClass,
-  businessId: string,
-  db: Queryable,
 ): Promise<number> {
   const { rows } = await db.query<{ n: string }>(
     `SELECT count(*)::text AS n FROM autonomy_events
       WHERE business_id = $1 AND action_class = $2 AND direction = 'demote'`,
-    [businessId, actionClass],
+    [db.businessId, actionClass],
   );
   return Number(rows[0]?.n ?? '0');
 }
@@ -142,10 +137,9 @@ export async function demotionCount(
  * the assistant learned to do on its own.
  */
 async function markCount(
+  db: BusinessDb,
   actionClass: ActionClass,
-  businessId: string,
   since: Date | null,
-  db: Queryable,
 ): Promise<number> {
   const { rows } = await db.query<{ n: string }>(
     `SELECT count(*)::text AS n FROM autonomy_marks m
@@ -155,7 +149,7 @@ async function markCount(
           SELECT 1 FROM boss_instructions b
            WHERE b.business_id = m.business_id AND b.job_id = m.job_id
         )`,
-    [businessId, actionClass, since],
+    [db.businessId, actionClass, since],
   );
   return Number(rows[0]?.n ?? '0');
 }
@@ -183,10 +177,9 @@ async function markCount(
  * command the owner gave.
  */
 async function failureCount(
+  db: BusinessDb,
   actionClass: ActionClass,
-  businessId: string,
   since: Date | null,
-  db: Queryable,
 ): Promise<number> {
   const { rows } = await db.query<{ n: string }>(
     `SELECT count(DISTINCT jp.job_id)::text AS n
@@ -200,7 +193,7 @@ async function failureCount(
           SELECT 1 FROM boss_instructions b
            WHERE b.business_id = jp.business_id AND b.job_id = jp.job_id
         )`,
-    [businessId, JSON.stringify({ steps: [{ expectedActionClass: actionClass }] }), since],
+    [db.businessId, JSON.stringify({ steps: [{ expectedActionClass: actionClass }] }), since],
   );
   return Number(rows[0]?.n ?? '0');
 }
@@ -239,11 +232,9 @@ function demotionReason(marks: number, failures: number): string {
  * rather than opening one of its own and taking the advisory lock inside a
  * single statement.
  *
- * The transaction is opened here rather than threaded from `evaluateAutonomy`'s
- * `options.db`: that parameter points the READS at a connection, and every
- * caller today leaves it unset. A caller that passed a live transaction there
- * would have its reads and this write on two different connections — recorded
- * because it is a real limit, not because anything relies on it.
+ * The transaction is opened on `db`, the same connection `evaluateAutonomy`
+ * reads on; a caller that passed a `db` already in a transaction has these
+ * four writes join it.
  *
  * `from` is whatever the caller passed — `evaluateAutonomy` passes the raw
  * `autonomy_ramp` row (`loadStoredRampLevel`), not the level the dial made
@@ -251,15 +242,16 @@ function demotionReason(marks: number, failures: number): string {
  * was actually stored at rather than what the gate saw.
  */
 async function move(
+  db: BusinessDb,
   direction: 'promote' | 'demote',
   actionClass: ActionClass,
   from: AutonomyLevel,
   to: AutonomyLevel,
   reason: string,
-  businessId: string,
 ): Promise<void> {
-  await withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 4)
-    await setRampLevel(actionClass, to, { businessId, db: tx });
+  const { businessId } = db;
+  await transaction(db, async (tx) => {
+    await setRampLevel(tx, actionClass, to);
     await tx.query(
       `INSERT INTO autonomy_events
          (event_id, business_id, action_class, direction, from_level, to_level, reason)
@@ -270,7 +262,7 @@ async function move(
       `UPDATE autonomy_ramp
           SET ${direction === 'promote' ? 'promoted_at' : 'demoted_at'} = now(), updated_at = now()
         WHERE business_id = $1 AND action_class = $2`,
-      [businessId, actionClass],
+      [db.businessId, actionClass],
     );
     await appendAudit(tx, {
       actor: 'orchestrator',
@@ -291,11 +283,9 @@ async function move(
  * produced: a card just decided, a job just failed.
  */
 export async function evaluateAutonomy(
-  options: { businessId?: string; db?: Queryable } = {},
+  db: BusinessDb,
 ): Promise<AutonomyPassResult> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
-  const mode = await withBusiness(businessId, (bdb) => loadAutonomyMode(bdb)); // TENANCY-TODO(task 4)
+  const mode = await loadAutonomyMode(db);
 
   const promoted: ActionClass[] = [];
   const demoted: ActionClass[] = [];
@@ -306,8 +296,8 @@ export async function evaluateAutonomy(
     // promotion that did not happen is late; a pass that threw is the whole
     // mechanism down.
     try {
-      const level = await loadRampLevel(actionClass, { businessId, db });
-      const since = await lastEventAt(actionClass, businessId, db);
+      const level = await loadRampLevel(db, actionClass);
+      const since = await lastEventAt(db, actionClass);
 
       // Demotion first, and not gated on the mode: the record of a class that
       // was acting on its own must be able to come back down whatever the
@@ -328,23 +318,23 @@ export async function evaluateAutonomy(
         // one, and otherwise since the level itself was written — see
         // `rampUpdatedAt`. Never the beginning of time, which would let
         // evidence from before the class was ever released count against it.
-        const signalSince = since ?? (await rampUpdatedAt(actionClass, businessId, db));
-        const marks = await markCount(actionClass, businessId, signalSince, db);
-        const failures = await failureCount(actionClass, businessId, signalSince, db);
+        const signalSince = since ?? (await rampUpdatedAt(db, actionClass));
+        const marks = await markCount(db, actionClass, signalSince);
+        const failures = await failureCount(db, actionClass, signalSince);
         if (marks + failures > 0) {
           // `from` is the row's own stored level, not the clamped `level`
           // this pass evaluated — see `loadStoredRampLevel`. The two agree
           // whenever the dial's ceiling did no work; they can differ when it
           // did (a hand-raised `auto` clamped down to `auto_notify` under
           // `learn`), and the event row must name what was actually there.
-          const storedFrom = (await loadStoredRampLevel(actionClass, { businessId, db })) ?? level;
+          const storedFrom = (await loadStoredRampLevel(db, actionClass)) ?? level;
           await move(
+            db,
             'demote',
             actionClass,
             storedFrom,
             EARNED_STEP.from,
             demotionReason(marks, failures),
-            businessId,
           );
           demoted.push(actionClass);
           continue;
@@ -353,11 +343,11 @@ export async function evaluateAutonomy(
 
       if (mode !== 'learn') continue;
       if (level !== EARNED_STEP.from) continue;
-      if ((await demotionCount(actionClass, businessId, db)) >= DEMOTIONS_BEFORE_STOP) continue;
+      if ((await demotionCount(db, actionClass)) >= DEMOTIONS_BEFORE_STOP) continue;
       // The owner agreed more than 80% of the time over at least five verdicts.
       // The "starts again after a move" rule (spec §6.3) is carried by `since`:
       // `agreementFor` only counts cards decided after the last ramp move.
-      const agreement = await withBusiness(businessId, (bdb) => agreementFor(bdb, actionClass, { since })); // TENANCY-TODO(task 4)
+      const agreement = await agreementFor(db, actionClass, { since });
       if (!isLearned(agreement)) continue;
 
       // Spec §5.1.4 — promotion on the windowed agreement rate (>80% of at
@@ -381,14 +371,14 @@ export async function evaluateAutonomy(
       // predates this branch, and it is named here rather than papered over:
       // it would matter the day something asks `failureCount` on the
       // promotion path.
-      const storedFrom = (await loadStoredRampLevel(actionClass, { businessId, db })) ?? level;
+      const storedFrom = (await loadStoredRampLevel(db, actionClass)) ?? level;
       await move(
+        db,
         'promote',
         actionClass,
         storedFrom,
         EARNED_STEP.to,
         `${agreement.right} מתוך ${agreement.counted} הכרעות אחרונות (${Math.round((100 * agreement.right) / agreement.counted)}%)`,
-        businessId,
       );
       promoted.push(actionClass);
     } catch {

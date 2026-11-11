@@ -80,7 +80,7 @@ describe('schedulerPass', () => {
   });
 
   it('wakes a sleeping job and runs its plan in the same pass', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         connections: [MAIL_CONNECTION],
@@ -92,17 +92,15 @@ describe('schedulerPass', () => {
         autonomyBase: { 'email.initiate': 'auto' },
       })
     ));
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'wake and run',
-    });
+    }));
     for (const to of ['understand', 'plan', 'execute'] as const) {
-      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'office-mail',
         status: 'live',
         endpoint: null,
@@ -110,26 +108,23 @@ describe('schedulerPass', () => {
         provider: null,
         lastOkAt: null,
         lastError: null,
-      },
-      { businessId: BUSINESS, by: 'test' },
-    );
-    await bindPlanToJob(job.jobId, PLAN, { businessId: BUSINESS });
+      }, { by: 'test' }));
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, PLAN));
     // The owner's dial (Task 2) defaults to `off`, which clamps
     // `loadRampLevel` to `draft_only` regardless of what is stored — open it
     // first so the promotion below is actually honoured.
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
 
     // Park it asleep, due as of NOON — the same fixed clock passed to
     // `schedulerPass` below, so `tick`'s `wake_at <= now` check finds it
     // regardless of the real wall clock.
-    await transition(job.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'followup',
       actor: 'orchestrator',
       reason: 'parked',
       wakeAt: new Date(NOON.getTime() - 1000),
-      businessId: BUSINESS,
-    });
+    }));
 
     const sent: MailMessage[] = [];
     const pass = await schedulerPass({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
@@ -145,7 +140,7 @@ describe('schedulerPass', () => {
     // production read `verify`, so every job the engine completed stayed there
     // for good. Ordering the close after the run — rather than before it — is
     // what lets one pass take a job from `execute` to `closed`.
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         connections: [MAIL_CONNECTION],
@@ -157,17 +152,15 @@ describe('schedulerPass', () => {
         autonomyBase: { 'email.initiate': 'auto' },
       })
     ));
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'run and close',
-    });
+    }));
     for (const to of ['understand', 'plan', 'execute'] as const) {
-      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'office-mail',
         status: 'live',
         endpoint: null,
@@ -175,22 +168,20 @@ describe('schedulerPass', () => {
         provider: null,
         lastOkAt: null,
         lastError: null,
-      },
-      { businessId: BUSINESS, by: 'test' },
-    );
-    await bindPlanToJob(job.jobId, PLAN, { businessId: BUSINESS });
+      }, { by: 'test' }));
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, PLAN));
     // The owner's dial (Task 2) defaults to `off`, which clamps
     // `loadRampLevel` to `draft_only` regardless of what is stored — open it
     // first so the promotion below is actually honoured.
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
 
     const sent: MailMessage[] = [];
     const pass = await schedulerPass({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
 
     expect(sent).toHaveLength(1);
     expect(pass.verified.closed).toContain(job.jobId);
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('closed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.phase).toBe('closed');
     // Shadow mode (H3): the step this very pass performed on its own is
     // reported in the same pass — the stage runs after the plans. No notify
     // seam on this runtime, and email is a default channel, so the send is
@@ -217,7 +208,7 @@ describe('schedulerPass', () => {
    * empty and the stored row stays `auto_notify`.
    */
   it('demotes a class on a job that failed in this same pass', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         connections: [MAIL_CONNECTION],
@@ -225,17 +216,15 @@ describe('schedulerPass', () => {
         autonomyBase: { 'email.initiate': 'auto' },
       })
     ));
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'run and fail',
-    });
+    }));
     for (const to of ['understand', 'plan', 'execute'] as const) {
-      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'office-mail',
         status: 'live',
         endpoint: null,
@@ -246,15 +235,13 @@ describe('schedulerPass', () => {
         provider: null,
         lastOkAt: null,
         lastError: null,
-      },
-      { businessId: BUSINESS, by: 'test' },
-    );
-    await bindPlanToJob(job.jobId, PLAN, { businessId: BUSINESS });
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
+      }, { by: 'test' }));
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, PLAN));
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
     // The rung a class can actually fall from. `auto` would be clamped to
     // `auto_notify` on read anyway; writing the level the demotion expects
     // makes what is being tested explicit.
-    await setRampLevel('email.initiate', 'auto_notify', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto_notify'));
 
     const sent: MailMessage[] = [];
     const pass = await schedulerPass({
@@ -281,11 +268,11 @@ describe('schedulerPass', () => {
 
     // The failure really happened in this pass, and nothing was sent.
     expect(sent).toHaveLength(0);
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.phase).toBe('failed');
     // And the evaluation that ran after it saw the failure.
     expect(pass.autonomyError).toBeNull();
     expect(pass.autonomy.demoted).toContain('email.initiate');
-    expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe(
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.initiate'))).toBe(
       'approve_required',
     );
   });
@@ -302,24 +289,22 @@ describe('schedulerPass', () => {
    * does not, purely as a function of which runs first within THIS pass.
    */
   it('counts an approval this very pass just raised', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         connections: [MAIL_CONNECTION],
         knownCounterpartyEmailDomain: 'example.com',
       })
     ));
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'needs approval',
-    });
+    }));
     for (const to of ['understand', 'plan', 'execute'] as const) {
-      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'office-mail',
         status: 'live',
         endpoint: null,
@@ -327,13 +312,11 @@ describe('schedulerPass', () => {
         provider: null,
         lastOkAt: null,
         lastError: null,
-      },
-      { businessId: BUSINESS, by: 'test' },
-    );
-    await bindPlanToJob(job.jobId, PLAN, { businessId: BUSINESS });
+      }, { by: 'test' }));
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, PLAN));
     // `ask` clamps floor AND ceiling to `approve_required` for every class —
     // the plan step must queue an approval rather than send or sit in draft.
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'owner@example.com')); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'owner@example.com'));
     await setDigestSettings(
       { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: false },
       'owner',
@@ -346,8 +329,8 @@ describe('schedulerPass', () => {
     // The step really ran and queued an approval, and nothing went out.
     expect(pass.due.ran.map((r) => r.jobId)).toContain(job.jobId);
     expect(sent).toHaveLength(0);
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
-    const stored = await recentDigests({ businessId: BUSINESS });
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.phase).toBe('await_approval');
+    const stored = await withBusiness(BUSINESS, (db) => recentDigests(db));
     expect(stored).toHaveLength(1);
     // Distinctive: this exact count-and-label only appears when
     // `waiting.approvals` is 1, and only `digest-render.ts`'s §3.1 block

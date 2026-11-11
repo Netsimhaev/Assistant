@@ -61,13 +61,13 @@ function expectHalted(result: RunPlanResult, reason: string): void {
 }
 
 async function jobInExecute(bundle: { charterVersion: string }, provenance: 'boss' | 'staff' = 'boss') {
-  const job = await createJob({
-    charterVersion: bundle.charterVersion, provenance, businessId: BUSINESS,
-  });
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
+    charterVersion: bundle.charterVersion, provenance, 
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  const loaded = await loadJob(job.jobId, { businessId: BUSINESS });
+  const loaded = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
   if (loaded === null) throw new Error('job vanished');
   return loaded;
 }
@@ -105,15 +105,15 @@ describe('a boss origin is no longer an exemption, and what replaced it', () => 
    * next test, by the mechanism that can actually express it.
    */
   it('asks even when the boss instructed it and nothing was read', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, permissiveCharter())); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, permissiveCharter()));
     const job = await jobInExecute(bundle);
     const sent: MailMessage[] = [];
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job, bundle, plan: SEND_ONLY, registry: registry(sent), bindings: [LIVE],
       credentials: envCredentials({ [`${PREFIX}OFFICE_MAIL`]: 'pw' }, PREFIX),
       counterpartyTags: [], rampLevel: 'auto', now: NOON,
-    });
+    }));
 
     expectHalted(result, 'awaiting_approval');
     expect(sent).toEqual([]);
@@ -133,37 +133,37 @@ describe('a boss origin is no longer an exemption, and what replaced it', () => 
    * only difference.
    */
   it('sends when the owner’s own instruction named that recipient', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, permissiveCharter())); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, permissiveCharter()));
     const job = await jobInExecute(bundle);
-    await withBusiness(BUSINESS, (bdb) => grantAuthorization( // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization(
       bdb,
       { jobId: job.jobId, actionClass: 'email.initiate', recipients: ['stranger@example.com'] }
     ));
     const sent: MailMessage[] = [];
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job, bundle, plan: SEND_ONLY, registry: registry(sent), bindings: [LIVE],
       credentials: envCredentials({ [`${PREFIX}OFFICE_MAIL`]: 'pw' }, PREFIX),
       counterpartyTags: [], rampLevel: 'auto', now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('done');
     expect(sent).toHaveLength(1);
   });
 
   it('still asks when the job has already ingested content', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, permissiveCharter())); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, permissiveCharter()));
     const job = await jobInExecute(bundle);
-    await markContentIngested(job.jobId, { businessId: BUSINESS });
-    const fresh = await loadJob(job.jobId, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => markContentIngested(db, job.jobId));
+    const fresh = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     if (fresh === null) throw new Error('job vanished');
     const sent: MailMessage[] = [];
 
-    const result = await runPlan({
+    const result = await withBusiness(fresh.businessId, (db) => runPlan(db, {
       job: fresh, bundle, plan: SEND_ONLY, registry: registry(sent), bindings: [LIVE],
       credentials: envCredentials({ [`${PREFIX}OFFICE_MAIL`]: 'pw' }, PREFIX),
       counterpartyTags: [], rampLevel: 'auto', now: NOON,
-    });
+    }));
 
     // Kept after the exempt set was emptied, and still worth its place: it
     // pins `runPlan`'s `!job.contentIngested` conjunct. The outcome no longer
@@ -177,7 +177,7 @@ describe('a boss origin is no longer an exemption, and what replaced it', () => 
   });
 
   it('still asks when the plan itself contains a reader, even after the send step', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, permissiveCharter())); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, permissiveCharter()));
     const job = await jobInExecute(bundle);
     const sent: MailMessage[] = [];
 
@@ -193,11 +193,11 @@ describe('a boss origin is no longer an exemption, and what replaced it', () => 
       ],
     });
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job, bundle, plan: readAfter, registry: registry(sent), bindings: [LIVE],
       credentials: envCredentials({ [`${PREFIX}OFFICE_MAIL`]: 'pw' }, PREFIX),
       counterpartyTags: [], rampLevel: 'auto', now: NOON,
-    });
+    }));
 
     expectHalted(result, 'awaiting_approval');
     expect(sent).toEqual([]);
@@ -226,15 +226,15 @@ describe('a boss origin is no longer an exemption, and what replaced it', () => 
    * property most easily lost by a later edit to the fixture's ceilings.
    */
   it('still asks when the job did not come from the boss', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, permissiveCharter())); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, permissiveCharter()));
     const job = await jobInExecute(bundle, 'staff');
     const sent: MailMessage[] = [];
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job, bundle, plan: SEND_ONLY, registry: registry(sent), bindings: [LIVE],
       credentials: envCredentials({ [`${PREFIX}OFFICE_MAIL`]: 'pw' }, PREFIX),
       counterpartyTags: [], rampLevel: 'auto', now: NOON,
-    });
+    }));
 
     expectHalted(result, 'awaiting_approval');
     expect(sent).toEqual([]);

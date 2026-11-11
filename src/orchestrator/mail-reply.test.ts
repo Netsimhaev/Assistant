@@ -12,7 +12,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import {
   DRAFT_BODY as BODY,
   NOON,
@@ -59,8 +59,9 @@ afterAll(async () => {
 let activeBundle: PolicyBundle | null = null;
 
 function reraise() {
-  if (activeBundle === null) throw new Error('install the charter first');
-  return reraiseAfterFailedSend({ bundle: activeBundle }, { businessId: BUSINESS });
+  const bundle = activeBundle;
+  if (bundle === null) throw new Error('install the charter first');
+  return withBusiness(BUSINESS, (db) => reraiseAfterFailedSend(db, { bundle }));
 }
 
 async function installMailboxCharter(): Promise<PolicyBundle> {
@@ -91,7 +92,7 @@ async function approvalCount(): Promise<number> {
 }
 
 async function approve(approvalId: string, editedInput?: unknown): Promise<void> {
-  const decided = await withBusiness(BUSINESS, (bdb) => decide( // TENANCY-TODO(task 4)
+  const decided = await withBusiness(BUSINESS, (bdb) => decide(
     bdb,
     approvalId,
     'approved',
@@ -101,7 +102,7 @@ async function approve(approvalId: string, editedInput?: unknown): Promise<void>
       ...(editedInput !== undefined ? { editedInput } : {}),
     }
   ));
-  await resumeAfterDecision(decided, 'p_boss', { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (db) => resumeAfterDecision(db, decided, 'p_boss'));
 }
 
 describe('replySubject folds control characters (a subject must never break a header)', () => {
@@ -114,12 +115,9 @@ describe('replySubject folds control characters (a subject must never break a he
   it('a raised reply proposes a subject with no line break in it', async () => {
     const bundle = await installMailboxCharter();
     const mail = await storedMail({ subject: 'Invoice\r\nBcc: v@y.com' });
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 4)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string));
     const subject = (approval?.proposedInput as Record<string, unknown>)['subject'];
     expect(subject).toBe('Re: Invoice Bcc: v@y.com');
   });
@@ -138,14 +136,11 @@ describe('raiseMailReply', () => {
   it('strips bidi controls from the drafted body, so the proposal is what the owner reads', async () => {
     const bundle = await installMailboxCharter();
     const mail = await storedMail();
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle, drafter: stubDrafter('שלום‮ דנה⁦, 500‏ ש"ח') },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter('שלום‮ דנה⁦, 500‏ ש"ח') }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 4)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string));
     expect((approval?.proposedInput as { body: string }).body).toBe('שלום דנה, 500 ש"ח');
-    const stored = await loadPlanBody(raised.replyJobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (db) => loadPlanBody(db, raised.replyJobId));
     expect((stored?.plan.steps[0]?.input as { body: string }).body).toBe('שלום דנה, 500 ש"ח');
   });
 
@@ -154,16 +149,16 @@ describe('raiseMailReply', () => {
     const mail = await storedMail();
     const drafter = stubDrafter();
 
-    const raised = await raiseMailReply({ mail, triage: TRIAGE, bundle, drafter }, { businessId: BUSINESS });
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     expect(drafter.calls).toBe(1);
 
-    const job = await loadJob(raised.replyJobId, { businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId));
     expect(job?.provenance).toBe('unknown_external');
     expect(job?.title).toBe(`תשובה: ${mail.subject}`);
     expect(job?.phase).toBe('await_approval');
 
-    const stored = await loadPlanBody(raised.replyJobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (db) => loadPlanBody(db, raised.replyJobId));
     const step = stored?.plan.steps[0];
     expect(stored?.plan.steps).toHaveLength(1);
     expect(step).toMatchObject({
@@ -184,7 +179,7 @@ describe('raiseMailReply', () => {
     };
     expect(step?.input).toEqual(payload);
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 4)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string));
     expect(approval?.jobId).toBe(raised.replyJobId);
     expect(approval?.proposedTool).toBe('mail.send');
     expect(approval?.actionClass).toBe('email.reply');
@@ -199,12 +194,9 @@ describe('raiseMailReply', () => {
     const bundle = await installMailboxCharter();
     const mail = await storedMail({ replyTo: 'Collect@Elsewhere.example', fromName: null });
 
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 4)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string));
     expect(approval?.summary).toBe('תשובה ל-dana@client.example: מתי תגיע ההצעה?');
     expect(approval?.detail).toContain('dana@client.example');
     expect(approval?.detail).toContain(BODY);
@@ -218,12 +210,9 @@ describe('raiseMailReply', () => {
   it('no Reply-To warning when Reply-To equals From in another case', async () => {
     const bundle = await installMailboxCharter();
     const mail = await storedMail({ replyTo: 'DANA@client.example' });
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 4)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string));
     expect(approval?.detail).not.toContain('שים לב');
   });
 
@@ -231,10 +220,7 @@ describe('raiseMailReply', () => {
     const bundle = await installMailboxCharter();
     const mail = await storedMail();
     const links: string[] = [];
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-      {
-        businessId: BUSINESS,
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }, {
         notify: {
           dashboardBaseUrl: 'https://dash.example',
           notifier: {
@@ -245,11 +231,10 @@ describe('raiseMailReply', () => {
             },
           },
         },
-      },
-    );
+      }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     expect(links).toEqual([`https://dash.example/a/${raised.approvalId}`]);
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('await_approval');
     const { rows } = await getPool().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'incident'`,
       [raised.replyJobId],
@@ -262,7 +247,7 @@ describe('raiseMailReply', () => {
     const mail = await storedMail({ internetMessageId: null });
     const drafter = stubDrafter();
 
-    const raised = await raiseMailReply({ mail, triage: TRIAGE, bundle, drafter }, { businessId: BUSINESS });
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter }));
     expect(raised).toBeNull();
     expect(drafter.calls).toBe(0);
     expect(await approvalCount()).toBe(0);
@@ -274,7 +259,7 @@ describe('raiseMailReply', () => {
     const mail = await storedMail({ fromAddress: '' });
     const drafter = stubDrafter();
 
-    const raised = await raiseMailReply({ mail, triage: TRIAGE, bundle, drafter }, { businessId: BUSINESS });
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter }));
     expect(raised).toBeNull();
     expect(drafter.calls).toBe(0);
     expect(await approvalCount()).toBe(0);
@@ -286,10 +271,7 @@ describe('raiseMailReply', () => {
     const mail = await storedMail();
     // A mail id with no row: `linkReplyJob`, the last write, throws.
     await expect(
-      raiseMailReply(
-        { mail: { ...mail, mailId: 'M-missing' }, triage: TRIAGE, bundle, drafter: stubDrafter() },
-        { businessId: BUSINESS },
-      ),
+      withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail: { ...mail, mailId: 'M-missing' }, triage: TRIAGE, bundle, drafter: stubDrafter() })),
     ).rejects.toThrow(/linkReplyJob/);
     const { rows } = await getPool().query<{ state: string; job_id: string }>(
       'SELECT state, job_id FROM approval_requests WHERE business_id = $1',
@@ -297,7 +279,7 @@ describe('raiseMailReply', () => {
     );
     expect(rows).toHaveLength(1);
     expect(rows[0]?.state).toBe('cancelled');
-    expect((await loadJob(rows[0]?.job_id ?? '', { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, rows[0]?.job_id ?? '')))?.phase).toBe('failed');
   });
 
   it('a failed draft raises no card and opens no job', async () => {
@@ -305,9 +287,9 @@ describe('raiseMailReply', () => {
     const mail = await storedMail();
     const drafter: Drafter = async () => ({ status: 'failed', reason: 'empty draft' });
 
-    expect(await raiseMailReply({ mail, triage: TRIAGE, bundle, drafter }, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter }))).toBeNull();
     expect(await approvalCount()).toBe(0);
-    const { rows } = await getPool().query('SELECT 1 FROM jobs WHERE business_id = $1', [BUSINESS]);
+    const { rows } = await testDb().query('SELECT 1 FROM jobs WHERE business_id = $1', [BUSINESS]);
     expect(rows).toHaveLength(0);
   });
 });
@@ -318,20 +300,17 @@ describe('approve sends, under mode off', () => {
     const mail = await storedMail({ replyTo: 'collect@elsewhere.example' });
     const { client, sent } = fakeClient();
 
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     await approve(raised.approvalId);
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
 
     expect(sent).toHaveLength(1);
     expect(sent[0]?.to).toEqual(['dana@client.example']);
     expect(sent[0]?.inReplyTo).toBe('<q-1@client.example>');
     expect(sent[0]?.providerMessageId).toBe('PM-1');
     expect(sent[0]?.body).toBe(BODY);
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('verify');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('verify');
   });
 
   it('same flow without approval sends nothing', async () => {
@@ -339,20 +318,16 @@ describe('approve sends, under mode off', () => {
     const mail = await storedMail();
     const { client, sent } = fakeClient();
 
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     // R2: reach the gate without a decision — a legal move, the approval
     // stays pending.
-    await transition(raised.replyJobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, raised.replyJobId, {
       to: 'execute',
       actor: 'orchestrator',
       reason: 'test: run without a decision',
-      businessId: BUSINESS,
-    });
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    }));
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
 
     expect(sent).toHaveLength(0);
     const { rows } = await getPool().query<{ reason: string }>(
@@ -360,7 +335,7 @@ describe('approve sends, under mode off', () => {
       [raised.replyJobId],
     );
     expect(rows.some((r) => r.reason.startsWith('draft_only'))).toBe(true);
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('failed');
   });
 
   it('edited approval sends the edited body', async () => {
@@ -368,19 +343,16 @@ describe('approve sends, under mode off', () => {
     const mail = await storedMail();
     const { client, sent } = fakeClient();
 
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 4)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string));
     const edited = { ...(approval?.proposedInput as Record<string, unknown>), body: 'גוף ערוך על ידי הבעלים' };
     await approve(raised.approvalId, edited);
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
 
     expect(sent).toHaveLength(1);
     expect(sent[0]?.body).toBe('גוף ערוך על ידי הבעלים');
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('verify');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('verify');
   });
 });
 
@@ -419,32 +391,28 @@ describe('the stage-8 exemption is a mailbox-reply-job exemption (R20)', () => {
       },
       clarifyingQuestion: null,
     } as unknown as Proposal;
-    const job = await createJob({
-      businessId: BUSINESS,
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'unknown_external',
-    });
+    }));
     for (const to of ['understand', 'plan'] as const) {
-      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'test' }));
     }
     const plan = proposalToPlan(proposal, { goal: 'test' });
     if (plan === null) throw new Error('no plan');
-    await bindPlanToJob(job.jobId, plan, { businessId: BUSINESS });
-    const approvalId = await raiseProposalApproval(
-      { jobId: job.jobId, proposal, bundle },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, plan));
+    const approvalId = await withBusiness(BUSINESS, (db) => raiseProposalApproval(db, { jobId: job.jobId, proposal, bundle }));
     if (approvalId === null) throw new Error('expected a conductor card');
-    const card = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 4)
+    const card = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(card?.detail).toContain(RAMP_HONESTY);
-    await transition(job.jobId, {
-      to: 'await_approval', actor: 'orchestrator', reason: 'test', businessId: BUSINESS,
-    });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
+      to: 'await_approval', actor: 'orchestrator', reason: 'test', 
+    }));
     if (options.linkToMail) await linkReplyJob(mail.mailId, job.jobId, { businessId: BUSINESS });
 
     await approve(approvalId);
     const { client, sent } = fakeClient();
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
     const { rows } = await getPool().query<{ consumed_at: Date | null }>(
       'SELECT consumed_at FROM approval_requests WHERE approval_id = $1',
       [approvalId],
@@ -462,7 +430,7 @@ describe('the stage-8 exemption is a mailbox-reply-job exemption (R20)', () => {
       [jobId],
     );
     expect(rows.some((r) => r.reason.startsWith('draft_only'))).toBe(true);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
   });
 
   it('control: the same approved payload on a mailbox reply job sends', async () => {
@@ -470,7 +438,7 @@ describe('the stage-8 exemption is a mailbox-reply-job exemption (R20)', () => {
 
     expect(sent).toHaveLength(1);
     expect(consumed).not.toBeNull();
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('verify');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('verify');
   });
 });
 
@@ -483,17 +451,14 @@ describe('a new message goes out through the mailbox too, under the gate (R21)',
    */
   async function newMailJob(): Promise<string> {
     const bundle = await installMailboxCharter();
-    const job = await createJob({
-      businessId: BUSINESS,
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-    });
+    }));
     for (const to of ['understand', 'plan'] as const) {
-      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'test' }));
     }
-    await bindPlanToJob(
-      job.jobId,
-      Plan.parse({
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, Plan.parse({
         goal: 'write to Avi',
         steps: [
           {
@@ -505,22 +470,20 @@ describe('a new message goes out through the mailbox too, under the gate (R21)',
             expectedActionClass: 'email.initiate',
           },
         ],
-      }),
-      { businessId: BUSINESS },
-    );
-    await transition(job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
+      })));
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'test' }));
     return job.jobId;
   }
 
   it('asks first, and once approved sends a new message (not a reply) from the mailbox', async () => {
     const jobId = await newMailJob();
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss'));
     const { client, sent, sentNew } = fakeClient();
 
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
     // email.initiate is approve_required in the charter: a card, nothing sent.
     expect(sentNew).toHaveLength(0);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('await_approval');
     const { rows } = await getPool().query<{ approval_id: string }>(
       `SELECT approval_id FROM approval_requests WHERE job_id = $1 AND state = 'pending'`,
       [jobId],
@@ -529,17 +492,17 @@ describe('a new message goes out through the mailbox too, under the gate (R21)',
     if (approvalId === undefined) throw new Error('expected a card');
 
     await approve(approvalId);
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
     expect(sent).toHaveLength(0);
     expect(sentNew).toEqual([{ to: ['avi@partner.example'], subject: 'הצעת מחיר', body: 'מצורפת ההצעה' }]);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('verify');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('verify');
   });
 
   it('under mode off a new message is still refused at stage 8 — no exemption reaches it', async () => {
     const jobId = await newMailJob();
     const { client, sentNew } = fakeClient();
 
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
 
     expect(sentNew).toHaveLength(0);
     const { rows } = await getPool().query<{ reason: string }>(
@@ -559,13 +522,11 @@ describe('an instruction-door reply goes out threaded through the mailbox', () =
    */
   async function instructedReplyJob(inReplyTo: string): Promise<string> {
     const bundle = await installMailboxCharter();
-    const job = await createJob({ businessId: BUSINESS, charterVersion: bundle.charterVersion, provenance: 'boss' });
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
     for (const to of ['understand', 'plan'] as const) {
-      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'test' }));
     }
-    await bindPlanToJob(
-      job.jobId,
-      Plan.parse({
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, Plan.parse({
         goal: 'answer Dana',
         steps: [
           {
@@ -577,10 +538,8 @@ describe('an instruction-door reply goes out threaded through the mailbox', () =
             expectedActionClass: 'email.reply',
           },
         ],
-      }),
-      { businessId: BUSINESS },
-    );
-    await transition(job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
+      })));
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'test' }));
     return job.jobId;
   }
 
@@ -597,16 +556,16 @@ describe('an instruction-door reply goes out threaded through the mailbox', () =
   it('asks first, and once approved sends a reply on the stored thread', async () => {
     await storedMail();
     const jobId = await instructedReplyJob('<q-1@client.example>');
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss'));
     const { client, sent, sentNew } = fakeClient();
 
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
     // The gate ran: under `ask` the reply is approve_required, so a card.
     expect(sent).toHaveLength(0);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('await_approval');
 
     await approve(await pendingCardFor(jobId));
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
 
     expect(sentNew).toHaveLength(0);
     expect(sent).toEqual([
@@ -620,22 +579,22 @@ describe('an instruction-door reply goes out threaded through the mailbox', () =
         providerMessageId: 'PM-1',
       },
     ]);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('verify');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('verify');
   });
 
   it('an approved reply to a mail the business never received fails reply_target_unknown, sending nothing', async () => {
     await storedMail();
     const jobId = await instructedReplyJob('<never-received@client.example>');
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss'));
     const { client, sent, sentNew } = fakeClient();
 
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
     await approve(await pendingCardFor(jobId));
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
 
     expect(sent).toHaveLength(0);
     expect(sentNew).toHaveLength(0);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
     const { rows } = await getPool().query<{ reason: string }>(
       `SELECT reason FROM job_steps WHERE job_id = $1 AND to_phase = 'failed'`,
       [jobId],
@@ -649,13 +608,10 @@ describe('reraiseAfterFailedSend', () => {
     const bundle = await installMailboxCharter();
     const mail = await storedMail();
     const { client, sent } = fakeClient(results);
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     await approve(raised.approvalId);
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
     return { bundle, mail, client, sent, raised: { replyJobId: raised.replyJobId, approvalId: raised.approvalId } };
   }
 
@@ -675,16 +631,16 @@ describe('reraiseAfterFailedSend', () => {
     expect(sent).toHaveLength(1);
     // Retryable: parked in followup. Waking it reaches the gate with the
     // approval already spent — stage 8 refuses, and the job fails.
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('followup');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('followup');
     // Not yet failed: nothing to re-raise.
     expect((await reraise()).reraised).toBe(0);
 
-    await transition(raised.replyJobId, {
-      to: 'execute', actor: 'orchestrator', reason: 'test: wake', businessId: BUSINESS,
-    });
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await withBusiness(BUSINESS, (db) => transition(db, raised.replyJobId, {
+      to: 'execute', actor: 'orchestrator', reason: 'test: wake', 
+    }));
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
     expect(sent).toHaveLength(1);
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('failed');
 
     const first = await reraise();
     expect(first.reraised).toBe(1);
@@ -697,10 +653,10 @@ describe('reraiseAfterFailedSend', () => {
     expect(card.detail.startsWith(RETRY_PREFIX)).toBe(true);
     expect(card.detail).not.toContain(MAY_HAVE_SENT_WARNING);
 
-    const fresh = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, card.approval_id)); // TENANCY-TODO(task 4)
-    const old = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId)); // TENANCY-TODO(task 4)
+    const fresh = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, card.approval_id));
+    const old = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId));
     expect(fresh?.proposedInput).toEqual(old?.proposedInput);
-    const newJob = await loadJob(card.job_id, { businessId: BUSINESS });
+    const newJob = await withBusiness(BUSINESS, (db) => loadJob(db, card.job_id));
     expect(newJob?.provenance).toBe('unknown_external');
     expect(newJob?.phase).toBe('await_approval');
     expect((await mailRow(mail.mailId)).reply_job_id).toBe(card.job_id);
@@ -708,9 +664,9 @@ describe('reraiseAfterFailedSend', () => {
     // Approving the fresh card sends — the retry is a real second chance.
     await approve(card.approval_id);
     const second = fakeClient();
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(second.client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(second.client), now: NOON }));
     expect(second.sent).toHaveLength(1);
-    expect((await loadJob(card.job_id, { businessId: BUSINESS }))?.phase).toBe('verify');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, card.job_id)))?.phase).toBe('verify');
   });
 
   it('running it twice raises no second card', async () => {
@@ -724,7 +680,7 @@ describe('reraiseAfterFailedSend', () => {
     const { mail, raised } = await approvedAndRun([{ failure: 'rejected', status: 400, message: 'bad request' }]);
     // Two re-raisers that both listed this row: only the claim's row count
     // separates them (a timing-free stand-in for the race).
-    const listed = await getPool().query('SELECT 1 FROM mail_messages WHERE reply_job_id = $1', [raised.replyJobId]);
+    const listed = await testDb().query('SELECT 1 FROM mail_messages WHERE reply_job_id = $1', [raised.replyJobId]);
     expect(listed.rows).toHaveLength(1);
     expect(await claimFailedReply(mail.mailId, raised.replyJobId, { businessId: BUSINESS })).toBe(true);
     expect(await claimFailedReply(mail.mailId, raised.replyJobId, { businessId: BUSINESS })).toBe(false);
@@ -732,7 +688,7 @@ describe('reraiseAfterFailedSend', () => {
 
   it('delivery_unknown carries the may-have-sent warning', async () => {
     const { raised } = await approvedAndRun([{ failure: 'transient', status: 0, message: 'socket dropped' }]);
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('failed');
     expect((await reraise()).reraised).toBe(1);
     const cards = await pendingCards();
     expect(cards[0]?.detail).toContain(`${RETRY_PREFIX}\n${MAY_HAVE_SENT_WARNING}`);
@@ -741,30 +697,24 @@ describe('reraiseAfterFailedSend', () => {
   it('a job the gate refused before any approval was spent is not re-raised', async () => {
     const bundle = await installMailboxCharter();
     const mail = await storedMail();
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-    await transition(raised.replyJobId, {
-      to: 'execute', actor: 'orchestrator', reason: 'test', businessId: BUSINESS,
-    });
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(fakeClient().client), now: NOON });
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    await withBusiness(BUSINESS, (db) => transition(db, raised.replyJobId, {
+      to: 'execute', actor: 'orchestrator', reason: 'test', 
+    }));
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(fakeClient().client), now: NOON }));
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('failed');
     expect((await reraise()).reraised).toBe(0);
   });
 
   it('an owner denial closes the job and is not re-raised', async () => {
     const bundle = await installMailboxCharter();
     const mail = await storedMail();
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-    const decided = await withBusiness(BUSINESS, (bdb) => decide(bdb, raised.approvalId as string, 'denied', { by: 'p_boss', channel: 'dashboard' })); // TENANCY-TODO(task 4)
-    await resumeAfterDecision(decided, 'p_boss', { businessId: BUSINESS });
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('closed');
+    const decided = await withBusiness(BUSINESS, (bdb) => decide(bdb, raised.approvalId as string, 'denied', { by: 'p_boss', channel: 'dashboard' }));
+    await withBusiness(BUSINESS, (db) => resumeAfterDecision(db, decided, 'p_boss'));
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('closed');
     expect((await reraise()).reraised).toBe(0);
   });
 
@@ -777,28 +727,25 @@ describe('reraiseAfterFailedSend', () => {
       const bundle = await installMailboxCharter();
       const mail = await storedMail();
       const { client, sent } = fakeClient();
-      const raised = await raiseMailReply(
-        { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-        { businessId: BUSINESS },
-      );
+      const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
       if (raised === null || raised.approvalId === null) throw new Error('expected a card');
       await approve(raised.approvalId);
-      await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NIGHT });
+      await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NIGHT }));
       expect(sent).toHaveLength(0);
-      expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('followup');
+      expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('followup');
       return { mail, client, sent, raised: { replyJobId: raised.replyJobId, approvalId: raised.approvalId } };
     }
 
     async function expire(approvalId: string): Promise<void> {
-      await getPool().query(
+      await testDb().query(
         `UPDATE approval_requests SET expires_at = now() - interval '1 minute' WHERE approval_id = $1`,
         [approvalId],
       );
     }
 
     async function wakeAndRun(jobId: string, client: Parameters<typeof runtimeWith>[0]): Promise<void> {
-      await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'test: wake', businessId: BUSINESS });
-      await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'execute', actor: 'orchestrator', reason: 'test: wake' }));
+      await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
     }
 
     it('is re-asked once, saying the approval expired, and approving the fresh card sends', async () => {
@@ -807,7 +754,7 @@ describe('reraiseAfterFailedSend', () => {
       await wakeAndRun(raised.replyJobId, client);
       // Without the approval the woken step dies at stage 8 — the "yes" lost.
       expect(sent).toHaveLength(0);
-      expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+      expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('failed');
 
       const first = await reraise();
       expect(first.reraised).toBe(1);
@@ -819,15 +766,15 @@ describe('reraiseAfterFailedSend', () => {
       expect(card.detail).not.toContain(RETRY_PREFIX);
       expect(card.detail).not.toContain(MAY_HAVE_SENT_WARNING);
       expect((await mailRow(mail.mailId)).reply_job_id).toBe(card.job_id);
-      const fresh = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, card.approval_id)); // TENANCY-TODO(task 4)
-      const old = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId)); // TENANCY-TODO(task 4)
+      const fresh = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, card.approval_id));
+      const old = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId));
       expect(fresh?.proposedInput).toEqual(old?.proposedInput);
 
       expect((await reraise()).reraised).toBe(0);
 
       await approve(card.approval_id);
       const second = fakeClient();
-      await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(second.client), now: NOON });
+      await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(second.client), now: NOON }));
       expect(second.sent).toHaveLength(1);
     });
 
@@ -835,22 +782,19 @@ describe('reraiseAfterFailedSend', () => {
       const bundle = await installMailboxCharter();
       const mail = await storedMail();
       const { client } = fakeClient();
-      const raised = await raiseMailReply(
-        { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-        { businessId: BUSINESS },
-      );
+      const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
       if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-      const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 4)
+      const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string));
       const edited = { ...(approval?.proposedInput as Record<string, unknown>), body: 'גוף ערוך' };
       await approve(raised.approvalId, edited);
-      await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NIGHT });
+      await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NIGHT }));
       await expire(raised.approvalId);
       await wakeAndRun(raised.replyJobId, client);
 
       expect((await reraise()).reraised).toBe(1);
       const card = (await pendingCards())[0];
       if (card === undefined) throw new Error('no card');
-      const fresh = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, card.approval_id)); // TENANCY-TODO(task 4)
+      const fresh = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, card.approval_id));
       expect((fresh?.proposedInput as Record<string, unknown>)['body']).toBe('גוף ערוך');
     });
 
@@ -858,10 +802,10 @@ describe('reraiseAfterFailedSend', () => {
       // The job failed for its own reason while the approval was still live;
       // that "yes" was not lost to expiry, so nothing is re-asked.
       const { client, raised } = await approvedThenDeferred();
-      await transition(raised.replyJobId, {
-        to: 'failed', actor: 'orchestrator', reason: 'test: failed for another reason', businessId: BUSINESS,
-      });
-      await getPool().query(
+      await withBusiness(BUSINESS, (db) => transition(db, raised.replyJobId, {
+        to: 'failed', actor: 'orchestrator', reason: 'test: failed for another reason', 
+      }));
+      await testDb().query(
         `UPDATE job_steps SET at = now() - interval '2 hours' WHERE job_id = $1 AND to_phase = 'failed'`,
         [raised.replyJobId],
       );
@@ -875,19 +819,16 @@ describe('reraiseAfterFailedSend', () => {
     it('an owner-denied card is never re-raised, even past its expiry', async () => {
       const bundle = await installMailboxCharter();
       const mail = await storedMail();
-      const raised = await raiseMailReply(
-        { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-        { businessId: BUSINESS },
-      );
+      const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
       if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-      const decided = await withBusiness(BUSINESS, (bdb) => decide(bdb, raised.approvalId as string, 'denied', { by: 'p_boss', channel: 'dashboard' })); // TENANCY-TODO(task 4)
-      await resumeAfterDecision(decided, 'p_boss', { businessId: BUSINESS });
+      const decided = await withBusiness(BUSINESS, (bdb) => decide(bdb, raised.approvalId as string, 'denied', { by: 'p_boss', channel: 'dashboard' }));
+      await withBusiness(BUSINESS, (db) => resumeAfterDecision(db, decided, 'p_boss'));
       await expire(raised.approvalId);
       // Even forced onto the failed path, a denial is not an approval to re-ask.
       // Phase AND a failed step after the expiry: every other condition of
       // the expired branch holds, so only the approval's state refuses it.
-      await getPool().query(`UPDATE jobs SET phase = 'failed' WHERE job_id = $1`, [raised.replyJobId]);
-      await getPool().query(
+      await testDb().query(`UPDATE jobs SET phase = 'failed' WHERE job_id = $1`, [raised.replyJobId]);
+      await testDb().query(
         `INSERT INTO job_steps (job_id, business_id, from_phase, to_phase, actor, reason)
          VALUES ($1, (SELECT business_id FROM jobs WHERE job_id = $1), 'closed', 'failed', 'test', 'test: forced')`,
         [raised.replyJobId],
@@ -910,24 +851,20 @@ describe('reraiseAfterFailedSend', () => {
     const failed: string[] = [];
     for (const n of [1, 2]) {
       const mail = await storedMail({ providerMessageId: `PM-${n}`, internetMessageId: `<q-${n}@client.example>` });
-      const raised = await raiseMailReply(
-        { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-        { businessId: BUSINESS },
-      );
+      const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
       if (raised === null || raised.approvalId === null) throw new Error('expected a card');
       await approve(raised.approvalId);
       failed.push(mail.mailId);
     }
-    await runDueJobs({
-      businessId: BUSINESS,
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, {
       runtime: runtimeWith(fakeClient([{ failure: 'rejected', status: 400, message: 'bad' }]).client),
       now: NOON,
-    });
+    }));
 
     // A charter version no row carries: `createJob` fails its foreign key for
     // every row, so both re-raises fail after their claim.
     const broken = { ...bundle, charterVersion: 'no-such-version' };
-    const result = await reraiseAfterFailedSend({ bundle: broken }, { businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => reraiseAfterFailedSend(db, { bundle: broken }));
     expect(result).toMatchObject({ reraised: 0, failed: 2 });
     for (const mailId of failed) expect((await mailRow(mailId)).error).toBe('reraise_failed');
     expect(await approvalCount()).toBe(2);
@@ -941,8 +878,8 @@ describe('a reply the assistant has LEARNED goes without a card (owner ruling H1
       'google',
       options.knownDomain !== undefined ? { knownCounterpartyEmailDomain: options.knownDomain } : {},
     );
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner')); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner'));
     return activeBundle;
   }
 
@@ -958,14 +895,11 @@ describe('a reply the assistant has LEARNED goes without a card (owner ruling H1
     const bundle = await learned({ knownDomain: 'client.example' });
     const mail = await storedMail();
 
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
     if (raised === null) throw new Error('expected a reply job');
     expect(raised.approvalId).toBeNull();
     expect(await approvalCount()).toBe(0);
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('execute');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('execute');
     expect((await mailRow(mail.mailId)).reply_job_id).toBe(raised.replyJobId);
 
     const { client, sent } = fakeClient();
@@ -986,28 +920,22 @@ describe('a reply the assistant has LEARNED goes without a card (owner ruling H1
     const bundle = await learned();
     const mail = await storedMail();
 
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
     if (raised === null) throw new Error('expected a reply job');
     expect(raised.approvalId).not.toBeNull();
     expect(await approvalCount()).toBe(1);
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('await_approval');
   });
 
   it('a known sender under learn, but a class NOT yet promoted, still gets a card', async () => {
     activeBundle = await installFor(BUSINESS, 'google', { knownCounterpartyEmailDomain: 'client.example' });
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner')); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner'));
     const mail = await storedMail();
 
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle: activeBundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle: activeBundle!, drafter: stubDrafter() }));
     if (raised === null) throw new Error('expected a reply job');
     expect(raised.approvalId).not.toBeNull();
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('await_approval');
   });
 
   async function learnedCards(): Promise<Array<{ approval_id: string; job_id: string; detail: string }>> {
@@ -1022,10 +950,7 @@ describe('a reply the assistant has LEARNED goes without a card (owner ruling H1
   async function raiseLearned(): Promise<{ mail: StoredMail; replyJobId: string }> {
     const bundle = await learned({ knownDomain: 'client.example' });
     const mail = await storedMail();
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
     if (raised === null || raised.approvalId !== null) throw new Error('expected a card-less reply job');
     return { mail, replyJobId: raised.replyJobId };
   }
@@ -1043,13 +968,13 @@ describe('a reply the assistant has LEARNED goes without a card (owner ruling H1
       },
       sendNew: async () => new Promise<never>(() => {}),
     } as unknown as Parameters<typeof runtimeWith>[0];
-    const job = await loadJob(replyJobId, { businessId: BUSINESS });
-    const stored = await loadPlanBody(replyJobId, { businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => loadJob(db, replyJobId));
+    const stored = await withBusiness(BUSINESS, (db) => loadPlanBody(db, replyJobId));
     if (job === null || stored === null) throw new Error('no job or plan');
     const runtime = runtimeWith(hanging);
-    const first = await runPlanForJob({
+    const first = await withBusiness(job.businessId, (db) => runPlanForJob(db, {
       job,
-      bundle: activeBundle,
+      bundle: activeBundle!,
       plan: stored.plan,
       registry: runtime.registry,
       credentials: runtime.credentials,
@@ -1057,17 +982,17 @@ describe('a reply the assistant has LEARNED goes without a card (owner ruling H1
       rampLevel: 'auto_notify',
       now: NOON,
       adapterTimeoutMs: 200,
-    });
+    }));
     expect(first.status).toBe('halted');
     expect(hung).toHaveLength(1);
-    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('followup');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, replyJobId)))?.phase).toBe('followup');
 
     // Due now; one pass with a provider that would answer.
-    await getPool().query(`UPDATE jobs SET wake_at = $2 WHERE job_id = $1`, [replyJobId, new Date(NOON.getTime() - 60_000)]);
+    await testDb().query(`UPDATE jobs SET wake_at = $2 WHERE job_id = $1`, [replyJobId, new Date(NOON.getTime() - 60_000)]);
     const { client, sent } = fakeClient();
     await schedulerPass({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON, inbox: null });
     expect(sent).toHaveLength(0);
-    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, replyJobId)))?.phase).toBe('failed');
     expect(await approvalCount()).toBe(0);
 
     const result = await reraise();
@@ -1083,12 +1008,11 @@ ${MAY_HAVE_SENT_WARNING}`);
 
   it('delivery_unknown on a learned job raises one card, warning it may have sent', async () => {
     const { replyJobId } = await raiseLearned();
-    await runDueJobs({
-      businessId: BUSINESS,
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, {
       runtime: runtimeWith(fakeClient([{ failure: 'transient', status: 0, message: 'socket dropped' }]).client),
       now: NOON,
-    });
-    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    }));
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, replyJobId)))?.phase).toBe('failed');
 
     expect((await reraise()).reraised).toBe(1);
     const cards = await learnedCards();
@@ -1100,12 +1024,11 @@ ${MAY_HAVE_SENT_WARNING}`);
 
   it('a terminal failure on a learned job raises one card, with no may-have-sent warning', async () => {
     const { replyJobId } = await raiseLearned();
-    await runDueJobs({
-      businessId: BUSINESS,
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, {
       runtime: runtimeWith(fakeClient([{ failure: 'rejected', status: 400, message: 'bad' }]).client),
       now: NOON,
-    });
-    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    }));
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, replyJobId)))?.phase).toBe('failed');
 
     expect((await reraise()).reraised).toBe(1);
     const cards = await learnedCards();
@@ -1116,11 +1039,11 @@ ${MAY_HAVE_SENT_WARNING}`);
 
   it('the dial flipped to off between the fork and the run: no send, then one card', async () => {
     const { replyJobId } = await raiseLearned();
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner')); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner'));
     const { client, sent } = fakeClient();
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
     expect(sent).toHaveLength(0);
-    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, replyJobId)))?.phase).toBe('failed');
 
     expect((await reraise()).reraised).toBe(1);
     expect(await learnedCards()).toHaveLength(1);
@@ -1129,7 +1052,7 @@ ${MAY_HAVE_SENT_WARNING}`);
   it('a learned job that succeeded is never re-raised', async () => {
     await raiseLearned();
     const { client, sent } = fakeClient();
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
     expect(sent).toHaveLength(1);
     expect((await reraise()).reraised).toBe(0);
     expect(await approvalCount()).toBe(0);
@@ -1138,11 +1061,11 @@ ${MAY_HAVE_SENT_WARNING}`);
   it('a learned job whose send completed is not re-raised, even if it later failed', async () => {
     const { replyJobId } = await raiseLearned();
     const { client, sent } = fakeClient();
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
     expect(sent).toHaveLength(1);
     // Forced onto the failed path: every other condition of the learned
     // branch holds, so only the completed step result refuses it.
-    await getPool().query(`UPDATE jobs SET phase = 'failed' WHERE job_id = $1`, [replyJobId]);
+    await testDb().query(`UPDATE jobs SET phase = 'failed' WHERE job_id = $1`, [replyJobId]);
     expect((await reraise()).reraised).toBe(0);
   });
 
@@ -1150,10 +1073,10 @@ ${MAY_HAVE_SENT_WARNING}`);
     // The learned job, its marker row rewritten: only the marker separates
     // it from a reply job that failed some other way.
     const { replyJobId } = await raiseLearned();
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner')); // TENANCY-TODO(task 4)
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(fakeClient().client), now: NOON });
-    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
-    await getPool().query(
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner'));
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(fakeClient().client), now: NOON }));
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, replyJobId)))?.phase).toBe('failed');
+    await testDb().query(
       `UPDATE job_steps SET reason = 'mail reply: something else' WHERE job_id = $1 AND reason = $2`,
       [replyJobId, LEARNED_NO_CARD_REASON],
     );
@@ -1162,9 +1085,9 @@ ${MAY_HAVE_SENT_WARNING}`);
 
   it('two re-raisers racing on one failed learned job raise exactly one card', async () => {
     const { replyJobId } = await raiseLearned();
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner')); // TENANCY-TODO(task 4)
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(fakeClient().client), now: NOON });
-    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner'));
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(fakeClient().client), now: NOON }));
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, replyJobId)))?.phase).toBe('failed');
 
     const [a, b] = await Promise.all([reraise(), reraise()]);
     expect(a.reraised + b.reraised).toBe(1);
@@ -1176,29 +1099,25 @@ ${MAY_HAVE_SENT_WARNING}`);
     const bundle = await installFor(BUSINESS, 'google', { knownCounterpartyEmailDomain: 'client.example' });
     activeBundle = bundle;
     const mail = await storedMail();
-    const raised = await raiseMailReply(
-      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter: stubDrafter() }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     await approve(raised.approvalId);
-    await runDueJobs({
-      businessId: BUSINESS,
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, {
       runtime: runtimeWith(fakeClient([{ failure: 'rejected', status: 400, message: 'bad' }]).client),
       now: NOON,
-    });
-    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    }));
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('failed');
 
     // Now the class is learned, and the sender is known — every other
     // condition for a card-less send holds.
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner')); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner'));
 
     const result = await reraise();
     expect(result.reraised).toBe(1);
     expect(result.approvalIds).toHaveLength(1);
     const fresh = (await mailRow(mail.mailId)).reply_job_id;
     if (fresh === null) throw new Error('mail not relinked');
-    expect((await loadJob(fresh, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, fresh)))?.phase).toBe('await_approval');
   });
 });

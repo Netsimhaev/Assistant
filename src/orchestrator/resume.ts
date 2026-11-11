@@ -1,8 +1,7 @@
-import { config } from '../config.js';
 import { decide, getApproval, type ApprovalRequest, type Decision } from '../governance/approvals.js';
 import { loadJob, transition } from './jobs.js';
 import type { Job } from './jobs.js';
-import { withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 export interface ResumeResult {
   approvalId: string;
@@ -23,13 +22,13 @@ export interface ResumeResult {
  * has since been halted must not silently discard the answer.
  */
 export async function applyDecision(
+  db: BusinessDb,
   approvalId: string,
   outcome: 'approved' | 'denied',
   decision: Decision,
-  options: { businessId?: string } = {},
 ): Promise<ResumeResult> {
-  const approval = await withBusiness(options.businessId ?? config.businessId, (bdb) => decide(bdb, approvalId, outcome, decision)); // TENANCY-TODO(task 4)
-  return resumeAfterDecision(approval, decision.by, options);
+  const approval = await decide(db, approvalId, outcome, decision);
+  return resumeAfterDecision(db, approval, decision.by);
 }
 
 /**
@@ -44,9 +43,9 @@ export async function applyDecision(
  * denial does to a job.
  */
 export async function resumeAfterDecision(
+  db: BusinessDb,
   approval: ApprovalRequest,
   decidedBy: string,
-  options: { businessId?: string } = {},
 ): Promise<ResumeResult> {
   const approvalId = approval.approvalId;
 
@@ -54,29 +53,25 @@ export async function resumeAfterDecision(
     return { approvalId, state: approval.state, jobPhase: null };
   }
 
-  const job = await loadJob(approval.jobId, options);
+  const job = await loadJob(db, approval.jobId);
   if (job === null || job.phase !== 'await_approval') {
     // The answer is recorded; the job simply is not waiting on it any more.
     return { approvalId, state: approval.state, jobPhase: job?.phase ?? null };
   }
 
   const denied = approval.state === 'denied';
-  const moved = await transition(job.jobId, {
+  const moved = await transition(db, job.jobId, {
     // A denial closes the job rather than failing it: the system did what was
     // asked of it and a person said no. That is an outcome, not a fault.
     to: denied ? 'closed' : 'execute',
     actor: 'human',
     reason: `${approval.state}:${approvalId} by ${decidedBy}`,
-    ...(options.businessId !== undefined ? { businessId: options.businessId } : {}),
   });
 
   return { approvalId, state: approval.state, jobPhase: moved.phase };
 }
 
 /** The approval a job is currently blocked on, if any. */
-export async function blockingApproval(
-  approvalId: string,
-  options: { businessId?: string } = {},
-) {
-  return withBusiness(options.businessId ?? config.businessId, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 4)
+export async function blockingApproval(db: BusinessDb, approvalId: string) {
+  return getApproval(db, approvalId);
 }

@@ -39,7 +39,6 @@
 // locked by a transitive import walk in `digest-invariants.test.ts`, which is
 // pointed at THIS file as its entry point.
 import { loadActiveCharter } from '../charter/store.js';
-import { config } from '../config.js';
 import { loadDigestSettings } from '../governance/digest-settings.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { collectDigestFacts } from './digest-facts.js';
@@ -47,7 +46,7 @@ import { renderDigest } from './digest-render.js';
 import { lastWindowEnd, recordChannel, storeDigest } from './digest-store.js';
 import { dueWindow } from './digest-window.js';
 import type { DigestKind } from './digest-window.js';
-import { withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 export interface DigestRunResult {
   /**
@@ -99,16 +98,15 @@ const KINDS: readonly DigestKind[] = ['daily', 'weekly'];
  * Each channel is caught on its own and never rethrown — one dead channel
  * must not cost the other, nor the stored digest.
  */
-export async function runDigests(options: {
-  businessId?: string;
+export async function runDigests(db: BusinessDb, options: {
   now?: Date;
   sendAlert?: (subject: string, body: string) => Promise<{ ok: boolean; error?: string }>;
   messenger?: BossMessenger;
-}): Promise<DigestRunResult> {
-  const businessId = options.businessId ?? config.businessId;
+} = {}): Promise<DigestRunResult> {
+  const businessId = db.businessId;
   const now = options.now ?? new Date();
 
-  const settings = await loadDigestSettings({ businessId });
+  const settings = await loadDigestSettings({ businessId, db });
   if (settings.schedule === 'off') {
     return { produced: [], screenOnly: 0, errored: null };
   }
@@ -121,7 +119,7 @@ export async function runDigests(options: {
   // throw in `scheduler.ts`.
   let active;
   try {
-    active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+    active = await loadActiveCharter(db);
   } catch (err) {
     return { produced: [], screenOnly: 0, errored: err instanceof Error ? err.message : String(err) };
   }
@@ -143,15 +141,15 @@ export async function runDigests(options: {
   let screenOnly = 0;
 
   for (const kind of KINDS) {
-    const lastEnd = await lastWindowEnd(kind, { businessId });
+    const lastEnd = await lastWindowEnd(db, kind);
     const window = dueWindow(settings, kind, lastEnd, now, timeZone);
     if (window === null) continue;
 
-    const facts = await collectDigestFacts(window, ceilings, { businessId });
+    const facts = await collectDigestFacts(db, window, ceilings);
     const rendered = renderDigest(facts);
 
     // Storage before delivery — see this function's own docblock.
-    const stored = await storeDigest({ window, rendered }, { businessId });
+    const stored = await storeDigest(db, { window, rendered });
 
     // Email: only when the owner opted in AND there is content worth
     // interrupting him for. Each channel's outcome is caught and recorded on
@@ -161,13 +159,13 @@ export async function runDigests(options: {
       if (rendered.hadContent && options.sendAlert !== undefined) {
         try {
           const result = await options.sendAlert(EMAIL_SUBJECT[kind], rendered.body);
-          await recordChannel(stored.digestId, 'email', result.ok ? 'sent' : 'failed', { businessId });
+          await recordChannel(db, stored.digestId, 'email', result.ok ? 'sent' : 'failed');
         } catch {
-          await recordChannel(stored.digestId, 'email', 'failed', { businessId });
+          await recordChannel(db, stored.digestId, 'email', 'failed');
         }
       } else if (rendered.hadContent) {
         // Wanted, but no seam supplied — not connected, never silenced.
-        await recordChannel(stored.digestId, 'email', 'skipped_not_connected', { businessId });
+        await recordChannel(db, stored.digestId, 'email', 'skipped_not_connected');
       }
       // `!rendered.hadContent`: email stays null on the row — spec §2
       // decision 3. Not sent, and not recorded as "not connected" either,
@@ -178,12 +176,12 @@ export async function runDigests(options: {
       if (rendered.hadContent && options.messenger !== undefined) {
         try {
           const result = await options.messenger.send({ text: rendered.body, jobId: null });
-          await recordChannel(stored.digestId, 'whatsapp', result.ok ? 'sent' : 'failed', { businessId });
+          await recordChannel(db, stored.digestId, 'whatsapp', result.ok ? 'sent' : 'failed');
         } catch {
-          await recordChannel(stored.digestId, 'whatsapp', 'failed', { businessId });
+          await recordChannel(db, stored.digestId, 'whatsapp', 'failed');
         }
       } else if (rendered.hadContent) {
-        await recordChannel(stored.digestId, 'whatsapp', 'skipped_not_connected', { businessId });
+        await recordChannel(db, stored.digestId, 'whatsapp', 'skipped_not_connected');
       }
     }
 

@@ -88,7 +88,7 @@ export function reminderBody(o: {
 /** The step's own `location`, else the fixed address of a fixed-location business, else none. */
 async function storedLocation(row: ReminderRow, businessId: string, db: Queryable): Promise<string | null> {
   try {
-    const stored = await loadPlanBody(row.job_id, { businessId, db });
+    const stored = await withBusiness(businessId, (bdb) => loadPlanBody(bdb, row.job_id)); // TENANCY-TODO(task 5)
     const step = stored?.plan.steps.find((s) => s.id === row.step_id);
     const loc = step?.input['location'];
     if (typeof loc === 'string' && loc.trim() !== '') return loc;
@@ -127,7 +127,7 @@ export async function openClientReminder(o: {
 
   // The gate would refuse a draft_only step at stage 8: hand the text to the
   // owner instead of opening a job that can only fail.
-  if ((await loadRampLevel('email.initiate', { businessId, db })) === 'draft_only') {
+  if ((await withBusiness(businessId, (bdb) => loadRampLevel(bdb, 'email.initiate'))) === 'draft_only') { // TENANCY-TODO(task 5)
     return {
       draftedForOwner: reminderBody({ meetingId: null, clientName: row.client_name, startMs, location, timeZone }),
     };
@@ -156,19 +156,18 @@ export async function openClientReminder(o: {
 
   let jobId: string | null = null;
   try {
-    const job = await createJob({
+    const job = await withBusiness(businessId, (db) => createJob(db, { // TENANCY-TODO(task 5)
       charterVersion: active.bundle.charterVersion,
       // A literal, not a parameter: the meeting was confirmed by the owner.
       // No boss_instructions row is written for this job, ever.
       provenance: 'boss',
-      businessId,
       title: `תזכורת לפגישה: ${clean(row.client_name).slice(0, 80)}`,
-    });
+    }));
     jobId = job.jobId;
     for (const to2 of ['understand', 'plan'] as const) {
-      await transition(job.jobId, { to: to2, actor: 'orchestrator', reason: 'meeting reminder: client has not answered', businessId });
+      await withBusiness(businessId, (db) => transition(db, job.jobId, { to: to2, actor: 'orchestrator', reason: 'meeting reminder: client has not answered' })); // TENANCY-TODO(task 5)
     }
-    const bound = await bindPlanToJob(job.jobId, plan, { businessId });
+    const bound = await withBusiness(businessId, (db) => bindPlanToJob(db, job.jobId, plan)); // TENANCY-TODO(task 5)
     if (bound.status === 'conflict') throw new Error(`meeting reminder: plan conflict on fresh job ${job.jobId}`);
     const linked = await db.query(
       `UPDATE meetings SET reminder_job_id = $3
@@ -176,20 +175,20 @@ export async function openClientReminder(o: {
       [businessId, row.meeting_id, job.jobId],
     );
     if ((linked.rowCount ?? 0) === 0) {
-      await transition(job.jobId, { to: 'closed', actor: 'orchestrator', reason: 'meeting reminder: already opened', businessId });
+      await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'closed', actor: 'orchestrator', reason: 'meeting reminder: already opened' })); // TENANCY-TODO(task 5)
       return { skipped: 'already' };
     }
-    await transition(job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'meeting reminder: to the gate', businessId });
+    await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'meeting reminder: to the gate' })); // TENANCY-TODO(task 5)
     return { jobId: job.jobId };
   } catch (err) {
     if (jobId !== null) {
+      const openedJobId = jobId;
       try {
-        await transition(jobId, {
+        await withBusiness(businessId, (db) => transition(db, openedJobId, { // TENANCY-TODO(task 5)
           to: 'failed',
           actor: 'orchestrator',
           reason: `meeting_reminder_open_failed — ${err instanceof Error ? err.message : String(err)}`,
-          businessId,
-        });
+        }));
       } catch {
         // Already terminal or unreachable.
       }

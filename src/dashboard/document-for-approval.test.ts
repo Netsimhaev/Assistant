@@ -126,12 +126,11 @@ async function aReadingAcross(
 }
 
 async function aJob(businessId: string, bundle: PolicyBundle, title: string) {
-  return createJob({
+  return withBusiness(businessId, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId,
     title,
-  });
+  }));
 }
 
 async function aProposal(
@@ -139,8 +138,7 @@ async function aProposal(
   readingId: string,
   jobId: string,
 ): Promise<ProposalRecord> {
-  return saveProposal(
-    {
+  return withBusiness(businessId, (db) => saveProposal(db, {
       proposalId: `PR-${ulid()}`,
       readingId,
       jobId,
@@ -150,9 +148,7 @@ async function aProposal(
       raw: '{}',
       model: 'haiku',
       promptVersion: 'v1',
-    },
-    { businessId },
-  );
+    }));
 }
 
 async function anApproval(
@@ -201,8 +197,7 @@ describe('documentForApproval', () => {
     const bundle = await install(BUSINESS);
     const { readingId } = await aDocumentAndReading(BUSINESS);
     const job = await aJob(BUSINESS, bundle, 'הצעה בלי פעולה');
-    await saveProposal(
-      {
+    await withBusiness(BUSINESS, (db) => saveProposal(db, {
         proposalId: `PR-${ulid()}`,
         readingId,
         jobId: job.jobId,
@@ -212,9 +207,7 @@ describe('documentForApproval', () => {
         raw: '{}',
         model: 'haiku',
         promptVersion: 'v1',
-      },
-      { businessId: BUSINESS },
-    );
+      }));
     const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
 
     const result = await documentForApproval(approvalId, { businessId: BUSINESS });

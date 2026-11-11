@@ -39,6 +39,7 @@
  * propagates, because that is not a property of the document.
  */
 
+import { withBusiness } from '../db/pool.js';
 import { createHash } from 'node:crypto';
 import { ulid } from 'ulid';
 import { config } from '../config.js';
@@ -136,10 +137,8 @@ export async function readDocument(
     // Before anything that could hand this job the document's conclusions —
     // which is the cache lookup, not just the model call. See this module's
     // header.
-    const matched = await markContentIngested(input.jobId, {
-      businessId,
-      ...(options.db !== undefined ? { db: options.db } : {}),
-    });
+    const jobId = input.jobId;
+    const matched = await withBusiness(businessId, (db) => markContentIngested(db, jobId)); // TENANCY-TODO(task 5)
     // Fail closed on a zero-row match, for the reason `src/sdk/gate-hook.ts`
     // records at its own call site: `jobId` and `businessId` arrive here as
     // two independent caller-supplied fields, not read off a job row already

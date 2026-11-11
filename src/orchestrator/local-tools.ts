@@ -34,7 +34,7 @@
  */
 import { z } from 'zod';
 import { config } from '../config.js';
-import { getPool, withTransaction, withBusiness, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { AgentId } from '../domain/audit.js';
 import { SafeLookupKey } from '../domain/charter.js';
 import { ContextRef, ResultEnvelopePayload } from '../domain/envelope.js';
@@ -110,8 +110,8 @@ import { localParts, localToInstant } from '../util/local-time.js';
 
 export interface LocalToolContext {
   jobId: string;
-  businessId: string;
-  db?: Queryable;
+  /** The business is `db.businessId` — there is no second id to disagree with it. */
+  db: BusinessDb;
   /**
    * Where produced files live (`doc.save` reads the approved version from
    * under it). Threaded from the scheduler like the production loop's; this
@@ -363,7 +363,7 @@ async function write(
       body: fields.body,
       ...(fields.sourceRef !== undefined ? { sourceRef: fields.sourceRef } : {}),
     },
-    { businessId: ctx.businessId, ...(ctx.db !== undefined ? { db: ctx.db } : {}) },
+    { businessId: ctx.db.businessId, db: ctx.db },
   );
   // The provenance is echoed back so the step's own record shows the trust
   // level this memory will carry forever after.
@@ -395,14 +395,14 @@ async function write(
  * door, not some other path that happens to stamp `boss`). Same reasoning as
  * `writeMemory` and `confirmedCommandCovers`.
  */
-export async function assertLedgerWriter(jobId: string, businessId: string, db: Queryable): Promise<void> {
+export async function assertLedgerWriter(db: BusinessDb, jobId: string): Promise<void> {
   const { rows } = await db.query<{ ok: boolean }>(
     `SELECT (j.provenance = 'boss'
              AND EXISTS (SELECT 1 FROM boss_instructions i
                           WHERE i.business_id = j.business_id AND i.job_id = j.job_id)) AS ok
        FROM jobs j
       WHERE j.business_id = $1 AND j.job_id = $2`,
-    [businessId, jobId],
+    [db.businessId, jobId],
   );
   if (rows[0]?.ok !== true) {
     throw new StepChannelError(
@@ -421,14 +421,14 @@ export async function assertLedgerWriter(jobId: string, businessId: string, db: 
  * payload or a context claim. A mail, a document or the conductor cannot
  * queue a production. Runs before the payload is parsed.
  */
-export async function assertProductionWriter(jobId: string, businessId: string, db: Queryable): Promise<void> {
+export async function assertProductionWriter(db: BusinessDb, jobId: string): Promise<void> {
   const { rows } = await db.query<{ ok: boolean }>(
     `SELECT (j.provenance = 'boss'
              AND EXISTS (SELECT 1 FROM boss_instructions i
                           WHERE i.business_id = j.business_id AND i.job_id = j.job_id)) AS ok
        FROM jobs j
       WHERE j.business_id = $1 AND j.job_id = $2`,
-    [businessId, jobId],
+    [db.businessId, jobId],
   );
   if (rows[0]?.ok !== true) {
     throw new StepChannelError(
@@ -445,18 +445,18 @@ function productionToolsUp(production: LocalToolContext['production']): boolean 
 }
 
 interface LedgerEnv {
-  db: Queryable;
+  db: BusinessDb;
   timeZone: string;
   dailyHour: number;
   bundle: PolicyBundle;
 }
 
 async function ledgerEnv(ctx: LocalToolContext): Promise<LedgerEnv> {
-  const db = ctx.db ?? getPool();
-  await assertLedgerWriter(ctx.jobId, ctx.businessId, db);
-  const active = await withBusiness(ctx.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
-  if (active === null) throw new Error(`runLocalTool: ledger tools need an active charter (${ctx.businessId})`);
-  const settings = await loadLedgerSettings({ businessId: ctx.businessId, db });
+  const db = ctx.db;
+  await assertLedgerWriter(db, ctx.jobId);
+  const active = await loadActiveCharter(ctx.db);
+  if (active === null) throw new Error(`runLocalTool: ledger tools need an active charter (${ctx.db.businessId})`);
+  const settings = await loadLedgerSettings({ businessId: ctx.db.businessId, db });
   return { db, timeZone: active.charter.identity.timezone, dailyHour: settings.dailyHour, bundle: active.bundle };
 }
 
@@ -528,7 +528,7 @@ const HANDLERS: Record<string, LocalHandler> = {
     const suppliedDomain =
       parsed.counterpartyDomain === undefined ? null : normaliseDomainString(parsed.counterpartyDomain);
 
-    const instruction = await loadInstructionForJob(ctx.jobId, { businessId: ctx.businessId, db: env.db });
+    const instruction = await loadInstructionForJob(ctx.jobId, { businessId: ctx.db.businessId, db: env.db });
     const counterpartyEmailVerified =
       counterpartyEmail === null
         ? false
@@ -558,7 +558,7 @@ const HANDLERS: Record<string, LocalHandler> = {
       importance = 'critical';
       importanceManual = true;
     } else {
-      const rules = await listCriticalRules({ businessId: ctx.businessId, db: env.db });
+      const rules = await listCriticalRules({ businessId: ctx.db.businessId, db: env.db });
       importance = matchesCriticalRule(facts, rules) ? 'critical' : 'normal';
     }
 
@@ -576,7 +576,7 @@ const HANDLERS: Record<string, LocalHandler> = {
         proposedStages: parsed.proposedStages === undefined ? null : toStages(parsed.proposedStages),
         originJobId: ctx.jobId,
       },
-      { businessId: ctx.businessId, by: 'boss', db: env.db },
+      { businessId: ctx.db.businessId, by: 'boss', db: env.db },
     );
     return {
       performed: true,
@@ -597,7 +597,7 @@ const HANDLERS: Record<string, LocalHandler> = {
   'ledger.update': async (input, ctx) => {
     const env = await ledgerEnv(ctx);
     const parsed = parseOrFail(LedgerUpdateInput, input, 'ledger.update');
-    const opts = { businessId: ctx.businessId, db: env.db };
+    const opts = { businessId: ctx.db.businessId, db: env.db };
 
     const item = await loadLedgerItem(parsed.itemId, opts);
     if (item === null) {
@@ -698,7 +698,7 @@ const HANDLERS: Record<string, LocalHandler> = {
         ...(parsed.preference !== undefined ? { attribute: parsed.preference } : {}),
         reason: parsed.reason,
       },
-      { businessId: ctx.businessId, ...(ctx.db !== undefined ? { db: ctx.db } : {}) },
+      { businessId: ctx.db.businessId, db: ctx.db },
     );
     // Zero is a result, not a failure: "there was nothing to retire" is a true
     // answer to the question asked, and reporting it as an error would make
@@ -717,7 +717,7 @@ const HANDLERS: Record<string, LocalHandler> = {
         ...(parsed.kind !== undefined ? { kind: parsed.kind } : {}),
         ...(parsed.limit !== undefined ? { limit: parsed.limit } : {}),
       },
-      { businessId: ctx.businessId, ...(ctx.db !== undefined ? { db: ctx.db } : {}) },
+      { businessId: ctx.db.businessId, db: ctx.db },
     );
     return renderRecalled(found);
   },
@@ -733,7 +733,7 @@ const HANDLERS: Record<string, LocalHandler> = {
         ...(parsed.query !== undefined ? { keyword: parsed.query } : {}),
         limit: 3,
       },
-      { businessId: ctx.businessId, ...(ctx.db !== undefined ? { db: ctx.db } : {}) },
+      { businessId: ctx.db.businessId, db: ctx.db },
     );
     return renderRecalled(found);
   },
@@ -747,9 +747,9 @@ const HANDLERS: Record<string, LocalHandler> = {
     const parsed = parseOrFail(DocSaveInput, input, 'doc.save');
     return runDocSave(parsed, {
       jobId: ctx.jobId,
-      businessId: ctx.businessId,
+      businessId: ctx.db.businessId,
       documentRoot: ctx.documentRoot ?? config.documentRoot,
-      ...(ctx.db ? { db: ctx.db } : {}),
+      db: ctx.db,
     });
   },
 
@@ -781,16 +781,16 @@ const HANDLERS: Record<string, LocalHandler> = {
    * from the instruction row, never from the plan.
    */
   'doc.produce': async (input, ctx) => {
-    const db = ctx.db ?? getPool();
-    await assertProductionWriter(ctx.jobId, ctx.businessId, db);
+    const db = ctx.db;
+    await assertProductionWriter(db, ctx.jobId);
     const parsed = parseOrFail(DocProduceInput, input, 'doc.produce');
     if (!productionToolsUp(ctx.production)) {
       throw new StepChannelError('production_tools_missing', PRODUCTION_TOOLS_MISSING_REASON, false);
     }
-    const instruction = await loadInstructionForJob(ctx.jobId, { businessId: ctx.businessId, db });
+    const instruction = await loadInstructionForJob(ctx.jobId, { businessId: ctx.db.businessId, db });
     if (instruction === null) throw new Error(`runLocalTool: doc.produce found no instruction for ${ctx.jobId}`);
-    const active = await withBusiness(ctx.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
-    if (active === null) throw new Error(`runLocalTool: doc.produce needs an active charter (${ctx.businessId})`);
+    const active = await loadActiveCharter(ctx.db);
+    if (active === null) throw new Error(`runLocalTool: doc.produce needs an active charter (${ctx.db.businessId})`);
 
     const notes: string[] = [];
     let destination: ProductionDestination;
@@ -816,9 +816,9 @@ const HANDLERS: Record<string, LocalHandler> = {
       destination = parsed.destination;
     }
 
-    const attached = await attachedDocumentsForJob(ctx.jobId, { businessId: ctx.businessId, db });
+    const attached = await attachedDocumentsForJob(ctx.jobId, { businessId: ctx.db.businessId, db });
     const sources = await resolveSourceDocuments(
-      ctx.businessId,
+      ctx.db.businessId,
       parsed.sourceHints ?? [],
       [...new Set([...attached, ...(parsed.sources ?? []).map((source) => source.documentId)])],
       db,
@@ -827,10 +827,10 @@ const HANDLERS: Record<string, LocalHandler> = {
     for (const { hint } of sources.ambiguous) notes.push(sourceAmbiguousNote(toOneLine(hint)));
     for (const missing of sources.missing) notes.push(sourceMissingNote(toOneLine(missing)));
 
-    const productionId = await withTransaction(async (tx) => {
+    const productionId = await transaction(db, async (tx) => {
       const id = await createProduction(
         {
-          businessId: ctx.businessId,
+          businessId: ctx.db.businessId,
           originJobId: ctx.jobId,
           instructionText: instruction.text,
           textOrigin: instruction.textOrigin,
@@ -844,14 +844,12 @@ const HANDLERS: Record<string, LocalHandler> = {
         },
         tx,
       );
-      await transition(ctx.jobId, {
+      await transition(tx, ctx.jobId, {
         to: 'followup',
         actor: 'orchestrator',
         reason: `doc.produce: production ${id} queued`,
-        businessId: ctx.businessId,
         expectFrom: 'execute',
         wakeAt: null,
-        tx,
       });
       return id;
     });
@@ -875,10 +873,7 @@ const HANDLERS: Record<string, LocalHandler> = {
     if (ctx.bundle === undefined) {
       throw new Error('runLocalTool: doc.fetch requires ctx.bundle (the active charter)');
     }
-    const job = await loadJob(ctx.jobId, {
-      businessId: ctx.businessId,
-      ...(ctx.db !== undefined ? { db: ctx.db } : {}),
-    });
+    const job = await loadJob(ctx.db, ctx.jobId);
     if (job === null) {
       throw new Error(`runLocalTool: doc.fetch could not load job ${ctx.jobId}`);
     }
@@ -895,8 +890,8 @@ const HANDLERS: Record<string, LocalHandler> = {
     // trade the conductor's own docblock names (M1): it can only under-run
     // the budget, never exceed it.
     const readsSoFar = await readingsToday({
-      businessId: ctx.businessId,
-      ...(ctx.db !== undefined ? { db: ctx.db } : {}),
+      businessId: ctx.db.businessId,
+      db: ctx.db,
     });
     if (readsSoFar >= config.documentReadsPerDay) {
       // `DOCUMENT_READS_PER_DAY=0` is a legitimate ceiling (CLAUDE.md: an
@@ -925,8 +920,8 @@ const HANDLERS: Record<string, LocalHandler> = {
         jobId: ctx.jobId,
       },
       {
-        businessId: ctx.businessId,
-        ...(ctx.db !== undefined ? { db: ctx.db } : {}),
+        businessId: ctx.db.businessId,
+        db: ctx.db,
         ...(ctx.reader !== undefined ? { reader: ctx.reader } : {}),
       },
     );
@@ -975,11 +970,10 @@ const HANDLERS: Record<string, LocalHandler> = {
     if (ctx.agent === undefined) {
       throw new Error('runLocalTool: agent.request_help requires ctx.agent (the requesting agent)');
     }
-    const dbOpts = { businessId: ctx.businessId, ...(ctx.db !== undefined ? { db: ctx.db } : {}) };
 
-    const parentEnvelope = await withBusiness(ctx.businessId, (bdb) => loadEnvelopeForChildJob(bdb, ctx.jobId)); // TENANCY-TODO(task 4)
+    const parentEnvelope = await loadEnvelopeForChildJob(ctx.db, ctx.jobId);
 
-    const result = await requestHelp({
+    const result = await requestHelp(ctx.db, {
       parentJobId: ctx.jobId,
       from: ctx.agent,
       to: parsed.to,
@@ -988,7 +982,6 @@ const HANDLERS: Record<string, LocalHandler> = {
       contextRefs: parsed.contextRefs ?? [],
       bundle: ctx.bundle,
       parentEnvelope,
-      businessId: ctx.businessId,
     });
 
     if (result.status === 'opened') {
@@ -1035,11 +1028,11 @@ const HANDLERS: Record<string, LocalHandler> = {
       // just the child job id — `loadResultForChildJob`'s own docblock says
       // why that predicate has to be real rather than a comment.
       const { childJobId: resultChildJobId, correlationId: resultCorrelationId } = result;
-      const resultEnvelope = await withBusiness(ctx.businessId, (bdb) => loadResultForChildJob( // TENANCY-TODO(task 4)
-        bdb,
+      const resultEnvelope = await loadResultForChildJob(
+        ctx.db,
         resultChildJobId,
-        resultCorrelationId
-      ));
+        resultCorrelationId,
+      );
       if (resultEnvelope !== null) {
         // Fix round 3, item 1. `ResultEnvelopePayload` is the ONE schema
         // both `resumeDelegatedJobs` (the writer) and this handler (the
@@ -1078,7 +1071,7 @@ const HANDLERS: Record<string, LocalHandler> = {
         };
       }
 
-      const child = await loadJob(result.childJobId, dbOpts);
+      const child = await loadJob(ctx.db, result.childJobId);
       if (child === null) {
         throw new Error(
           `runLocalTool: agent.request_help's child ${result.childJobId} does not exist`,
@@ -1094,7 +1087,7 @@ const HANDLERS: Record<string, LocalHandler> = {
       // this parent again. Re-parking under the same envelope id keeps that
       // mechanism in charge of the wait instead of an uncapped five-minute
       // poll.
-      await transition(ctx.jobId, {
+      await transition(ctx.db, ctx.jobId, {
         to: 'followup',
         actor: 'orchestrator',
         reason: `ממתין לתשובת ${parsed.to} על "${parsed.intent}" (מעטפת ${result.envelopeId})`,
@@ -1105,7 +1098,6 @@ const HANDLERS: Record<string, LocalHandler> = {
         // only place the envelope id survived.
         envelopeId: result.envelopeId,
         awaitingEnvelopeId: result.envelopeId,
-        businessId: ctx.businessId,
       });
       return {
         performed: false,
@@ -1124,7 +1116,7 @@ const HANDLERS: Record<string, LocalHandler> = {
     // reported as `parked` instead of thrown, or `executeStep` would try to
     // fail an already-failed job and hit `LEGAL_TRANSITIONS`'s empty entry for
     // it.
-    const after = await loadJob(ctx.jobId, dbOpts);
+    const after = await loadJob(ctx.db, ctx.jobId);
     if (after !== null && after.phase !== 'execute') {
       return {
         performed: false,
@@ -1178,9 +1170,9 @@ const HANDLERS: Record<string, LocalHandler> = {
    */
   'assert.evaluate': async (input, ctx) => {
     const parsed = parseOrFail(AssertEvaluateInput, input, 'assert.evaluate');
-    const dbOpts = { businessId: ctx.businessId, ...(ctx.db !== undefined ? { db: ctx.db } : {}) };
+    const dbOpts = { businessId: ctx.db.businessId, db: ctx.db };
 
-    const delegation = await withBusiness(ctx.businessId, (bdb) => loadHelpRequestFromParentJob(bdb, ctx.jobId)); // TENANCY-TODO(task 4)
+    const delegation = await loadHelpRequestFromParentJob(ctx.db, ctx.jobId);
     if (delegation === null) {
       throw new StepChannelError(
         'verification_answer_missing',
@@ -1196,11 +1188,11 @@ const HANDLERS: Record<string, LocalHandler> = {
         false,
       );
     }
-    const resultEnvelope = await withBusiness(ctx.businessId, (bdb) => loadResultForChildJob( // TENANCY-TODO(task 4)
-      bdb,
+    const resultEnvelope = await loadResultForChildJob(
+      ctx.db,
       childJobId,
-      delegation.envelope.correlationId
-    ));
+      delegation.envelope.correlationId,
+    );
     if (resultEnvelope === null) {
       throw new StepChannelError(
         'verification_answer_missing',
@@ -1227,7 +1219,7 @@ const HANDLERS: Record<string, LocalHandler> = {
       // `DelegationOutcome` minus `succeeded` is exactly `NotJudgedReason` —
       // narrowed here, never cast.
       const notJudged = payload.data.outcome;
-      await withBusiness(ctx.businessId, (bdb) => saveNotJudged(bdb, parsed.subjectJobId, notJudged)); // TENANCY-TODO(task 4)
+      await saveNotJudged(ctx.db, parsed.subjectJobId, notJudged);
       return { performed: true, status: 'not_judged', reason: payload.data.outcome };
     }
 
@@ -1239,7 +1231,7 @@ const HANDLERS: Record<string, LocalHandler> = {
     // coincidence, not by construction: the moment they diverge, the key
     // misses the reading the child actually wrote and either refuses forever
     // or composes from an older row at the wrong trust level.
-    const child = await loadJob(childJobId, dbOpts);
+    const child = await loadJob(ctx.db, childJobId);
     if (child === null) {
       throw new Error(
         `runLocalTool: assert.evaluate's child job ${childJobId} does not exist`,
@@ -1261,7 +1253,7 @@ const HANDLERS: Record<string, LocalHandler> = {
     // exactly this, and it is deliberately not one of the two that come from
     // `DelegationOutcome`: the delegation did not fail.
     if (record === null || record.content === null) {
-      await withBusiness(ctx.businessId, (bdb) => saveNotJudged(bdb, parsed.subjectJobId, 'unreadable')); // TENANCY-TODO(task 4)
+      await saveNotJudged(ctx.db, parsed.subjectJobId, 'unreadable');
       return { performed: true, status: 'not_judged', reason: 'unreadable' };
     }
 
@@ -1282,11 +1274,11 @@ const HANDLERS: Record<string, LocalHandler> = {
       // The envelope that caused THIS job to run, if any — passed straight
       // through, and only ever read by the delegating branch `answer`
       // being non-null means we cannot reach.
-      parentEnvelope: await withBusiness(ctx.businessId, (bdb) => loadEnvelopeForChildJob(bdb, ctx.jobId)), // TENANCY-TODO(task 4)
-      businessId: ctx.businessId,
+      parentEnvelope: await loadEnvelopeForChildJob(ctx.db, ctx.jobId),
+      businessId: ctx.db.businessId,
       // So `verifyDraft`'s own `saveVerdict` and this handler's land on the
       // SAME connection — see `VerifyDraftInput.db`.
-      ...(ctx.db !== undefined ? { db: ctx.db } : {}),
+      db: ctx.db,
       // The narrow seam: it replaces the billed model call and nothing else,
       // so the delegation branch above it cannot be turned off from outside.
       // Ignored when `ctx.verifier` replaced the whole function — a
@@ -1316,7 +1308,7 @@ const HANDLERS: Record<string, LocalHandler> = {
     // is threaded into `VerifyDraftInput.db` above — and `saveVerdict` is an
     // upsert on `(business_id, job_id)`, so the second write of the same
     // verdict is the same row.
-    await withBusiness(ctx.businessId, (bdb) => saveVerdict(bdb, parsed.subjectJobId, result)); // TENANCY-TODO(task 4)
+    await saveVerdict(ctx.db, parsed.subjectJobId, result);
     return { performed: true, status: 'judged' };
   },
 };

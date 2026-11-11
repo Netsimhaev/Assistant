@@ -20,15 +20,12 @@ async function seedJob(provenance: 'boss' | 'unknown_external', toolName = 'mail
   const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `curation-${randomUUID()}` }))); // TENANCY-TODO(task 5)
   // `createJob` takes ONE argument and requires `charterVersion`. There is no
   // `counterpartyTags` on it — preflight for Task 2 caught this shape.
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance,
     title: 'עדכון לרונית',
-    businessId: BUSINESS,
-  });
-  await bindPlanToJob(
-    job.jobId,
-    {
+  }));
+  await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, {
       goal: 'עדכון',
       steps: [
         {
@@ -41,9 +38,7 @@ async function seedJob(provenance: 'boss' | 'unknown_external', toolName = 'mail
           expectedActionClass: null,
         },
       ],
-    } as never,
-    { businessId: BUSINESS },
-  );
+    } as never));
   return job.jobId;
 }
 

@@ -602,9 +602,8 @@ describe('buildRuntime', () => {
    * `runtime.ts`'s own docblock on `buildRuntime`.
    */
   it('registers the provider adapter for a declared system even with no grant stored', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 4)
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] })));
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'office-calendar',
         status: 'live',
         endpoint: null,
@@ -612,9 +611,7 @@ describe('buildRuntime', () => {
         provider: 'google',
         lastOkAt: null,
         lastError: null,
-      },
-      { by: 'test' },
-    );
+      }, { by: 'test' }));
 
     const runtime = await buildRuntime(FULL);
     expect(runtime.registry.get('office-calendar')).not.toBeNull();
@@ -645,7 +642,7 @@ describe('buildRuntime', () => {
     // declared for `office-mail`, the registration loop's own
     // `connection === undefined` check already skips it, and this test would
     // pass without ever exercising the bug it is named for.
-    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         connections: [
@@ -660,8 +657,7 @@ describe('buildRuntime', () => {
         ],
       })
     ));
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'office-mail',
         status: 'live',
         endpoint: null,
@@ -669,9 +665,7 @@ describe('buildRuntime', () => {
         provider: 'google',
         lastOkAt: null,
         lastError: null,
-      },
-      { by: 'test' },
-    );
+      }, { by: 'test' }));
 
     // Must not throw.
     const runtime = await buildRuntime(FULL);
@@ -690,7 +684,7 @@ describe('buildRuntime', () => {
    * must never receive a calendar adapter.
    */
   it('does not register a calendar adapter for a mailbox binding', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         connections: [
@@ -705,8 +699,7 @@ describe('buildRuntime', () => {
         ],
       })
     ));
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'mailbox',
         status: 'live',
         endpoint: null,
@@ -714,9 +707,7 @@ describe('buildRuntime', () => {
         provider: 'google',
         lastOkAt: null,
         lastError: null,
-      },
-      { by: 'test' },
-    );
+      }, { by: 'test' }));
 
     const runtime = await buildRuntime(FULL);
     expect(runtime.registry.resolve('mailbox', 'api', 'calendar.read')).toBeNull();
@@ -725,7 +716,7 @@ describe('buildRuntime', () => {
   });
 
   it('runtime registers mailbox-send for a microsoft mailbox binding', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         connections: [
@@ -740,8 +731,7 @@ describe('buildRuntime', () => {
         ],
       })
     ));
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'mailbox',
         status: 'live',
         endpoint: null,
@@ -749,9 +739,7 @@ describe('buildRuntime', () => {
         provider: 'microsoft',
         lastOkAt: null,
         lastError: null,
-      },
-      { by: 'test' },
-    );
+      }, { by: 'test' }));
 
     const runtime = await buildRuntime(FULL);
     expect(runtime.registry.resolve('mailbox', 'api', 'mail.send')).not.toBeNull();
@@ -761,7 +749,7 @@ describe('buildRuntime', () => {
   });
 
   it('registers the calendar adapter for the calendar binding only', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         connections: [
@@ -788,8 +776,7 @@ describe('buildRuntime', () => {
       ['calendar', 'google'],
       ['office-calendar', 'google'],
     ] as const) {
-      await upsertBinding(
-        {
+      await withBusiness(BUSINESS, (db) => upsertBinding(db, {
           system,
           status: 'live',
           endpoint: null,
@@ -797,9 +784,7 @@ describe('buildRuntime', () => {
           provider,
           lastOkAt: null,
           lastError: null,
-        },
-        { by: 'test' },
-      );
+        }, { by: 'test' }));
     }
 
     // Must not throw: the legacy read-only adapter is NOT registered under
@@ -814,7 +799,7 @@ describe('buildRuntime', () => {
   });
 
   it('does not register the calendar adapter when the binding provider is not the signed one', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         connections: [
@@ -829,8 +814,7 @@ describe('buildRuntime', () => {
         ],
       })
     ));
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'calendar',
         status: 'live',
         endpoint: null,
@@ -838,16 +822,14 @@ describe('buildRuntime', () => {
         provider: 'microsoft',
         lastOkAt: null,
         lastError: null,
-      },
-      { by: 'test' },
-    );
+      }, { by: 'test' }));
     const runtime = await buildRuntime(FULL);
     expect(runtime.registry.resolve('calendar', 'api', 'calendar.write')).toBeNull();
     expect(runtime.warnings.some((w) => w.includes('no calendar adapter') && w.includes('signed charter'))).toBe(true);
   });
 
   it('does not register the calendar adapter for a calendar binding that has no provider', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         connections: [
@@ -862,8 +844,7 @@ describe('buildRuntime', () => {
         ],
       })
     ));
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'calendar',
         status: 'live',
         endpoint: null,
@@ -871,9 +852,7 @@ describe('buildRuntime', () => {
         provider: null,
         lastOkAt: null,
         lastError: null,
-      },
-      { by: 'test' },
-    );
+      }, { by: 'test' }));
     const runtime = await buildRuntime(FULL);
     expect(runtime.registry.resolve('calendar', 'api', 'calendar.write')).toBeNull();
   });
@@ -894,7 +873,7 @@ describe('buildRuntime', () => {
    * booting, for any charter shape.
    */
   it('does not collide with the mail adapter when one charter connection serves both mail and calendar', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         connections: [
@@ -909,8 +888,7 @@ describe('buildRuntime', () => {
         ],
       })
     ));
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'office-mail',
         status: 'live',
         endpoint: null,
@@ -918,9 +896,7 @@ describe('buildRuntime', () => {
         provider: 'google',
         lastOkAt: null,
         lastError: null,
-      },
-      { by: 'test' },
-    );
+      }, { by: 'test' }));
 
     // Must not throw.
     const runtime = await buildRuntime(FULL);

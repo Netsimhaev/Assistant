@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -16,12 +16,11 @@ const MIGRATION_011 = join(
 const BUSINESS = 'test-business';
 
 async function newJob(): Promise<string> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
-  const job = await createJob({
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
-  });
+  }));
   return job.jobId;
 }
 
@@ -36,28 +35,28 @@ describe('the content-ingested flag', () => {
 
   it('starts false on a new job', async () => {
     const jobId = await newJob();
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.contentIngested).toBe(false);
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.contentIngested).toBe(false);
   });
 
   it('is true after marking, and reports one row matched', async () => {
     const jobId = await newJob();
-    const matched = await markContentIngested(jobId, { businessId: BUSINESS });
+    const matched = await withBusiness(BUSINESS, (db) => markContentIngested(db, jobId));
     expect(matched).toBe(1);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.contentIngested).toBe(true);
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.contentIngested).toBe(true);
   });
 
   it('is idempotent — marking twice leaves it true', async () => {
     const jobId = await newJob();
-    await markContentIngested(jobId, { businessId: BUSINESS });
-    await markContentIngested(jobId, { businessId: BUSINESS });
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.contentIngested).toBe(true);
+    await withBusiness(BUSINESS, (db) => markContentIngested(db, jobId));
+    await withBusiness(BUSINESS, (db) => markContentIngested(db, jobId));
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.contentIngested).toBe(true);
   });
 
   it('does not mark another business’s job, and reports zero rows matched', async () => {
     const jobId = await newJob();
-    const matched = await markContentIngested(jobId, { businessId: 'other-business' });
+    const matched = await withBusiness('other-business', (db) => markContentIngested(db, jobId));
     expect(matched).toBe(0);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.contentIngested).toBe(false);
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.contentIngested).toBe(false);
   });
 
   it('backfills an open job that predates the column, and leaves a closed one alone', async () => {
@@ -74,18 +73,18 @@ describe('the content-ingested flag', () => {
     // back, or every later test (in this file and beyond) inherits a schema
     // this test broke rather than restored.
     try {
-      const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+      const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
       const insertJob = () =>
-        createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+        withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
       const openJobId = (await insertJob()).jobId;
       const closedJobId = (await insertJob()).jobId;
-      await getPool().query('UPDATE jobs SET closed_at = now() WHERE job_id = $1', [closedJobId]);
+      await testDb().query('UPDATE jobs SET closed_at = now() WHERE job_id = $1', [closedJobId]);
 
       const sql = await readFile(MIGRATION_011, 'utf8');
       await testDb().query(sql);
 
-      expect((await loadJob(openJobId, { businessId: BUSINESS }))?.contentIngested).toBe(true);
-      expect((await loadJob(closedJobId, { businessId: BUSINESS }))?.contentIngested).toBe(false);
+      expect((await withBusiness(BUSINESS, (db) => loadJob(db, openJobId)))?.contentIngested).toBe(true);
+      expect((await withBusiness(BUSINESS, (db) => loadJob(db, closedJobId)))?.contentIngested).toBe(false);
     } finally {
       await testDb().query(
         'ALTER TABLE jobs ADD COLUMN IF NOT EXISTS content_ingested BOOLEAN NOT NULL DEFAULT false',

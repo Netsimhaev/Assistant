@@ -46,13 +46,13 @@
  * that cannot be read is never treated as "still inside the window".
  */
 import { ulid } from 'ulid';
-import { config } from '../config.js';
-import { getPool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { AgentId } from '../domain/audit.js';
 import type { AgentEnvelope, DelegationOutcome } from '../domain/envelope.js';
 import { canonicalHash } from '../util/canonical.js';
 import { loadEnvelopeWithChild, writeEnvelope } from '../governance/envelope-store.js';
 import { loadJob, transition } from './jobs.js';
+import { withSessionLock } from './session-lock.js';
 
 /** A parent whose processing threw before reaching a disposition, and why. */
 export interface ErroredParent {
@@ -96,13 +96,14 @@ interface DueParentRow {
  * row this function moves, so it is the row this function starts from.
  */
 export async function resumeDelegatedJobs(
-  options: { businessId?: string; limit?: number; now?: Date } = {},
+  db: BusinessDb,
+  options: { limit?: number; now?: Date } = {},
 ): Promise<ResumeResult> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const limit = options.limit ?? 20;
   const now = options.now ?? new Date();
 
-  const { rows } = await getPool().query<DueParentRow>(
+  const { rows } = await db.query<DueParentRow>(
     `SELECT job_id FROM jobs
       WHERE business_id = $1
         AND phase = 'followup'
@@ -118,32 +119,24 @@ export async function resumeDelegatedJobs(
   for (const row of rows) {
     const jobId = row.job_id;
     const lockScope = `resume-delegated:${businessId}:${jobId}`;
-    const client = await getPool().connect();
-    let holdsLock = false;
     try {
-      try {
-        const lock = await client.query<{ locked: boolean }>(
-          'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
-          [lockScope],
-        );
-        if (lock.rows[0]?.locked !== true) continue;
-        holdsLock = true;
-
+      // Locked out (another runner holds this parent): it comes back next pass.
+      await withSessionLock(businessId, lockScope, async (jobDb) => {
         // Re-read under the lock, the same reasoning `runDueJobs` argues at
         // length: the phase may have moved between the query above and the
         // lock being granted.
-        const parent = await loadJob(jobId, { businessId });
+        const parent = await loadJob(jobDb, jobId);
         if (parent === null || parent.phase !== 'followup' || parent.awaitingEnvelopeId === null) {
-          continue;
+          return;
         }
 
         const awaitingEnvelopeId = parent.awaitingEnvelopeId;
-        const stored = await withBusiness(businessId, (bdb) => loadEnvelopeWithChild(bdb, awaitingEnvelopeId)); // TENANCY-TODO(task 4)
+        const stored = await loadEnvelopeWithChild(jobDb, awaitingEnvelopeId);
         if (stored === null) {
           const error = `job ${jobId} awaits envelope ${parent.awaitingEnvelopeId}, which does not exist`;
-          await failCorruptedParent(jobId, businessId, error);
+          await failCorruptedParent(jobDb, jobId, error);
           result.errored.push({ jobId, error });
-          continue;
+          return;
         }
         if (stored.childJobId === null) {
           // The crash window `requestHelp`'s own docblock names: the
@@ -152,26 +145,26 @@ export async function resumeDelegatedJobs(
           // child id and call `attachChildJob` by hand — but a parent cannot
           // be left parked on a promise nothing will ever keep.
           const error = `job ${jobId} awaits envelope ${stored.envelope.id}, which has no child job attached`;
-          await failCorruptedParent(jobId, businessId, error);
+          await failCorruptedParent(jobDb, jobId, error);
           result.errored.push({ jobId, error });
-          continue;
+          return;
         }
 
-        const child = await loadJob(stored.childJobId, { businessId });
+        const child = await loadJob(jobDb, stored.childJobId);
         if (child === null) {
           const error = `job ${jobId}'s child ${stored.childJobId} does not exist`;
-          await failCorruptedParent(jobId, businessId, error);
+          await failCorruptedParent(jobDb, jobId, error);
           result.errored.push({ jobId, error });
-          continue;
+          return;
         }
 
         const terminal = child.phase === 'closed' || child.phase === 'failed' || child.phase === 'halted';
 
         if (terminal) {
           const outcome: DelegationOutcome = child.phase === 'closed' ? 'succeeded' : 'failed';
-          await writeResultAndWake(stored.envelope, jobId, child.jobId, outcome, { businessId, now });
+          await writeResultAndWake(jobDb, stored.envelope, jobId, child.jobId, outcome, { now });
           result.resumed.push(jobId);
-          continue;
+          return;
         }
 
         // The child is still running. Whether the parent may keep waiting
@@ -188,52 +181,30 @@ export async function resumeDelegatedJobs(
           const error =
             `job ${jobId}'s envelope ${stored.envelope.id} carries an unreadable deadline ` +
             `(${JSON.stringify(stored.envelope.constraints.deadlineAt)})`;
-          await failCorruptedParent(jobId, businessId, error);
+          await failCorruptedParent(jobDb, jobId, error);
           result.errored.push({ jobId, error });
-          continue;
+          return;
         }
 
         if (deadlineMs > now.getTime()) {
           // Still running, still inside the deadline — left exactly alone.
-          continue;
+          return;
         }
 
-        await writeResultAndWake(stored.envelope, jobId, child.jobId, 'timeout', { businessId, now });
+        await writeResultAndWake(jobDb, stored.envelope, jobId, child.jobId, 'timeout', { now });
         result.timedOut.push(jobId);
-      } catch (error) {
-        // This parent's failure must not take the rest of the pass down with
-        // it — the same isolation `runDueJobs` gives every job it touches.
-        // Unlike the corrupted shapes above, an unexpected throw here is not
-        // moved to `failed`: a transient failure (a dropped connection) is
-        // not evidence the parent's own state is unrecoverable, and forcing
-        // a terminal phase on it would be the wrong direction to guess.
-        result.errored.push({
-          jobId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    } finally {
-      if (holdsLock) {
-        // Unlock-then-release, kept apart so `release` is called exactly
-        // once on every path, and a failed unlock destroys the connection
-        // instead of returning a session to the pool that still holds this
-        // job's lock. `runDueJobs` argues both points at length.
-        let unlockError: unknown;
-        try {
-          await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [lockScope]);
-        } catch (error) {
-          unlockError = error;
-        }
-        if (unlockError === undefined) {
-          client.release();
-        } else {
-          client.release(
-            unlockError instanceof Error ? unlockError : new Error(String(unlockError)),
-          );
-        }
-      } else {
-        client.release();
-      }
+      });
+    } catch (error) {
+      // This parent's failure must not take the rest of the pass down with
+      // it — the same isolation `runDueJobs` gives every job it touches.
+      // Unlike the corrupted shapes above, an unexpected throw here is not
+      // moved to `failed`: a transient failure (a dropped connection) is
+      // not evidence the parent's own state is unrecoverable, and forcing
+      // a terminal phase on it would be the wrong direction to guess.
+      result.errored.push({
+        jobId,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -254,12 +225,11 @@ export async function resumeDelegatedJobs(
  * `run-due.ts` documents and fixes for an unbound job (`RunDueResult.unbound`).
  * Loud and terminal, the same treatment.
  */
-async function failCorruptedParent(jobId: string, businessId: string, reason: string): Promise<void> {
-  await transition(jobId, {
+async function failCorruptedParent(db: BusinessDb, jobId: string, reason: string): Promise<void> {
+  await transition(db, jobId, {
     to: 'failed',
     actor: 'system',
     reason: `resume_delegated: ${reason}`,
-    businessId,
   });
 }
 
@@ -289,11 +259,12 @@ function outcomeNote(outcome: DelegationOutcome): string {
  * exactly like any other corrupted-state finding.
  */
 async function writeResultAndWake(
+  db: BusinessDb,
   original: AgentEnvelope,
   parentJobId: string,
   helperJobId: string,
   outcome: DelegationOutcome,
-  ctx: { businessId: string; now: Date },
+  ctx: { now: Date },
 ): Promise<void> {
   const to = AgentId.parse(original.from);
 
@@ -319,14 +290,13 @@ async function writeResultAndWake(
     createdAt: ctx.now.toISOString(),
   };
 
-  const written = await withBusiness(ctx.businessId, (bdb) => writeEnvelope(bdb, resultEnvelope, { parentJobId: helperJobId })); // TENANCY-TODO(task 4)
+  const written = await writeEnvelope(db, resultEnvelope, { parentJobId: helperJobId });
 
-  await transition(parentJobId, {
+  await transition(db, parentJobId, {
     to: 'execute',
     actor: 'orchestrator',
     reason: `${outcomeNote(outcome)} (מעטפת ${written.envelope.id})`,
     envelopeId: written.envelope.id,
     awaitingEnvelopeId: null,
-    businessId: ctx.businessId,
   });
 }

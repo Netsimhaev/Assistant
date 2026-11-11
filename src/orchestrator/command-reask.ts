@@ -82,8 +82,7 @@
  * `tooLong`), not silenced.
  */
 import { loadActiveCharter } from '../charter/store.js';
-import { config } from '../config.js';
-import { getPool, withTransaction, withBusiness } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { JobPhase } from '../domain/job.js';
 import { Plan, planProblems } from '../domain/plan.js';
 import { loadInstructionForJob, saveInstruction } from '../governance/instructions.js';
@@ -99,6 +98,7 @@ import { ledgerEchoForSteps } from '../ledger/echo.js';
 import { WHATSAPP_MESSAGE_MAX_CHARS, WHATSAPP_QUESTION_TOO_LONG } from './command-confirm.js';
 import { PhaseMovedError, createJob, linkWhatsAppMessage, transition } from './jobs.js';
 import { bindPlanToJob, completedSteps, loadStoredPlan, planHashOf } from './plan-store.js';
+import { withSessionLock } from './session-lock.js';
 
 /**
  * The reason an old job is moved to `failed` with when it is re-asked. The
@@ -230,8 +230,8 @@ const CANDIDATES_SQL = `
    ORDER BY job_id
    LIMIT $3`;
 
-async function readCandidates(businessId: string, jobId: string | null, limit: number): Promise<CandidateRow[]> {
-  const { rows } = await getPool().query<CandidateRow>(CANDIDATES_SQL, [businessId, jobId, limit]);
+async function readCandidates(db: BusinessDb, jobId: string | null, limit: number): Promise<CandidateRow[]> {
+  const { rows } = await db.query<CandidateRow>(CANDIDATES_SQL, [db.businessId, jobId, limit]);
   return rows;
 }
 
@@ -239,56 +239,36 @@ async function readCandidates(businessId: string, jobId: string | null, limit: n
  * Re-ask every qualifying command job of this business, once each. Each job on
  * its own: one that throws is in `errored` and found again next pass.
  */
-export async function reaskFailedCommands(o: {
-  businessId?: string;
-  messenger?: BossMessenger;
-  limit?: number;
-}): Promise<ReaskResult> {
-  const businessId = o.businessId ?? config.businessId;
+export async function reaskFailedCommands(
+  db: BusinessDb,
+  o: { messenger?: BossMessenger; limit?: number } = {},
+): Promise<ReaskResult> {
+  const businessId = db.businessId;
   const result: ReaskResult = { reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] };
 
-  const candidates = await readCandidates(businessId, null, o.limit ?? 20);
+  const candidates = await readCandidates(db, null, o.limit ?? 20);
   for (const candidate of candidates) {
     const oldJobId = candidate.job_id;
     const lockScope = `command-reask:${businessId}:${oldJobId}`;
-    const client = await getPool().connect();
-    let holdsLock = false;
-    let broken = false;
     try {
-      const lock = await client.query<{ locked: boolean }>(
-        'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
-        [lockScope],
-      );
-      if (lock.rows[0]?.locked !== true) {
-        result.lockedOut.push(oldJobId);
-        continue;
-      }
-      holdsLock = true;
+      // A session whose unlock failed may still hold the lock: it is
+      // destroyed rather than handed back to the pool (`withSessionLock`).
+      const locked = await withSessionLock(businessId, lockScope, async (jobDb) => {
+        // Re-read under the lock: another pass may have re-asked it already.
+        const fresh = (await readCandidates(jobDb, oldJobId, 1))[0];
+        if (fresh === undefined) return;
 
-      // Re-read under the lock: another pass may have re-asked it already.
-      const fresh = (await readCandidates(businessId, oldJobId, 1))[0];
-      if (fresh === undefined) continue;
-
-      const outcome = await reaskOne(fresh, businessId, o.messenger);
-      if (outcome === null) continue;
-      result.reasked.push(outcome.reasked);
-      if (outcome.delivery === 'sent') result.sent += 1;
-      if (outcome.delivery === 'not_connected') result.notConnected += 1;
-      if (outcome.delivery === 'failed') result.sendFailed += 1;
-      if (outcome.delivery === 'too_long') result.tooLong += 1;
+        const outcome = await reaskOne(jobDb, fresh, o.messenger);
+        if (outcome === null) return;
+        result.reasked.push(outcome.reasked);
+        if (outcome.delivery === 'sent') result.sent += 1;
+        if (outcome.delivery === 'not_connected') result.notConnected += 1;
+        if (outcome.delivery === 'failed') result.sendFailed += 1;
+        if (outcome.delivery === 'too_long') result.tooLong += 1;
+      });
+      if (!locked.locked) result.lockedOut.push(oldJobId);
     } catch (err) {
       result.errored.push({ jobId: oldJobId, error: err instanceof Error ? err.message : String(err) });
-    } finally {
-      if (holdsLock) {
-        try {
-          await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [lockScope]);
-        } catch {
-          broken = true;
-        }
-      }
-      // A session whose unlock failed may still hold the lock: destroy it
-      // rather than hand it back to the pool (`run-due.ts` does the same).
-      client.release(broken ? true : undefined);
     }
   }
   return result;
@@ -300,10 +280,11 @@ interface ReaskOneOutcome {
 }
 
 async function reaskOne(
+  db: BusinessDb,
   candidate: CandidateRow,
-  businessId: string,
   messenger: BossMessenger | undefined,
 ): Promise<ReaskOneOutcome | null> {
+  const { businessId } = db;
   const oldJobId = candidate.job_id;
   const chosen = ConfirmationOption.array()
     .parse(candidate.options)
@@ -317,23 +298,22 @@ async function reaskOne(
   // One fact, one hash: the plan the old job is bound to must be the one the
   // owner chose. If they differ, which steps "completed" is a question about
   // a plan nobody confirmed — refuse rather than guess.
-  const bound = await loadStoredPlan(oldJobId, { businessId });
+  const bound = await loadStoredPlan(db, oldJobId);
   if (bound?.planHash !== chosen.planHash) {
     throw new Error(
       `command re-ask: job ${oldJobId} is bound to ${bound?.planHash ?? 'nothing'}, not the confirmed plan ${chosen.planHash}`,
     );
   }
-  const done = await completedSteps(oldJobId, chosen.planHash, { businessId });
+  const done = await completedSteps(db, oldJobId, chosen.planHash);
   const residual = residualPlan(chosen.plan, new Set(done.keys()));
   if (residual === null) {
     // Nothing left to run, so nothing to ask. A `followup` job is closed;
     // one already `failed` stays where it is.
     if (JobPhase.parse(candidate.phase) === 'followup') {
-      await transition(oldJobId, {
+      await transition(db, oldJobId, {
         to: 'closed',
         actor: 'orchestrator',
         reason: 'command: nothing left to re-ask',
-        businessId,
         expectFrom: 'followup',
       });
     }
@@ -341,7 +321,7 @@ async function reaskOne(
   }
   const option: ConfirmationOption = { ...chosen, plan: residual, planHash: planHashOf(residual) };
 
-  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+  const active = await loadActiveCharter(db);
   if (active === null) throw new Error(`command re-ask: no active charter for business ${businessId}`);
   // T6: the ledger steps still left are read-only, so `renderStepEcho` hides
   // them; the owner sees what they will record, as in the first question.
@@ -367,11 +347,10 @@ async function reaskOne(
   // built. Locked and conditional: a job someone else moved on is not ours.
   if (JobPhase.parse(candidate.phase) === 'followup') {
     try {
-      await transition(oldJobId, {
+      await transition(db, oldJobId, {
         to: 'failed',
         actor: 'orchestrator',
         reason: REASK_REASON,
-        businessId,
         expectFrom: 'followup',
       });
     } catch (err) {
@@ -380,10 +359,9 @@ async function reaskOne(
     }
   }
 
-  const job = await createJob({
+  const job = await createJob(db, {
     charterVersion: active.charter.charterVersion,
     provenance: 'boss',
-    businessId,
     ...(candidate.title !== null ? { title: candidate.title } : {}),
   });
 
@@ -394,14 +372,13 @@ async function reaskOne(
       { businessId },
     );
     for (const to of ['understand', 'plan'] as const) {
-      await transition(job.jobId, {
+      await transition(db, job.jobId, {
         to,
         actor: 'orchestrator',
         reason: `command: re-ask of ${oldJobId}`,
-        businessId,
       });
     }
-    const binding = await bindPlanToJob(job.jobId, option.plan, { businessId });
+    const binding = await bindPlanToJob(db, job.jobId, option.plan);
     if (binding.status !== 'stored' || binding.planHash !== option.planHash) {
       throw new Error(`command re-ask: job ${job.jobId} could not be bound to plan ${option.planHash}`);
     }
@@ -409,7 +386,7 @@ async function reaskOne(
     // confirmation without the link would leave the successor's report with
     // no message to go to — the owner would never hear how it ended.
     try {
-      await withTransaction(async (tx) => {
+      await transaction(db, async (tx) => {
         await createConfirmation(
           {
             jobId: job.jobId,
@@ -421,7 +398,7 @@ async function reaskOne(
           { businessId, db: tx },
         );
         if (candidate.whatsapp_message_id !== null) {
-          await linkWhatsAppMessage(job.jobId, candidate.whatsapp_message_id, { businessId, db: tx });
+          await linkWhatsAppMessage(tx, job.jobId, candidate.whatsapp_message_id);
         }
       });
     } catch (err) {
@@ -435,11 +412,10 @@ async function reaskOne(
     if (!confirmed) {
       // A job in `plan` with no confirmation is one nothing revisits.
       try {
-        await transition(job.jobId, {
+        await transition(db, job.jobId, {
           to: 'failed',
           actor: 'orchestrator',
           reason: 'command: re-ask could not be built',
-          businessId,
         });
       } catch {
         // Best effort: the error that brought us here is the one to report.

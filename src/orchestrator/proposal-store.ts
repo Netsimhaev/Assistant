@@ -7,8 +7,7 @@
  * document legitimately deserves a different proposal next week.
  */
 
-import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { Proposal } from '../domain/proposal.js';
 
 export type ProposalStatus = 'proposed' | 'unproposable';
@@ -41,7 +40,7 @@ export interface ProposalRecord {
   decidedNote: string | null;
 }
 
-/** What a caller supplies. `businessId` rides on the options, as everywhere else here. */
+/** What a caller supplies. The business is the `db`'s, as everywhere else here. */
 export interface NewProposal {
   proposalId: string;
   readingId: string;
@@ -109,11 +108,10 @@ const COLUMNS = `proposal_id, business_id, reading_id, job_id, status, reason, c
  * owner rejected the first one and asked for another.
  */
 export async function saveProposal(
+  db: BusinessDb,
   input: NewProposal,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<ProposalRecord> {
-  const db = options.db ?? getPool();
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
 
   const { rows } = await db.query<ProposalRow>(
     `INSERT INTO proposals
@@ -144,15 +142,14 @@ export async function saveProposal(
 
 /** Every proposal ever made for this reading, newest first. */
 export async function loadProposalsForReading(
+  db: BusinessDb,
   readingId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<ProposalRecord[]> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<ProposalRow>(
     `SELECT ${COLUMNS} FROM proposals
       WHERE business_id = $1 AND reading_id = $2
       ORDER BY created_at DESC, proposal_id DESC`,
-    [options.businessId ?? config.businessId, readingId],
+    [db.businessId, readingId],
   );
   return rows.map(toProposal);
 }

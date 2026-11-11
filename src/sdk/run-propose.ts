@@ -46,7 +46,7 @@ async function main(): Promise<void> {
   const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
   const bundle = active?.bundle ?? (await withBusiness(config.businessId, (bdb) => installCharter(bdb, buildCharter()))); // TENANCY-TODO(task 7)
 
-  const result = await proposeForReading({ documentId, jobId, bundle });
+  const result = await withBusiness(config.businessId, (db) => proposeForReading(db, { documentId, jobId, bundle })); // TENANCY-TODO(task 7)
 
   console.log('--- תוצאה ---');
   if (result.status === 'no_reading') {

@@ -783,9 +783,8 @@ export async function handleOAuthCallback(
     const existing =
       system === MAILBOX_SYSTEM
         ? null
-        : ((await loadBindings({ businessId, db: tx })).find((b) => b.system === system) ?? null);
-    await upsertBinding(
-      {
+        : ((await loadBindings(tx)).find((b) => b.system === system) ?? null);
+    await upsertBinding(tx, {
         system,
         status: 'live',
         endpoint: existing?.endpoint ?? null,
@@ -793,9 +792,7 @@ export async function handleOAuthCallback(
         provider,
         lastOkAt: existing?.lastOkAt ?? null,
         lastError: existing?.lastError ?? null,
-      },
-      { businessId, by: session.username, db: tx },
-    );
+      }, { by: session.username });
     if (mailboxCursor !== null) {
       await setCursor(
         { provider, cursor: mailboxCursor, connectedAt: new Date().toISOString() },

@@ -83,10 +83,7 @@ function csrfOf(html: string): string {
 async function setup(provider: 'google' | 'microsoft' = 'google') {
   const bundle = await installMailboxCharter(BUSINESS, provider);
   const mail = await storedMail(BUSINESS);
-  const raised = await raiseMailReply(
-    { mail, triage: QUESTION_TRIAGE, bundle, drafter: stubDrafter() },
-    { businessId: BUSINESS },
-  );
+  const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: QUESTION_TRIAGE, bundle, drafter: stubDrafter() }));
   if (raised === null || raised.approvalId === null) throw new Error('expected a card');
   const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 10)
   const proposed = approval?.proposedInput as Record<string, unknown>;
@@ -108,7 +105,7 @@ async function submit(s: Awaited<ReturnType<typeof setup>>, edited: unknown): Pr
 
 async function runAndCollect() {
   const { client, sent } = fakeMailboxClient();
-  await runDueJobs({ businessId: BUSINESS, runtime: mailboxRuntime(client), now: NOON });
+  await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: mailboxRuntime(client), now: NOON }));
   return sent;
 }
 
@@ -124,7 +121,7 @@ describe('editing a mailbox-reply card', () => {
     expect(res.status).toBe(400);
     expect(await res.text()).toContain(REFUSAL);
     expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, s.raised.approvalId)))?.state).toBe('pending'); // TENANCY-TODO(task 10)
-    expect((await loadJob(s.raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, s.raised.replyJobId)))?.phase).toBe('await_approval');
     expect(await runAndCollect()).toHaveLength(0);
   });
 

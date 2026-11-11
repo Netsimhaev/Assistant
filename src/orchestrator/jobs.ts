@@ -1,9 +1,7 @@
-import type pg from 'pg';
 import { ulid } from 'ulid';
-import { config } from '../config.js';
 import { JobPhase, canTransition, type JobActor } from '../domain/job.js';
 import type { TrustLevel } from '../domain/trust.js';
-import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { recordStepCompletion, type StepCompletion } from './plan-store.js';
 
 export interface Job {
@@ -69,20 +67,18 @@ export interface CreateJobInput {
    */
   provenance: TrustLevel;
   title?: string;
-  businessId?: string;
-  /**
-   * Run inside the caller's transaction. For a caller that must create the
-   * job and everything that makes it runnable atomically — the document
-   * card's delivery job (`production/card.ts`). Omitted, the pool.
-   */
-  db?: Queryable;
 }
 
-export async function createJob(input: CreateJobInput): Promise<Job> {
-  const businessId = input.businessId ?? config.businessId;
+/**
+ * Create a job in `db`'s business. Joins `db`'s transaction when it is in one
+ * — the document card's delivery job (`production/card.ts`) creates the job
+ * and everything that makes it runnable atomically.
+ */
+export async function createJob(db: BusinessDb, input: CreateJobInput): Promise<Job> {
+  const businessId = db.businessId;
   const jobId = `J-${ulid()}`;
 
-  const { rows } = await (input.db ?? getPool()).query<JobRow>(
+  const { rows } = await db.query<JobRow>(
     `INSERT INTO jobs (job_id, business_id, phase, charter_version, provenance, title)
      VALUES ($1, $2, 'intake', $3, $4, $5)
      RETURNING *`,
@@ -94,14 +90,10 @@ export async function createJob(input: CreateJobInput): Promise<Job> {
   return toJob(row);
 }
 
-export async function loadJob(
-  jobId: string,
-  options: { businessId?: string; db?: Queryable } = {},
-): Promise<Job | null> {
-  const db = options.db ?? getPool();
+export async function loadJob(db: BusinessDb, jobId: string): Promise<Job | null> {
   const { rows } = await db.query<JobRow>(
     'SELECT * FROM jobs WHERE job_id = $1 AND business_id = $2',
-    [jobId, options.businessId ?? config.businessId],
+    [jobId, db.businessId],
   );
   const row = rows[0];
   return row ? toJob(row) : null;
@@ -125,7 +117,6 @@ export interface TransitionInput {
    */
   awaitingEnvelopeId?: string | null;
   costMinor?: number | null;
-  businessId?: string;
   /**
    * A plan step that finished and whose completion belongs with this move.
    *
@@ -146,15 +137,6 @@ export interface TransitionInput {
    * behaves exactly as it always has.
    */
   expectFrom?: JobPhase;
-  /**
-   * Run inside the caller's transaction instead of opening one. Every
-   * statement is the same; only the commit is the caller's. For a move that
-   * must land with the caller's own writes or not at all — the document
-   * card's approval (`production/card.ts`) commits the delivery job's move to
-   * `execute` together with the card that names it, and `doc.produce` parks
-   * its job in the same transaction that writes the production row.
-   */
-  tx?: pg.PoolClient;
 }
 
 /**
@@ -189,14 +171,22 @@ export class PhaseMovedError extends Error {
  *
  * The read is `FOR UPDATE`, so two workers racing on the same job serialise
  * here rather than both reading `execute` and both deciding to advance.
+ *
+ * On a `db` already in a transaction the move joins it: every statement is the
+ * same, only the commit is the caller's. For a move that must land with the
+ * caller's own writes or not at all — the document card's approval
+ * (`production/card.ts`) commits the delivery job's move to `execute` together
+ * with the card that names it, and `doc.produce` parks its job in the same
+ * transaction that writes the production row.
  */
 export async function transition(
+  db: BusinessDb,
   jobId: string,
   input: TransitionInput,
 ): Promise<Job> {
-  const businessId = input.businessId ?? config.businessId;
+  const businessId = db.businessId;
 
-  const body = async (tx: pg.PoolClient): Promise<Job> => {
+  const body = async (tx: BusinessDb): Promise<Job> => {
     const { rows } = await tx.query<JobRow>(
       'SELECT * FROM jobs WHERE job_id = $1 AND business_id = $2 FOR UPDATE',
       [jobId, businessId],
@@ -247,7 +237,6 @@ export async function transition(
       await recordStepCompletion(tx, {
         ...input.completedStep,
         jobId,
-        businessId,
       });
     }
 
@@ -255,7 +244,7 @@ export async function transition(
     if (!row) throw new Error(`job ${jobId} vanished mid-transition`);
     return toJob(row);
   };
-  return input.tx !== undefined ? body(input.tx) : withTransaction(body);
+  return transaction(db, body);
 }
 
 export interface JobStep {
@@ -267,16 +256,17 @@ export interface JobStep {
 }
 
 /** The full history of a job, reconstructible from the database alone. */
-export async function jobHistory(jobId: string): Promise<JobStep[]> {
-  const { rows } = await getPool().query<{
+export async function jobHistory(db: BusinessDb, jobId: string): Promise<JobStep[]> {
+  const { rows } = await db.query<{
     from_phase: string;
     to_phase: string;
     at: Date;
     actor: string;
     reason: string;
   }>(
-    'SELECT from_phase, to_phase, at, actor, reason FROM job_steps WHERE job_id = $1 ORDER BY at, id',
-    [jobId],
+    `SELECT from_phase, to_phase, at, actor, reason FROM job_steps
+      WHERE job_id = $1 AND business_id = $2 ORDER BY at, id`,
+    [jobId, db.businessId],
   );
   return rows.map((row) => ({
     from: JobPhase.parse(row.from_phase),
@@ -294,9 +284,10 @@ export async function jobHistory(jobId: string): Promise<JobStep[]> {
  * than starving the jobs that have waited longest.
  */
 export async function dueJobs(
-  options: { businessId?: string; now?: Date; limit?: number } = {},
+  db: BusinessDb,
+  options: { now?: Date; limit?: number } = {},
 ): Promise<Job[]> {
-  const { rows } = await getPool().query<JobRow>(
+  const { rows } = await db.query<JobRow>(
     `SELECT * FROM jobs
       WHERE business_id = $1
         AND closed_at IS NULL
@@ -304,7 +295,7 @@ export async function dueJobs(
         AND wake_at <= $2
       ORDER BY wake_at ASC
       LIMIT $3`,
-    [options.businessId ?? config.businessId, options.now ?? new Date(), options.limit ?? 50],
+    [db.businessId, options.now ?? new Date(), options.limit ?? 50],
   );
   return rows.map(toJob);
 }
@@ -334,15 +325,11 @@ export async function dueJobs(
  * with a separate query. This function reports the count itself instead, so
  * a caller with something to protect does not have to guess.
  */
-export async function markContentIngested(
-  jobId: string,
-  options: { businessId?: string; db?: Queryable } = {},
-): Promise<number> {
-  const db = options.db ?? getPool();
+export async function markContentIngested(db: BusinessDb, jobId: string): Promise<number> {
   const result = await db.query(
     `UPDATE jobs SET content_ingested = true, updated_at = now()
       WHERE job_id = $1 AND business_id = $2`,
-    [jobId, options.businessId ?? config.businessId],
+    [jobId, db.businessId],
   );
   return result.rowCount ?? 0;
 }
@@ -362,12 +349,11 @@ export async function markContentIngested(
  * wrong rather than finding out later, downstream, as silence.
  */
 export async function linkWhatsAppMessage(
+  db: BusinessDb,
   jobId: string,
   whatsappMessageId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
-  const db = options.db ?? getPool();
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const { rowCount } = await db.query(
     `UPDATE jobs SET whatsapp_message_id = $1, updated_at = now()
       WHERE job_id = $2 AND business_id = $3`,
@@ -394,12 +380,8 @@ export async function linkWhatsAppMessage(
  * thing to every caller — there is no opening message to act on — and
  * neither is treated as a reason to guess one.
  */
-export async function whatsAppMessageOf(
-  jobId: string,
-  options: { businessId?: string; db?: Queryable } = {},
-): Promise<string | null> {
-  const db = options.db ?? getPool();
-  const businessId = options.businessId ?? config.businessId;
+export async function whatsAppMessageOf(db: BusinessDb, jobId: string): Promise<string | null> {
+  const businessId = db.businessId;
   const { rows } = await db.query<{ whatsapp_message_id: string | null }>(
     'SELECT whatsapp_message_id FROM jobs WHERE job_id = $1 AND business_id = $2',
     [jobId, businessId],

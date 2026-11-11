@@ -31,7 +31,7 @@
  * channels answering at once — gets `already_decided` and moves nothing.
  */
 import { config } from '../config.js';
-import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { CLOSURE_VERB_WORDS } from '../governance/closure-command.js';
 import {
   ConfirmationOption,
@@ -247,17 +247,13 @@ export function readConfirmation(text: string, options: readonly ConfirmationOpt
  *   - the job is still parked in `plan` and was born at the instruction door
  *     (it has a `boss_instructions` row).
  */
-export async function openConfirmations(o: {
-  businessId: string;
-  channel: 'whatsapp';
-  inboundAt: Date | null;
-  windowMinutes?: number;
-  db?: Queryable;
-}): Promise<InstructionConfirmation[]> {
+export async function openConfirmations(
+  db: BusinessDb,
+  o: { channel: 'whatsapp'; inboundAt: Date | null; windowMinutes?: number },
+): Promise<InstructionConfirmation[]> {
   if (o.inboundAt === null || Number.isNaN(o.inboundAt.getTime())) return [];
   const windowMinutes = o.windowMinutes ?? config.whatsappQuestionWindowMinutes;
   if (windowMinutes <= 0) return [];
-  const db = o.db ?? getPool();
 
   const { rows } = await db.query<ConfirmationRow>(
     `SELECT c.job_id, c.options, c.presented_text, c.presented_at, c.delivered_at, c.channel, c.state,
@@ -276,7 +272,7 @@ export async function openConfirmations(o: {
            WHERE b.business_id = c.business_id AND b.job_id = c.job_id
         )
       ORDER BY c.presented_at`,
-    [o.businessId, o.channel, o.inboundAt, windowMinutes],
+    [db.businessId, o.channel, o.inboundAt, windowMinutes],
   );
   return rows.map(toConfirmation);
 }
@@ -290,14 +286,12 @@ export async function openConfirmations(o: {
  * because the collision refusal sends the owner here. Read-only;
  * `confirmChoice` still enforces the window when the answer lands.
  */
-export async function dashboardConfirmations(o: {
-  businessId: string;
-  windowMinutes?: number;
-  db?: Queryable;
-}): Promise<InstructionConfirmation[]> {
+export async function dashboardConfirmations(
+  db: BusinessDb,
+  o: { windowMinutes?: number } = {},
+): Promise<InstructionConfirmation[]> {
   const windowMinutes = o.windowMinutes ?? config.whatsappQuestionWindowMinutes;
   if (windowMinutes <= 0) return [];
-  const db = o.db ?? getPool();
   const { rows } = await db.query<ConfirmationRow>(
     `SELECT c.job_id, c.options, c.presented_text, c.presented_at, c.delivered_at, c.channel, c.state,
             c.chosen_plan_hash, c.decided_at, c.decided_by, c.reask_of
@@ -312,7 +306,7 @@ export async function dashboardConfirmations(o: {
            WHERE b.business_id = c.business_id AND b.job_id = c.job_id
         )
       ORDER BY c.presented_at DESC`,
-    [o.businessId, windowMinutes],
+    [db.businessId, windowMinutes],
   );
   return rows.map(toConfirmation);
 }
@@ -330,14 +324,14 @@ export async function dashboardConfirmations(o: {
  * only production caller.
  */
 export async function bindChosenPlan(
+  db: BusinessDb,
   jobId: string,
   planHash: string,
-  o: { businessId: string },
 ): Promise<void> {
-  await withTransaction(async (tx) => {
+  await transaction(db, async (tx) => {
     const job = await tx.query<{ phase: string }>(
       'SELECT phase FROM jobs WHERE business_id = $1 AND job_id = $2 FOR UPDATE',
-      [o.businessId, jobId],
+      [db.businessId, jobId],
     );
     const phase = job.rows[0]?.phase;
     if (phase === undefined) throw new Error(`command confirm: unknown job ${jobId}`);
@@ -347,7 +341,7 @@ export async function bindChosenPlan(
         WHERE business_id = $1 AND job_id = $2
           AND state = 'confirmed' AND chosen_plan_hash = $3
         FOR UPDATE`,
-      [o.businessId, jobId, planHash],
+      [db.businessId, jobId, planHash],
     );
     const row = rows[0];
     if (row === undefined) {
@@ -359,7 +353,7 @@ export async function bindChosenPlan(
     if (chosen === undefined) {
       throw new Error(`command confirm: plan ${planHash} is not among job ${jobId}'s options`);
     }
-    const binding = await bindPlanToJob(jobId, chosen.plan, { businessId: o.businessId, tx });
+    const binding = await bindPlanToJob(tx, jobId, chosen.plan);
     if (binding.status === 'conflict' || binding.planHash !== planHash) {
       throw new Error(
         `command confirm: job ${jobId} could not be bound to the chosen plan ${planHash} (${binding.status})`,
@@ -392,52 +386,53 @@ export async function bindChosenPlan(
  * first), the answer did take effect.
  */
 export async function applyConfirmation(
+  db: BusinessDb,
   jobId: string,
   reading: ConfirmReading,
   by: string,
-  o: { businessId: string; whatsappInboundAt?: Date },
+  o: { whatsappInboundAt?: Date } = {},
 ): Promise<ConfirmOutcome> {
   if (reading.kind !== 'confirm' && reading.kind !== 'cancel') return 'unclear';
 
-  const job = await loadJob(jobId, { businessId: o.businessId });
+  const job = await loadJob(db, jobId);
   if (job?.phase !== 'plan') return 'already_decided';
 
   if (reading.kind === 'cancel') {
-    const cancelled = await cancelConfirmation(jobId, by, { businessId: o.businessId });
+    const cancelled = await cancelConfirmation(jobId, by, { businessId: db.businessId });
     if (!cancelled) return 'already_decided';
     try {
-      await moveTo(jobId, 'closed', 'command: cancelled', 'human', o.businessId);
+      await moveTo(db, jobId, 'closed', 'command: cancelled', 'human');
     } catch (err) {
-      if (await phaseIs(jobId, 'closed', o.businessId)) return 'cancelled';
+      if (await phaseIs(db, jobId, 'closed')) return 'cancelled';
       throw err;
     }
     return 'cancelled';
   }
 
   const confirmed = await confirmChoice(jobId, reading.planHash, by, {
-    businessId: o.businessId,
+    businessId: db.businessId,
     ...(o.whatsappInboundAt !== undefined ? { whatsappInboundAt: o.whatsappInboundAt } : {}),
   });
   if (!confirmed) return 'already_decided';
 
   try {
-    const confirmation = await loadConfirmation(jobId, { businessId: o.businessId });
+    const confirmation = await loadConfirmation(jobId, { businessId: db.businessId });
     if (confirmation === null) {
       throw new Error(`command confirm: job ${jobId} lost its confirmation row`);
     }
     if (confirmation.options.length > 1) {
-      await bindChosenPlan(jobId, reading.planHash, o);
+      await bindChosenPlan(db, jobId, reading.planHash);
     } else {
-      const stored = await loadStoredPlan(jobId, { businessId: o.businessId });
+      const stored = await loadStoredPlan(db, jobId);
       if (stored?.planHash !== reading.planHash) {
         throw new Error(
           `command confirm: job ${jobId} is bound to ${stored?.planHash ?? 'nothing'}, not the confirmed plan ${reading.planHash}`,
         );
       }
     }
-    await moveTo(jobId, 'execute', 'command: confirmed', 'human', o.businessId);
+    await moveTo(db, jobId, 'execute', 'command: confirmed', 'human');
   } catch (err) {
-    if (await phaseIs(jobId, 'execute', o.businessId)) return 'executing';
+    if (await phaseIs(db, jobId, 'execute')) return 'executing';
     throw err;
   }
   return 'executing';
@@ -450,17 +445,17 @@ export async function applyConfirmation(
  * already moved on (`PhaseMovedError` instead).
  */
 async function moveTo(
+  db: BusinessDb,
   jobId: string,
   to: 'execute' | 'closed' | 'failed',
   reason: string,
   actor: 'human' | 'system',
-  businessId: string,
 ): Promise<void> {
-  await transition(jobId, { to, actor, reason, businessId, expectFrom: 'plan' });
+  await transition(db, jobId, { to, actor, reason, expectFrom: 'plan' });
 }
 
-async function phaseIs(jobId: string, phase: string, businessId: string): Promise<boolean> {
-  return (await loadJob(jobId, { businessId }))?.phase === phase;
+async function phaseIs(db: BusinessDb, jobId: string, phase: string): Promise<boolean> {
+  return (await loadJob(db, jobId))?.phase === phase;
 }
 
 export interface SettleResult {
@@ -522,11 +517,11 @@ export const WHATSAPP_QUESTION_TOO_LONG =
  * see its own bind refused and fail a job the owner had just confirmed
  * (`execute → failed` is legal). A job that moved on is `skipped`.
  */
-export async function settleDecidedConfirmations(o: {
-  businessId: string;
-  limit?: number;
-}): Promise<SettleResult> {
-  const { rows } = await getPool().query<ConfirmationRow>(
+export async function settleDecidedConfirmations(
+  db: BusinessDb,
+  o: { limit?: number } = {},
+): Promise<SettleResult> {
+  const { rows } = await db.query<ConfirmationRow>(
     `SELECT c.job_id, c.options, c.presented_text, c.presented_at, c.channel, c.state,
             c.chosen_plan_hash, c.decided_at, c.decided_by, c.reask_of
        FROM instruction_confirmations c
@@ -540,14 +535,14 @@ export async function settleDecidedConfirmations(o: {
         )
       ORDER BY c.decided_at, c.job_id
       LIMIT $2`,
-    [o.businessId, o.limit ?? 50],
+    [db.businessId, o.limit ?? 50],
   );
 
   const result: SettleResult = { settled: [], skipped: [], errored: [] };
   for (const row of rows) {
     const jobId = row.job_id;
     try {
-      const to = await settleOne(toConfirmation(row), o.businessId);
+      const to = await settleOne(db, toConfirmation(row));
       result.settled.push({ jobId, to });
     } catch (err) {
       if (err instanceof PhaseMovedError) {
@@ -561,43 +556,43 @@ export async function settleDecidedConfirmations(o: {
 }
 
 async function settleOne(
+  db: BusinessDb,
   confirmation: InstructionConfirmation,
-  businessId: string,
 ): Promise<'execute' | 'closed' | 'failed'> {
   const { jobId } = confirmation;
   if (confirmation.state === 'cancelled') {
-    await moveTo(jobId, 'closed', 'command: cancelled', 'system', businessId);
+    await moveTo(db, jobId, 'closed', 'command: cancelled', 'system');
     return 'closed';
   }
   if (confirmation.state === 'expired') {
-    await moveTo(jobId, 'closed', 'command: confirmation expired', 'system', businessId);
+    await moveTo(db, jobId, 'closed', 'command: confirmation expired', 'system');
     return 'closed';
   }
 
   const chosen = confirmation.state === 'confirmed' ? confirmation.chosenPlanHash : null;
   if (chosen !== null) {
-    const stored = await loadStoredPlan(jobId, { businessId });
+    const stored = await loadStoredPlan(db, jobId);
     if (stored?.planHash === chosen) {
-      await moveTo(jobId, 'execute', 'command: confirmed', 'system', businessId);
+      await moveTo(db, jobId, 'execute', 'command: confirmed', 'system');
       return 'execute';
     }
     if (stored === null && confirmation.options.length > 1) {
       let bound = true;
       try {
-        await bindChosenPlan(jobId, chosen, { businessId });
+        await bindChosenPlan(db, jobId, chosen);
       } catch (err) {
         // A refusal is a reason to fail the job only while it is still
         // parked here; one that moved on was settled by someone else.
-        const now = (await loadJob(jobId, { businessId }))?.phase;
+        const now = (await loadJob(db, jobId))?.phase;
         if (now !== undefined && now !== 'plan') throw new PhaseMovedError(jobId, 'plan', now);
         bound = false;
       }
       if (bound) {
-        await moveTo(jobId, 'execute', 'command: confirmed', 'system', businessId);
+        await moveTo(db, jobId, 'execute', 'command: confirmed', 'system');
         return 'execute';
       }
     }
   }
-  await moveTo(jobId, 'failed', UNAPPLIABLE_REASON, 'system', businessId);
+  await moveTo(db, jobId, 'failed', UNAPPLIABLE_REASON, 'system');
   return 'failed';
 }

@@ -15,12 +15,11 @@ async function jobWith(provenance: 'boss' | 'unknown_external'): Promise<string>
   // One argument, `charterVersion` required, no `counterpartyTags`.
   const version = `recall-job-${jobCounter++}`;
   const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version }))); // TENANCY-TODO(task 5)
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance,
     title: 't',
-    businessId: BUSINESS,
-  });
+  }));
   return job.jobId;
 }
 

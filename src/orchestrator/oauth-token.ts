@@ -314,8 +314,10 @@ async function auditRefreshRejection(params: {
   provider: string;
   message: string;
 }): Promise<void> {
-  await withBusiness(params.businessId, (bdb) => appendAudit( // TENANCY-TODO(task 4)
-    bdb,
+  // A credential resolve carries only the business id (`CredentialSource`),
+  // so this entry point opens its own connection for it.
+  await withBusiness(params.businessId, (db) => appendAudit(
+    db,
     {
       actor: 'orchestrator',
       provenance: 'boss',
@@ -329,7 +331,7 @@ async function auditRefreshRejection(params: {
       reason:
         `ריענון ההרשאה למערכת "${params.system}" (ספק: ${params.provider}) נדחה ` +
         `על ידי הספק — נדרשת הרשאה מחדש (${params.message})`,
-    }
+    },
   ));
 }
 

@@ -11,7 +11,7 @@ import { canonicalHash } from '../util/canonical.js';
 import { markContentIngested, transition } from './jobs.js';
 import { StepChannelError } from './step-error.js';
 import type { Job } from './jobs.js';
-import { withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 /**
  * How long a step sleeps before a retryable channel failure is tried again.
@@ -208,8 +208,11 @@ export type StepOutcome =
  * repeat and a duplicate at the far end, and it protects only against systems
  * that honour such a key.
  */
-export async function executeStep(request: StepRequest): Promise<StepOutcome> {
+export async function executeStep(db: BusinessDb, request: StepRequest): Promise<StepOutcome> {
   const { job, bundle, toolName } = request;
+  if (job.businessId !== db.businessId) {
+    throw new Error(`executeStep: job ${job.jobId} is not of the connection's business`);
+  }
   const now = request.now ?? new Date();
 
   // The phase is checked BEFORE the side effect, not after it.
@@ -245,7 +248,7 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
   let effectiveInput = request.toolInput;
   if (request.approvalId !== undefined) {
     const approvalId = request.approvalId;
-    const approval = await withBusiness(job.businessId, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 4)
+    const approval = await getApproval(db, approvalId);
     if (
       approval?.jobId === job.jobId &&
       approval.state === 'approved_with_edit' &&
@@ -255,7 +258,7 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     }
   }
 
-  const decision = await withBusiness(job.businessId, (db) => evaluateToolCall(toolName, effectiveInput, { // TENANCY-TODO(task 4)
+  const decision = await evaluateToolCall(toolName, effectiveInput, {
     agent: request.agent,
     bundle,
     // The job's stamp, inherited by every step. `provenanceChainDerived` below
@@ -305,14 +308,13 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     ...(request.autonomyCeiling !== undefined
       ? { autonomyCeiling: request.autonomyCeiling }
       : {}),
-  }));
+  });
 
   if (decision.outcome === 'queue_approval') {
-    await transition(job.jobId, {
+    await transition(db, job.jobId, {
       to: 'await_approval',
       actor: 'orchestrator',
       reason: decision.code,
-      businessId: job.businessId,
     });
     return { status: 'awaiting_approval', approvalId: decision.approvalId };
   }
@@ -323,21 +325,19 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     // closes instead of failing and losing the work.
     if (decision.code === 'quiet_hours' && bundle.quietHours !== null) {
       const wakeAt = nextTimeAt(bundle.quietHours.to, bundle.quietHours.timezone, now);
-      await transition(job.jobId, {
+      await transition(db, job.jobId, {
         to: 'followup',
         actor: 'orchestrator',
         reason: `${decision.code} — נדחה ל-${wakeAt.toISOString()}`,
         wakeAt,
-        businessId: job.businessId,
       });
       return { status: 'deferred', code: decision.code, wakeAt: wakeAt.toISOString() };
     }
 
-    await transition(job.jobId, {
+    await transition(db, job.jobId, {
       to: 'failed',
       actor: 'orchestrator',
       reason: `${decision.code} — ${decision.reason}`,
-      businessId: job.businessId,
     });
     return { status: 'refused', code: decision.code, reason: decision.reason };
   }
@@ -364,7 +364,7 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
   // takes `jobId` and `businessId` as independent caller-supplied fields and
   // checks the count for exactly that reason.
   if (ingestsExternalContent(toolName)) {
-    await markContentIngested(job.jobId, { businessId: job.businessId });
+    await markContentIngested(db, job.jobId);
   }
 
   let effect: StepEffect;
@@ -398,12 +398,11 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
       const unknownOutcome =
         error instanceof StepChannelError && error.outcomeUnknown;
 
-      await transition(job.jobId, {
+      await transition(db, job.jobId, {
         to: 'followup',
         actor: 'orchestrator',
         reason: `${code} — retry:${request.stepId} at ${wakeAt.toISOString()}`,
         wakeAt,
-        businessId: job.businessId,
         ...(unknownOutcome && request.planHash !== undefined
           ? {
               completedStep: {
@@ -422,11 +421,10 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
       return { status: 'deferred', code, wakeAt: wakeAt.toISOString() };
     }
 
-    await transition(job.jobId, {
+    await transition(db, job.jobId, {
       to: 'failed',
       actor: 'orchestrator',
       reason: `${code} — ${message}`,
-      businessId: job.businessId,
     });
     return { status: 'refused', code, reason: message };
   }
@@ -438,16 +436,15 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     return { status: 'parked', result: effect.output, externalId: effect.externalId };
   }
 
-  const spendRecorded = await recordStepSpend(request, effectiveInput);
+  const spendRecorded = await recordStepSpend(db, request, effectiveInput);
 
   // The completion rides inside this transition's transaction. Recording it
   // afterwards would leave a window where the job has moved on and the step it
   // moved past is unrecorded — which a resume reads as work still to do.
-  await transition(job.jobId, {
+  await transition(db, job.jobId, {
     to: 'verify',
     actor: request.agent,
     reason: `${request.stepId} · ${toolName}`,
-    businessId: job.businessId,
     ...(request.planHash === undefined
       ? {}
       : {
@@ -481,6 +478,7 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
  * after an uncertain timeout cannot count the same purchase twice.
  */
 async function recordStepSpend(
+  db: BusinessDb,
   request: StepRequest,
   effectiveInput: Record<string, unknown>,
 ): Promise<boolean> {
@@ -499,8 +497,8 @@ async function recordStepSpend(
   // passed the per-action cap while the daily total stayed at zero.
   if (!isMoneyBearing(actionClass, amountMinor)) return false;
 
-  return withBusiness(request.job.businessId, (bdb) => recordSpend( // TENANCY-TODO(task 4)
-    bdb,
+  return recordSpend(
+    db,
     {
       jobId: request.job.jobId,
       actionClass,
@@ -512,7 +510,7 @@ async function recordStepSpend(
         input: effectiveInput,
       }),
     },
-  ));
+  );
 }
 
 /**

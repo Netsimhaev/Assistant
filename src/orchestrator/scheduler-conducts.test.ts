@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { ingestDocument } from '../documents/ingest.js';
@@ -114,17 +114,15 @@ function runtimeWith(sent: MailMessage[]): Runtime {
 
 /** A job sitting in `execute` with a bound plan, ready for `runDueJobs` to run it. */
 async function jobReadyToRun(charterVersion: string): Promise<string> {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
     title: 'run and close',
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  await upsertBinding(
-    {
+  await withBusiness(BUSINESS, (db) => upsertBinding(db, {
       system: 'office-mail',
       status: 'live',
       endpoint: null,
@@ -132,22 +130,20 @@ async function jobReadyToRun(charterVersion: string): Promise<string> {
       provider: null,
       lastOkAt: null,
       lastError: null,
-    },
-    { businessId: BUSINESS, by: 'test' },
-  );
-  await bindPlanToJob(job.jobId, PLAN, { businessId: BUSINESS });
+    }, { by: 'test' }));
+  await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, PLAN));
   // The owner's dial (Task 2) defaults to `off`, which clamps `loadRampLevel`
   // to `draft_only` regardless of what is stored — open it first so the
   // promotion below is actually honoured.
-  await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-  await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+  await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
   return job.jobId;
 }
 
 describe('schedulerPass and the conductor', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
   });
 
   it('scans the inbox when one is configured, into the given document root', async () => {
@@ -249,7 +245,7 @@ describe('schedulerPass and the conductor', () => {
     // stay 0, `reads`/`proposals` would stay 0, and no approval row would
     // exist.
     const conductBusiness = 'biz-sched-conduct-2';
-    await withBusiness(conductBusiness, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    await withBusiness(conductBusiness, (bdb) => installCharter(bdb, buildCharter()));
     const dir = await mkdtemp(join(tmpdir(), 'sched-doc-'));
     const path = join(dir, 'doc.txt');
     await writeFile(path, 'חוזה שיווק', 'utf8');
@@ -286,7 +282,7 @@ describe('schedulerPass and the conductor', () => {
     expect(reads).toBe(1);
     expect(proposals).toBe(1);
     expect(result.conduct?.carded).toBe(1);
-    const approvals = await getPool().query(
+    const approvals = await testDb().query(
       `SELECT 1 FROM approval_requests ar
          JOIN jobs j ON j.job_id = ar.job_id
         WHERE j.business_id = $1`,
@@ -303,7 +299,7 @@ describe('schedulerPass and the conductor', () => {
   // `runtime.notify` on the way into the conductor.
   it('forwards the runtime notifier all the way to the conductor card', async () => {
     const notifyBusiness = 'biz-sched-conduct-notify';
-    await withBusiness(notifyBusiness, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    await withBusiness(notifyBusiness, (bdb) => installCharter(bdb, buildCharter()));
     const dir = await mkdtemp(join(tmpdir(), 'sched-notify-doc-'));
     const path = join(dir, 'doc.txt');
     await writeFile(path, 'חוזה שיווק להתראה', 'utf8');
@@ -354,7 +350,7 @@ describe('schedulerPass and the conductor', () => {
   // show is that the conductor made zero model calls because of it.
   it('a hostile file is rejected by the scan and costs nothing', async () => {
     const hostileBusiness = 'biz-sched-conduct-hostile';
-    await withBusiness(hostileBusiness, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    await withBusiness(hostileBusiness, (bdb) => installCharter(bdb, buildCharter()));
     const inbox = await mkdtemp(join(tmpdir(), 'sched-hostile-inbox-'));
     const documentRoot = await mkdtemp(join(tmpdir(), 'sched-hostile-root-'));
     // A `.xlsx` name over bytes that begin as a ZIP and then are not one:
@@ -404,7 +400,7 @@ describe('schedulerPass and the conductor', () => {
     // A second version: `beforeEach` already installed one for `BUSINESS` at
     // the default `buildCharter()` version, and `charter_versions` refuses a
     // repeat.
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         version: '2026-08-15.2',
@@ -447,6 +443,6 @@ describe('schedulerPass and the conductor', () => {
     expect(sent).toHaveLength(1);
     expect(pass.due.ran.map((r) => r.jobId)).toContain(jobId);
     expect(pass.verified.closed).toContain(jobId);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('closed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('closed');
   });
 });

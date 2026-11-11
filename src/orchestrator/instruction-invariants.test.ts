@@ -266,12 +266,11 @@ describe('the planner never receives an instruction the owner did not write', ()
   }
 
   it('passes the stored text unchanged to every candidate planning pass', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
-    const seed = await createJob({
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+    const seed = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     for (const [key, name, email] of [
       ['ronit-cohen', 'רונית כהן', 'ronit@beta-log.example'],
       ['ronit-levi', 'רונית לוי', 'ronit.levi@gamma.example'],
@@ -284,19 +283,15 @@ describe('the planner never receives an instruction the owner did not write', ()
 
     const requests: PlanRequest[] = [];
     const text = 'תשלחי לרונית את ההצעה';
-    const outcome = await runInstruction(
-      { text },
-      {
+    const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async (request) => {
           requests.push(request);
           const to = request.resolvedContact?.includes('gamma') ? 'ronit.levi@gamma.example' : 'ronit@beta-log.example';
           return { status: 'planned', plan: mailTo(to) };
         },
-      },
-    );
+      }));
 
     // The ambiguity path really ran: one pass per candidate, each carrying
     // its candidate. Without this, a regression that skipped the path would

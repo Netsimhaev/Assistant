@@ -76,7 +76,7 @@ interface Seed {
 }
 
 async function seed(s: Seed = {}): Promise<{ meetingId: string; jobId: string }> {
-  const job = await createJob({ charterVersion, provenance: 'boss', title: 'פגישה', businessId: B });
+  const job = await withBusiness(B, (db) => createJob(db, { charterVersion, provenance: 'boss', title: 'פגישה' }));
   await getPool().query('UPDATE jobs SET phase = $1 WHERE job_id = $2', [s.phase ?? 'execute', job.jobId]);
   await getPool().query(
     `INSERT INTO job_plans (business_id, job_id, plan_hash, plan) VALUES ($1, $2, 'h', '{}'::jsonb)`,
@@ -137,8 +137,7 @@ function recordingAlert(sent: { subject: string; body: string }[]) {
 }
 
 async function connectCalendar(): Promise<void> {
-  await upsertBinding(
-    {
+  await withBusiness(B, (db) => upsertBinding(db, {
       system: CALENDAR_SYSTEM,
       status: 'live',
       endpoint: null,
@@ -146,9 +145,7 @@ async function connectCalendar(): Promise<void> {
       provider: 'google',
       lastOkAt: null,
       lastError: null,
-    },
-    { businessId: B, by: 'test' },
-  );
+    }, { by: 'test' }));
 }
 
 beforeEach(async () => {

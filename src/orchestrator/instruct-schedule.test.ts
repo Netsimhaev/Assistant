@@ -17,7 +17,7 @@ import { createServer } from '../dashboard/server.js';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { CALENDAR_NOT_CONNECTED_REPLY } from '../meetings/door.js';
 import { buildCharter } from '../test/fixtures.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
 import { localParts, localToInstant } from '../util/local-time.js';
 import { upsertBinding } from './bindings.js';
 import type { CredentialSource } from './credentials.js';
@@ -51,10 +51,7 @@ function clientWith(title: string): CalendarClient {
 }
 
 async function bindCalendar(): Promise<void> {
-  await upsertBinding(
-    { system: CALENDAR_SYSTEM, status: 'live', endpoint: null, credentialRef: 'OAUTH_CALENDAR', provider: 'google', lastOkAt: null, lastError: null },
-    { businessId: BUSINESS, by: 'test' },
-  );
+  await withBusiness(BUSINESS, (db) => upsertBinding(db, { system: CALENDAR_SYSTEM, status: 'live', endpoint: null, credentialRef: 'OAUTH_CALENDAR', provider: 'google', lastOkAt: null, lastError: null }, { by: 'test' }));
 }
 
 async function count(table: 'jobs' | 'boss_instructions'): Promise<number> {
@@ -66,7 +63,7 @@ const SCHEDULE_OPTIONS = { businessId: BUSINESS, textOrigin: 'typed', channel: '
 
 beforeEach(async () => {
   await resetDatabase();
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 4)
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' })));
 });
 afterAll(async () => {
   await closePool();
@@ -77,10 +74,7 @@ describe('runInstruction: schedule answers', () => {
     await bindCalendar();
     const jobsBefore = await count('jobs');
     const instructionsBefore = await count('boss_instructions');
-    const outcome = await runInstruction(
-      { text: 'מה יש לי מחר?' },
-      { ...SCHEDULE_OPTIONS, calendar: { runtime: { credentials: CREDENTIALS }, client: clientWith('דני כהן') } },
-    );
+    const outcome = await withBusiness(TEST_BUSINESS, (db) => runInstruction(db, { text: 'מה יש לי מחר?' }, { ...SCHEDULE_OPTIONS, calendar: { runtime: { credentials: CREDENTIALS }, client: clientWith('דני כהן') } }));
     expect(outcome.status).toBe('answered');
     if (outcome.status !== 'answered') return;
     expect(outcome.text).toContain('*10:00–11:00 · דני כהן*');
@@ -91,35 +85,26 @@ describe('runInstruction: schedule answers', () => {
   });
 
   it('asks for the range when the question has none, still without a job', async () => {
-    const outcome = await runInstruction(
-      { text: 'מה יש לי?' },
-      { ...SCHEDULE_OPTIONS, calendar: { runtime: { credentials: CREDENTIALS } } },
-    );
+    const outcome = await withBusiness(TEST_BUSINESS, (db) => runInstruction(db, { text: 'מה יש לי?' }, { ...SCHEDULE_OPTIONS, calendar: { runtime: { credentials: CREDENTIALS } } }));
     expect(outcome).toEqual({ status: 'answered', text: 'לאיזה טווח? למשל "מחר", "השבוע" או "יום שלישי".' });
     expect(await count('jobs')).toBe(0);
   });
 
   it('says the calendar is not connected when there is no calendar binding', async () => {
-    const outcome = await runInstruction(
-      { text: 'מה יש לי מחר' },
-      { ...SCHEDULE_OPTIONS, calendar: { runtime: { credentials: CREDENTIALS } } },
-    );
+    const outcome = await withBusiness(TEST_BUSINESS, (db) => runInstruction(db, { text: 'מה יש לי מחר' }, { ...SCHEDULE_OPTIONS, calendar: { runtime: { credentials: CREDENTIALS } } }));
     expect(outcome).toEqual({ status: 'answered', text: CALENDAR_NOT_CONNECTED_REPLY });
     expect(await count('jobs')).toBe(0);
   });
 
   it('does not route when the caller passes no calendar: the planner sees the text', async () => {
     let planned = 0;
-    const outcome = await runInstruction(
-      { text: 'מה יש לי מחר?' },
-      {
+    const outcome = await withBusiness(TEST_BUSINESS, (db) => runInstruction(db, { text: 'מה יש לי מחר?' }, {
         ...SCHEDULE_OPTIONS,
         planner: async () => {
           planned += 1;
           return { status: 'unparseable', raw: '', reason: 'test' };
         },
-      },
-    );
+      }));
     expect(outcome.status).not.toBe('answered');
     expect(planned).toBeGreaterThan(0);
   });
@@ -165,9 +150,7 @@ describe('both doors pass the calendar', () => {
     await bindCalendar();
     await createOwner({ username: 'owner', password: 'correct horse battery staple', businessId: BUSINESS });
     // A parked question: the planner asks for clarification.
-    const parkedOutcome = await runInstruction(
-      { text: 'תשלחי לרונית מחר' },
-      {
+    const parkedOutcome = await withBusiness(TEST_BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לרונית מחר' }, {
         ...SCHEDULE_OPTIONS,
         planner: async () => ({
           status: 'planned',
@@ -176,8 +159,7 @@ describe('both doors pass the calendar', () => {
             steps: [{ id: 's1', agent: 'comms.email', intent: 'לשלוח', toolName: 'mail.send', input: { to: 'dana@example.com', subject: 'נ', body: 'ג' }, dependsOn: [], expectedActionClass: 'email.initiate' }],
           },
         }),
-      },
-    );
+      }));
     if (parkedOutcome.status !== 'needs_answer') throw new Error(`expected a parked question, got ${parkedOutcome.status}`);
     const jobsBefore = await count('jobs');
 
@@ -214,7 +196,7 @@ describe('both doors pass the calendar', () => {
     expect(door).toMatch(/answered !== null\s*\?\s*\{ scheduleRouting: false, answerTo:/);
     expect(door).toMatch(/\.\.\.\(options\.calendar !== undefined \? \{ calendar: options\.calendar \} : \{\}\)/);
     const scheduler = readFileSync('src/orchestrator/scheduler.ts', 'utf8');
-    expect(scheduler).toMatch(/runWhatsAppDoor\(\{[\s\S]*?calendar: \{ runtime \}/);
+    expect(scheduler).toMatch(/runWhatsAppDoor\(db, \{[\s\S]*?calendar: \{ runtime \}/);
     const server = readFileSync('src/dashboard/server.ts', 'utf8').replace(/\r\n/g, '\n');
     expect((server.match(/\.\.\.\(calendar !== undefined \? \{ calendar \} : \{\}\)/g) ?? []).length).toBe(1);
     // The answer route: calendar for the meeting door, schedule routing off.

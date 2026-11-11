@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { MAIL_BODY_RETENTION_DAYS, scrubOldMailBodies } from './mail-retention.js';
 
 const BUSINESS = 'test-business';
@@ -8,7 +8,7 @@ const NOW = new Date('2026-10-22T12:00:00.000Z');
 const DAY = 24 * 3600_000;
 
 async function seedMail(mailId: string, receivedAt: Date, businessId = BUSINESS): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO mail_messages
        (mail_id, business_id, provider_message_id, thread_id, from_address, from_name,
         subject, received_at, body_text, summary, state)
@@ -35,7 +35,7 @@ describe('scrubOldMailBodies', () => {
     await seedMail('M-recent', recent);
     // Another business's old mail: the scrub is scoped, never global.
     await seedMail('M-other', old, 'other-business');
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO mail_invoices
          (invoice_id, business_id, mail_id, supplier_address, supplier_name, invoice_number,
           amount_text, document_id, file_name, received_at)
@@ -44,7 +44,7 @@ describe('scrubOldMailBodies', () => {
       [BUSINESS, old.toISOString()],
     );
 
-    const result = await scrubOldMailBodies({ businessId: BUSINESS, now: NOW });
+    const result = await withBusiness(BUSINESS, (db) => scrubOldMailBodies(db, { now: NOW }));
     expect(result).toEqual({ scrubbed: 1 });
 
     const { rows } = await getPool().query<{
@@ -70,11 +70,11 @@ describe('scrubOldMailBodies', () => {
     expect(byId.get('M-recent')?.body_scrubbed_at).toBeNull();
     expect(byId.get('M-other')?.body_text).toBe('הגוף המלא של המייל מדנה');
 
-    const invoices = await getPool().query('SELECT 1 FROM mail_invoices WHERE invoice_id = $1', ['INV-old']);
+    const invoices = await testDb().query('SELECT 1 FROM mail_invoices WHERE invoice_id = $1', ['INV-old']);
     expect(invoices.rows).toHaveLength(1);
 
     // Idempotent: a scrubbed body is not counted again.
-    expect(await scrubOldMailBodies({ businessId: BUSINESS, now: NOW })).toEqual({ scrubbed: 0 });
+    expect(await withBusiness(BUSINESS, (db) => scrubOldMailBodies(db, { now: NOW }))).toEqual({ scrubbed: 0 });
   });
 
   it('retention audit row carries only a count', async () => {
@@ -82,7 +82,7 @@ describe('scrubOldMailBodies', () => {
     await seedMail('M-a', old);
     await seedMail('M-b', old);
 
-    await scrubOldMailBodies({ businessId: BUSINESS, now: NOW });
+    await withBusiness(BUSINESS, (db) => scrubOldMailBodies(db, { now: NOW }));
 
     const { rows } = await getPool().query<{ reason: string; kind: string; input_hash: string }>(
       `SELECT reason, kind, input_hash FROM audit_log WHERE business_id = $1`,
@@ -100,8 +100,8 @@ describe('scrubOldMailBodies', () => {
 
   it('writes no audit row on a pass that scrubbed nothing', async () => {
     await seedMail('M-fresh', new Date(NOW.getTime() - DAY));
-    expect(await scrubOldMailBodies({ businessId: BUSINESS, now: NOW })).toEqual({ scrubbed: 0 });
-    const { rows } = await getPool().query('SELECT 1 FROM audit_log WHERE business_id = $1', [BUSINESS]);
+    expect(await withBusiness(BUSINESS, (db) => scrubOldMailBodies(db, { now: NOW }))).toEqual({ scrubbed: 0 });
+    const { rows } = await testDb().query('SELECT 1 FROM audit_log WHERE business_id = $1', [BUSINESS]);
     expect(rows).toHaveLength(0);
   });
 });

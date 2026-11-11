@@ -3,7 +3,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
-import { closePool, getPool, withTransaction, withBusiness } from '../db/pool.js';
+import { closePool, getPool, withBusiness, withBusinessTransaction } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -102,14 +102,14 @@ async function ownerJob(
   options: { textOrigin?: InstructionTextOrigin; instruction?: boolean; provenance?: 'boss' | 'unknown_external' } = {},
 ): Promise<Job> {
   const active = await charter();
-  const job = await createJob({ charterVersion: active.charterVersion, provenance: options.provenance ?? 'boss', businessId: B });
+  const job = await withBusiness(B, (db) => createJob(db, { charterVersion: active.charterVersion, provenance: options.provenance ?? 'boss' }));
   if (options.instruction !== false) {
     await saveInstruction({ jobId: job.jobId, text, textOrigin: options.textOrigin ?? 'typed' }, { businessId: B });
   }
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: B });
+    await withBusiness(B, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  return (await loadJob(job.jobId, { businessId: B }))!;
+  return (await withBusiness(B, (db) => loadJob(db, job.jobId)))!;
 }
 
 async function productionCount(): Promise<number> {
@@ -118,11 +118,10 @@ async function productionCount(): Promise<number> {
 }
 
 function produce(input: Record<string, unknown>, job: Job, production: unknown = AVAILABLE) {
-  return runLocalTool('doc.produce', input, {
+  return withBusiness(B, (db) => runLocalTool('doc.produce', input, { ...{
     jobId: job.jobId,
-    businessId: B,
     ...(production === null ? {} : { production: production as typeof AVAILABLE }),
-  });
+  }, db }));
 }
 
 const PRODUCE_INPUT = {
@@ -193,8 +192,7 @@ function runtimeWith(sent: MailMessage[]): Runtime {
 }
 
 async function liveMail(): Promise<void> {
-  await upsertBinding(
-    {
+  await withBusiness(B, (db) => upsertBinding(db, {
       system: 'office-mail',
       status: 'live',
       endpoint: null,
@@ -202,9 +200,7 @@ async function liveMail(): Promise<void> {
       provider: null,
       lastOkAt: null,
       lastError: null,
-    },
-    { businessId: B, by: 'test' },
-  );
+    }, { by: 'test' }));
 }
 
 async function deliveryJobs(): Promise<number> {
@@ -258,13 +254,13 @@ describe('doc.produce', () => {
     const job = await ownerJob('תכיני מכתב');
     const result = await produce(PRODUCE_INPUT, job);
     expect(result).toMatchObject({ performed: true, parked: true });
-    const parked = await loadJob(job.jobId, { businessId: B });
+    const parked = await withBusiness(B, (db) => loadJob(db, job.jobId));
     expect(parked?.phase).toBe('followup');
     expect(parked?.wakeAt).toBeNull();
     const woke = await tick({ businessId: B, now: new Date('2099-01-01T00:00:00Z') });
     expect(woke.skipped).toBe(false);
     expect(woke.wokenJobs).not.toContain(job.jobId);
-    expect((await loadJob(job.jobId, { businessId: B }))?.phase).toBe('followup');
+    expect((await withBusiness(B, (db) => loadJob(db, job.jobId)))?.phase).toBe('followup');
     const production = await loadProduction(B, String(result['productionId']));
     expect(production?.originJobId).toBe(job.jobId);
     expect(production?.stage).toBe('queued');
@@ -281,7 +277,7 @@ describe('doc.produce', () => {
       expect((err as StepChannelError).message).toBe(PRODUCTION_TOOLS_MISSING_REASON);
     }
     expect(await productionCount()).toBe(0);
-    expect((await loadJob(job.jobId, { businessId: B }))?.phase).toBe('execute');
+    expect((await withBusiness(B, (db) => loadJob(db, job.jobId)))?.phase).toBe('execute');
   });
 
   it('language is he unless the instruction asks for English', async () => {
@@ -335,21 +331,21 @@ describe('approveDocumentCard', () => {
     if (outcome.status !== 'approved') throw new Error(`expected approval, got ${outcome.status}`);
     expect(outcome.option).toBe('send');
 
-    const job = await loadJob(outcome.jobId, { businessId: B });
+    const job = await withBusiness(B, (db) => loadJob(db, outcome.jobId));
     expect(job?.provenance).toBe('boss');
     expect(job?.phase).toBe('execute');
     expect((await loadInstructionForJob(outcome.jobId, { businessId: B }))?.text).toContain('stranger@nowhere.example');
     const confirmation = await loadConfirmation(outcome.jobId, { businessId: B });
     expect(confirmation?.state).toBe('confirmed');
     expect(confirmation?.chosenPlanHash).toBe(shown.planHash);
-    expect((await loadStoredPlan(outcome.jobId, { businessId: B }))?.planHash).toBe(shown.planHash);
+    expect((await withBusiness(B, (db) => loadStoredPlan(db, outcome.jobId)))?.planHash).toBe(shown.planHash);
     const after = await loadDocumentCard(B, card.cardId);
     expect(after).toMatchObject({ state: 'approved', deliveryJobId: outcome.jobId });
 
     await liveMail();
     expect(await withBusiness(B, (bdb) => loadAutonomyMode(bdb))).toBe('off'); // TENANCY-TODO(task 5)
     const sent: MailMessage[] = [];
-    const ran = await runDueJobs({ businessId: B, runtime: runtimeWith(sent), now: NOON });
+    const ran = await withBusiness(B, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
     expect(ran.ran).toEqual([{ jobId: outcome.jobId, status: 'done', detail: null }]);
     expect(sent).toHaveLength(1);
     expect(sent[0]?.to).toEqual(['stranger@nowhere.example']);
@@ -483,7 +479,7 @@ describe('requestFix', () => {
     // Recipients re-checked on the joined, now-transcribed text: the address
     // only the recording carries is no longer authorised.
     expect(production?.destination).toEqual({ mode: 'send', to: [] });
-    const job = await loadJob(fix.jobId, { businessId: B });
+    const job = await withBusiness(B, (db) => loadJob(db, fix.jobId));
     expect(job).toMatchObject({ provenance: 'boss', phase: 'followup', wakeAt: null });
     // Control: typed + typed stays typed and keeps the typed address.
     const typed = await readyProduction();
@@ -617,16 +613,15 @@ describe('exclusions', () => {
       businessId: B,
     });
     if (outcome.status !== 'approved') throw new Error(outcome.status);
-    const stored = await loadStoredPlan(outcome.jobId, { businessId: B });
+    const stored = await withBusiness(B, (db) => loadStoredPlan(db, outcome.jobId));
     await getPool().query(
       `INSERT INTO confirmed_step_claims (business_id, job_id, step_id, plan_hash) VALUES ($1, $2, 'deliver', $3)`,
       [B, outcome.jobId, stored!.planHash],
     );
     if (unknown) {
-      await withTransaction((tx) =>
+      await withBusinessTransaction(B, (tx) =>
         recordStepCompletion(tx, {
           jobId: outcome.jobId,
-          businessId: B,
           planHash: stored!.planHash,
           stepId: 'deliver',
           externalId: null,
@@ -635,13 +630,13 @@ describe('exclusions', () => {
         } as Parameters<typeof recordStepCompletion>[1]),
       );
     }
-    await transition(outcome.jobId, { to: 'failed', actor: 'orchestrator', reason: 'adapter_timeout', businessId: B });
+    await withBusiness(B, (db) => transition(db, outcome.jobId, { to: 'failed', actor: 'orchestrator', reason: 'adapter_timeout' }));
     return { cardId: card.cardId, jobId: outcome.jobId };
   }
 
   it('reask skips a failed delivery job; the card returns once with "השליחה הקודמת לא הושלמה"', async () => {
     const { cardId, jobId } = await failedDelivery(false);
-    expect((await reaskFailedCommands({ businessId: B })).reasked).toEqual([]);
+    expect((await withBusiness(B, (db) => reaskFailedCommands(db))).reasked).toEqual([]);
 
     await saveDocumentSettings({ toWhatsApp: true, toEmail: false, toScreen: true, baseFolder: null }, { businessId: B });
     const messenger = createFakeMessenger();
@@ -658,7 +653,7 @@ describe('exclusions', () => {
     // Control: the very same job, with its delivery record gone, IS a re-ask
     // candidate — the delivery marker is what kept it out.
     await getPool().query('DELETE FROM document_deliveries WHERE job_id = $1', [jobId]);
-    const control = await reaskFailedCommands({ businessId: B });
+    const control = await withBusiness(B, (db) => reaskFailedCommands(db));
     expect(control.reasked.map((r) => r.oldJobId)).toEqual([jobId]);
   });
 
@@ -675,7 +670,7 @@ describe('exclusions', () => {
       [cardId],
     );
     expect(rows.map((r) => r.job_id).sort()).toEqual([jobId, again.jobId].sort());
-    expect((await reaskFailedCommands({ businessId: B })).reasked).toEqual([]);
+    expect((await withBusiness(B, (db) => reaskFailedCommands(db))).reasked).toEqual([]);
   });
 
   it("a production's origin job is never re-asked as a command", async () => {
@@ -684,7 +679,7 @@ describe('exclusions', () => {
       goal: 'g',
       steps: [{ id: 's1', agent: 'prod.docs', intent: 'i', toolName: 'doc.produce', input: PRODUCE_INPUT }],
     });
-    await bindPlanToJob(job.jobId, plan, { businessId: B });
+    await withBusiness(B, (db) => bindPlanToJob(db, job.jobId, plan));
     const hash = planHashOf(plan);
     await createConfirmation(
       {
@@ -700,7 +695,7 @@ describe('exclusions', () => {
       `INSERT INTO confirmed_step_claims (business_id, job_id, step_id, plan_hash) VALUES ($1, $2, 's1', $3)`,
       [B, job.jobId, hash],
     );
-    await transition(job.jobId, { to: 'failed', actor: 'orchestrator', reason: 'x', businessId: B });
+    await withBusiness(B, (db) => transition(db, job.jobId, { to: 'failed', actor: 'orchestrator', reason: 'x' }));
     await createProduction({
       businessId: B,
       originJobId: job.jobId,
@@ -712,10 +707,10 @@ describe('exclusions', () => {
       destination: { mode: 'save', folder: null },
       sourceDocumentIds: [],
     });
-    expect((await reaskFailedCommands({ businessId: B })).reasked).toEqual([]);
+    expect((await withBusiness(B, (db) => reaskFailedCommands(db))).reasked).toEqual([]);
     // Control: without the production row it would be re-asked.
     await getPool().query('DELETE FROM document_productions WHERE origin_job_id = $1', [job.jobId]);
-    expect((await reaskFailedCommands({ businessId: B })).reasked.map((r) => r.oldJobId)).toEqual([job.jobId]);
+    expect((await withBusiness(B, (db) => reaskFailedCommands(db))).reasked.map((r) => r.oldJobId)).toEqual([job.jobId]);
   });
 
   it('a delivery job is never curated', async () => {
@@ -764,7 +759,7 @@ describe('card notices are each unique, and save needs a base folder', () => {
     const option = card!.deliveryPlans.find((o) => o.option === kind)!;
     const outcome = await approveDocumentCard(cardId, option.planHash, 'dashboard', { businessId: B });
     if (outcome.status !== 'approved') throw new Error(outcome.status);
-    await transition(outcome.jobId, { to: 'failed', actor: 'orchestrator', reason: 'adapter_timeout', businessId: B });
+    await withBusiness(B, (db) => transition(db, outcome.jobId, { to: 'failed', actor: 'orchestrator', reason: 'adapter_timeout' }));
     return outcome.jobId;
   }
 

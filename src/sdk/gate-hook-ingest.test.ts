@@ -28,11 +28,10 @@ function preToolUse(toolName: string, toolInput: unknown) {
 }
 
 async function newJob(bundle: PolicyBundle): Promise<string> {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
-  });
+  }));
   return job.jobId;
 }
 
@@ -86,7 +85,7 @@ describe('the gate hook marks content-ingestion on its own path', () => {
     }, jobId);
 
     expect(decision).toBe('allow');
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.contentIngested).toBe(true);
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.contentIngested).toBe(true);
   });
 
   it('leaves the flag false when an allowed tool does not ingest content', async () => {
@@ -106,7 +105,7 @@ describe('the gate hook marks content-ingestion on its own path', () => {
     // Assert the call was actually allowed, so this cannot pass because
     // nothing ran.
     expect(decision).toBe('allow');
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.contentIngested).toBe(false);
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.contentIngested).toBe(false);
   });
 
   it('does not mark when the gate denies a reading tool', async () => {
@@ -121,7 +120,7 @@ describe('the gate hook marks content-ingestion on its own path', () => {
 
     expect(decision).toBe('deny');
     expect(reason).toContain('path_outside_document_root');
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.contentIngested).toBe(false);
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.contentIngested).toBe(false);
   });
 
   it('does not error when a reading tool runs with an explicit null jobId', async () => {

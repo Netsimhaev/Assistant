@@ -74,7 +74,7 @@ import { resolveIntent, type IntentSpec } from '../governance/intent-registry.js
 import { canonicalHash } from '../util/canonical.js';
 import { createJob, loadJob, transition } from './jobs.js';
 import { bindPlanToJob } from './plan-store.js';
-import { withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 /**
  * The ceiling a job with no incoming envelope inherits from — maximally
@@ -126,7 +126,6 @@ export interface RequestHelpInput {
    * only the first left the loosest claim as the only unchecked one.
    */
   parentEnvelope: AgentEnvelope | null;
-  businessId?: string;
   now?: Date;
 }
 
@@ -235,13 +234,12 @@ function contextRefField(ref: ContextRef): Record<string, string> {
   }
 }
 
-export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpResult> {
-  const businessId = input.businessId ?? config.businessId;
+export async function requestHelp(db: BusinessDb, input: RequestHelpInput): Promise<RequestHelpResult> {
   const now = input.now ?? new Date();
 
   // 1. The parent must be executing, checked before any write — the same
   // reasoning `runPlan` applies to its own phase check.
-  const parent = await loadJob(input.parentJobId, { businessId });
+  const parent = await loadJob(db, input.parentJobId);
   if (parent === null || parent.phase !== 'execute') {
     return {
       status: 'refused',
@@ -345,7 +343,7 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
   let verifiedAncestor: AgentEnvelope | null = null;
   if (input.parentEnvelope !== null) {
     const parentEnvelopeId = input.parentEnvelope.id;
-    const stored = await withBusiness(businessId, (bdb) => loadEnvelopeWithChild(bdb, parentEnvelopeId)); // TENANCY-TODO(task 4)
+    const stored = await loadEnvelopeWithChild(db, parentEnvelopeId);
     if (stored === null || stored.childJobId !== parent.jobId) {
       return {
         status: 'refused',
@@ -376,7 +374,7 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
     // ABOVE guard 3 (idempotency): it reads no time-varying counter, so unlike
     // `dailyCapGuard` its answer cannot differ between the call that opened a
     // delegation and the call retrying it.
-    const governing = await withBusiness(businessId, (bdb) => loadEnvelopeForChildJob(bdb, parent.jobId)); // TENANCY-TODO(task 4)
+    const governing = await loadEnvelopeForChildJob(db, parent.jobId);
     if (governing !== null) {
       return {
         status: 'refused',
@@ -448,7 +446,7 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
     contextRefsHash: refsHash,
     payload: parsedPayload.data,
   });
-  const alreadyAnswered = await withBusiness(businessId, (bdb) => loadEnvelopeByIdempotencyKey(bdb, idempotencyKey)); // TENANCY-TODO(task 4)
+  const alreadyAnswered = await loadEnvelopeByIdempotencyKey(db, idempotencyKey);
   if (alreadyAnswered !== null) {
     return {
       status: 'duplicate',
@@ -461,18 +459,18 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
   const hopDenial = hopGuard(parentHops);
   if (hopDenial !== null) return { status: 'refused', ...hopDenial };
 
-  const usedToday = await withBusiness(businessId, (bdb) => delegationsToday(bdb)); // TENANCY-TODO(task 4)
+  const usedToday = await delegationsToday(db);
   const capDenial = dailyCapGuard(usedToday, config.delegationsPerDay);
   if (capDenial !== null) return { status: 'refused', ...capDenial };
 
-  const prior = await withBusiness(businessId, (bdb) => priorQuadruples(bdb, correlationId)); // TENANCY-TODO(task 4)
+  const prior = await priorQuadruples(db, correlationId);
   const noInfoDenial = noNewInformationGuard(
     { from: input.from, to: input.to, intent: input.intent, contextRefsHash: refsHash },
     prior,
   );
   if (noInfoDenial !== null) return { status: 'refused', ...noInfoDenial };
 
-  const exchanges = await withBusiness(businessId, (bdb) => countPairExchanges(bdb, correlationId, input.from, input.to, input.intent)); // TENANCY-TODO(task 4)
+  const exchanges = await countPairExchanges(db, correlationId, input.from, input.to, input.intent);
   const oscillationDenial = oscillationGuard(exchanges);
   if (oscillationDenial !== null) {
     // The reason is enriched with the pair and the intent here rather than
@@ -485,11 +483,10 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
       `כוונה: "${input.intent}"`;
     // The only guard that also fails the parent — a disagreement between two
     // agents is a signal a human should see, not one a third agent resolves.
-    await transition(parent.jobId, {
+    await transition(db, parent.jobId, {
       to: 'failed',
       actor: 'orchestrator',
       reason: named,
-      businessId,
     });
     return { status: 'refused', code: oscillationDenial.code, reason: named };
   }
@@ -519,7 +516,7 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
     createdAt: now.toISOString(),
   };
 
-  const written = await withBusiness(businessId, (bdb) => writeEnvelope(bdb, envelope, { parentJobId: parent.jobId })); // TENANCY-TODO(task 4)
+  const written = await writeEnvelope(db, envelope, { parentJobId: parent.jobId });
   if (written.status === 'duplicate') {
     return {
       status: 'duplicate',
@@ -529,11 +526,10 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
     };
   }
 
-  const child = await createJob({
+  const child = await createJob(db, {
     charterVersion: constraints.charterVersion,
     provenance: constraints.provenanceCeiling,
     title: `בקשת עזרה: ${input.intent} (מ-${input.from})`,
-    businessId,
   });
 
   const childPlan: Plan = {
@@ -575,40 +571,36 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
   // Attaching first at least means the only reachable crash window leaves a
   // child that is attached but not yet runnable, which the deadline branch of
   // `resumeDelegatedJobs` has something to find.
-  await transition(child.jobId, {
+  await transition(db, child.jobId, {
     to: 'understand',
     actor: 'orchestrator',
     reason: 'child job opened by a delegation',
-    businessId,
   });
-  await transition(child.jobId, {
+  await transition(db, child.jobId, {
     to: 'plan',
     actor: 'orchestrator',
     reason: 'plan derived deterministically from the envelope, not from the planner',
-    businessId,
   });
-  await bindPlanToJob(child.jobId, childPlan, { businessId });
-  await withBusiness(businessId, (bdb) => attachChildJob(bdb, envelope.id, child.jobId)); // TENANCY-TODO(task 4)
-  await transition(child.jobId, {
+  await bindPlanToJob(db, child.jobId, childPlan);
+  await attachChildJob(db, envelope.id, child.jobId);
+  await transition(db, child.jobId, {
     to: 'execute',
     actor: 'orchestrator',
     reason: 'ready to run its one step',
-    businessId,
   });
-  await transition(parent.jobId, {
+  await transition(db, parent.jobId, {
     to: 'followup',
     actor: 'orchestrator',
     reason: `ממתין לתשובת ${input.to} על "${input.intent}" (מעטפת ${envelope.id})`,
     envelopeId: envelope.id,
     awaitingEnvelopeId: envelope.id,
-    businessId,
   });
 
   // 5. Audit, after the commit — never the payload, never what the context
   // refs point at (see the docblock on `AuditKind`'s `'delegation'` member).
   try {
-    await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 4)
-      bdb,
+    await appendAudit(
+      db,
       {
         jobId: parent.jobId,
         envelopeId: envelope.id,
@@ -620,8 +612,8 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
         reason:
           `${input.from} ביקש עזרה מ-${input.to} ("${input.intent}"), ` +
           `קפיצה ${envelope.hops}, מעטפת ${envelope.id}`,
-      }
-    ));
+      },
+    );
   } catch (error) {
     throw new DelegationAuditUnrecordedError(
       { envelopeId: envelope.id, childJobId: child.jobId, parentJobId: parent.jobId },

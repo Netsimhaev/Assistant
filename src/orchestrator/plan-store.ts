@@ -1,6 +1,4 @@
-import type pg from 'pg';
-import { config } from '../config.js';
-import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { Plan } from '../domain/plan.js';
 import { canonicalHash } from '../util/canonical.js';
 
@@ -115,23 +113,20 @@ export type PlanBinding =
  * re-read, rather than read then insert, for the same reason one level up.
  */
 export async function bindPlanToJob(
+  /**
+   * Joined when already in a transaction — for a caller whose own check must
+   * hold in the same transaction as the bind: the boss-command confirm reader
+   * re-reads its confirmation row (`command-confirm.ts`). Every statement
+   * below is the same either way.
+   */
+  db: BusinessDb,
   jobId: string,
   plan: Plan,
-  options: {
-    businessId?: string;
-    /**
-     * Run inside the caller's transaction instead of opening one. For a
-     * caller whose own check must hold in the same transaction as the bind —
-     * the boss-command confirm reader re-reads its confirmation row
-     * (`command-confirm.ts`). Every statement below is the same either way.
-     */
-    tx?: Queryable;
-  } = {},
 ): Promise<PlanBinding> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const offeredHash = planHashOf(plan);
 
-  const bind = async (tx: Queryable): Promise<PlanBinding> => {
+  const bind = async (tx: BusinessDb): Promise<PlanBinding> => {
     const inserted = await tx.query<PlanRow>(
       `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
        VALUES ($1, $2, $3, $4)
@@ -176,18 +171,17 @@ export async function bindPlanToJob(
     );
     return { status: 'replaced', previousHash: stored.plan_hash, planHash: offeredHash };
   };
-  return options.tx !== undefined ? bind(options.tx) : withTransaction(bind);
+  return transaction(db, bind);
 }
 
 /** The plan hash a job is bound to, or null when it is not bound yet. */
 export async function loadStoredPlan(
+  db: BusinessDb,
   jobId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<StoredPlan | null> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<PlanRow>(
     'SELECT business_id, job_id, plan_hash FROM job_plans WHERE business_id = $1 AND job_id = $2',
-    [options.businessId ?? config.businessId, jobId],
+    [db.businessId, jobId],
   );
   const row = rows[0];
   return row ? toStoredPlan(row) : null;
@@ -213,16 +207,15 @@ export async function loadStoredPlan(
  * definition and no deduplication can fire.
  */
 export async function completedSteps(
+  db: BusinessDb,
   jobId: string,
   planHash: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<Map<string, string | null>> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<StepResultRow>(
     `SELECT step_id, external_id FROM job_step_results
       WHERE business_id = $1 AND job_id = $2 AND plan_hash = $3
         AND status = 'completed'`,
-    [options.businessId ?? config.businessId, jobId, planHash],
+    [db.businessId, jobId, planHash],
   );
   return new Map(rows.map((row) => [row.step_id, row.external_id]));
 }
@@ -236,12 +229,12 @@ export async function completedSteps(
  * the job has advanced and the step it advanced past is unrecorded, and a
  * resume would then run that step a second time.
  *
- * The parameter is `pg.PoolClient` and not `Queryable` deliberately. A `Pool`
- * satisfies `Queryable` structurally, so the narrower type is the only thing
- * that stops `recordStepCompletion(getPool(), …)` from compiling — which is
- * exactly the separate write this docblock forbids, and exactly the defect
- * `upsertBinding` hit earlier on this branch. The read functions above keep
- * `Queryable`: they hold no lock and have no atomicity to lose.
+ * A `BusinessDb` that is not in a transaction is refused at run time: such a
+ * write is exactly the separate write this docblock forbids, and exactly the
+ * defect `upsertBinding` hit earlier on this branch. (Before the business was
+ * threaded through, the narrower `pg.PoolClient` type did this job.) The read
+ * functions above take any `BusinessDb`: they hold no lock and have no
+ * atomicity to lose.
  *
  * **Resumption is at-least-once, not exactly-once, and no transaction can make
  * it otherwise.** The external call happens before this row can possibly be
@@ -275,9 +268,12 @@ export async function completedSteps(
  * same `WHERE` that gates `status` and `external_id` gates this column too.
  */
 export async function recordStepCompletion(
-  tx: pg.PoolClient,
-  input: StepCompletion & { jobId: string; businessId: string },
+  tx: BusinessDb,
+  input: StepCompletion & { jobId: string },
 ): Promise<void> {
+  if (!tx.inTransaction) {
+    throw new Error('recordStepCompletion must run inside the transaction that moves the job');
+  }
   await tx.query(
     `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id, status, performed)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -288,7 +284,7 @@ export async function recordStepCompletion(
             completed_at = now()
       WHERE job_step_results.status = 'unknown' AND EXCLUDED.status = 'completed'`,
     [
-      input.businessId,
+      tx.businessId,
       input.jobId,
       input.planHash,
       input.stepId,
@@ -326,14 +322,13 @@ interface PlanBodyRow {
  * a different fact and deserves a different, loud ending.
  */
 export async function loadPlanBody(
+  db: BusinessDb,
   jobId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<StoredPlanBody | null> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<PlanBodyRow>(
     `SELECT plan_hash, plan FROM job_plans
       WHERE business_id = $1 AND job_id = $2`,
-    [options.businessId ?? config.businessId, jobId],
+    [db.businessId, jobId],
   );
 
   const row = rows[0];
@@ -372,18 +367,17 @@ export async function loadPlanBody(
  * `completed` row that cannot say whether the step did anything.
  */
 export async function stepResults(
+  db: BusinessDb,
   jobId: string,
   planHash: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<StepCompletion[]> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<
     StepResultRow & { status: StepResultStatus; performed: boolean | null }
   >(
     `SELECT step_id, external_id, status, performed FROM job_step_results
       WHERE business_id = $1 AND job_id = $2 AND plan_hash = $3
       ORDER BY step_id`,
-    [options.businessId ?? config.businessId, jobId, planHash],
+    [db.businessId, jobId, planHash],
   );
   return rows.map((row) => ({
     stepId: row.step_id,

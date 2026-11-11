@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { setDigestSettings } from '../governance/digest-settings.js';
@@ -19,7 +19,7 @@ describe('runDigests', () => {
     // `jobs.charter_version` also carries a composite FK to
     // `charter_versions (business_id, charter_version)` since migration 002,
     // which the "seed a closed job" helper below relies on.
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     charterVersion = bundle.charterVersion;
   });
 
@@ -32,7 +32,7 @@ describe('runDigests', () => {
    * window the test's own `now` produces.
    */
   async function seedClosedJob(closedAt: Date): Promise<void> {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO jobs (job_id, business_id, title, phase, charter_version, provenance, content_ingested, closed_at)
        VALUES ($1, $2, 'משימה שהושלמה', 'closed', $3, 'boss', false, $4)`,
       [`J-${Math.random().toString(36).slice(2)}`, BUSINESS, charterVersion, closedAt],
@@ -41,9 +41,9 @@ describe('runDigests', () => {
 
   /** Spec §4: off means nothing is produced at all. */
   it('does nothing while the schedule is off', async () => {
-    const result = await runDigests({ businessId: BUSINESS, now: new Date('2026-10-07T09:00:00+03:00') });
+    const result = await withBusiness(BUSINESS, (db) => runDigests(db, { now: new Date('2026-10-07T09:00:00+03:00') }));
     expect(result.produced).toEqual([]);
-    expect(await recentDigests({ businessId: BUSINESS })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (db) => recentDigests(db))).toEqual([]);
   });
 
   /**
@@ -57,15 +57,14 @@ describe('runDigests', () => {
       'owner', { businessId: BUSINESS },
     );
     const calls: string[] = [];
-    const result = await runDigests({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => runDigests(db, {
       now: new Date('2026-10-07T09:00:00+03:00'),
       sendAlert: async (subject) => { calls.push(subject); return { ok: true }; },
-    });
+    }));
 
     expect(result.screenOnly).toBe(1);
     expect(calls).toEqual([]);
-    const stored = await recentDigests({ businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (db) => recentDigests(db));
     expect(stored).toHaveLength(1);
     expect(stored[0]?.hadContent).toBe(false);
     expect(stored[0]?.emailState).toBeNull();
@@ -85,8 +84,8 @@ describe('runDigests', () => {
     // see `digest-window.test.ts` for the same arithmetic spelled out.
     await seedClosedJob(new Date('2026-10-07T07:00:00+03:00'));
 
-    await runDigests({ businessId: BUSINESS, now: new Date('2026-10-07T09:00:00+03:00') });
-    const stored = await recentDigests({ businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => runDigests(db, { now: new Date('2026-10-07T09:00:00+03:00') }));
+    const stored = await withBusiness(BUSINESS, (db) => recentDigests(db));
     expect(stored[0]?.whatsappState).toBe('skipped_not_connected');
   });
 
@@ -99,14 +98,13 @@ describe('runDigests', () => {
     // Seed content — same window as above.
     await seedClosedJob(new Date('2026-10-07T07:00:00+03:00'));
 
-    const result = await runDigests({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => runDigests(db, {
       now: new Date('2026-10-07T09:00:00+03:00'),
       sendAlert: async () => ({ ok: false, error: 'smtp down' }),
-    });
+    }));
 
     expect(result.errored).toBeNull();
-    const stored = await recentDigests({ businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (db) => recentDigests(db));
     expect(stored[0]?.emailState).toBe('failed');
   });
 
@@ -127,15 +125,14 @@ describe('runDigests', () => {
     await seedClosedJob(new Date('2026-10-07T07:00:00+03:00'));
 
     const calls: string[] = [];
-    const result = await runDigests({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => runDigests(db, {
       now: new Date('2026-10-07T09:00:00+03:00'),
       sendAlert: async (subject) => { calls.push(subject); return { ok: true }; },
-    });
+    }));
 
     expect(result.errored).toBeNull();
     expect(calls).toEqual(['תדריך יומי']);
-    const stored = await recentDigests({ businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (db) => recentDigests(db));
     expect(stored[0]?.emailState).toBe('sent');
   });
 
@@ -159,15 +156,14 @@ describe('runDigests', () => {
       },
     };
 
-    const result = await runDigests({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => runDigests(db, {
       now: new Date('2026-10-07T09:00:00+03:00'),
       messenger,
-    });
+    }));
 
     expect(result.errored).toBeNull();
     expect(texts).toHaveLength(1);
-    const stored = await recentDigests({ businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (db) => recentDigests(db));
     expect(stored[0]?.whatsappState).toBe('sent');
   });
 
@@ -184,14 +180,13 @@ describe('runDigests', () => {
     );
     await seedClosedJob(new Date('2026-10-07T07:00:00+03:00'));
 
-    const result = await runDigests({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => runDigests(db, {
       now: new Date('2026-10-07T09:00:00+03:00'),
       sendAlert: async () => { throw new Error('boom'); },
-    });
+    }));
 
     expect(result.errored).toBeNull();
-    const stored = await recentDigests({ businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (db) => recentDigests(db));
     expect(stored).toHaveLength(1);
     expect(stored[0]?.emailState).toBe('failed');
   });
@@ -203,9 +198,9 @@ describe('runDigests', () => {
       'owner', { businessId: BUSINESS },
     );
     const now = new Date('2026-10-07T09:00:00+03:00');
-    await runDigests({ businessId: BUSINESS, now });
-    await runDigests({ businessId: BUSINESS, now });
-    expect(await recentDigests({ businessId: BUSINESS })).toHaveLength(1);
+    await withBusiness(BUSINESS, (db) => runDigests(db, { now }));
+    await withBusiness(BUSINESS, (db) => runDigests(db, { now }));
+    expect(await withBusiness(BUSINESS, (db) => recentDigests(db))).toHaveLength(1);
   });
 
   /** Spec §5: both kinds fire independently, and the overlap is deliberate. */
@@ -214,10 +209,9 @@ describe('runDigests', () => {
       { schedule: 'both', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: false },
       'owner', { businessId: BUSINESS },
     );
-    const result = await runDigests({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => runDigests(db, {
       now: new Date('2026-10-11T09:00:00+03:00'), // Sunday
-    });
+    }));
     expect(result.produced.map((s) => s.kind).sort()).toEqual(['daily', 'weekly']);
   });
 });

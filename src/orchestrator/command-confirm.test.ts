@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase, testDb } from '../test/db.js';
+import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { Plan } from '../domain/plan.js';
@@ -93,20 +93,20 @@ const versions = new Map<string, string>();
 async function charterVersion(businessId: string): Promise<string> {
   const known = versions.get(businessId);
   if (known !== undefined) return known;
-  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter()));
   versions.set(businessId, bundle.charterVersion);
   return bundle.charterVersion;
 }
 
 /** A boss job parked in `plan` with an instruction row, the shape `runInstruction` leaves. */
 async function parkedJob(businessId = BUSINESS): Promise<string> {
-  const job = await createJob({ charterVersion: await charterVersion(businessId), provenance: 'boss', businessId });
+  const job = await withBusiness(businessId, async (db) => createJob(db, { charterVersion: await charterVersion(businessId), provenance: 'boss' }));
   await saveInstruction(
     { jobId: job.jobId, text: 'תשלחי לדנה תזכורת', textOrigin: 'typed' },
     { businessId },
   );
-  await transition(job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't', businessId });
-  await transition(job.jobId, { to: 'plan', actor: 'orchestrator', reason: 't', businessId });
+  await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't' }));
+  await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'plan', actor: 'orchestrator', reason: 't' }));
   return job.jobId;
 }
 
@@ -127,7 +127,7 @@ async function ask(
  * the window or strict-after read the delivered question they mean.
  */
 async function presentedAt(jobId: string, at: Date): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `UPDATE instruction_confirmations
         SET presented_at = $2,
             delivered_at = CASE WHEN channel = 'whatsapp' THEN $2::timestamptz ELSE NULL END
@@ -137,18 +137,18 @@ async function presentedAt(jobId: string, at: Date): Promise<void> {
 }
 
 async function deliveredAt(jobId: string, at: Date | null): Promise<void> {
-  await getPool().query('UPDATE instruction_confirmations SET delivered_at = $2 WHERE job_id = $1', [
+  await testDb().query('UPDATE instruction_confirmations SET delivered_at = $2 WHERE job_id = $1', [
     jobId,
     at,
   ]);
 }
 
 async function phaseOf(jobId: string, businessId = BUSINESS): Promise<string | undefined> {
-  return (await loadJob(jobId, { businessId }))?.phase;
+  return (await withBusiness(businessId, (db) => loadJob(db, jobId)))?.phase;
 }
 
 async function transitionsTo(jobId: string, to: string): Promise<number> {
-  const { rows } = await getPool().query(
+  const { rows } = await testDb().query(
     'SELECT 1 FROM job_steps WHERE job_id = $1 AND to_phase = $2',
     [jobId, to],
   );
@@ -156,7 +156,7 @@ async function transitionsTo(jobId: string, to: string): Promise<number> {
 }
 
 async function tamperFirstOption(jobId: string): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `UPDATE instruction_confirmations
         SET options = jsonb_set(options, '{0,plan,goal}', '"tampered"')
       WHERE job_id = $1`,
@@ -384,7 +384,7 @@ describe('openConfirmations', () => {
     const jobId = await parkedJob();
     await ask(jobId, [SINGLE]);
     await presentedAt(jobId, new Date(Date.now() - 60_000));
-    const open = await openConfirmations({ businessId: BUSINESS, channel: 'whatsapp', inboundAt: new Date() });
+    const open = await withBusiness(BUSINESS, (db) => openConfirmations(db, { channel: 'whatsapp', inboundAt: new Date() }));
     expect(open.map((c) => c.jobId)).toEqual([jobId]);
   });
 
@@ -394,9 +394,9 @@ describe('openConfirmations', () => {
     const shown = new Date(Date.now() - 60_000);
     await presentedAt(jobId, shown);
     const before = new Date(shown.getTime() - 1_000);
-    expect(await openConfirmations({ businessId: BUSINESS, channel: 'whatsapp', inboundAt: before })).toEqual([]);
-    expect(await openConfirmations({ businessId: BUSINESS, channel: 'whatsapp', inboundAt: shown })).toEqual([]);
-    expect(await openConfirmations({ businessId: BUSINESS, channel: 'whatsapp', inboundAt: null })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (db) => openConfirmations(db, { channel: 'whatsapp', inboundAt: before }))).toEqual([]);
+    expect(await withBusiness(BUSINESS, (db) => openConfirmations(db, { channel: 'whatsapp', inboundAt: shown }))).toEqual([]);
+    expect(await withBusiness(BUSINESS, (db) => openConfirmations(db, { channel: 'whatsapp', inboundAt: null }))).toEqual([]);
   });
 
   it('excludes a question presented outside the window', async () => {
@@ -404,7 +404,7 @@ describe('openConfirmations', () => {
     await ask(jobId, [SINGLE]);
     await presentedAt(jobId, new Date(Date.now() - 31 * 60_000));
     expect(
-      await openConfirmations({ businessId: BUSINESS, channel: 'whatsapp', inboundAt: new Date() }),
+      await withBusiness(BUSINESS, (db) => openConfirmations(db, { channel: 'whatsapp', inboundAt: new Date() })),
     ).toEqual([]);
   });
 
@@ -419,27 +419,27 @@ describe('openConfirmations', () => {
 
     const cancelled = await parkedJob();
     await ask(cancelled, [SINGLE]);
-    await getPool().query(
+    await testDb().query(
       "UPDATE instruction_confirmations SET state = 'cancelled', decided_at = now() WHERE job_id = $1",
       [cancelled],
     );
 
     const movedOn = await parkedJob();
     await ask(movedOn, [SINGLE]);
-    await transition(movedOn, { to: 'closed', actor: 'system', reason: 't', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, movedOn, { to: 'closed', actor: 'system', reason: 't' }));
 
     const noInstruction = (
-      await createJob({ charterVersion: await charterVersion(BUSINESS), provenance: 'boss', businessId: BUSINESS })
+      await withBusiness(BUSINESS, async (db) => createJob(db, { charterVersion: await charterVersion(BUSINESS), provenance: 'boss' }))
     ).jobId;
-    await transition(noInstruction, { to: 'understand', actor: 'orchestrator', reason: 't', businessId: BUSINESS });
-    await transition(noInstruction, { to: 'plan', actor: 'orchestrator', reason: 't', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, noInstruction, { to: 'understand', actor: 'orchestrator', reason: 't' }));
+    await withBusiness(BUSINESS, (db) => transition(db, noInstruction, { to: 'plan', actor: 'orchestrator', reason: 't' }));
     await ask(noInstruction, [SINGLE]);
 
     for (const jobId of [otherBusiness, dashboard, cancelled, movedOn, noInstruction]) {
       await presentedAt(jobId, minuteAgo);
     }
     expect(
-      await openConfirmations({ businessId: BUSINESS, channel: 'whatsapp', inboundAt: new Date() }),
+      await withBusiness(BUSINESS, (db) => openConfirmations(db, { channel: 'whatsapp', inboundAt: new Date() })),
     ).toEqual([]);
   });
 });
@@ -448,14 +448,14 @@ describe('a WhatsApp question counts only once it was delivered', () => {
   it('an undelivered WhatsApp question answers no WhatsApp message, and is still listed on the dashboard', async () => {
     const jobId = await parkedJob();
     await ask(jobId, [SINGLE]);
-    await getPool().query(
+    await testDb().query(
       'UPDATE instruction_confirmations SET presented_at = $2 WHERE job_id = $1',
       [jobId, new Date(Date.now() - 60_000)],
     );
     expect(
-      await openConfirmations({ businessId: BUSINESS, channel: 'whatsapp', inboundAt: new Date() }),
+      await withBusiness(BUSINESS, (db) => openConfirmations(db, { channel: 'whatsapp', inboundAt: new Date() })),
     ).toEqual([]);
-    expect((await dashboardConfirmations({ businessId: BUSINESS })).map((c) => c.jobId)).toEqual([jobId]);
+    expect((await withBusiness(BUSINESS, (db) => dashboardConfirmations(db))).map((c) => c.jobId)).toEqual([jobId]);
   });
 
   it('strict-after is measured from delivery: a message between presentation and delivery answers nothing', async () => {
@@ -463,15 +463,15 @@ describe('a WhatsApp question counts only once it was delivered', () => {
     await ask(jobId, [SINGLE]);
     const shown = new Date(Date.now() - 120_000);
     const delivered = new Date(Date.now() - 60_000);
-    await getPool().query('UPDATE instruction_confirmations SET presented_at = $2 WHERE job_id = $1', [
+    await testDb().query('UPDATE instruction_confirmations SET presented_at = $2 WHERE job_id = $1', [
       jobId,
       shown,
     ]);
     await deliveredAt(jobId, delivered);
     const between = new Date(delivered.getTime() - 30_000);
-    expect(await openConfirmations({ businessId: BUSINESS, channel: 'whatsapp', inboundAt: between })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (db) => openConfirmations(db, { channel: 'whatsapp', inboundAt: between }))).toEqual([]);
     expect(
-      (await openConfirmations({ businessId: BUSINESS, channel: 'whatsapp', inboundAt: new Date() })).map(
+      (await withBusiness(BUSINESS, (db) => openConfirmations(db, { channel: 'whatsapp', inboundAt: new Date() }))).map(
         (c) => c.jobId,
       ),
     ).toEqual([jobId]);
@@ -519,13 +519,12 @@ describe('a WhatsApp question counts only once it was delivered', () => {
 
   it('applyConfirmation from WhatsApp is already_decided on an undelivered row, and moves nothing', async () => {
     const jobId = await parkedJob();
-    await bindPlanToJob(jobId, PLAN_A, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN_A));
     await ask(jobId, [SINGLE]);
     expect(
-      await applyConfirmation(jobId, { kind: 'confirm', planHash: HASH_A }, 'owner', {
-        businessId: BUSINESS,
+      await withBusiness(BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'confirm', planHash: HASH_A }, 'owner', {
         whatsappInboundAt: new Date(),
-      }),
+      })),
     ).toBe('already_decided');
     expect(await phaseOf(jobId)).toBe('plan');
     expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.state).toBe('pending');
@@ -535,12 +534,10 @@ describe('a WhatsApp question counts only once it was delivered', () => {
 describe('applyConfirmation', () => {
   it('a single option: confirms, keeps the bound plan, moves plan → execute', async () => {
     const jobId = await parkedJob();
-    await bindPlanToJob(jobId, PLAN_A, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN_A));
     await ask(jobId, [SINGLE]);
 
-    const outcome = await applyConfirmation(jobId, { kind: 'confirm', planHash: HASH_A }, 'owner', {
-      businessId: BUSINESS,
-    });
+    const outcome = await withBusiness(BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'confirm', planHash: HASH_A }, 'owner'));
     expect(outcome).toBe('executing');
     expect(await phaseOf(jobId)).toBe('execute');
     expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.state).toBe('confirmed');
@@ -554,26 +551,23 @@ describe('applyConfirmation', () => {
   it('several options: binds the chosen plan only after the pick', async () => {
     const jobId = await parkedJob();
     await ask(jobId, [OPTION_A, OPTION_B]);
-    expect(await loadStoredPlan(jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => loadStoredPlan(db, jobId))).toBeNull();
 
-    const outcome = await applyConfirmation(jobId, readConfirmation('לוי', [OPTION_A, OPTION_B]), 'owner', {
-      businessId: BUSINESS,
-    });
+    const outcome = await withBusiness(BUSINESS, (db) => applyConfirmation(db, jobId, readConfirmation('לוי', [OPTION_A, OPTION_B]), 'owner'));
     expect(outcome).toBe('executing');
-    expect((await loadStoredPlan(jobId, { businessId: BUSINESS }))?.planHash).toBe(HASH_B);
+    expect((await withBusiness(BUSINESS, (db) => loadStoredPlan(db, jobId)))?.planHash).toBe(HASH_B);
     expect(await phaseOf(jobId)).toBe('execute');
   });
 
   it('a second confirm is a no-op: already_decided, one transition', async () => {
     const jobId = await parkedJob();
     await ask(jobId, [OPTION_A, OPTION_B]);
-    const by = { businessId: BUSINESS };
-    expect(await applyConfirmation(jobId, { kind: 'confirm', planHash: HASH_A }, 'owner', by)).toBe('executing');
-    expect(await applyConfirmation(jobId, { kind: 'confirm', planHash: HASH_B }, 'owner', by)).toBe(
+    expect(await withBusiness(TEST_BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'confirm', planHash: HASH_A }, 'owner'))).toBe('executing');
+    expect(await withBusiness(TEST_BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'confirm', planHash: HASH_B }, 'owner'))).toBe(
       'already_decided',
     );
     expect(await transitionsTo(jobId, 'execute')).toBe(1);
-    expect((await loadStoredPlan(jobId, by))?.planHash).toBe(HASH_A);
+    expect((await withBusiness(TEST_BUSINESS, (db) => loadStoredPlan(db, jobId)))?.planHash).toBe(HASH_A);
   });
 
   it('a confirm on an expired question is already_decided and moves nothing', async () => {
@@ -581,19 +575,19 @@ describe('applyConfirmation', () => {
     await ask(jobId, [OPTION_A, OPTION_B]);
     await presentedAt(jobId, new Date(Date.now() - 31 * 60_000));
     expect(
-      await applyConfirmation(jobId, { kind: 'confirm', planHash: HASH_A }, 'owner', { businessId: BUSINESS }),
+      await withBusiness(BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'confirm', planHash: HASH_A }, 'owner')),
     ).toBe('already_decided');
     expect(await phaseOf(jobId)).toBe('plan');
-    expect(await loadStoredPlan(jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => loadStoredPlan(db, jobId))).toBeNull();
   });
 
   it('refuses to execute when the bound plan is not the chosen one (single option)', async () => {
     const jobId = await parkedJob();
     // The job is bound to a plan the owner was never shown.
-    await bindPlanToJob(jobId, PLAN_C, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN_C));
     await ask(jobId, [SINGLE]);
     await expect(
-      applyConfirmation(jobId, { kind: 'confirm', planHash: HASH_A }, 'owner', { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'confirm', planHash: HASH_A }, 'owner')),
     ).rejects.toThrow(/bound/);
     expect(await phaseOf(jobId)).toBe('plan');
   });
@@ -601,18 +595,18 @@ describe('applyConfirmation', () => {
   it('refuses to execute when the chosen plan cannot be bound (several options)', async () => {
     const jobId = await parkedJob();
     // Another plan already bound and a step of it already ran: bindPlanToJob conflicts.
-    await bindPlanToJob(jobId, PLAN_C, { businessId: BUSINESS });
-    await getPool().query(
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN_C));
+    await testDb().query(
       `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, status)
        VALUES ($1, $2, $3, 's1', 'unknown')`,
       [BUSINESS, jobId, planHashOf(PLAN_C)],
     );
     await ask(jobId, [OPTION_A, OPTION_B]);
     await expect(
-      applyConfirmation(jobId, { kind: 'confirm', planHash: HASH_A }, 'owner', { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'confirm', planHash: HASH_A }, 'owner')),
     ).rejects.toThrow(/bound/);
     expect(await phaseOf(jobId)).toBe('plan');
-    expect((await loadStoredPlan(jobId, { businessId: BUSINESS }))?.planHash).toBe(planHashOf(PLAN_C));
+    expect((await withBusiness(BUSINESS, (db) => loadStoredPlan(db, jobId)))?.planHash).toBe(planHashOf(PLAN_C));
   });
 
   it('does not bind when the confirmation row was erased between the confirm and the bind', async () => {
@@ -620,32 +614,32 @@ describe('applyConfirmation', () => {
     await ask(jobId, [OPTION_A, OPTION_B]);
     expect(await confirmChoice(jobId, HASH_A, 'owner', { businessId: BUSINESS })).toBe(true);
     // Erasure lands between `confirmChoice` and the bind.
-    await getPool().query('DELETE FROM instruction_confirmations WHERE job_id = $1', [jobId]);
-    await expect(bindChosenPlan(jobId, HASH_A, { businessId: BUSINESS })).rejects.toThrow(
+    await testDb().query('DELETE FROM instruction_confirmations WHERE job_id = $1', [jobId]);
+    await expect(withBusiness(BUSINESS, (db) => bindChosenPlan(db, jobId, HASH_A))).rejects.toThrow(
       /no longer confirmed/,
     );
-    expect(await loadStoredPlan(jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => loadStoredPlan(db, jobId))).toBeNull();
   });
 
   it('does not bind a hash other than the confirmed one', async () => {
     const jobId = await parkedJob();
     await ask(jobId, [OPTION_A, OPTION_B]);
     expect(await confirmChoice(jobId, HASH_A, 'owner', { businessId: BUSINESS })).toBe(true);
-    await expect(bindChosenPlan(jobId, HASH_B, { businessId: BUSINESS })).rejects.toThrow(
+    await expect(withBusiness(BUSINESS, (db) => bindChosenPlan(db, jobId, HASH_B))).rejects.toThrow(
       /no longer confirmed/,
     );
-    expect(await loadStoredPlan(jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => loadStoredPlan(db, jobId))).toBeNull();
   });
 
   it('a job no longer in plan is already decided, and its row is not flipped', async () => {
     const jobId = await parkedJob();
     await ask(jobId, [OPTION_A, OPTION_B]);
-    await transition(jobId, { to: 'closed', actor: 'system', reason: 't', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'closed', actor: 'system', reason: 't' }));
     const by = { businessId: BUSINESS };
-    expect(await applyConfirmation(jobId, { kind: 'confirm', planHash: HASH_A }, 'owner', by)).toBe(
+    expect(await withBusiness(TEST_BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'confirm', planHash: HASH_A }, 'owner'))).toBe(
       'already_decided',
     );
-    expect(await applyConfirmation(jobId, { kind: 'cancel' }, 'owner', by)).toBe('already_decided');
+    expect(await withBusiness(TEST_BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'cancel' }, 'owner'))).toBe('already_decided');
     expect((await loadConfirmation(jobId, by))?.state).toBe('pending');
   });
 
@@ -656,20 +650,19 @@ describe('applyConfirmation', () => {
     // would run bytes the owner was never shown.
     await tamperFirstOption(jobId);
     await expect(
-      applyConfirmation(jobId, { kind: 'confirm', planHash: HASH_A }, 'owner', { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'confirm', planHash: HASH_A }, 'owner')),
     ).rejects.toThrow(/could not be bound/);
-    expect(await loadStoredPlan(jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => loadStoredPlan(db, jobId))).toBeNull();
     expect(await phaseOf(jobId)).toBe('plan');
   });
 
   it('cancel: closes the job, once', async () => {
     const jobId = await parkedJob();
     await ask(jobId, [OPTION_A, OPTION_B]);
-    const by = { businessId: BUSINESS };
-    expect(await applyConfirmation(jobId, { kind: 'cancel' }, 'owner', by)).toBe('cancelled');
+    expect(await withBusiness(TEST_BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'cancel' }, 'owner'))).toBe('cancelled');
     expect(await phaseOf(jobId)).toBe('closed');
-    expect(await applyConfirmation(jobId, { kind: 'cancel' }, 'owner', by)).toBe('already_decided');
-    expect(await applyConfirmation(jobId, { kind: 'confirm', planHash: HASH_A }, 'owner', by)).toBe(
+    expect(await withBusiness(TEST_BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'cancel' }, 'owner'))).toBe('already_decided');
+    expect(await withBusiness(TEST_BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'confirm', planHash: HASH_A }, 'owner'))).toBe(
       'already_decided',
     );
     expect(await transitionsTo(jobId, 'closed')).toBe(1);
@@ -684,8 +677,8 @@ describe('applyConfirmation', () => {
     const jobId = await parkedJob();
     await ask(jobId, [OPTION_A, OPTION_B]);
     const by = { businessId: BUSINESS };
-    expect(await applyConfirmation(jobId, { kind: 'unclear' }, 'owner', by)).toBe('unclear');
-    expect(await applyConfirmation(jobId, { kind: 'none' }, 'owner', by)).toBe('unclear');
+    expect(await withBusiness(TEST_BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'unclear' }, 'owner'))).toBe('unclear');
+    expect(await withBusiness(TEST_BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'none' }, 'owner'))).toBe('unclear');
     expect((await loadConfirmation(jobId, by))?.state).toBe('pending');
     expect(await phaseOf(jobId)).toBe('plan');
   });
@@ -718,7 +711,7 @@ describe('scheduler expiry', () => {
     const gone = await parkedJob();
     await ask(gone, [SINGLE]);
     await presentedAt(gone, new Date(Date.now() - 31 * 60_000));
-    await transition(gone, { to: 'closed', actor: 'system', reason: 'other', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, gone, { to: 'closed', actor: 'system', reason: 'other' }));
 
     const result = await schedulerPass({ businessId: BUSINESS, runtime: inertRuntime(), inbox: null });
 
@@ -736,7 +729,7 @@ describe('settleDecidedConfirmations', () => {
     const jobId = await parkedJob();
     await ask(jobId, [OPTION_A, OPTION_B]);
     expect(await cancelConfirmation(jobId, 'owner', by)).toBe(true);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'closed' }], skipped: [], errored: [] });
+    expect(await withBusiness(TEST_BUSINESS, (db) => settleDecidedConfirmations(db))).toEqual({ settled: [{ jobId, to: 'closed' }], skipped: [], errored: [] });
     expect(await reasonsTo(jobId, 'closed')).toEqual(['command: cancelled']);
   });
 
@@ -744,16 +737,16 @@ describe('settleDecidedConfirmations', () => {
     const jobId = await parkedJob();
     await ask(jobId, [SINGLE]);
     expect(await expireConfirmations({ businessId: BUSINESS, windowMinutes: 0 })).toEqual([jobId]);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'closed' }], skipped: [], errored: [] });
+    expect(await withBusiness(TEST_BUSINESS, (db) => settleDecidedConfirmations(db))).toEqual({ settled: [{ jobId, to: 'closed' }], skipped: [], errored: [] });
     expect(await reasonsTo(jobId, 'closed')).toEqual(['command: confirmation expired']);
   });
 
   it('confirmed and bound to the chosen plan → execute', async () => {
     const jobId = await parkedJob();
-    await bindPlanToJob(jobId, PLAN_A, by);
+    await withBusiness(TEST_BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN_A));
     await ask(jobId, [SINGLE]);
     expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'execute' }], skipped: [], errored: [] });
+    expect(await withBusiness(TEST_BUSINESS, (db) => settleDecidedConfirmations(db))).toEqual({ settled: [{ jobId, to: 'execute' }], skipped: [], errored: [] });
     expect(await reasonsTo(jobId, 'execute')).toEqual(['command: confirmed']);
   });
 
@@ -761,16 +754,16 @@ describe('settleDecidedConfirmations', () => {
     const jobId = await parkedJob();
     await ask(jobId, [OPTION_A, OPTION_B]);
     expect(await confirmChoice(jobId, HASH_B, 'owner', by)).toBe(true);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'execute' }], skipped: [], errored: [] });
-    expect((await loadStoredPlan(jobId, by))?.planHash).toBe(HASH_B);
+    expect(await withBusiness(TEST_BUSINESS, (db) => settleDecidedConfirmations(db))).toEqual({ settled: [{ jobId, to: 'execute' }], skipped: [], errored: [] });
+    expect((await withBusiness(TEST_BUSINESS, (db) => loadStoredPlan(db, jobId)))?.planHash).toBe(HASH_B);
   });
 
   it('confirmed but bound to another plan → failed', async () => {
     const jobId = await parkedJob();
-    await bindPlanToJob(jobId, PLAN_C, by);
+    await withBusiness(TEST_BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN_C));
     await ask(jobId, [SINGLE]);
     expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'failed' }], skipped: [], errored: [] });
+    expect(await withBusiness(TEST_BUSINESS, (db) => settleDecidedConfirmations(db))).toEqual({ settled: [{ jobId, to: 'failed' }], skipped: [], errored: [] });
     expect(await reasonsTo(jobId, 'failed')).toEqual([UNAPPLIABLE_REASON]);
     expect(await transitionsTo(jobId, 'execute')).toBe(0);
   });
@@ -779,7 +772,7 @@ describe('settleDecidedConfirmations', () => {
     const jobId = await parkedJob();
     await ask(jobId, [SINGLE]);
     expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'failed' }], skipped: [], errored: [] });
+    expect(await withBusiness(TEST_BUSINESS, (db) => settleDecidedConfirmations(db))).toEqual({ settled: [{ jobId, to: 'failed' }], skipped: [], errored: [] });
   });
 
   it('confirmed, several options, a bind that refuses → failed', async () => {
@@ -787,17 +780,17 @@ describe('settleDecidedConfirmations', () => {
     await ask(jobId, [OPTION_A, OPTION_B]);
     await tamperFirstOption(jobId);
     expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'failed' }], skipped: [], errored: [] });
-    expect(await loadStoredPlan(jobId, by)).toBeNull();
+    expect(await withBusiness(TEST_BUSINESS, (db) => settleDecidedConfirmations(db))).toEqual({ settled: [{ jobId, to: 'failed' }], skipped: [], errored: [] });
+    expect(await withBusiness(TEST_BUSINESS, (db) => loadStoredPlan(db, jobId))).toBeNull();
   });
 
   it('an applyConfirmation that threw after its flip is finished by the sweep', async () => {
     const jobId = await parkedJob();
-    await bindPlanToJob(jobId, PLAN_C, by);
+    await withBusiness(TEST_BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN_C));
     await ask(jobId, [SINGLE]);
-    await expect(applyConfirmation(jobId, { kind: 'confirm', planHash: HASH_A }, 'owner', by)).rejects.toThrow();
+    await expect(withBusiness(TEST_BUSINESS, (db) => applyConfirmation(db, jobId, { kind: 'confirm', planHash: HASH_A }, 'owner'))).rejects.toThrow();
     expect(await phaseOf(jobId)).toBe('plan');
-    await settleDecidedConfirmations(by);
+    await withBusiness(TEST_BUSINESS, (db) => settleDecidedConfirmations(db));
     expect(await phaseOf(jobId)).toBe('failed');
   });
 
@@ -805,13 +798,13 @@ describe('settleDecidedConfirmations', () => {
     const pending = await parkedJob();
     await ask(pending, [SINGLE]);
     const orphan = (
-      await createJob({ charterVersion: await charterVersion(BUSINESS), provenance: 'boss', businessId: BUSINESS })
+      await withBusiness(BUSINESS, async (db) => createJob(db, { charterVersion: await charterVersion(BUSINESS), provenance: 'boss' }))
     ).jobId;
-    await transition(orphan, { to: 'understand', actor: 'orchestrator', reason: 't', businessId: BUSINESS });
-    await transition(orphan, { to: 'plan', actor: 'orchestrator', reason: 't', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, orphan, { to: 'understand', actor: 'orchestrator', reason: 't' }));
+    await withBusiness(BUSINESS, (db) => transition(db, orphan, { to: 'plan', actor: 'orchestrator', reason: 't' }));
     await ask(orphan, [SINGLE]);
     await cancelConfirmation(orphan, 'owner', by);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [], skipped: [], errored: [] });
+    expect(await withBusiness(TEST_BUSINESS, (db) => settleDecidedConfirmations(db))).toEqual({ settled: [], skipped: [], errored: [] });
     expect(await phaseOf(orphan)).toBe('plan');
     expect(await phaseOf(pending)).toBe('plan');
   });
@@ -834,7 +827,7 @@ describe('settleDecidedConfirmations', () => {
       'CREATE TRIGGER test_refuse_job_step BEFORE INSERT ON job_steps FOR EACH ROW EXECUTE FUNCTION test_refuse_job_step()',
     );
     try {
-      const result = await settleDecidedConfirmations(by);
+      const result = await withBusiness(TEST_BUSINESS, (db) => settleDecidedConfirmations(db));
       expect(result.settled).toEqual([{ jobId: fine, to: 'closed' }]);
       expect(result.errored.map((e) => e.jobId)).toEqual([broken]);
       expect(result.errored[0]?.error).toContain('refused for test');

@@ -59,16 +59,15 @@ async function setup(
     bdb,
     buildCharter({ knownCounterpartyEmailDomain: 'client.example', ...overrides })
   ));
-  await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
   await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, options.mode ?? 'learn', 'owner'));
-  const rampLevel = await loadRampLevel('email.reply', { businessId: BUSINESS });
+  const rampLevel = await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'));
   expect(rampLevel).toBe(options.mode === 'off' ? 'draft_only' : 'auto_notify');
 
-  const job = await createJob({
-    businessId: BUSINESS,
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'unknown_external',
-  });
+  }));
   // A mail from the sender is ALWAYS stored, linked or not, so a mutation that
   // dropped the reply-job predicate would still find a row by From alone.
   const link = options.link ?? 'this';

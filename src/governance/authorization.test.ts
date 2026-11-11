@@ -236,10 +236,10 @@ describe('coveredByAuthorization', () => {
 
 describe('grantAuthorization', () => {
   it('stores and reloads what the owner named', async () => {
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion, provenance: 'boss',
-      businessId: BUSINESS, title: 'להשיב לדנה',
-    });
+      title: 'להשיב לדנה',
+    }));
     await withBusiness(BUSINESS, (bdb) => grantAuthorization(
       bdb,
       { jobId: job.jobId, actionClass: 'email.reply', recipients: ['Dana@Example.com'] }
@@ -251,10 +251,10 @@ describe('grantAuthorization', () => {
   });
 
   it('refuses to authorise a job whose provenance is not boss, and writes no row', async () => {
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion, provenance: 'unknown_external',
-      businessId: BUSINESS, title: 'מסמך שהגיע',
-    });
+      title: 'מסמך שהגיע',
+    }));
     await expect(
       withBusiness(BUSINESS, (bdb) => grantAuthorization(
         bdb,
@@ -279,9 +279,9 @@ describe('grantAuthorization', () => {
     // filters on `AND business_id = $2`, so this job is simply not found
     // under that business — dropping that clause would make this pass
     // silently instead of rejecting.
-    const job = await createJob({
-      charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS,
-    });
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
+      charterVersion: bundle.charterVersion, provenance: 'boss', 
+    }));
     await expect(
       withBusiness('other-business', (bdb) => grantAuthorization(
         bdb,
@@ -292,9 +292,9 @@ describe('grantAuthorization', () => {
   });
 
   it('refuses a second authorisation for the same job, and leaves the first row unchanged', async () => {
-    const job = await createJob({
-      charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS,
-    });
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
+      charterVersion: bundle.charterVersion, provenance: 'boss', 
+    }));
     await withBusiness(BUSINESS, (bdb) => grantAuthorization(
       bdb,
       { jobId: job.jobId, actionClass: 'email.reply', recipients: ['dana@example.com'] }
@@ -312,16 +312,16 @@ describe('grantAuthorization', () => {
   });
 
   it('returns null for a job nobody authorised', async () => {
-    const job = await createJob({
-      charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS,
-    });
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
+      charterVersion: bundle.charterVersion, provenance: 'boss', 
+    }));
     expect(await withBusiness(BUSINESS, (bdb) => loadAuthorization(bdb, job.jobId))).toBeNull();
   });
 
   it('does not cross the business boundary', async () => {
-    const job = await createJob({
-      charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS,
-    });
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
+      charterVersion: bundle.charterVersion, provenance: 'boss', 
+    }));
     await withBusiness(BUSINESS, (bdb) => grantAuthorization(
       bdb,
       { jobId: job.jobId, actionClass: 'email.reply', recipients: ['x@y.com'] }

@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { appendAudit } from '../audit/log.js';
@@ -69,7 +69,7 @@ const JOINED_ANSWER = ['תשלחי לרונית', 'רונית כהן'].join('\n\
 const STRANGER_NUMBER = '+972549999999';
 
 async function withCharter(): Promise<void> {
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
 }
 
 let nextId = 0;
@@ -217,7 +217,7 @@ async function jobWhatsAppMessageId(jobId: string): Promise<string | null> {
 }
 
 async function seedInstructionAttempt(businessId: string): Promise<void> {
-  await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 4)
+  await withBusiness(businessId, (bdb) => appendAudit(
     bdb,
     {
       actor: 'orchestrator',
@@ -249,15 +249,14 @@ describe('runWhatsAppDoor', () => {
     const msg = textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לדנה את ההצעה' });
     gateway.enqueue(msg);
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       // Reads only, so the job goes straight to `execute` as before; a
       // side-effecting plan now parks on a confirmation question (see the
       // boss-command tests at the end of this file).
       planner: plannedWith(recallPlan()),
-    });
+    }));
 
     expect(result).toEqual({ polled: 1, instructed: 1, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, documentCardReplies: 0, confirmErrored: [], malformedSenderCount: 0 });
     expect(messenger.sentTexts).toHaveLength(1);
@@ -288,12 +287,11 @@ describe('runWhatsAppDoor', () => {
     const messenger = createFakeMessenger();
     gateway.enqueue(textMsg({ senderNumber: STRANGER_NUMBER, body: 'מה המחיר שלכם?' }));
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: neverCalled,
-    });
+    }));
 
     expect(result.recordedOnly).toBe(1);
     expect(result.instructed).toBe(0);
@@ -327,12 +325,11 @@ describe('runWhatsAppDoor', () => {
     const messenger = createFakeMessenger();
     gateway.enqueue(textMsg({ senderNumber: '0549999999', body: 'מה המחיר שלכם?' }));
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: neverCalled,
-    });
+    }));
 
     expect(result.recordedOnly).toBe(1); // handled identically to a stranger
     expect(result.malformedSenderCount).toBe(1); // but counted apart
@@ -351,10 +348,10 @@ describe('runWhatsAppDoor', () => {
     const msg = textMsg({ senderNumber: '0549999999', body: 'מה המחיר שלכם?' });
     gateway.enqueue(msg);
 
-    await runWhatsAppDoor({ gateway, messenger, businessId: BUSINESS, planner: neverCalled });
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, { gateway, messenger, planner: neverCalled }));
 
     gateway.enqueue(msg); // identical providerMessageId — a redelivery
-    const second = await runWhatsAppDoor({ gateway, messenger, businessId: BUSINESS, planner: neverCalled });
+    const second = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, { gateway, messenger, planner: neverCalled }));
 
     expect(second.malformedSenderCount).toBe(0);
   });
@@ -385,27 +382,25 @@ describe('runWhatsAppDoor', () => {
     const question = 'לאיזו רונית — רונית כהן או רונית לוי?';
 
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
-    const first = await runWhatsAppDoor({
+    const first = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: plannedWith(mailPlan({ clarifyingQuestion: question })),
-    });
+    }));
     expect(first.instructed).toBe(1);
     const parked = (await openJobs(BUSINESS))[0];
     if (parked === undefined) throw new Error('unreachable');
 
     const seen: string[] = [];
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'רונית כהן' }));
-    const second = await runWhatsAppDoor({
+    const second = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: async (request) => {
         seen.push(request.instruction ?? '');
         return { status: 'planned', plan: mailPlan() };
       },
-    });
+    }));
 
     expect(second.instructed).toBe(1);
     // The planner saw the original request AND the answer, not the answer
@@ -458,13 +453,12 @@ describe('runWhatsAppDoor', () => {
    * ambiguous) is what bounds the loop.
    */
   it('suppresses the identity question on the answer pass, so the same name is not asked about forever', async () => {
-    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     if (active === null) throw new Error('unreachable');
-    const seedJob = await createJob({
+    const seedJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     await writeMemory(
       {
         jobId: seedJob.jobId,
@@ -499,28 +493,26 @@ describe('runWhatsAppDoor', () => {
     const gateway = createFakeGateway();
     const messenger = createFakeMessenger();
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
-    const first = await runWhatsAppDoor({
+    const first = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       // The identity question returns before the planner is reached at all.
       planner: neverCalled,
-    });
+    }));
     expect(first.instructed).toBe(1);
     expect(messenger.sentTexts[0]).toContain('רונית כהן'); // the question names both
     expect(messenger.sentTexts[0]).toContain('רונית לוי');
 
     const seen: string[] = [];
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'רונית כהן' }));
-    const second = await runWhatsAppDoor({
+    const second = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: async (request) => {
         seen.push(request.instruction ?? '');
         return { status: 'planned', plan: mailPlan() };
       },
-    });
+    }));
 
     // The planner really ran on the joined text — the identity question did
     // not fire a second time and send the owner round again.
@@ -541,23 +533,21 @@ describe('runWhatsAppDoor', () => {
     const messenger = createFakeMessenger();
 
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
-    await runWhatsAppDoor({
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })),
-    });
+    }));
     const parked = (await openJobs(BUSINESS))[0];
     if (parked === undefined) throw new Error('unreachable');
 
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'סגרנו' }));
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       // A closure never reaches the planner at all.
       planner: neverCalled,
-    });
+    }));
 
     expect(result.closed).toBe(1);
     expect(result.instructed).toBe(0);
@@ -598,26 +588,24 @@ describe('runWhatsAppDoor', () => {
     const messenger = createFakeMessenger();
 
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
-    await runWhatsAppDoor({
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })),
-    });
+    }));
     const parked = (await openJobs(BUSINESS))[0];
     if (parked === undefined) throw new Error('unreachable');
 
     const seen: string[] = [];
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'זהו, רונית כהן' }));
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: async (request) => {
         seen.push(request.instruction ?? '');
         return { status: 'planned', plan: mailPlan() };
       },
-    });
+    }));
 
     // Routed as the ANSWER: the planner ran on the joined text, and nothing
     // was closed.
@@ -645,20 +633,18 @@ describe('runWhatsAppDoor', () => {
     const messenger = createFakeMessenger();
 
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
-    await runWhatsAppDoor({
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })),
-    });
+    }));
 
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'זהו' }));
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: neverCalled,
-    });
+    }));
 
     expect(result.closed).toBe(1);
     expect(messenger.sentTexts[1]).toContain('סגרתי');
@@ -685,15 +671,14 @@ describe('runWhatsAppDoor', () => {
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תעזבי את הפגישה' }));
 
     const seen: string[] = [];
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: async (request) => {
         seen.push(request.instruction ?? '');
         return { status: 'planned', plan: mailPlan() };
       },
-    });
+    }));
 
     expect(result.instructed).toBe(1);
     expect(result.closed).toBe(0);
@@ -706,12 +691,11 @@ describe('runWhatsAppDoor', () => {
     const messenger = createFakeMessenger();
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'סגרנו' }));
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: neverCalled,
-    });
+    }));
 
     expect(result.closed).toBe(1);
     expect(messenger.sentTexts[0]).toContain('אין לי כרגע בקשה פתוחה');
@@ -730,22 +714,20 @@ describe('runWhatsAppDoor', () => {
     const messenger = createFakeMessenger();
 
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
-    await runWhatsAppDoor({
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })),
-    });
+    }));
     const parked = (await openJobs(BUSINESS))[0];
     if (parked === undefined) throw new Error('unreachable');
 
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'משהו אחר לגמרי' }));
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: async () => ({ status: 'unparseable', raw: 'not json', reason: 'bad model output' }),
-    });
+    }));
 
     expect(result.refused).toBe(1);
     const told = messenger.sentTexts[1] ?? '';
@@ -773,20 +755,18 @@ describe('runWhatsAppDoor', () => {
     const messenger = createFakeMessenger();
 
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
-    await runWhatsAppDoor({
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })),
-    });
+    }));
 
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'משהו אחר' }));
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: plannedWith(mailPlan({ clarifyingQuestion: 'עדיין לא הבנתי — למי?' })),
-    });
+    }));
 
     expect(result.instructed).toBe(1);
     const told = messenger.sentTexts[1] ?? '';
@@ -812,26 +792,24 @@ describe('runWhatsAppDoor', () => {
 
     for (const body of ['תשלחי לרונית', 'תזמיני ספקים']) {
       gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body }));
-      await runWhatsAppDoor({
+      await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
         gateway,
         messenger,
-        businessId: BUSINESS,
         planner: plannedWith(mailPlan({ clarifyingQuestion: `לגבי ${body}?` })),
         questionWindowMinutes: 0,
-      });
+      }));
     }
     const parkedBefore = await openJobs(BUSINESS);
     expect(parkedBefore).toHaveLength(2);
 
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'רונית כהן' }));
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       // Nothing is planned on this branch — no planner call at all.
       planner: neverCalled,
       questionWindowMinutes: 30,
-    });
+    }));
 
     expect(result.refused).toBe(1);
     expect(result.instructed).toBe(0);
@@ -864,26 +842,24 @@ describe('runWhatsAppDoor', () => {
     const messenger = createFakeMessenger();
 
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
-    await runWhatsAppDoor({
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })),
       questionWindowMinutes: 0,
-    });
+    }));
 
     const seen: string[] = [];
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תזמיני לי ספקים' }));
-    await runWhatsAppDoor({
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: async (request) => {
         seen.push(request.instruction ?? '');
         return { status: 'planned', plan: mailPlan() };
       },
       questionWindowMinutes: 0,
-    });
+    }));
 
     // Nothing was joined: the planner saw the new message on its own.
     expect(seen).toEqual(['תזמיני לי ספקים']);
@@ -902,12 +878,11 @@ describe('runWhatsAppDoor', () => {
     const messenger = createFakeMessenger();
 
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
-    await runWhatsAppDoor({
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })),
-    });
+    }));
     const parked = (await openJobs(BUSINESS))[0];
     if (parked === undefined) throw new Error('unreachable');
 
@@ -916,12 +891,11 @@ describe('runWhatsAppDoor', () => {
     }
 
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'סגרנו' }));
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: neverCalled,
-    });
+    }));
 
     expect(result.closed).toBe(1);
     expect(result.refused).toBe(0);
@@ -939,12 +913,11 @@ describe('runWhatsAppDoor', () => {
     const question = 'למי בדיוק את מתכוונת, לדנה מהנהלת חשבונות או לדנה מהשיווק?';
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לדנה הודעה' }));
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: plannedWith(mailPlan({ clarifyingQuestion: question })),
-    });
+    }));
 
     // One message, carrying the question verbatim — `composeAck` returns
     // `runInstruction`'s own sentence unchanged and never paraphrases it.
@@ -967,12 +940,11 @@ describe('runWhatsAppDoor', () => {
     const messenger = createFakeMessenger();
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'ג׳יבריש לא מובן' }));
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: async () => ({ status: 'unparseable', raw: 'not json', reason: 'bad model output' }),
-    });
+    }));
 
     expect(result.refused).toBe(1);
     expect(result.instructed).toBe(0);
@@ -1007,12 +979,11 @@ describe('runWhatsAppDoor', () => {
     const messenger = createFakeMessenger();
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'ג׳יבריש לא מובן' }));
 
-    await runWhatsAppDoor({
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: async () => ({ status: 'unparseable', raw: 'not json', reason: 'bad model output' }),
-    });
+    }));
 
     const underGivenBusiness = await getPool().query<{ n: string }>(
       `SELECT count(*)::text AS n FROM audit_log WHERE business_id = $1 AND kind = 'whatsapp_instruction'`,
@@ -1041,15 +1012,14 @@ describe('runWhatsAppDoor', () => {
     );
 
     const seen: Array<string | null> = [];
-    await runWhatsAppDoor({
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: async () => {
         seen.push(await stateOf(providerMessageId));
         throw new Error('boom');
       },
-    }).catch(() => {});
+    })).catch(() => {});
 
     expect(seen).toEqual(['claimed']); // not 'received'
     expect(await stateOf(providerMessageId)).toBe('failed');
@@ -1066,13 +1036,12 @@ describe('runWhatsAppDoor', () => {
 
     const provider = async () => ({ text: 'תשלחי למוטי שאני בדרך' });
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       provider,
       planner: plannedWith(mailPlan()),
-    });
+    }));
 
     expect(result.instructed).toBe(1);
     // Fix round 1, Important 6: without `toHaveLength(1)`, a two-message
@@ -1103,13 +1072,12 @@ describe('runWhatsAppDoor', () => {
 
     const provider = async () => ({ text: 'תשלחי למוטי‮000,5 ש"ח' });
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       provider,
       planner: plannedWith(mailPlan()),
-    });
+    }));
 
     expect(result.instructed).toBe(1);
     expect(messenger.sentTexts).toHaveLength(1);
@@ -1123,15 +1091,14 @@ describe('runWhatsAppDoor', () => {
     const messenger = createFakeMessenger();
     gateway.enqueue(audioMsg({ senderNumber: PRINCIPAL_NUMBER }));
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       provider: async () => {
         throw new Error('upstream 503');
       },
       planner: neverCalled,
-    });
+    }));
 
     expect(result.refused).toBe(1);
     expect(messenger.sentTexts).toHaveLength(1);
@@ -1161,13 +1128,12 @@ describe('runWhatsAppDoor', () => {
     };
     gateway.enqueue(msg);
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       provider: async () => ({ text: 'should never be reached' }),
       planner: neverCalled,
-    });
+    }));
 
     expect(result.refused).toBe(1);
     expect(messenger.sentTexts).toHaveLength(1);
@@ -1196,13 +1162,12 @@ describe('runWhatsAppDoor', () => {
     });
     gateway.enqueue(msg);
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       provider: neverCalledProvider,
       planner: neverCalled,
-    });
+    }));
 
     expect(result.refused).toBe(1);
     expect(messenger.sentTexts).toHaveLength(1);
@@ -1215,12 +1180,11 @@ describe('runWhatsAppDoor', () => {
     const messenger = createFakeMessenger();
     gateway.enqueue(audioMsg({ senderNumber: PRINCIPAL_NUMBER }));
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: neverCalled,
-    });
+    }));
 
     expect(result.refused).toBe(1);
     expect(messenger.sentTexts).toHaveLength(1);
@@ -1241,12 +1205,11 @@ describe('runWhatsAppDoor', () => {
     const messenger = createFakeMessenger();
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לדנה' }));
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: neverCalled, // the cap must stop this before the planner is ever paid for
-    });
+    }));
 
     expect(result.refused).toBe(1);
     expect(messenger.sentTexts).toHaveLength(1);
@@ -1265,15 +1228,14 @@ describe('runWhatsAppDoor', () => {
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'ראשונה (מוקדמת)', providerTimestamp: earlier }));
 
     const seenInstructions: string[] = [];
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: async (request) => {
         seenInstructions.push(request.instruction ?? '');
         return { status: 'planned', plan: mailPlan() };
       },
-    });
+    }));
 
     expect(result).toEqual({ polled: 2, instructed: 2, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, documentCardReplies: 0, confirmErrored: [], malformedSenderCount: 0 });
     expect(seenInstructions).toEqual(['ראשונה (מוקדמת)', 'שנייה (מאוחרת)']);
@@ -1348,7 +1310,7 @@ describe('runWhatsAppDoor', () => {
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לדנה' }));
 
     await expect(
-      runWhatsAppDoor({ gateway, messenger, businessId: BUSINESS, planner: neverCalled }),
+      withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, { gateway, messenger, planner: neverCalled })),
     ).rejects.toThrow();
 
     // Failed before the first `recordInbound` — nothing was ever written.
@@ -1392,13 +1354,12 @@ describe('runWhatsAppDoor', () => {
     };
 
     await expect(
-      runWhatsAppDoor({
+      withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
         gateway: hangingGateway,
         messenger,
-        businessId: BUSINESS,
         planner: neverCalled,
         pollTimeoutMs: 25,
-      }),
+      })),
     ).rejects.toThrow(/did not finish within/);
   });
 });
@@ -1447,17 +1408,16 @@ describe('a recording is not typing', () => {
     const messenger = createFakeMessenger();
     gateway.enqueue(audioMsg({ senderNumber: PRINCIPAL_NUMBER }));
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       // The transcription provider is where these bytes come from. Nobody
       // typed them — which is the whole point: this is a third party's model
       // output, and before the origin rule it satisfied a check whose
       // meaning is "the owner typed this address himself".
       provider: async () => ({ text: SPOKEN }),
       planner: plannedWith(mailPlan()),
-    });
+    }));
 
     expect(result.instructed).toBe(1);
     expect(await storedOrigins()).toEqual(['transcribed']);
@@ -1482,12 +1442,11 @@ describe('a recording is not typing', () => {
     const messenger = createFakeMessenger();
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: SPOKEN }));
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: plannedWith(mailPlan()),
-    });
+    }));
 
     // The paired positive, and the reason it matters: a door that simply
     // declared everything `'transcribed'` would pass the test above and fail
@@ -1514,27 +1473,25 @@ describe('a recording is not typing', () => {
     const messenger = createFakeMessenger();
 
     gateway.enqueue(audioMsg({ senderNumber: PRINCIPAL_NUMBER }));
-    const first = await runWhatsAppDoor({
+    const first = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       provider: async () => ({ text: SPOKEN }),
       planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו דנה?' })),
-    });
+    }));
     expect(first.instructed).toBe(1);
     expect(await storedOrigins()).toEqual(['transcribed']);
 
     const seen: string[] = [];
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'דנה מהמשרד' }));
-    const second = await runWhatsAppDoor({
+    const second = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: async (request) => {
         seen.push(request.instruction ?? '');
         return { status: 'planned', plan: mailPlan() };
       },
-    });
+    }));
 
     expect(second.instructed).toBe(1);
     // The join really happened — without this, the assertions below could
@@ -1581,12 +1538,11 @@ describe('a side-effecting instruction over WhatsApp', () => {
     const msg = textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי ל-dana@example.com את ההצעה' });
     gateway.enqueue(msg);
 
-    const result = await runWhatsAppDoor({
+    const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: plannedWith(mailPlan()),
-    });
+    }));
 
     expect(result.instructed).toBe(1);
     const ack = messenger.sentTexts[0] ?? '';
@@ -1607,13 +1563,12 @@ describe('a side-effecting instruction over WhatsApp', () => {
   });
 
   it('counts one instruction once against the daily cap, however many candidates were planned', async () => {
-    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     if (active === null) throw new Error('unreachable');
-    const seedJob = await createJob({
+    const seedJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     for (const [key, name, email] of [
       ['ronit-cohen', 'רונית כהן', 'ronit@beta-log.example'],
       ['ronit-levi', 'רונית לוי', 'ronit.levi@gamma.example'],
@@ -1631,10 +1586,9 @@ describe('a side-effecting instruction over WhatsApp', () => {
     let calls = 0;
     const base = mailPlan().steps[0];
     if (base === undefined) throw new Error('unreachable');
-    await runWhatsAppDoor({
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       planner: async (request) => {
         calls += 1;
         const to = request.resolvedContact?.includes('gamma')
@@ -1645,7 +1599,7 @@ describe('a side-effecting instruction over WhatsApp', () => {
           plan: mailPlan({ steps: [{ ...base, input: { to, subject: 'נושא', body: 'גוף' } }] }),
         };
       },
-    });
+    }));
 
     // Two planner calls really happened — one per candidate — and still one
     // row against the cap.
@@ -1703,12 +1657,12 @@ describe('confirming a held command over WhatsApp', () => {
 
   /** A boss job parked in `plan` on a WhatsApp confirmation — what `runInstruction` leaves. */
   async function held(options: ConfirmationOption[], bind = true): Promise<string> {
-    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
     await saveInstruction({ jobId: job.jobId, text: 'תשלחי לדנה', textOrigin: 'typed' }, { businessId: BUSINESS });
-    await transition(job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't', businessId: BUSINESS });
-    await transition(job.jobId, { to: 'plan', actor: 'orchestrator', reason: 't', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't' }));
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'plan', actor: 'orchestrator', reason: 't' }));
     const only = options.length === 1 ? options[0] : undefined;
-    if (bind && only !== undefined) await bindPlanToJob(job.jobId, only.plan, { businessId: BUSINESS });
+    if (bind && only !== undefined) await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, only.plan));
     await createConfirmation(
       { jobId: job.jobId, options, presentedText: 'שאלה', channel: 'whatsapp' },
       { businessId: BUSINESS },
@@ -1728,7 +1682,7 @@ describe('confirming a held command over WhatsApp', () => {
   }
 
   function pass(planner: (r: PlanRequest) => Promise<PlanOutcome> = neverCalled) {
-    return runWhatsAppDoor({ gateway, messenger, businessId: BUSINESS, planner });
+    return withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, { gateway, messenger, planner }));
   }
 
   function lastSent(): string {
@@ -1736,7 +1690,7 @@ describe('confirming a held command over WhatsApp', () => {
   }
 
   async function phase(jobId: string): Promise<string | undefined> {
-    return (await loadJob(jobId, { businessId: BUSINESS }))?.phase;
+    return (await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase;
   }
 
   async function confirmationState(jobId: string): Promise<string | undefined> {
@@ -1749,19 +1703,12 @@ describe('confirming a held command over WhatsApp', () => {
       internetMessageId: '<q-1@client.example>',
       threadId: 'TH-1',
     });
-    const raised = await raiseMailReply(
-      { mail, triage: QUESTION_TRIAGE, bundle, drafter: stubDrafter() },
-      { businessId: BUSINESS },
-    );
+    const raised = await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: QUESTION_TRIAGE, bundle, drafter: stubDrafter() }));
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-    await presentMailCard(
-      raised.approvalId,
-      async (text, jobId) => {
+    await withBusiness(BUSINESS, (db) => presentMailCard(db, raised.approvalId!, async (text, jobId) => {
         const sent = await messenger.send({ text, jobId });
         if (!sent.ok) throw new Error(sent.error ?? 'send failed');
-      },
-      { businessId: BUSINESS },
-    );
+      }));
     return raised.approvalId;
   }
 
@@ -1815,7 +1762,7 @@ describe('confirming a held command over WhatsApp', () => {
     expect(result.confirmationReplies).toBe(0);
     expect(await confirmationState(jobId)).toBe('pending');
     expect(await phase(jobId)).toBe('plan');
-    expect((await dashboardConfirmations({ businessId: BUSINESS })).map((c) => c.jobId)).toEqual([jobId]);
+    expect((await withBusiness(BUSINESS, (db) => dashboardConfirmations(db))).map((c) => c.jobId)).toEqual([jobId]);
   });
 
   it('a question too long for one WhatsApp message is not sent: a pointer to the dashboard instead, and it stays undelivered', async () => {
@@ -1841,7 +1788,7 @@ describe('confirming a held command over WhatsApp', () => {
     gateway.enqueue(reply('כן'));
     await pass(async () => ({ status: 'planned', plan: recallPlan() }));
     expect(await confirmationState(jobId)).toBe('pending');
-    expect((await dashboardConfirmations({ businessId: BUSINESS })).map((c) => c.jobId)).toEqual([jobId]);
+    expect((await withBusiness(BUSINESS, (db) => dashboardConfirmations(db))).map((c) => c.jobId)).toEqual([jobId]);
   });
 
   it('a typed "כן" dated BEFORE the question was presented never confirms it', async () => {
@@ -1871,16 +1818,15 @@ describe('confirming a held command over WhatsApp', () => {
     gateway.enqueue({ ...audioMsg({ senderNumber: PRINCIPAL_NUMBER }), providerTimestamp: new Date(Date.now() + 1_000).toISOString() });
 
     let planned = 0;
-    await runWhatsAppDoor({
+    await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
       gateway,
       messenger,
-      businessId: BUSINESS,
       provider: async () => ({ text: 'כן' }),
       planner: async () => {
         planned += 1;
         return { status: 'planned', plan: recallPlan() };
       },
-    });
+    }));
 
     expect(planned).toBe(1);
     expect(await phase(jobId)).toBe('plan');
@@ -1931,7 +1877,7 @@ describe('confirming a held command over WhatsApp', () => {
     // to it at all, and nothing moves the job a second time.
     gateway.enqueue(reply('כן', 2_000));
     await pass(async () => ({ status: 'planned', plan: recallPlan() }));
-    const { rows } = await getPool().query(
+    const { rows } = await testDb().query(
       "SELECT 1 FROM job_steps WHERE job_id = $1 AND to_phase = 'execute'",
       [jobId],
     );
@@ -1972,7 +1918,7 @@ describe('confirming a held command over WhatsApp', () => {
     const result = await pass();
 
     expect(result.mailCardReplies).toBe(1);
-    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('approved'); // TENANCY-TODO(task 4)
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('approved');
     expect(await confirmationState(jobId)).toBe('pending');
   });
 
@@ -1988,7 +1934,7 @@ describe('confirming a held command over WhatsApp', () => {
       expect(lastSent()).toBe(SEVERAL_OPEN_REFUSAL);
       expect(await phase(jobId)).toBe('plan');
       expect(await confirmationState(jobId)).toBe('pending');
-      expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('pending'); // TENANCY-TODO(task 4)
+      expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('pending');
       expect((await messageRow(msg.providerMessageId))?.state).toBe('failed');
     });
   }
@@ -2060,7 +2006,7 @@ describe('confirming a held command over WhatsApp', () => {
 
     /** A batch the owner received a minute ago. */
     async function deliveredBatch(items: string[]): Promise<void> {
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO ledger_whatsapp_batches (batch_id, business_id, items, sent_at)
          VALUES ($1, $2, $3, now() - interval '1 minute')`,
         [`LB-door-${items.join('-')}`, BUSINESS, items],
@@ -2128,7 +2074,7 @@ describe('confirming a held command over WhatsApp', () => {
       const jobId = await held([fathi, OPTION_B]);
       const only = await ledgerItem('יחיד');
       await deliveredBatch([only]);
-      await getPool().query(`UPDATE ledger_items SET status = 'done' WHERE item_id = $1`, [only]);
+      await testDb().query(`UPDATE ledger_items SET status = 'done' WHERE item_id = $1`, [only]);
 
       gateway.enqueue(reply('פתחי'));
       const result = await pass();
@@ -2159,16 +2105,15 @@ describe('confirming a held command over WhatsApp', () => {
 
       gateway.enqueue({ ...audioMsg({ senderNumber: PRINCIPAL_NUMBER }), providerTimestamp: new Date(Date.now() + 1_000).toISOString() });
       let transcribed = 0;
-      const result = await runWhatsAppDoor({
+      const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
         gateway,
         messenger,
-        businessId: BUSINESS,
         provider: async () => {
           transcribed += 1;
           return { text: '2 בוצע' };
         },
         planner: plannedWith(recallPlan()),
-      });
+      }));
 
       expect(transcribed).toBe(1);
       expect(result.ledgerReplies).toBe(0);
@@ -2230,7 +2175,7 @@ describe('confirming a held command over WhatsApp', () => {
       });
       expect(await advanceStage(productionId, 'queued', 'ready', {})).toBe(true);
       const created = await createDocumentCard(versionId, { businessId: BUSINESS });
-      await getPool().query(
+      await testDb().query(
         `UPDATE document_cards SET whatsapp_delivered_at = now() - make_interval(secs => $2::double precision / 1000)
           WHERE card_id = $1`,
         [created.cardId, deliveredAgoMs],
@@ -2287,16 +2232,15 @@ describe('confirming a held command over WhatsApp', () => {
       const cardId = await documentCard({ mode: 'send', to: ['dana@example.com'] });
       gateway.enqueue(audioMsg({ senderNumber: PRINCIPAL_NUMBER, providerTimestamp: new Date(Date.now() + 1_000).toISOString() }));
       let transcribed = 0;
-      const result = await runWhatsAppDoor({
+      const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, {
         gateway,
         messenger,
-        businessId: BUSINESS,
         provider: async () => {
           transcribed += 1;
           return { text: 'שלחי' };
         },
         planner: plannedWith(recallPlan()),
-      });
+      }));
       expect(transcribed).toBe(1);
       expect(result.documentCardReplies).toBe(0);
       expect(result.instructed).toBe(1);
@@ -2314,7 +2258,7 @@ describe('confirming a held command over WhatsApp', () => {
       expect(result.documentCardReplies).toBe(0);
       expect(result.mailCardReplies).toBe(0);
       expect(await cardState(cardId)).toBe('open');
-      expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('pending'); // TENANCY-TODO(task 4)
+      expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('pending');
     });
 
     it('"שמרי" with no base folder set is refused with the reason, and nothing is approved', async () => {
@@ -2404,7 +2348,7 @@ describe('confirming a held command over WhatsApp', () => {
 
     it('a card never delivered on WhatsApp is not answered there', async () => {
       const cardId = await documentCard();
-      await getPool().query('UPDATE document_cards SET whatsapp_delivered_at = NULL WHERE card_id = $1', [cardId]);
+      await testDb().query('UPDATE document_cards SET whatsapp_delivered_at = NULL WHERE card_id = $1', [cardId]);
       gateway.enqueue(reply('שלחי'));
       const result = await pass(plannedWith(recallPlan()));
       expect(result.documentCardReplies).toBe(0);
@@ -2445,7 +2389,7 @@ describe('confirming a held command over WhatsApp', () => {
     it('"תיקון: …" requests a fix', async () => {
       const cardId = await documentCard();
       gateway.enqueue(reply('תיקון: להוסיף את המע"מ'));
-      const result = await runWhatsAppDoor({ gateway, messenger, businessId: BUSINESS, planner: neverCalled, production: AVAILABLE });
+      const result = await withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, { gateway, messenger, planner: neverCalled, production: AVAILABLE }));
 
       expect(result.documentCardReplies).toBe(1);
       expect(lastSent()).toBe(DOCUMENT_CARD_FIX_OPENED);
@@ -2463,7 +2407,7 @@ describe('confirming a held command over WhatsApp', () => {
       gateway.enqueue(reply('שלח'));
       const result = await pass();
       expect(result.mailCardReplies).toBe(1);
-      expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).not.toBe('pending'); // TENANCY-TODO(task 4)
+      expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).not.toBe('pending');
     });
   });
 });

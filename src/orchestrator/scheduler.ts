@@ -125,15 +125,15 @@ async function expireApprovals(businessId: string, limit: number): Promise<strin
     ids.push(approval.approvalId);
     if (approval.jobId === null) continue;
 
-    const job = await loadJob(approval.jobId, { businessId });
+    const approvalJobId = approval.jobId;
+    const job = await withBusiness(businessId, (db) => loadJob(db, approvalJobId)); // TENANCY-TODO(task 9)
     if (job === null || job.phase !== 'await_approval') continue;
 
-    await transition(job.jobId, {
+    await withBusiness(businessId, (db) => transition(db, job.jobId, { // TENANCY-TODO(task 9)
       to: 'followup',
       actor: 'system',
       reason: `approval_expired:${approval.approvalId}`,
-      businessId,
-    });
+    }));
   }
   return ids;
 }
@@ -161,12 +161,11 @@ async function wakeDueJobs(
     // ours to advance, and `transition` would reject it anyway — checking here
     // keeps one stale row from aborting the whole tick.
     if (row.phase !== 'followup') continue;
-    await transition(row.job_id, {
+    await withBusiness(businessId, (db) => transition(db, row.job_id, { // TENANCY-TODO(task 9)
       to: 'execute',
       actor: 'system',
       reason: 'wake_at reached',
-      businessId,
-    });
+    }));
     woken.push(row.job_id);
   }
   return woken;
@@ -911,7 +910,7 @@ export async function schedulerPass(
     judge?: Judge;
     /** Test seam only; production leaves it unset and `runInstruction` uses the real planner. */
     whatsappPlanner?: RunInstructionOptions['planner'];
-    whatsappProvider?: Parameters<typeof runWhatsAppDoor>[0]['provider'];
+    whatsappProvider?: Parameters<typeof runWhatsAppDoor>[1]['provider'];
     /** Test seams only; production leaves them unset and the poll uses the real client, triage and drafter. */
     mailClient?: PollMailboxOptions['client'];
     mailTriage?: PollMailboxOptions['triage'];
@@ -931,7 +930,7 @@ export async function schedulerPass(
   // previous pass wakes its parent at the top of this one, so the parent runs
   // in this very pass through `runDueJobs` below. Run it after the plans
   // instead and every delegation would cost a full extra interval.
-  const delegated = await resumeDelegatedJobs(options);
+  const delegated = await withBusiness(businessId, (db) => resumeDelegatedJobs(db, options)); // TENANCY-TODO(task 9)
 
   // Before the WhatsApp door: expire questions past their window, then move
   // on every job parked in `plan` whose confirmation is no longer pending —
@@ -943,7 +942,7 @@ export async function schedulerPass(
   let expiredConfirmationsError: string | null = null;
   try {
     expiredConfirmations = await expireConfirmations({ businessId });
-    settledConfirmations = await settleDecidedConfirmations({ businessId });
+    settledConfirmations = await withBusiness(businessId, (db) => settleDecidedConfirmations(db)); // TENANCY-TODO(task 9)
   } catch (err) {
     expiredConfirmationsError = err instanceof Error ? err.message : String(err);
   }
@@ -1009,10 +1008,11 @@ export async function schedulerPass(
         active.charter.charterVersion,
       );
 
-      whatsappDoor = await runWhatsAppDoor({
-        gateway: runtime.whatsapp.gateway,
-        messenger: whatsappMessenger,
-        businessId,
+      const doorGateway = runtime.whatsapp.gateway;
+      const doorMessenger = whatsappMessenger;
+      whatsappDoor = await withBusiness(businessId, (db) => runWhatsAppDoor(db, { // TENANCY-TODO(task 9)
+        gateway: doorGateway,
+        messenger: doorMessenger,
         // Fix round 1, F11 — the SAME charter load this block already did
         // for the messenger's number, handed to the door so it checks the
         // sender against it rather than loading a second, independently
@@ -1029,7 +1029,7 @@ export async function schedulerPass(
         ...(runtime.production !== undefined ? { production: runtime.production } : {}),
         // The schedule answer reads the calendar through the runtime's credentials.
         calendar: { runtime },
-      });
+      }));
     } catch (err) {
       whatsappError = err instanceof Error ? err.message : String(err);
       whatsappMessenger = null;
@@ -1045,8 +1045,7 @@ export async function schedulerPass(
   let mailError: string | null = null;
   try {
     const messenger = whatsappMessenger;
-    mail = await pollMailbox({
-      businessId,
+    mail = await withBusiness(businessId, (db) => pollMailbox(db, { // TENANCY-TODO(task 9)
       runtime,
       ...(options.mailClient !== undefined ? { client: options.mailClient } : {}),
       ...(options.mailTriage !== undefined ? { triage: options.mailTriage } : {}),
@@ -1062,7 +1061,7 @@ export async function schedulerPass(
             },
           }
         : {}),
-    });
+    }));
   } catch (err) {
     mailError = err instanceof Error ? err.message : String(err);
   }
@@ -1112,11 +1111,10 @@ export async function schedulerPass(
   let conduct: ConductResult | null = null;
   if (inbox !== null) {
     try {
-      scan = await scanInbox({
+      scan = await withBusiness(businessId, (db) => scanInbox(db, { // TENANCY-TODO(task 9)
         inbox,
-        ...(options.businessId !== undefined ? { businessId: options.businessId } : {}),
         ...(options.documentRoot !== undefined ? { documentRoot: options.documentRoot } : {}),
-      });
+      }));
     } catch (err) {
       // A broken inbox must not stop the rest of the pass. `scan` stays
       // `null` and `conduct`/`due`/`verified` still run below. Note the
@@ -1128,19 +1126,19 @@ export async function schedulerPass(
       scanError = err instanceof Error ? err.message : String(err);
     }
 
-    conduct = await conductPendingDocuments({
+    conduct = await withBusiness(businessId, (db) => conductPendingDocuments(db, { // TENANCY-TODO(task 9)
       ...conductOptions,
       // The conductor writes approvals without passing through the gate, and
       // the gate was carrying the notification. Threaded here so a conductor
       // card reaches the owner's mailbox exactly as a gate-raised one does.
       ...(runtime.notify !== undefined ? { notify: runtime.notify } : {}),
-    });
+    }));
   }
 
   // `...options` here, not `conductOptions`: this is the path `judge` belongs
   // on. `verifier` rides along and is ignored — `runDueJobs` declares no such
   // field, and the judging step reads `judge` alone.
-  const due = await runDueJobs({ ...options, runtime });
+  const due = await withBusiness(businessId, (db) => runDueJobs(db, { ...options, runtime })); // TENANCY-TODO(task 9)
 
   // Right after the plans (spec §5.5): a production `doc.produce` queued
   // this very pass is drafted now. Its own time budget bounds how long the
@@ -1181,10 +1179,9 @@ export async function schedulerPass(
   let reasked: ReaskResult = { reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] };
   let reaskError: string | null = null;
   try {
-    reasked = await reaskFailedCommands({
-      businessId,
+    reasked = await withBusiness(businessId, (db) => reaskFailedCommands(db, { // TENANCY-TODO(task 9)
       ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
-    });
+    }));
   } catch (err) {
     reaskError = err instanceof Error ? err.message : String(err);
   }
@@ -1202,7 +1199,7 @@ export async function schedulerPass(
   } catch (err) {
     deliveriesReraisedError = err instanceof Error ? err.message : String(err);
   }
-  const verified = await closeVerifiedJobs(options);
+  const verified = await withBusiness(businessId, (db) => closeVerifiedJobs(db, options)); // TENANCY-TODO(task 9)
 
   // The meetings sweep, after the closes and before the ledger pass — see
   // `SchedulerPassResult.meetings`. Guarded: a sweep that threw must not hide
@@ -1249,10 +1246,9 @@ export async function schedulerPass(
   let mailRetention: { scrubbed: number } | null = null;
   let mailRetentionError: string | null = null;
   try {
-    mailRetention = await scrubOldMailBodies({
-      businessId,
+    mailRetention = await withBusiness(businessId, (db) => scrubOldMailBodies(db, { // TENANCY-TODO(task 9)
       ...(options.now !== undefined ? { now: options.now } : {}),
-    });
+    }));
   } catch (err) {
     mailRetentionError = err instanceof Error ? err.message : String(err);
   }
@@ -1264,13 +1260,12 @@ export async function schedulerPass(
   // process cannot parse skips this loop too, never only the door.
   if (runtime.whatsapp !== undefined && whatsappMessenger !== null) {
     try {
-      whatsappReport = await reportWhatsAppJobs({
+      whatsappReport = await withBusiness(businessId, (db) => reportWhatsAppJobs(db, { // TENANCY-TODO(task 9)
         messenger: whatsappMessenger,
-        businessId,
         ...(runtime.notify !== undefined
           ? { dashboardBaseUrl: runtime.notify.dashboardBaseUrl }
           : {}),
-      });
+      }));
     } catch (err) {
       whatsappError = err instanceof Error ? err.message : String(err);
     }
@@ -1287,7 +1282,7 @@ export async function schedulerPass(
   let autonomy: AutonomyPassResult = { promoted: [], demoted: [], errored: [] };
   let autonomyError: string | null = null;
   try {
-    autonomy = await evaluateAutonomy(options);
+    autonomy = await withBusiness(businessId, (db) => evaluateAutonomy(db)); // TENANCY-TODO(task 9)
   } catch (err) {
     autonomyError = err instanceof Error ? err.message : String(err);
   }
@@ -1303,8 +1298,7 @@ export async function schedulerPass(
   const digestSettings = await loadDigestSettings({ businessId });
   let digest: DigestRunResult | null = null;
   if (digestSettings.schedule !== 'off') {
-    digest = await runDigests({
-      businessId,
+    digest = await withBusiness(businessId, (db) => runDigests(db, { // TENANCY-TODO(task 9)
       ...(options.now !== undefined ? { now: options.now } : {}),
       // `runtime.notify?.sendAlert` — the SAME email seam `checkWhatsAppHealth`
       // above already sends the bridge-outage alert through, never a second,
@@ -1314,7 +1308,7 @@ export async function schedulerPass(
       // `null` both when no gateway is configured and when the charter failed
       // to load, the same guard `whatsappReport` already keys on.
       ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
-    });
+    }));
   }
 
   // One update per autonomous step, dead last — see
@@ -1330,13 +1324,12 @@ export async function schedulerPass(
   };
   let actionUpdatesError: string | null = null;
   try {
-    actionUpdates = await dispatchActionUpdates({
-      businessId,
+    actionUpdates = await withBusiness(businessId, (db) => dispatchActionUpdates(db, { // TENANCY-TODO(task 9)
       ...(options.now !== undefined ? { now: options.now } : {}),
       ...(runtime.notify?.sendAlert !== undefined ? { sendAlert: runtime.notify.sendAlert } : {}),
       ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
       ...(runtime.notify !== undefined ? { dashboardBaseUrl: runtime.notify.dashboardBaseUrl } : {}),
-    });
+    }));
   } catch (err) {
     actionUpdatesError = err instanceof Error ? err.message : String(err);
   }

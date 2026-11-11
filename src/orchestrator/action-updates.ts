@@ -53,7 +53,7 @@
  * added only to what is sent.
  */
 import { ulid } from 'ulid';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { actionClassLabel } from '../domain/labels.js';
 import { loadActionUpdateSettings } from '../governance/action-update-settings.js';
 import { NOTIFY_TIMEOUT_MS, withDeadline } from '../governance/notify.js';
@@ -124,18 +124,15 @@ async function deliver(
   }
 }
 
-export async function dispatchActionUpdates(options: {
-  businessId: string;
+export async function dispatchActionUpdates(db: BusinessDb, options: {
   now?: Date;
   sendAlert?: (subject: string, body: string) => Promise<{ ok: boolean; error?: string }>;
   messenger?: BossMessenger;
   dashboardBaseUrl?: string;
-  db?: Queryable;
   /** Test seam: the per-send deadline. Defaults to `NOTIFY_TIMEOUT_MS`. */
   timeoutMs?: number;
-}): Promise<ActionUpdatesResult> {
-  const { businessId } = options;
-  const db = options.db ?? getPool();
+} = {}): Promise<ActionUpdatesResult> {
+  const { businessId } = db;
   const now = options.now ?? new Date();
   const timeoutMs = options.timeoutMs ?? NOTIFY_TIMEOUT_MS;
   const link =

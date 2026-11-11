@@ -1,3 +1,4 @@
+import { withBusiness } from '../db/pool.js';
 import { listGrants } from '../governance/oauth-grants.js';
 import { loadBindings } from '../orchestrator/bindings.js';
 import { OAuthGrantRevokedError, OAuthRefreshRejectedError } from '../orchestrator/oauth-token.js';
@@ -23,7 +24,7 @@ export async function resolveCalendarAccess(o: {
   runtime: Pick<Runtime, 'credentials'>;
   client?: CalendarClient;
 }): Promise<CalendarAccess | { unavailable: 'not_connected' | 'needs_reauth' | 'credential_error' }> {
-  const binding = (await loadBindings({ businessId: o.businessId })).find((b) => b.system === CALENDAR_SYSTEM);
+  const binding = (await withBusiness(o.businessId, (db) => loadBindings(db))).find((b) => b.system === CALENDAR_SYSTEM); // TENANCY-TODO(task 5)
   if (binding === undefined || binding.status !== 'live') return { unavailable: 'not_connected' };
   if (binding.provider !== 'google' && binding.provider !== 'microsoft') return { unavailable: 'not_connected' };
   const ref = binding.credentialRef;

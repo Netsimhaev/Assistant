@@ -36,19 +36,19 @@ describe('the dial raises the ramp floor, and the charter still wins', () => {
    * is the worst thing this feature could do.
    */
   it('pulls a promoted class back to draft_only when the dial is off', async () => {
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('draft_only');
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('draft_only');
   });
 
   it('pins everything at approve_required on ask — she asks every time', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('approve_required');
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('approve_required');
   });
 
   it('lifts a class with no row to approve_required once the dial is on', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'owner@example.com')); // TENANCY-TODO(task 4)
-    expect(await loadRampLevel('calendar.create', { businessId: BUSINESS })).toBe('approve_required');
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'owner@example.com'));
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'calendar.create'))).toBe('approve_required');
   });
 
   /**
@@ -61,15 +61,15 @@ describe('the dial raises the ramp floor, and the charter still wins', () => {
    * only input that exercises the raise itself.
    */
   it('raises a stored level below the floor up to the floor', async () => {
-    await setRampLevel('email.reply', 'draft_only', { businessId: BUSINESS });
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('approve_required');
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'draft_only'));
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('approve_required');
   });
 
   it('keeps an earned level while the dial is on learn', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('auto_notify');
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('auto_notify');
   });
 
   /**
@@ -80,9 +80,9 @@ describe('the dial raises the ramp floor, and the charter still wins', () => {
    * `approve_required`) must still produce a card.
    */
   it('still raises a card when the charter caps the class, however high the ramp', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'c1' }))); // TENANCY-TODO(task 4)
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'c1' })));
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
 
     // Three POSITIONAL arguments — `(toolName, toolInput, ctx)` — not one
     // object. Matches `src/policy/standing-approval.test.ts`, which is the
@@ -98,7 +98,7 @@ describe('the dial raises the ramp floor, and the charter still wins', () => {
         counterpartyTags: [],
         businessId: BUSINESS,
         jobId: null,
-        rampLevel: await loadRampLevel('email.initiate', { businessId: BUSINESS }),
+        rampLevel: await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.initiate')),
         now: NOON,
       },
     );

@@ -41,7 +41,7 @@
  * redelivered or raced copy cannot approve twice.
  */
 import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import type { NormalizedInboundMessage } from '../whatsapp/gateway.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
@@ -103,20 +103,16 @@ export function isDocumentCardAction(text: string): boolean {
  * see the module docblock for the conditions. Read-only. `windowMinutes <= 0`
  * means none is ever open.
  */
-export async function openDocumentCards(input: {
-  businessId?: string;
-  inboundAt: string;
-  now?: number;
-  windowMinutes?: number;
-  db?: Queryable;
-}): Promise<DocumentCard[]> {
-  const businessId = input.businessId ?? config.businessId;
+export async function openDocumentCards(
+  db: BusinessDb,
+  input: { inboundAt: string; now?: number; windowMinutes?: number },
+): Promise<DocumentCard[]> {
+  const businessId = db.businessId;
   const windowMinutes = input.windowMinutes ?? config.whatsappQuestionWindowMinutes;
   if (windowMinutes <= 0) return [];
   const inboundMs = Date.parse(input.inboundAt);
   if (Number.isNaN(inboundMs)) return [];
   const nowMs = input.now ?? Date.now();
-  const db = input.db ?? getPool();
 
   const { rows } = await db.query<{ card_id: string; delivered_at: Date }>(
     `SELECT c.card_id, c.whatsapp_delivered_at AS delivered_at

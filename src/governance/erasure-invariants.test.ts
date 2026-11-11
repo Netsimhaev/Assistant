@@ -146,12 +146,11 @@ describe('what an erasure leaves behind', () => {
    */
   it('leaves the probe in no text or JSON column of any table, anywhere', async () => {
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'probe' }))); // TENANCY-TODO(task 6)
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: `מייל אל ${PROBE}`,
-    });
+    }));
     const db = getPool();
 
     await db.query(
@@ -347,12 +346,11 @@ describe('what an erasure leaves behind', () => {
 
     // The two scrubbed stores. Both survive the erasure as rows and must come
     // back holding nothing to read.
-    await transition(job.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'understand',
       actor: 'orchestrator',
       reason: `פתיחת משימה בעקבות ${PROBE}`,
-      businessId: BUSINESS,
-    });
+    }));
     await db.query(
       `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id)
        VALUES ($1, $2, 'hp', 's1', $3)`,
@@ -503,12 +501,11 @@ describe('what an erasure leaves behind', () => {
     // counterparty name, in one event's note and one reminder's body, plus a
     // counterparty critical rule whose match is the probe. The WhatsApp
     // batch holds the item's id only and is checked directly below.
-    const ledgerOrigin = await createJob({
+    const ledgerOrigin = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'שורה בפנקס',
-    });
+    }));
     await db.query(
       `INSERT INTO ledger_items
          (item_id, business_id, family, description, counterparty_name, counterparty_email,
@@ -555,18 +552,16 @@ describe('what an erasure leaves behind', () => {
     // check results; the card's delivery plans; and the path the delivery
     // job's `doc.save` recorded. The `"` beside it in the spec makes the JSON
     // path of `jsonbContentMatches` the arm that has to find it there.
-    const productionOrigin = await createJob({
+    const productionOrigin = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'הפקת מסמך',
-    });
-    const productionDelivery = await createJob({
+    }));
+    const productionDelivery = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'מסירת מסמך',
-    });
+    }));
     await db.query(
       `INSERT INTO document_productions
          (production_id, business_id, origin_job_id, instruction_text, text_origin, format, language,
@@ -614,18 +609,16 @@ describe('what an erasure leaves behind', () => {
     // person can land in. The reminder job is a second nameless job: it must
     // join `jobIds` through the meeting, not through its own (empty) title.
     // The hold carries no content and is asserted deleted directly.
-    const meetingJob = await createJob({
+    const meetingJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'פגישה',
-    });
-    const meetingReminderJob = await createJob({
+    }));
+    const meetingReminderJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'תזכורת',
-    });
+    }));
     await db.query(
       `INSERT INTO meetings
          (meeting_id, business_id, job_id, step_id, calendar_id, event_id, operation,
@@ -763,12 +756,11 @@ describe('what an erasure leaves behind', () => {
     // escaped in the plan's JSONB text form.
     const BODY = `לכבוד ${NAME}\nשלום, שלחתי את ההצעה`;
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'update-only' }))); // TENANCY-TODO(task 6)
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'משימה רגילה שלא קשורה לאיש',
-    });
+    }));
     const db = getPool();
     await db.query(
       `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
@@ -814,24 +806,21 @@ describe('what an erasure leaves behind', () => {
     const NAME = 'אלפא בע"מ';
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'confirmation-only' }))); // TENANCY-TODO(task 6)
     const db = getPool();
-    const textJob = await createJob({
+    const textJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'משימה רגילה שלא קשורה לאיש',
-    });
-    const optionJob = await createJob({
+    }));
+    const optionJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'משימה רגילה אחרת',
-    });
-    const unrelatedJob = await createJob({
+    }));
+    const unrelatedJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'משימה שלישית',
-    });
+    }));
     const plainOption = JSON.stringify([{ label: 'אפשרות', planHash: 'h1', plan: { steps: [] }, contactSource: null }]);
     await db.query(
       `INSERT INTO instruction_confirmations (business_id, job_id, options, presented_text, channel)
@@ -900,14 +889,13 @@ describe('what an erasure leaves behind', () => {
    */
   it('reaches a correction note that names a counterparty the job otherwise never mentions', async () => {
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'note-only' }))); // TENANCY-TODO(task 6)
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       // Deliberately silent on the contact: no plan, no instruction, no
       // authorization and a title that never names it either.
       title: 'משימה רגילה שלא קשורה לאיש',
-    });
+    }));
 
     await getPool().query(
       `INSERT INTO autonomy_marks (mark_id, business_id, job_id, step_id, action_class, note, marked_by)
@@ -960,12 +948,11 @@ describe('what an erasure leaves behind', () => {
     // The SUBJECT job: the one the document anchor already found, through
     // reading → proposal. Seeded so the test proves a gap rather than an empty
     // anchor set, and so the assertion below can distinguish the two jobs.
-    const subject = await createJob({
+    const subject = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'unknown_external',
-      businessId: BUSINESS,
       title: 'משימת המסמך',
-    });
+    }));
     const readingId = `READ-anchor-${Date.now()}`;
     await db.query(
       `INSERT INTO document_readings
@@ -985,14 +972,13 @@ describe('what an erasure leaves behind', () => {
     // row, NO proposal, and a bound plan carrying the document id and the
     // draft. The title names only the subject job — nothing here mentions the
     // document except the plan itself.
-    const verifier = await createJob({
+    const verifier = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'unknown_external',
-      businessId: BUSINESS,
       // The shape `beginVerification` writes: `אימות: <כותרת ההצעה>` — the
       // subject job id appears only in the plan's own `goal`, never here.
       title: 'אימות: אשיב לדנה',
-    });
+    }));
     await db.query(
       `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
        VALUES ($1, $2, 'hp-verify', $3::jsonb)`,
@@ -1059,12 +1045,11 @@ describe('what an erasure leaves behind', () => {
   it('leaves a second contact entirely intact', async () => {
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'two' }))); // TENANCY-TODO(task 6)
     const mk = async (identifier: string, title: string): Promise<string> => {
-      const job = await createJob({
+      const job = await withBusiness(BUSINESS, (db) => createJob(db, {
         charterVersion: bundle.charterVersion,
         provenance: 'boss',
-        businessId: BUSINESS,
         title,
-      });
+      }));
       await getPool().query(
         `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
          VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
@@ -1118,12 +1103,11 @@ describe('what an erasure leaves behind', () => {
    */
   it('leaves a kept job’s own WhatsApp message alone', async () => {
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'wa-kept' }))); // TENANCY-TODO(task 6)
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'kept-job-with-whatsapp',
-    });
+    }));
     await getPool().query(
       `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
        VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
@@ -1170,14 +1154,13 @@ describe('what an erasure leaves behind', () => {
    */
   it('reaches a job whose only trace of the contact is its own WhatsApp message', async () => {
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'wa-discovery' }))); // TENANCY-TODO(task 6)
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       // Deliberately silent on the contact — no plan, no authorization, no
       // boss_instructions row at all, and a title that never names it.
       title: 'שיחה עם לקוח',
-    });
+    }));
 
     // The "opening" message: unrelated content, so `boss_instructions.text`
     // (if there were one) would be silent too — but there is no
@@ -1273,12 +1256,11 @@ describe('what an erasure leaves behind', () => {
     const SENDER = 'ronit@client.example';
     const mk = async (title: string): Promise<string> =>
       (
-        await createJob({
+        await withBusiness(BUSINESS, (db) => createJob(db, {
           charterVersion: bundle.charterVersion,
           provenance: 'unknown_external',
-          businessId: BUSINESS,
           title,
-        })
+        }))
       ).jobId;
 
     const triageJob = await mk('מייל: שאלה על המחיר');

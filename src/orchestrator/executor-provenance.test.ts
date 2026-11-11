@@ -17,16 +17,15 @@ async function jobInExecute() {
   // is a first contact — correctly, because nothing ties that id to that
   // mailbox. These tests are about the provenance flag, not about escalation,
   // so the charter is given the domain and the recipient is genuinely known.
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ knownCounterpartyEmailDomain: 'example.com' }))); // TENANCY-TODO(task 4)
-  const job = await createJob({
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ knownCounterpartyEmailDomain: 'example.com' })));
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  const loaded = await loadJob(job.jobId, { businessId: BUSINESS });
+  const loaded = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
   if (loaded === null) throw new Error('job vanished');
   return { job: loaded, bundle };
 }
@@ -43,7 +42,7 @@ describe('the executor and the provenance signal', () => {
   it('marks the job as having ingested content when the tool reads', async () => {
     const { job, bundle } = await jobInExecute();
 
-    const outcome = await executeStep({
+    const outcome = await withBusiness(job.businessId, (db) => executeStep(db, {
       job,
       stepId: 's1',
       agent: 'know.reader',
@@ -54,14 +53,14 @@ describe('the executor and the provenance signal', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     // `doc.fetch` is in `READ_ONLY_TOOLS`, so this must reach `allow` and
     // therefore `perform` — otherwise the assertion below would hold for the
     // wrong reason, exactly like the vacuous `mail.send` test this replaces.
     expect(outcome.status).toBe('done');
     if (outcome.status === 'done') expect(outcome.result).toBe('text');
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.contentIngested).toBe(true);
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.contentIngested).toBe(true);
   });
 
   it('leaves the flag alone for a tool that does not read', async () => {
@@ -73,7 +72,7 @@ describe('the executor and the provenance signal', () => {
     // `perform`, and the flag would read `false` regardless of whether the
     // marking code ran at all. Asserting `outcome.status === 'done'` is what
     // makes that distinction visible.
-    const outcome = await executeStep({
+    const outcome = await withBusiness(job.businessId, (db) => executeStep(db, {
       job,
       stepId: 's1',
       agent: 'comms.email',
@@ -90,16 +89,16 @@ describe('the executor and the provenance signal', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(outcome.status).toBe('done');
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.contentIngested).toBe(false);
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.contentIngested).toBe(false);
   });
 
   it('marks the flag before perform runs, even when perform throws', async () => {
     const { job, bundle } = await jobInExecute();
 
-    const outcome = await executeStep({
+    const outcome = await withBusiness(job.businessId, (db) => executeStep(db, {
       job,
       stepId: 's1',
       agent: 'know.reader',
@@ -112,13 +111,13 @@ describe('the executor and the provenance signal', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     // `refused`/`adapter_threw` only happens if `perform` was actually
     // invoked and threw — proof this test exercises the real call, not a
     // gate short-circuit.
     expect(outcome.status).toBe('refused');
     if (outcome.status === 'refused') expect(outcome.code).toBe('adapter_threw');
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.contentIngested).toBe(true);
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.contentIngested).toBe(true);
   });
 });

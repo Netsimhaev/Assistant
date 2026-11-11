@@ -140,8 +140,8 @@ describe('the conductor queries', () => {
     const db = getPool();
     const own = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'cond-own' }))); // TENANCY-TODO(task 5)
     const foreign = await withBusiness('someone-else', (bdb) => installCharter(bdb, buildCharter({ version: 'cond-foreign' }))); // TENANCY-TODO(task 5)
-    const ownJob = await createJob({ businessId: BUSINESS, charterVersion: own.charterVersion, provenance: 'boss' });
-    const foreignJob = await createJob({ businessId: 'someone-else', charterVersion: foreign.charterVersion, provenance: 'boss' });
+    const ownJob = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: own.charterVersion, provenance: 'boss' }));
+    const foreignJob = await withBusiness('someone-else', (db) => createJob(db, { charterVersion: foreign.charterVersion, provenance: 'boss' }));
     await db.query(
       `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text, text_origin, attached_document_ids)
        VALUES ('INS-upload', $1, $2, 'תכיני הצעה', 'typed', $3)`,

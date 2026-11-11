@@ -79,7 +79,7 @@ import { ulid } from 'ulid';
 import { z } from 'zod';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { getPool, withTransaction, withBusiness, type Queryable } from '../db/pool.js';
+import { getPool, withTransaction, withBusiness, withBusinessTransaction, type Queryable } from '../db/pool.js';
 import { FORMAT_MEDIA_TYPE, formatAttachmentSize, type AttachmentRef } from '../domain/attachment-ref.js';
 import { DocumentCardState } from '../domain/document-spec.js';
 import { documentKindLabel } from '../domain/labels.js';
@@ -695,7 +695,7 @@ export async function approveDocumentCard(
   },
 ): Promise<ApproveOutcome> {
   const { businessId } = options;
-  return withTransaction(async (tx) => {
+  return withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 5)
     const locked = await lockCard(tx, businessId, cardId);
     if (locked === null) return { status: 'not_found' };
     const { card, production, version } = locked;
@@ -731,22 +731,20 @@ export async function approveDocumentCard(
     const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
     if (active === null) throw new Error(`approveDocumentCard: no active charter for ${businessId}`);
 
-    const job = await createJob({
+    const job = await createJob(tx, {
       charterVersion: active.charter.charterVersion,
       // A literal, as at the instruction door: the owner pressed it.
       provenance: 'boss',
-      businessId,
       title: toOneLine(`מסירת מסמך: ${version.spec.title}`).slice(0, 80),
-      db: tx,
     });
     await saveInstruction(
       { jobId: job.jobId, text: production.instructionText, textOrigin: production.textOrigin },
       { businessId, db: tx },
     );
     for (const to of ['understand', 'plan'] as const) {
-      await transition(job.jobId, { to, actor: 'human', reason: `document card ${cardId}`, businessId, tx });
+      await transition(tx, job.jobId, { to, actor: 'human', reason: `document card ${cardId}` });
     }
-    const binding = await bindPlanToJob(job.jobId, rebuilt.plan, { businessId, tx });
+    const binding = await bindPlanToJob(tx, job.jobId, rebuilt.plan);
     if (binding.status !== 'stored' || binding.planHash !== planHash) {
       throw new Error(`approveDocumentCard: job ${job.jobId} could not be bound to ${planHash}`);
     }
@@ -770,13 +768,11 @@ export async function approveDocumentCard(
     if (!(await confirmChoice(job.jobId, planHash, `owner:${actor}`, { businessId, db: tx }))) {
       throw new Error(`approveDocumentCard: confirmation for ${job.jobId} could not be confirmed`);
     }
-    await transition(job.jobId, {
+    await transition(tx, job.jobId, {
       to: 'execute',
       actor: 'human',
       reason: `document card ${cardId}: approved`,
-      businessId,
       expectFrom: 'plan',
-      tx,
     });
     // The only writer of `delivery_job_id` (carry (a)), on the job just made.
     await tx.query(
@@ -981,7 +977,7 @@ export async function requestFix(
     return { status: 'refused', reason: PRODUCTION_TOOLS_MISSING_REASON };
   }
 
-  return withTransaction(async (tx) => {
+  return withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 5)
     const locked = await lockCard(tx, businessId, cardId);
     if (locked === null) return { status: 'not_found' };
     const { card, production, version } = locked;
@@ -1017,16 +1013,14 @@ export async function requestFix(
       destination = { ...destination, to: authorised };
     }
 
-    const job = await createJob({
+    const job = await createJob(tx, {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
-      businessId,
       title: toOneLine(`תיקון מסמך: ${version.spec.title}`).slice(0, 80),
-      db: tx,
     });
     await saveInstruction({ jobId: job.jobId, text: instruction, textOrigin: origin }, { businessId, db: tx });
     for (const to of ['understand', 'plan', 'execute'] as const) {
-      await transition(job.jobId, { to, actor: 'human', reason: `document card ${cardId}: fix (${actor})`, businessId, tx });
+      await transition(tx, job.jobId, { to, actor: 'human', reason: `document card ${cardId}: fix (${actor})` });
     }
     const productionId = await createProduction(
       {
@@ -1046,13 +1040,11 @@ export async function requestFix(
       tx,
     );
     // Parked like `doc.produce` parks: the production loop closes it.
-    await transition(job.jobId, {
+    await transition(tx, job.jobId, {
       to: 'followup',
       actor: 'orchestrator',
       reason: `doc.produce: production ${productionId} queued (fix of ${cardId})`,
-      businessId,
       wakeAt: null,
-      tx,
     });
     await tx.query(
       `UPDATE document_cards SET state = 'superseded', decided_at = now() WHERE business_id = $1 AND card_id = $2`,

@@ -23,12 +23,11 @@ const RONIT = 'ronit@beta-log.example';
 /** A job with a fresh charter, nothing else attached. */
 async function bareJob(title: string): Promise<string> {
   const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `er-${title}` }))); // TENANCY-TODO(task 6)
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
     title,
-  });
+  }));
   return job.jobId;
 }
 
@@ -721,7 +720,7 @@ describe('buildErasurePlan', () => {
   it('refuses while a job it would touch is still waiting on the owner', async () => {
     const jobId = await jobAbout(RONIT, 'ronit');
     for (const to of ['understand', 'plan', 'execute', 'await_approval'] as const) {
-      await transition(jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
 
     const plan = await buildErasurePlan(

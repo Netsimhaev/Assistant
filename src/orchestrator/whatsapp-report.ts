@@ -92,8 +92,7 @@
  * than letting one throw end the pass — the same isolation `runDueJobs` and
  * `closeVerifiedJobs` already give each job they touch.
  */
-import { config } from '../config.js';
-import { getPool, withBusiness, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { JobPhase } from '../domain/job.js';
 import { pendingApprovalForJob } from '../governance/approvals.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
@@ -464,10 +463,7 @@ interface ReportCandidate {
  * not be the honest reading of a kill-switch stop — a decision for whoever
  * wires it, not a defect of this predicate today.
  */
-async function reportCandidates(
-  businessId: string,
-  db: Queryable,
-): Promise<ReportCandidate[]> {
+async function reportCandidates(db: BusinessDb): Promise<ReportCandidate[]> {
   const { rows } = await db.query<ReportCandidateRow>(
     `SELECT j.job_id, j.phase, j.whatsapp_message_id
        FROM jobs j
@@ -503,7 +499,7 @@ async function reportCandidates(
                 ORDER BY st.at DESC, st.id DESC LIMIT 1) = $2
         )
       ORDER BY j.updated_at ASC`,
-    [businessId, REASK_REASON],
+    [db.businessId, REASK_REASON],
   );
   return rows.map((row) => ({
     jobId: row.job_id,
@@ -513,8 +509,8 @@ async function reportCandidates(
 }
 
 /** The reason on the last `job_steps` row for this job, or `null` if it has none. */
-async function lastReason(jobId: string): Promise<string | null> {
-  const history = await jobHistory(jobId);
+async function lastReason(db: BusinessDb, jobId: string): Promise<string | null> {
+  const history = await jobHistory(db, jobId);
   return history[history.length - 1]?.reason ?? null;
 }
 
@@ -570,12 +566,12 @@ export type JobVerdict =
  *    close a job at all.
  */
 export async function classifyJob(
+  db: BusinessDb,
   jobId: string,
   phase: JobPhase,
-  businessId: string,
 ): Promise<JobVerdict> {
   if (phase === 'await_approval') {
-    const approvalId = await withBusiness(businessId, (bdb) => pendingApprovalForJob(bdb, jobId)); // TENANCY-TODO(task 4)
+    const approvalId = await pendingApprovalForJob(db, jobId);
     if (approvalId !== null) {
       return { status: 'report', outcome: 'awaiting_approval', failReason: null, approvalId };
     }
@@ -586,15 +582,15 @@ export async function classifyJob(
     return { status: 'defer' };
   }
 
-  const stored = await loadPlanBody(jobId, { businessId });
-  const recorded = stored === null ? [] : await stepResults(jobId, stored.planHash, { businessId });
+  const stored = await loadPlanBody(db, jobId);
+  const recorded = stored === null ? [] : await stepResults(db, jobId, stored.planHash);
 
   if (recorded.some((step) => step.performed === false)) {
     return { status: 'report', outcome: 'not_implemented', failReason: null, approvalId: null };
   }
 
   if (phase === 'failed') {
-    const reason = await lastReason(jobId);
+    const reason = await lastReason(db, jobId);
     const code = reason === null ? null : leadingCode(reason);
     if (code !== null && isGateDenialCode(code)) {
       return { status: 'report', outcome: 'not_permitted', failReason: null, approvalId: null };
@@ -621,7 +617,7 @@ export async function classifyJob(
     );
     if (everyStepCompleted) {
       const everyStepPerformed = recorded.length > 0 && recorded.every((step) => step.performed === true);
-      if (phase === 'closed' && everyStepPerformed && (await isConfirmedCommand(jobId, businessId))) {
+      if (phase === 'closed' && everyStepPerformed && (await isConfirmedCommand(db, jobId))) {
         return { status: 'report', outcome: 'performed_on_confirmation', failReason: null, approvalId: null };
       }
       return { status: 'report', outcome: 'performed', failReason: null, approvalId: null };
@@ -635,15 +631,15 @@ export async function classifyJob(
  * A job born at the instruction door (a `boss_instructions` row) whose
  * confirmation the owner said "כן" to — both positive facts, both required.
  */
-async function isConfirmedCommand(jobId: string, businessId: string): Promise<boolean> {
-  const { rows } = await getPool().query(
+async function isConfirmedCommand(db: BusinessDb, jobId: string): Promise<boolean> {
+  const { rows } = await db.query(
     `SELECT 1 FROM instruction_confirmations c
       WHERE c.business_id = $1 AND c.job_id = $2 AND c.state = 'confirmed'
         AND EXISTS (
           SELECT 1 FROM boss_instructions b
            WHERE b.business_id = c.business_id AND b.job_id = c.job_id
         )`,
-    [businessId, jobId],
+    [db.businessId, jobId],
   );
   return rows.length === 1;
 }
@@ -681,16 +677,14 @@ function composeText(
  * `SchedulerPassResult.whatsappReport`, for why that ordering is load-bearing
  * rather than incidental.
  */
-export async function reportWhatsAppJobs(options: {
-  messenger: BossMessenger;
-  businessId?: string;
-  dashboardBaseUrl?: string;
-}): Promise<ReportResult> {
-  const businessId = options.businessId ?? config.businessId;
+export async function reportWhatsAppJobs(
+  db: BusinessDb,
+  options: { messenger: BossMessenger; dashboardBaseUrl?: string },
+): Promise<ReportResult> {
+  const businessId = db.businessId;
   const dashboardBaseUrl = options.dashboardBaseUrl ?? DEFAULT_DASHBOARD_BASE_URL;
-  const db = getPool();
 
-  const candidates = await reportCandidates(businessId, db);
+  const candidates = await reportCandidates(db);
   let reported = 0;
   let deferred = 0;
   const errored: string[] = [];
@@ -702,7 +696,7 @@ export async function reportWhatsAppJobs(options: {
     // without this a single unreadable job would sit first forever and
     // starve every WhatsApp job behind it.
     try {
-      const verdict = await classifyJob(candidate.jobId, candidate.phase, businessId);
+      const verdict = await classifyJob(db, candidate.jobId, candidate.phase);
       if (verdict.status === 'defer') {
         deferred += 1;
         continue;

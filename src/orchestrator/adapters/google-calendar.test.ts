@@ -229,10 +229,9 @@ describe('createGoogleCalendarAdapter', () => {
     // declared" — the charter -> registry link itself (does a declared
     // `serves: ['calendar.read']` connection actually cause registration)
     // is proven separately, by `runtime.test.ts`'s two registration tests.
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] })));
     await writeKeyState(KEY, 'KEY-e2e', { businessId: BUSINESS });
-    await upsertBinding(
-      {
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'office-calendar',
         status: 'live',
         endpoint: null,
@@ -240,9 +239,7 @@ describe('createGoogleCalendarAdapter', () => {
         provider: 'google',
         lastOkAt: null,
         lastError: null,
-      },
-      { by: 'test' },
-    );
+      }, { by: 'test' }));
     await writeGrant(
       {
         businessId: BUSINESS,
@@ -284,7 +281,7 @@ describe('createGoogleCalendarAdapter', () => {
     // that ref resolves to a freshly minted access token. Asserted BEFORE
     // the call, so the assertions below cannot pass on a chain that never
     // started.
-    const bindings = await loadBindings({ businessId: BUSINESS });
+    const bindings = await withBusiness(BUSINESS, (db) => loadBindings(db));
     const ref = bindings.find((b) => b.system === 'office-calendar')?.credentialRef;
     expect(ref).toBe('OFFICE_CALENDAR');
     const credential = await credentials.resolve(ref!, BUSINESS);

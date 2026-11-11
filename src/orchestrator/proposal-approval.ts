@@ -30,8 +30,7 @@
  * recorded as an `approval_notify_failed` audit row rather than thrown.
  */
 import { appendAudit } from '../audit/log.js';
-import { config } from '../config.js';
-import { withBusiness, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { ActionFacts, PolicyBundle } from '../domain/policy.js';
 import type { Proposal } from '../domain/proposal.js';
 import { enqueueApproval, getApproval } from '../governance/approvals.js';
@@ -64,13 +63,14 @@ export interface NotifyTarget {
  * send mail must not undo either.
  */
 export async function notifyOwner(
+  db: BusinessDb,
   approvalId: string,
   target: NotifyTarget,
-  context: { businessId: string; jobId: string | null; facts: ActionFacts; charterVersion: string },
+  context: { jobId: string | null; facts: ActionFacts; charterVersion: string },
 ): Promise<void> {
-  const { businessId, jobId, facts, charterVersion } = context;
+  const { jobId, facts, charterVersion } = context;
   try {
-    const request = await withBusiness(businessId, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 4)
+    const request = await getApproval(db, approvalId);
     if (request === null) {
       throw new Error('approval vanished immediately after being queued');
     }
@@ -81,8 +81,8 @@ export async function notifyOwner(
     if (!delivered.ok) throw new Error(delivered.error ?? 'notify returned not-ok');
   } catch (error) {
     try {
-      await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 4)
-        bdb,
+      await appendAudit(
+        db,
         {
           actor: 'system',
           kind: 'incident',
@@ -94,8 +94,8 @@ export async function notifyOwner(
           reason:
             `approval_notify_failed:${approvalId} via ${target.notifier.channel} — ` +
             `${error instanceof Error ? error.message : String(error)}`,
-        }
-      ));
+        },
+      );
     } catch {
       // The audit write itself failed — the same bad moment that most likely
       // broke the send. Swallowed for the reason in this function's docblock:
@@ -133,8 +133,9 @@ export interface RaiseInput {
 }
 
 export async function raiseProposalApproval(
+  db: BusinessDb,
   input: RaiseInput,
-  options: { businessId?: string; db?: Queryable; notify?: NotifyTarget } = {},
+  options: { notify?: NotifyTarget } = {},
 ): Promise<string | null> {
   const { proposal } = input;
   const text = proposalToApprovalText(proposal);
@@ -165,20 +166,19 @@ export async function raiseProposalApproval(
   const risk = await assessRisk(facts, input.bundle);
 
   const proposedInput = proposal.action.input;
-  const approvalId = await withBusiness(options.businessId ?? config.businessId, (bdb) => enqueueApproval(bdb, { // TENANCY-TODO(task 4)
+  const approvalId = await enqueueApproval(db, {
     jobId: input.jobId,
     facts,
     risk,
     proposedInput,
     summary: text.headline,
     detail: `${text.detail}\n\n${RAMP_HONESTY}`,
-  }));
+  });
 
   // After the row exists, never before: the notification's whole subject is a
   // card the owner can already open.
   if (options.notify !== undefined) {
-    await notifyOwner(approvalId, options.notify, {
-      businessId: options.businessId ?? config.businessId,
+    await notifyOwner(db, approvalId, options.notify, {
       jobId: input.jobId,
       facts,
       charterVersion: input.bundle.charterVersion,

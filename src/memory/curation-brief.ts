@@ -13,9 +13,8 @@
  * here rather than in the validator because only this module reads the plan
  * and the reading together.
  */
-import type { Queryable } from '../db/pool.js';
+import { getPool, withBusiness, type Queryable } from '../db/pool.js';
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
 import { messagesAPerson } from '../domain/action.js';
 import { ATTACHMENT_DOC_TYPE_LABELS } from '../domain/mail-triage.js';
 import type { Reading } from '../domain/reading.js';
@@ -166,10 +165,10 @@ export async function buildCurationBrief(
   const businessId = options.businessId ?? config.businessId;
   const db = options.db ?? getPool();
 
-  const job = await loadJob(jobId, { businessId, db });
+  const job = await withBusiness(businessId, (bdb) => loadJob(bdb, jobId)); // TENANCY-TODO(task 5)
   if (job === null) return null;
 
-  const stored = await loadPlanBody(jobId, { businessId, db });
+  const stored = await withBusiness(businessId, (bdb) => loadPlanBody(bdb, jobId)); // TENANCY-TODO(task 5)
   if (stored === null) return buildMailBrief(jobId, { businessId, db });
 
   const recipients = new Set<string>();

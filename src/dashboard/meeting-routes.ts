@@ -612,7 +612,7 @@ async function loadTomorrow(businessId: string, timeZone: string, options: Meeti
 }
 
 async function pendingMeetingConfirmations(businessId: string, csrf: string): Promise<string> {
-  const confirmations = await dashboardConfirmations({ businessId });
+  const confirmations = await withBusiness(businessId, (db) => dashboardConfirmations(db)); // TENANCY-TODO(task 10)
   if (confirmations.length === 0) return '';
   const { rows } = await getPool().query<{ job_id: string }>(
     `SELECT DISTINCT job_id FROM meetings WHERE business_id = $1 AND job_id = ANY($2::text[]) AND state = 'proposed'`,
@@ -838,10 +838,7 @@ export async function handleMeetingNewPost(
   const calendar = await calendarWiring(options);
   if (calendar === undefined) return refuse(CALENDAR_NOT_CONNECTED_REPLY);
 
-  const outcome = await runInstruction(
-    { text: built.text },
-    { businessId, textOrigin: 'typed', channel: 'dashboard', calendar, meetingRequest: built.request },
-  );
+  const outcome = await withBusiness(businessId, (db) => runInstruction(db, { text: built.text }, { textOrigin: 'typed', channel: 'dashboard', calendar, meetingRequest: built.request })); // TENANCY-TODO(task 10)
   if (outcome.status === 'refused') return refuse(outcome.reason);
   // The question is listed at the top of the GET (PRG: a refresh must not book twice).
   if (outcome.status === 'needs_confirmation') return seeOther(res, '/meetings');

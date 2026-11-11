@@ -3,8 +3,8 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
@@ -125,11 +125,11 @@ function mailPlan(attachments: unknown, extra: Record<string, unknown> = {}): Pl
 }
 
 async function jobInExecute(bundle: PolicyBundle) {
-  const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  const loaded = await loadJob(job.jobId, { businessId: BUSINESS });
+  const loaded = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
   if (loaded === null) throw new Error('job vanished');
   return loaded;
 }
@@ -143,7 +143,7 @@ interface RunOptions {
 async function run(plan: Plan, registry: AdapterRegistry, opts: RunOptions = {}) {
   const { redactBeforeSending } = opts;
   const cardBusiness = opts.cardBusiness === undefined ? BUSINESS : opts.cardBusiness;
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
     bdb,
     buildCharter({
       connections: [MAIL_CONNECTION],
@@ -153,13 +153,13 @@ async function run(plan: Plan, registry: AdapterRegistry, opts: RunOptions = {})
   ));
   const job = await jobInExecute(bundle);
   if (cardBusiness !== null && lastVersionId !== null) {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_cards (card_id, business_id, version_id, state, delivery_job_id)
        VALUES ($1, $2, $3, 'approved', $4)`,
       [`DC-${job.jobId}`, cardBusiness, lastVersionId, job.jobId],
     );
   }
-  return runPlan({
+  return withBusiness(job.businessId, (db) => runPlan(db, {
     job,
     bundle,
     plan,
@@ -169,7 +169,7 @@ async function run(plan: Plan, registry: AdapterRegistry, opts: RunOptions = {})
     counterpartyTags: [],
     rampLevel: 'auto',
     now: NOON,
-  });
+  }));
 }
 
 beforeEach(async () => {

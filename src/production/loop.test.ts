@@ -97,9 +97,9 @@ const neverPrinter: PdfPrinter = async () => {
 };
 
 async function originJob(): Promise<string> {
-  const job = await createJob({ businessId: B, charterVersion, provenance: 'boss', title: 'הפקת מסמך' });
+  const job = await withBusiness(B, (db) => createJob(db, { charterVersion, provenance: 'boss', title: 'הפקת מסמך' }));
   for (const to of ['understand', 'plan', 'execute', 'followup'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'test', businessId: B });
+    await withBusiness(B, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'test' }));
   }
   return job.jobId;
 }
@@ -181,7 +181,7 @@ describe('runDocumentProductions', () => {
     expect(r.renderer.calls).toHaveLength(1);
     expect(await readFile(join(root, (version!.check2 as { previewPath: string }).previewPath))).toEqual(PNG);
 
-    expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('closed');
+    expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('closed');
     expect(r.finished).toEqual([{ productionId: id, versionId: version!.versionId, stage: 'ready', reason: null }]);
 
     // The audit row carries no content: no title, no instruction, no file name.
@@ -232,7 +232,7 @@ describe('runDocumentProductions', () => {
     const version = await latestVersion(id);
     expect(version?.versionNo).toBe(3);
     expect(r.finished).toEqual([{ productionId: id, versionId: version!.versionId, stage: 'failed_checks', reason: null }]);
-    expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('closed');
+    expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('closed');
   });
 
   it('a crash after building (simulate by throwing after saveVersion) resumes at check1 and does not call the drafter again', async () => {
@@ -323,7 +323,7 @@ describe('runDocumentProductions', () => {
     expect(p?.work.reason).toBe(productionCapReason(20));
     expect(p?.work.drafted).toBe(false);
     expect(r.finished).toEqual([{ productionId: id, versionId: null, stage: 'failed', reason: productionCapReason(20) }]);
-    expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('failed');
+    expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
   });
 
   it('the 20th is not refused (the cap counts calls already made)', async () => {
@@ -374,7 +374,7 @@ describe('runDocumentProductions', () => {
     expect(p?.stage).toBe('failed');
     expect(p?.work.reason).toBe('ניסוח המסמך לא הסתיים בזמן');
     expect(r.finished[0]).toMatchObject({ stage: 'failed', reason: 'ניסוח המסמך לא הסתיים בזמן', versionId: null });
-    expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('failed');
+    expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
   });
 
   it('an undrafted outcome → failed; a render error → failed with its Hebrew reason', async () => {
@@ -486,7 +486,7 @@ describe('fix round 1', () => {
     expect(p?.work.reason).toBe(PRODUCTION_TOOLS_MISSING_REASON);
     expect(p?.work.finished).toBe(true);
     expect(finished).toEqual([{ productionId: id, versionId: null, stage: 'failed', reason: PRODUCTION_TOOLS_MISSING_REASON }]);
-    expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('failed');
+    expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
   });
 
   it('spec-stage failed_checks has no version to show: versionId null', async () => {

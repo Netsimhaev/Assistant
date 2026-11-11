@@ -59,7 +59,7 @@ describe('runSetRampCli', () => {
       runSetRampCli(['email.nope', 'approve_required'], { log, businessId: BUSINESS }),
     ).rejects.toThrow(/email\.reply/);
 
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('draft_only');
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('draft_only');
   });
 
   it('refuses an unknown level and writes nothing', async () => {
@@ -69,7 +69,7 @@ describe('runSetRampCli', () => {
       runSetRampCli(['email.reply', 'whenever_you_like'], { log, businessId: BUSINESS }),
     ).rejects.toThrow(/approve_required/);
 
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('draft_only');
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('draft_only');
   });
 
   it('reports where the new level is actually felt, and where a ceiling still overrides it', async () => {
@@ -135,6 +135,6 @@ describe('runSetRampCli', () => {
       runSetRampCli(['email.reply', 'approve_required'], { log, businessId: BUSINESS }),
     ).rejects.toThrow();
 
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('draft_only');
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('draft_only');
   });
 });

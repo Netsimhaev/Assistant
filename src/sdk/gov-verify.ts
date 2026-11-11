@@ -683,7 +683,7 @@ export async function verifyDraft(input: VerifyDraftInput): Promise<VerifyDraftR
   // function does not wait for `know.reader` to answer; it ends its own run
   // the moment the request is opened.
   if (input.answer === null) {
-    const result = await requestHelp({
+    const result = await withBusiness(businessId, (db) => requestHelp(db, { // TENANCY-TODO(task 7)
       parentJobId: input.parentJobId,
       // Literal, not threaded from a caller — the same reasoning
       // `conduct.ts` and `instruct.ts` apply to their own `provenance`
@@ -698,9 +698,8 @@ export async function verifyDraft(input: VerifyDraftInput): Promise<VerifyDraftR
       contextRefs: [{ kind: 'document', documentId: input.documentId }],
       bundle,
       parentEnvelope: input.parentEnvelope,
-      businessId,
       ...(input.now !== undefined ? { now: input.now } : {}),
-    });
+    }));
 
     if (result.status === 'refused') {
       throw new Error(

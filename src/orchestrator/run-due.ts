@@ -1,5 +1,4 @@
-import { config } from '../config.js';
-import { getPool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { loadEnvelopeForChildJob } from '../governance/envelope-store.js';
 import { loadJob, transition } from './jobs.js';
@@ -7,6 +6,7 @@ import { loadPlanBody } from './plan-store.js';
 import { rampLevelForPlan } from './ramp.js';
 import { runPlanForJob, type RunPlanForJobRequest } from './run-plan.js';
 import { buildRuntime } from './runtime.js';
+import { withSessionLock } from './session-lock.js';
 import type { Runtime } from './runtime.js';
 
 /**
@@ -100,9 +100,10 @@ interface DueJobRow {
  * transaction-scoped.** A plan run makes external calls bounded only by the
  * adapter deadline (`run-plan.ts`'s `ADAPTER_TIMEOUT_MS`), and holding a
  * database transaction open across that call is how a ten-connection pool
- * dies under two concurrent runs. The lock is taken on a client checked out
- * for exactly this purpose and released in a `finally`, whatever happens in
- * between.
+ * dies under two concurrent runs. Each job runs on its own connection
+ * (`withSessionLock`), the lock is taken on that very connection, the job's
+ * work runs on it, and the lock is released in a `finally`, whatever happens
+ * in between.
  *
  * **`pg_try_advisory_lock`, not the blocking form**, for the same reason
  * `tick()` (`scheduler.ts`) uses `pg_try_advisory_xact_lock` and not a
@@ -131,8 +132,8 @@ interface DueJobRow {
  * that finds the due jobs in the first place.
  */
 export async function runDueJobs(
+  db: BusinessDb,
   options: {
-    businessId?: string;
     limit?: number;
     runtime?: Runtime;
     now?: Date;
@@ -157,11 +158,11 @@ export async function runDueJobs(
     judge?: RunPlanForJobRequest['judge'];
   } = {},
 ): Promise<RunDueResult> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const limit = options.limit ?? 20;
   const runtime = options.runtime ?? (await buildRuntime());
 
-  const { rows } = await getPool().query<DueJobRow>(
+  const { rows } = await db.query<DueJobRow>(
     `SELECT job_id FROM jobs
       WHERE business_id = $1
         AND phase = 'execute'
@@ -182,28 +183,16 @@ export async function runDueJobs(
   for (const row of rows) {
     const jobId = row.job_id;
     const lockScope = `run-due:${businessId}:${jobId}`;
-    const client = await getPool().connect();
-    let holdsLock = false;
     try {
-      try {
-        const lock = await client.query<{ locked: boolean }>(
-          'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
-          [lockScope],
-        );
-        if (lock.rows[0]?.locked !== true) {
-          result.lockedOut.push(jobId);
-          continue;
-        }
-        holdsLock = true;
-
+      const locked = await withSessionLock(businessId, lockScope, async (jobDb) => {
         // Re-read under the lock — see the docblock above.
-        const job = await loadJob(jobId, { businessId });
+        const job = await loadJob(jobDb, jobId);
         if (job === null || job.phase !== 'execute') {
           result.phaseMoved.push(jobId);
-          continue;
+          return;
         }
 
-        const stored = await loadPlanBody(jobId, { businessId });
+        const stored = await loadPlanBody(jobDb, jobId);
         if (stored === null) {
           // Terminal, not merely reported — see `RunDueResult.unbound`.
           //
@@ -225,17 +214,16 @@ export async function runDueJobs(
           // This branch remains for what it was always really about — a job
           // that reached `execute` with nothing bound for some other reason —
           // and stays terminal so it cannot hold the scheduler's window.
-          await transition(jobId, {
+          await transition(jobDb, jobId, {
             to: 'failed',
             actor: 'system',
             reason: 'run_due: no_plan_bound',
-            businessId,
           });
           result.unbound.push(jobId);
-          continue;
+          return;
         }
 
-        const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+        const active = await loadActiveCharter(jobDb);
         if (active === null) {
           // Fatal, never permissive: a job cannot run without the policy
           // that governs it.
@@ -248,10 +236,10 @@ export async function runDueJobs(
           // one of them runnable again. Failing them all on the way past
           // would be an irreversible answer to a repairable condition.
           result.ran.push({ jobId, status: 'rejected', detail: 'no_active_charter' });
-          continue;
+          return;
         }
 
-        const rampLevel = await rampLevelForPlan(stored.plan, { businessId });
+        const rampLevel = await rampLevelForPlan(jobDb, stored.plan);
 
         // A hard cap this job inherited from the envelope that opened it as a
         // delegation's child — `null` for an ordinary root job nothing ever
@@ -260,9 +248,9 @@ export async function runDueJobs(
         // true of what gets ENFORCED, not merely of what gets stored: without
         // this lookup the ceiling `requestHelp` wrote onto the envelope has no
         // reader in production at all.
-        const governingEnvelope = await withBusiness(businessId, (bdb) => loadEnvelopeForChildJob(bdb, job.jobId)); // TENANCY-TODO(task 4)
+        const governingEnvelope = await loadEnvelopeForChildJob(jobDb, job.jobId);
 
-        const outcome = await runPlanForJob({
+        const outcome = await runPlanForJob(jobDb, {
           job,
           bundle: active.bundle,
           plan: stored.plan,
@@ -307,11 +295,10 @@ export async function runDueJobs(
           // `await_approval`, `followup` or `failed` — so this job is not in
           // `execute` any more and a transition from here would either be
           // illegal or would overwrite a decision that was made properly.
-          await transition(jobId, {
+          await transition(jobDb, jobId, {
             to: 'failed',
             actor: 'system',
             reason: `run_due: ${outcome.code}`,
-            businessId,
           });
         }
 
@@ -325,51 +312,16 @@ export async function runDueJobs(
                 ? outcome.reason
                 : outcome.code,
         });
-      } catch (error) {
-        // This job's failure must not take the rest of the pass down with
-        // it — see the docblock above. Nothing ran, so this is `errored`,
-        // never a `ran` entry with a made-up status.
-        result.errored.push({
-          jobId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    } finally {
-      if (holdsLock) {
-        // The unlock attempt and the release are kept apart so `release` is
-        // called exactly once on every path. Nesting `client.release()`
-        // inside the `try` and `client.release(err)` inside its `catch` — the
-        // earlier shape here — released twice if `release()` itself ever
-        // threw: once from the `try`, once more from the `catch` it fell
-        // into.
-        let unlockError: unknown;
-        try {
-          await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [lockScope]);
-        } catch (error) {
-          unlockError = error;
-        }
-        if (unlockError === undefined) {
-          client.release();
-        } else {
-          // The advisory lock is session-scoped, not connection-scoped by
-          // magic: it lives on the session pg gave this client, and only
-          // ends for certain when that session ends. `client.release()`
-          // with no argument returns the session to the pool ALIVE, so a
-          // failed unlock followed by a plain release hands the next
-          // caller of this connection a session that still holds this
-          // job's lock — every future run on this job would see
-          // `pg_try_advisory_lock` fail and report `lockedOut`, silently,
-          // until the pool eventually recycles the connection on its own
-          // (`idleTimeoutMillis` in `db/pool.ts`). Passing the error to
-          // `release` tells `pg` to destroy the connection instead of
-          // pooling it, which is the only way to be sure the lock is gone.
-          client.release(
-            unlockError instanceof Error ? unlockError : new Error(String(unlockError)),
-          );
-        }
-      } else {
-        client.release();
-      }
+      });
+      if (!locked.locked) result.lockedOut.push(jobId);
+    } catch (error) {
+      // This job's failure must not take the rest of the pass down with
+      // it — see the docblock above. Nothing ran, so this is `errored`,
+      // never a `ran` entry with a made-up status.
+      result.errored.push({
+        jobId,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 

@@ -250,7 +250,7 @@ describe('learningSnapshot', () => {
   });
 
   it('a class promoted in its ramp row but clamped by dial off is not acting alone', async () => {
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
     await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner')); // TENANCY-TODO(task 10)
     expect((await replyCard()).status).toBe('shadow');
 

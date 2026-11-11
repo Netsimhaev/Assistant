@@ -157,9 +157,9 @@ async function makeApproval(options: {
 
 async function jobAwaitingApproval(businessId: string) {
   const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
-  const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId });
+  const job = await withBusiness(businessId, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
   for (const to of ['understand', 'plan', 'await_approval'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId });
+    await withBusiness(businessId, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
   return job;
 }
@@ -178,7 +178,7 @@ async function seedAutonomousAction(
   input: Record<string, unknown> = { to: 'dana@example.com', inReplyTo: 'thread-1', subject: 'תשובה', body: 'גוף' },
 ): Promise<{ jobId: string; stepId: string }> {
   const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter({ version: `autonomy-actions-${ulid()}` }))); // TENANCY-TODO(task 10)
-  const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId });
+  const job = await withBusiness(businessId, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
   const plan = Plan.parse({
     goal: 'reply to a known customer',
     steps: [
@@ -191,7 +191,7 @@ async function seedAutonomousAction(
       },
     ],
   });
-  const binding = await bindPlanToJob(job.jobId, plan, { businessId });
+  const binding = await withBusiness(businessId, (db) => bindPlanToJob(db, job.jobId, plan));
   if (binding.status !== 'stored') throw new Error(`unexpected plan binding status ${binding.status}`);
 
   await getPool().query(
@@ -315,12 +315,11 @@ async function anApprovalForReading(
   readingId: string,
   proposal: Proposal = FILING_PROPOSAL,
 ): Promise<{ approvalId: string; jobId: string }> {
-  const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId });
+  const job = await withBusiness(businessId, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
   for (const to of ['understand', 'plan', 'await_approval'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId });
+    await withBusiness(businessId, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  await saveProposal(
-    {
+  await withBusiness(businessId, (db) => saveProposal(db, {
       proposalId: `PR-${ulid()}`,
       readingId,
       jobId: job.jobId,
@@ -330,9 +329,7 @@ async function anApprovalForReading(
       raw: '{}',
       model: 'haiku',
       promptVersion: 'v1',
-    },
-    { businessId },
-  );
+    }));
   const approvalId = await makeApproval({ businessId, jobId: job.jobId });
   return { approvalId, jobId: job.jobId };
 }
@@ -624,7 +621,7 @@ describe('GET /readings', () => {
     // one first). The job never reaches `await_approval`: an `advise_against`
     // with no alternative raises no approval at all, which is exactly the
     // "no card" case this test also checks for.
-    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
 
     const documentId = `DOC-${ulid()}`;
     // U+202E RIGHT-TO-LEFT OVERRIDE, exactly the payload
@@ -670,8 +667,7 @@ describe('GET /readings', () => {
       action: null,
       clarifyingQuestion: null,
     };
-    await saveProposal(
-      {
+    await withBusiness(BUSINESS, (db) => saveProposal(db, {
         proposalId: `PR-${ulid()}`,
         readingId: record.readingId,
         jobId: job.jobId,
@@ -681,9 +677,7 @@ describe('GET /readings', () => {
         raw: '{}',
         model: 'haiku',
         promptVersion: 'v1',
-      },
-      { businessId: BUSINESS },
-    );
+      }));
 
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const res = await fetch(`${baseUrl}/readings`, { headers: { cookie } });
@@ -814,11 +808,10 @@ describe('GET /instruct, POST /instruct', () => {
   it('shows a parked question and its answer form on a fresh GET', async () => {
     const baseUrl = await startServer(BUSINESS);
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     const instruction = await saveInstruction(
       { textOrigin: 'typed', jobId: job.jobId, text: 'תשלחי לדנה את ההצעה' },
       { businessId: BUSINESS },
@@ -826,12 +819,11 @@ describe('GET /instruct, POST /instruct', () => {
     await recordQuestion(instruction.instructionId, 'לאיזו דנה — כהן או לוי?', {
       businessId: BUSINESS,
     });
-    await transition(job.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'understand',
       actor: 'orchestrator',
       reason: 'test setup',
-      businessId: BUSINESS,
-    });
+    }));
 
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const body = await (await fetch(`${baseUrl}/instruct`, { headers: { cookie } })).text();
@@ -845,11 +837,10 @@ describe('GET /instruct, POST /instruct', () => {
     const baseUrl = await startServer(BUSINESS);
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
 
-    const answeredJob = await createJob({
+    const answeredJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     const answeredInstruction = await saveInstruction(
       { textOrigin: 'typed', jobId: answeredJob.jobId, text: 'תשלחי לדנה את ההצעה' },
       { businessId: BUSINESS },
@@ -857,12 +848,11 @@ describe('GET /instruct, POST /instruct', () => {
     await recordQuestion(answeredInstruction.instructionId, 'לאיזו דנה?', {
       businessId: BUSINESS,
     });
-    await transition(answeredJob.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, answeredJob.jobId, {
       to: 'understand',
       actor: 'orchestrator',
       reason: 'test setup',
-      businessId: BUSINESS,
-    });
+    }));
     // The answer is recorded but the re-run refused, so the job is still
     // parked in `understand`. Phase alone would keep listing this as an open
     // question the owner has in fact already answered.
@@ -872,11 +862,10 @@ describe('GET /instruct, POST /instruct', () => {
     // an assertion that the answered question is absent would hold just as
     // well if the whole listing were deleted — this proves the listing
     // filters on the answer instead of proving nothing is listed at all.
-    const openJob = await createJob({
+    const openJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     const openInstruction = await saveInstruction(
       { textOrigin: 'typed', jobId: openJob.jobId, text: 'תזמיני פגישה עם רואה החשבון' },
       { businessId: BUSINESS },
@@ -884,12 +873,11 @@ describe('GET /instruct, POST /instruct', () => {
     await recordQuestion(openInstruction.instructionId, 'איזה יום מתאים?', {
       businessId: BUSINESS,
     });
-    await transition(openJob.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, openJob.jobId, {
       to: 'understand',
       actor: 'orchestrator',
       reason: 'test setup',
-      businessId: BUSINESS,
-    });
+    }));
 
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const body = await (await fetch(`${baseUrl}/instruct`, { headers: { cookie } })).text();
@@ -1162,9 +1150,9 @@ describe('POST /instruct/:jobId/answer', () => {
    */
   async function anInstructionJob(businessId: string, text: string): Promise<string> {
     const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
-    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId });
+    const job = await withBusiness(businessId, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
     await saveInstruction({ textOrigin: 'typed', jobId: job.jobId, text }, { businessId });
-    await transition(job.jobId, { to: 'understand', actor: 'orchestrator', reason: 'test setup', businessId });
+    await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'understand', actor: 'orchestrator', reason: 'test setup' }));
     return job.jobId;
   }
 
@@ -1244,7 +1232,7 @@ describe('POST /instruct/:jobId/answer', () => {
     // The parked job is untouched — refused before the close-out transition
     // too, and still `understand` (fix round 2: `anInstructionJob` parks the
     // job there directly, matching where a real answer-pending job sits).
-    const job = await loadJob(jobId, { businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
     expect(job?.phase).toBe('understand');
   });
 
@@ -1355,7 +1343,7 @@ describe('POST /instruct/:jobId/answer', () => {
     expect(firstBody).toContain('ההוראה ארוכה מ-4000 תווים');
     expect(firstBody).toContain('סגרתי את הבקשה הקודמת');
 
-    const afterFirst = await loadJob(jobId, { businessId: BUSINESS });
+    const afterFirst = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
     expect(afterFirst?.phase).toBe('closed');
     // Nothing is left for `GET /instruct` to show, which is the point: it
     // could not have shown it anyway (the answer is recorded), so the state
@@ -1374,7 +1362,7 @@ describe('POST /instruct/:jobId/answer', () => {
     expect(secondRes.status).toBe(400);
     expect(await secondRes.text()).toContain('כבר אינה ממתינה לתשובה');
 
-    const afterSecond = await loadJob(jobId, { businessId: BUSINESS });
+    const afterSecond = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
     expect(afterSecond?.phase).toBe('closed');
   });
 
@@ -1389,12 +1377,11 @@ describe('POST /instruct/:jobId/answer', () => {
   it('refuses a second POST after the parked job has already been closed out', async () => {
     const baseUrl = await startServer(BUSINESS);
     const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
-    await transition(jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, {
       to: 'failed',
       actor: 'human',
       reason: 'instruction door: answered; superseded by J-SIMULATED-REPLACEMENT',
-      businessId: BUSINESS,
-    });
+    }));
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
     const csrf = extractCsrf(await boxPage.text());
@@ -1492,7 +1479,7 @@ describe('POST /instruct/:jobId/answer', () => {
 
     // And the job is still waiting, so the owner's resubmit lands on a job in
     // the phase the route requires.
-    const job = await loadJob(jobId, { businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
     expect(job?.phase).toBe('understand');
   });
 
@@ -1505,7 +1492,7 @@ describe('POST /instruct/:jobId/answer', () => {
     const baseUrl = await startServer(BUSINESS);
     const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
     for (const to of ['plan', 'execute'] as const) {
-      await transition(jobId, { to, actor: 'orchestrator', reason: 'test setup', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { to, actor: 'orchestrator', reason: 'test setup' }));
     }
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
@@ -1519,7 +1506,7 @@ describe('POST /instruct/:jobId/answer', () => {
     expect(res.status).toBe(400);
     expect(await res.text()).toContain('כבר אינה ממתינה לתשובה');
 
-    const job = await loadJob(jobId, { businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
     expect(job?.phase).toBe('execute');
     const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
     expect(stored?.answer).toBeNull();
@@ -1554,11 +1541,10 @@ describe('POST /instruct/:jobId/answer', () => {
     const jobId = await anInstructionJob(BUSINESS, 'תשיבי לרונית');
 
     // Two people one name — the ambiguity the answer below will not settle.
-    const seedJob = await createJob({
-      charterVersion: (await loadJob(jobId, { businessId: BUSINESS }))?.charterVersion ?? '',
+    const seedJob = await withBusiness(BUSINESS, async (db) => createJob(db, {
+      charterVersion: (await withBusiness(BUSINESS, async (db) => loadJob(db, jobId)))?.charterVersion ?? '',
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     await writeMemory(
       {
         jobId: seedJob.jobId,
@@ -1636,7 +1622,7 @@ describe('deciding an approval', () => {
 
     const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('approved');
-    const updatedJob = await loadJob(job.jobId, { businessId: BUSINESS });
+    const updatedJob = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(updatedJob?.phase).toBe('execute');
   });
 
@@ -1659,7 +1645,7 @@ describe('deciding an approval', () => {
 
     const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('denied');
-    const updatedJob = await loadJob(job.jobId, { businessId: BUSINESS });
+    const updatedJob = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(updatedJob?.phase).toBe('closed');
   });
 });
@@ -2015,7 +2001,7 @@ describe('signing an approval', () => {
     expect(audit[0]?.reason).toContain(`signature:${documentId}`);
     expect(audit[0]?.reason).toContain(`for approval ${approvalId}`);
 
-    const updatedJob = await loadJob(jobId, { businessId: BUSINESS });
+    const updatedJob = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
     expect(updatedJob?.phase).toBe('execute');
   });
 
@@ -2781,7 +2767,7 @@ describe('editing before approval', () => {
     const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('approved_with_edit');
     expect(approval?.editedInput).toEqual(edited);
-    const updatedJob = await loadJob(job.jobId, { businessId: BUSINESS });
+    const updatedJob = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(updatedJob?.phase).toBe('execute');
   });
 
@@ -2887,7 +2873,7 @@ describe('editing before approval', () => {
       const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
       expect(approval?.state).toBe('pending');
       expect(approval?.editedInput).toBeNull();
-      const jobAfter = await loadJob(job.jobId, { businessId: BUSINESS });
+      const jobAfter = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
       expect(jobAfter?.phase).toBe('await_approval');
     },
   );
@@ -3612,15 +3598,15 @@ describe('boss-command confirmation on the dashboard', () => {
     const charterVersion =
       active?.charter.charterVersion ??
       (await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter()))).charterVersion; // TENANCY-TODO(task 10)
-    const job = await createJob({ charterVersion, provenance: 'boss', businessId });
+    const job = await withBusiness(businessId, (db) => createJob(db, { charterVersion, provenance: 'boss' }));
     await saveInstruction(
       { textOrigin: 'typed', jobId: job.jobId, text: 'תשלחי לדנה תזכורת' },
       { businessId },
     );
-    await transition(job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't', businessId });
-    await transition(job.jobId, { to: 'plan', actor: 'orchestrator', reason: 't', businessId });
+    await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't' }));
+    await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'plan', actor: 'orchestrator', reason: 't' }));
     const only = options.length === 1 ? options[0] : undefined;
-    if (only !== undefined) await bindPlanToJob(job.jobId, only.plan, { businessId });
+    if (only !== undefined) await withBusiness(businessId, (db) => bindPlanToJob(db, job.jobId, only.plan));
     await createConfirmation(
       { jobId: job.jobId, options, presentedText: QUESTION, channel },
       { businessId },
@@ -3722,7 +3708,7 @@ describe('boss-command confirmation on the dashboard', () => {
     const { baseUrl, cookie } = await signedIn();
     const res = await confirmPost(baseUrl, cookie, jobId, { planHash: SINGLE.planHash });
     expect(res.status).toBe(403);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('plan');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('plan');
     expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.state).toBe('pending');
   });
 
@@ -3732,7 +3718,7 @@ describe('boss-command confirmation on the dashboard', () => {
     const res = await confirmPost(baseUrl, '', jobId, { planHash: SINGLE.planHash });
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('plan');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('plan');
   });
 
   it('refuses a planHash that is not among the options with 400, and nothing changes', async () => {
@@ -3747,7 +3733,7 @@ describe('boss-command confirmation on the dashboard', () => {
     expect(body).toContain('אינה אחת מהאפשרויות');
     // The refusal keeps the buttons: the question is still open.
     expect(body).toContain(`action="/instruct/${jobId}/confirm"`);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('plan');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('plan');
     const stored = await loadConfirmation(jobId, { businessId: BUSINESS });
     expect(stored?.state).toBe('pending');
     expect(stored?.chosenPlanHash).toBeNull();
@@ -3760,7 +3746,7 @@ describe('boss-command confirmation on the dashboard', () => {
     const first = await confirmPost(baseUrl, cookie, jobId, { csrf, planHash: OPTION_B.planHash });
     expect(first.status).toBe(302);
     expect(first.headers.get('location')).toBe('/');
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('execute');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('execute');
     const stored = await loadConfirmation(jobId, { businessId: BUSINESS });
     expect(stored?.state).toBe('confirmed');
     expect(stored?.chosenPlanHash).toBe(OPTION_B.planHash);
@@ -3778,7 +3764,7 @@ describe('boss-command confirmation on the dashboard', () => {
     const { baseUrl, cookie, csrf } = await signedIn();
     const res = await confirmPost(baseUrl, cookie, jobId, { csrf, planHash: SINGLE.planHash });
     expect(res.status).toBe(302);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('execute');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('execute');
   });
 
   it('answers a question presented on WhatsApp: the dashboard needs no WhatsApp freshness', async () => {
@@ -3786,7 +3772,7 @@ describe('boss-command confirmation on the dashboard', () => {
     const { baseUrl, cookie, csrf } = await signedIn();
     const res = await confirmPost(baseUrl, cookie, jobId, { csrf, planHash: SINGLE.planHash });
     expect(res.status).toBe(302);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('execute');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('execute');
   });
 
   it('cancels with cancel=1: the job is closed, not failed', async () => {
@@ -3794,7 +3780,7 @@ describe('boss-command confirmation on the dashboard', () => {
     const { baseUrl, cookie, csrf } = await signedIn();
     const res = await confirmPost(baseUrl, cookie, jobId, { csrf, cancel: '1' });
     expect(res.status).toBe(302);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('closed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('closed');
     expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.state).toBe('cancelled');
   });
 
@@ -3813,7 +3799,7 @@ describe('boss-command confirmation on the dashboard', () => {
     const { baseUrl, cookie, csrf } = await signedIn();
     const res = await confirmPost(baseUrl, cookie, otherJob, { csrf, planHash: SINGLE.planHash });
     expect(res.status).toBe(404);
-    expect((await loadJob(otherJob, { businessId: OTHER_BUSINESS }))?.phase).toBe('plan');
+    expect((await withBusiness(OTHER_BUSINESS, (db) => loadJob(db, otherJob)))?.phase).toBe('plan');
     expect((await loadConfirmation(otherJob, { businessId: OTHER_BUSINESS }))?.state).toBe('pending');
   });
 

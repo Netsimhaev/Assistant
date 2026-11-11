@@ -1,6 +1,5 @@
-import { config } from '../config.js';
 import { ConnectionBinding } from '../domain/connection.js';
-import { getPool, withBusinessTransaction, transaction, type Queryable, type BusinessDb } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 
@@ -26,16 +25,13 @@ function toBinding(row: BindingRow): ConnectionBinding {
   });
 }
 
-export async function loadBindings(
-  options: { businessId?: string; db?: Queryable } = {},
-): Promise<ConnectionBinding[]> {
-  const db = options.db ?? getPool();
+export async function loadBindings(db: BusinessDb): Promise<ConnectionBinding[]> {
   const { rows } = await db.query<BindingRow>(
     `SELECT system, status, endpoint, credential_ref, provider, last_ok_at, last_error
        FROM connection_bindings
       WHERE business_id = $1
       ORDER BY system`,
-    [options.businessId ?? config.businessId],
+    [db.businessId],
   );
   return rows.map(toBinding);
 }
@@ -72,29 +68,31 @@ export async function loadBindings(
  * worse than a stop with a late or manually reconstructed record. See the
  * docblock on `trip()` for why that asymmetry is intentional.)
  *
- * `options.db`, when supplied, is a `BusinessDb`: `transaction` joins the
- * caller's transaction when it is in one and opens one on it otherwise — never
- * a bare `pg.Pool`, which would silently defeat the atomicity this function
- * exists to provide.
+ * `db` is a `BusinessDb`, and the business written is `db.businessId` — the
+ * same one the audit row goes to, with no second id that could disagree with
+ * it. `transaction` joins the caller's transaction when it is in one and opens
+ * one on it otherwise — never a bare `pg.Pool`, which would silently defeat
+ * the atomicity this function exists to provide.
  */
 export async function upsertBinding(
+  db: BusinessDb,
   binding: ConnectionBinding,
-  options: { businessId?: string; db?: BusinessDb; charterVersion?: string; by: string },
+  options: { charterVersion?: string; by: string },
 ): Promise<void> {
   if (options.by.trim().length === 0) {
     throw new Error('upsertBinding: "by" must not be empty');
   }
   const parsed = ConnectionBinding.parse(binding);
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
 
   // The insert and the audit append must land on the same connection inside
   // one transaction, or (a) a crash between them lets a redirect commit
   // unaudited, and (b) `appendAudit`'s advisory lock — transaction-scoped —
   // would be taken and released inside a single statement, letting two
-  // concurrent appends read the same chain tail and fork it. When the caller
-  // supplies `options.db`, it is trusted to already be such a handle and the
-  // caller owns committing or rolling it back; otherwise a transaction is
-  // opened here and used for both statements.
+  // concurrent appends read the same chain tail and fork it. When `db` is
+  // already in a transaction both statements join it and the caller owns
+  // committing or rolling it back; otherwise a transaction is opened on `db`
+  // and used for both.
   const write = async (tx: BusinessDb): Promise<void> => {
     await tx.query(
       `INSERT INTO connection_bindings
@@ -151,11 +149,7 @@ export async function upsertBinding(
     );
   };
 
-  if (options.db) {
-    await transaction(options.db, write); // TENANCY-TODO(task 4)
-  } else {
-    await withBusinessTransaction(businessId, write); // TENANCY-TODO(task 4)
-  }
+  await transaction(db, write);
 }
 
 /**
@@ -204,27 +198,22 @@ export async function upsertBinding(
  * matter. Only `upsertBinding`, driven by a human or a health check, moves
  * `status`.
  *
- * `businessId` is required, with no default, for the same reason
- * `CredentialSource.resolve` requires it: a caller that could omit it would
- * read the omission as "the business in the configuration," which is
- * exactly how one customer's connection history ends up recorded against
- * another's. `upsertBinding` a few lines above is *not* a second precedent
- * for this — it defaults to `config.businessId` when its caller omits one
- * (`options.businessId ?? config.businessId`). This function deliberately
- * does not follow that fallback; it is stricter than the pattern beside it,
- * not consistent with it.
+ * The business is `db.businessId`, required with no default, for the same
+ * reason `CredentialSource.resolve` requires its id: a caller that could omit
+ * it would read the omission as "the business in the configuration," which
+ * is exactly how one customer's connection history ends up recorded against
+ * another's.
  */
 export async function recordBindingOutcome(
-  input: { businessId: string; system: string; ok: boolean; errorCode?: string; errorMessage?: string },
-  options: { db?: Queryable } = {},
+  db: BusinessDb,
+  input: { system: string; ok: boolean; errorCode?: string; errorMessage?: string },
 ): Promise<void> {
-  const db = options.db ?? getPool();
   const detail = input.ok ? null : `${input.errorCode ?? 'unknown'} — ${input.errorMessage ?? ''}`.trim();
   await db.query(
     `UPDATE connection_bindings
         SET last_ok_at = CASE WHEN $3 THEN now() ELSE last_ok_at END,
             last_error = $4
       WHERE business_id = $1 AND system = $2`,
-    [input.businessId, input.system, input.ok, detail],
+    [db.businessId, input.system, input.ok, detail],
   );
 }

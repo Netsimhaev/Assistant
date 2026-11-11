@@ -108,7 +108,7 @@ type GrantSummary = Awaited<ReturnType<typeof listGrants>>[number];
 
 /** Working = a live binding AND a live grant that does not need reauth. */
 async function calendarIsWorking(businessId: string): Promise<{ working: boolean; grant: GrantSummary | null }> {
-  const [bindings, grants] = await Promise.all([loadBindings({ businessId }), listGrants(businessId)]);
+  const [bindings, grants] = await Promise.all([withBusiness(businessId, (db) => loadBindings(db)), listGrants(businessId)]); // TENANCY-TODO(task 10)
   const binding = bindings.find((b) => b.system === CALENDAR_SYSTEM) ?? null;
   const grant = grants.find((g) => g.system === CALENDAR_SYSTEM && g.revokedAt === null) ?? null;
   return { working: binding?.status === 'live' && grant !== null && grant.needsReauthAt === null, grant };

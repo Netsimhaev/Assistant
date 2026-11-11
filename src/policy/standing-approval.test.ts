@@ -17,9 +17,9 @@ const bundle = compileCharter(buildCharter());
 const NOON = new Date('2026-08-18T09:00:00.000Z');
 
 async function bossJob(title: string) {
-  return createJob({
-    charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS, title,
-  });
+  return withBusiness(BUSINESS, (db) => createJob(db, {
+    charterVersion: bundle.charterVersion, provenance: 'boss', title,
+  }));
 }
 
 /** A reply to Dana. Classified `email.reply` because it carries `inReplyTo`. */
@@ -168,10 +168,10 @@ describe('standing authorisation at the gate', () => {
     const dataExportBundle = compileCharter(dataExportCharter);
     await withBusiness(BUSINESS, (bdb) => installCharter(bdb, dataExportCharter));
 
-    const job = await createJob({
-      charterVersion: dataExportBundle.charterVersion, provenance: 'boss', businessId: BUSINESS,
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
+      charterVersion: dataExportBundle.charterVersion, provenance: 'boss', 
       title: 'ייצוא נתונים',
-    });
+    }));
     await withBusiness(BUSINESS, (bdb) => grantAuthorization(
       bdb,
       { jobId: job.jobId, actionClass: 'data.export', recipients: ['dana@example.com'] }

@@ -4,7 +4,7 @@ import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { ingestDocument } from '../documents/ingest.js';
@@ -108,7 +108,7 @@ function deps(proposal: Proposal = ACTING) {
 describe('conductPendingDocuments', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
   });
 
   // I3: the conductor writes `approval_requests` without passing through the
@@ -123,8 +123,7 @@ describe('conductPendingDocuments', () => {
     const d = deps();
     const notified: { approvalId: string; link: string }[] = [];
 
-    const result = await conductPendingDocuments({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
       reader: d.reader,
       proposer: d.proposer,
       notify: {
@@ -137,7 +136,7 @@ describe('conductPendingDocuments', () => {
         },
         dashboardBaseUrl: 'http://127.0.0.1:8787',
       },
-    });
+    }));
 
     expect(result.carded).toBe(1);
     const { rows } = await getPool().query<{ approval_id: string }>(
@@ -159,8 +158,7 @@ describe('conductPendingDocuments', () => {
     await aDocument('חוזה שיווק כשל שליחה');
     const d = deps();
 
-    const result = await conductPendingDocuments({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
       reader: d.reader,
       proposer: d.proposer,
       notify: {
@@ -172,7 +170,7 @@ describe('conductPendingDocuments', () => {
         },
         dashboardBaseUrl: 'http://127.0.0.1:8787',
       },
-    });
+    }));
 
     // The card was still raised and the job still moved — nothing about the
     // failed send is load-bearing.
@@ -198,11 +196,10 @@ describe('conductPendingDocuments', () => {
     const documentId = await aDocument('חוזה שיווק');
     const d = deps();
 
-    const result = await conductPendingDocuments({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
       reader: d.reader,
       proposer: d.proposer,
-    });
+    }));
 
     expect(result.carded).toBe(1);
     const { rows } = await getPool().query<{ state: string; job_id: string }>(
@@ -239,11 +236,10 @@ describe('conductPendingDocuments', () => {
     await aDocument('חוזה שיווק');
     const d = deps();
 
-    const result = await conductPendingDocuments({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
       reader: d.reader,
       proposer: d.proposer,
-    });
+    }));
     expect(result.carded).toBe(1);
 
     const jobs = await getPool().query<{ job_id: string }>(
@@ -272,17 +268,16 @@ describe('conductPendingDocuments', () => {
     await aDocument('חוזה גרוע');
     const d = deps(PASSIVE);
 
-    const result = await conductPendingDocuments({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
       reader: d.reader,
       proposer: d.proposer,
-    });
+    }));
 
     expect(result.carded).toBe(0);
     expect(result.readOnly).toBe(1);
-    const approvals = await getPool().query(`SELECT 1 FROM approval_requests`);
+    const approvals = await testDb().query(`SELECT 1 FROM approval_requests`);
     expect(approvals.rows).toHaveLength(0);
-    const proposals = await getPool().query(`SELECT 1 FROM proposals`);
+    const proposals = await testDb().query(`SELECT 1 FROM proposals`);
     expect(proposals.rows, 'the proposal must still be stored').toHaveLength(1);
 
     // I4: `readOnly += 1` and `continue` sit outside the `to: 'closed'`
@@ -301,13 +296,12 @@ describe('conductPendingDocuments', () => {
     await aDocument('מסמך שני');
     const d = deps();
 
-    const result = await conductPendingDocuments({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
       readsPerDay: 1,
       reader: d.reader,
       proposer: d.proposer,
       verifier: noopVerifier,
-    });
+    }));
 
     expect(result.ceilingReached).toBe(true);
     expect(d.calls.reads, 'the second document must not be read').toBe(1);
@@ -327,7 +321,7 @@ describe('conductPendingDocuments', () => {
       docs.rows[1]?.read_attempts,
       'the skipped document must be untouched',
     ).toBe(0);
-    const jobs = await getPool().query(`SELECT 1 FROM jobs WHERE business_id = $1`, [BUSINESS]);
+    const jobs = await testDb().query(`SELECT 1 FROM jobs WHERE business_id = $1`, [BUSINESS]);
     // Two, not one: the carded document's own job, plus the `gov.verify` job
     // `beginVerification` opens beside its card (`noopVerifier` stops it
     // there — no third, `know.reader` child job). The point of this
@@ -342,8 +336,7 @@ describe('conductPendingDocuments', () => {
     let first = true;
     const d = deps();
 
-    const result = await conductPendingDocuments({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
       reader: async (...args: Parameters<typeof d.reader>) => {
         if (first) {
           first = false;
@@ -352,7 +345,7 @@ describe('conductPendingDocuments', () => {
         return d.reader(...args);
       },
       proposer: d.proposer,
-    });
+    }));
 
     expect(result.failed).toBe(1);
     expect(result.carded, 'the second document must still get its card').toBe(1);
@@ -382,11 +375,10 @@ describe('conductPendingDocuments', () => {
     await aDocument('בלי תקנון');
     const d = deps();
 
-    const result = await conductPendingDocuments({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
       reader: d.reader,
       proposer: d.proposer,
-    });
+    }));
 
     expect(result.considered).toBe(0);
     expect(d.calls.reads).toBe(0);
@@ -407,23 +399,21 @@ describe('conductPendingDocuments', () => {
     const d = deps();
 
     const [a, b] = await Promise.all([
-      conductPendingDocuments({
-        businessId: BUSINESS,
+      withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
         reader: d.reader,
         proposer: d.proposer,
         verifier: noopVerifier,
-      }),
-      conductPendingDocuments({
-        businessId: BUSINESS,
+      })),
+      withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
         reader: d.reader,
         proposer: d.proposer,
         verifier: noopVerifier,
-      }),
+      })),
     ]);
 
     expect(a.considered + b.considered, 'the single document is considered exactly once').toBe(1);
     expect(d.calls.reads, 'the model must not be called twice for one document').toBe(1);
-    const jobs = await getPool().query(`SELECT 1 FROM jobs WHERE business_id = $1`, [BUSINESS]);
+    const jobs = await testDb().query(`SELECT 1 FROM jobs WHERE business_id = $1`, [BUSINESS]);
     // Two, not one: the document's own job, plus the `gov.verify` job opened
     // beside its card (`noopVerifier` stops it there). The invariant this
     // test exists for is unchanged — the race must not double either count.
@@ -438,21 +428,20 @@ describe('conductPendingDocuments', () => {
     const d = deps();
     let verifierCalls = 0;
 
-    const result = await conductPendingDocuments({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
       reader: d.reader,
       proposer: d.proposer,
       verifier: async () => {
         verifierCalls += 1;
         throw new Error('gov.verify boom');
       },
-    });
+    }));
 
     // The card exists regardless of the throw above — proof that raising it
     // does not depend on the verification finishing, or even succeeding.
     expect(result.carded).toBe(1);
     expect(result.failed, 'a stumbling verification must not fail the document').toBe(0);
-    const approvals = await getPool().query(`SELECT 1 FROM approval_requests`);
+    const approvals = await testDb().query(`SELECT 1 FROM approval_requests`);
     expect(approvals.rows).toHaveLength(1);
     expect(verifierCalls).toBe(1);
     // Fix round 1, Important 3: a stumbling verification is counted, not
@@ -491,12 +480,11 @@ describe('conductPendingDocuments', () => {
     await aDocument('חוזה שיווק לאימות אמיתי');
     const d = deps();
 
-    const result = await conductPendingDocuments({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
       reader: d.reader,
       proposer: d.proposer,
       // No `verifier` override — the real `verifyDraft` runs.
-    });
+    }));
 
     expect(result.carded).toBe(1);
     expect(
@@ -527,8 +515,7 @@ describe('conductPendingDocuments', () => {
     await aDocument('חוזה שיווק לאימות תקין');
     const d = deps();
 
-    const result = await conductPendingDocuments({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
       reader: d.reader,
       proposer: d.proposer,
       // A well-behaved stand-in for the real `verifyDraft` on the branch
@@ -540,7 +527,7 @@ describe('conductPendingDocuments', () => {
         childJobId: null,
         ungroundedNumbers: [],
       }),
-    });
+    }));
 
     expect(result.carded).toBe(1);
     // Not a failure — the delegation opened cleanly.
@@ -577,8 +564,7 @@ describe('conductPendingDocuments', () => {
     await aDocument('חוזה שיווק — אימות שהושלם');
     const d = deps();
 
-    const result = await conductPendingDocuments({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
       reader: d.reader,
       proposer: d.proposer,
       // No `status` key — the OTHER arm of `VerifyDraftResult`.
@@ -588,7 +574,7 @@ describe('conductPendingDocuments', () => {
         answerTruncated: false,
         draftTruncated: false,
       }),
-    });
+    }));
 
     expect(result.carded).toBe(1);
     expect(result.verificationFailed).toBe(0);
@@ -614,11 +600,10 @@ describe('conductPendingDocuments', () => {
     await aDocument('חוזה שיווק לתוכנית האימות');
     const d = deps();
 
-    const result = await conductPendingDocuments({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
       reader: d.reader,
       proposer: d.proposer,
-    });
+    }));
     expect(result.carded).toBe(1);
     expect(result.verificationFailed).toBe(0);
 
@@ -635,7 +620,7 @@ describe('conductPendingDocuments', () => {
     expect(jobs.rows[1]?.title).toContain('אימות');
     expect(verifyJobId).toBeTruthy();
 
-    const bound = await loadPlanBody(verifyJobId as string, { businessId: BUSINESS });
+    const bound = await withBusiness(BUSINESS, (db) => loadPlanBody(db, verifyJobId as string));
     expect(bound).not.toBeNull();
     // One step, and specifically NOT `agent.request_help` — see
     // `beginVerification`'s own docblock: that tool classifies to
@@ -648,11 +633,10 @@ describe('conductPendingDocuments', () => {
     await aDocument('חוזה שיווק לחניה על ההאצלה');
     const d = deps();
 
-    const result = await conductPendingDocuments({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
       reader: d.reader,
       proposer: d.proposer,
-    });
+    }));
     expect(result.carded).toBe(1);
 
     const jobs = await getPool().query<{ job_id: string; title: string | null }>(
@@ -663,7 +647,7 @@ describe('conductPendingDocuments', () => {
     expect(jobs.rows[1]?.title).toContain('אימות');
     expect(verifyJobId).toBeTruthy();
 
-    const verifyJob = await loadJob(verifyJobId as string, { businessId: BUSINESS });
+    const verifyJob = await withBusiness(BUSINESS, (db) => loadJob(db, verifyJobId as string));
     // The bug this replaces: the job was transitioned to `failed`
     // unconditionally, every time, right after the delegation opened.
     expect(verifyJob?.phase).not.toBe('failed');
@@ -678,11 +662,10 @@ describe('conductPendingDocuments', () => {
     await aDocument('חוזה שיווק בלי פסיקה עדיין');
     const d = deps();
 
-    const result = await conductPendingDocuments({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, {
       reader: d.reader,
       proposer: d.proposer,
-    });
+    }));
     expect(result.carded).toBe(1);
 
     const jobs = await getPool().query<{ job_id: string }>(
@@ -691,7 +674,7 @@ describe('conductPendingDocuments', () => {
     );
     const subjectJobId = jobs.rows[0]?.job_id;
     expect(subjectJobId).toBeTruthy();
-    expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId as string))).toBeNull(); // TENANCY-TODO(task 4)
+    expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId as string))).toBeNull();
   });
 
   /**
@@ -748,7 +731,7 @@ describe('conductPendingDocuments', () => {
 describe('conductPendingDocuments and mail-sourced documents', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
   });
 
   // `intake.triage` already read the mail an attachment came with (spec
@@ -765,15 +748,15 @@ describe('conductPendingDocuments and mail-sourced documents', () => {
     expect(doc.status).toBe('extracted');
     const d = deps();
 
-    const result = await conductPendingDocuments({ businessId: BUSINESS, reader: d.reader, proposer: d.proposer });
+    const result = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, { reader: d.reader, proposer: d.proposer }));
 
     expect(result.considered).toBe(0);
     expect(d.calls.reads).toBe(0);
 
     // The control: the same bytes under `manual` ARE considered, so the zero
     // above is the source filter and not an empty or broken pass.
-    await getPool().query("UPDATE documents SET source = 'manual' WHERE document_id = $1", [doc.documentId]);
-    const again = await conductPendingDocuments({ businessId: BUSINESS, reader: d.reader, proposer: d.proposer });
+    await testDb().query("UPDATE documents SET source = 'manual' WHERE document_id = $1", [doc.documentId]);
+    const again = await withBusiness(BUSINESS, (db) => conductPendingDocuments(db, { reader: d.reader, proposer: d.proposer }));
     expect(again.considered).toBe(1);
   });
 });

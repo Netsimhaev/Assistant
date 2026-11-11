@@ -32,8 +32,7 @@
  */
 
 import { ulid } from 'ulid';
-import { config } from '../config.js';
-import type { Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { AutonomyLevel } from '../domain/trust.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { Plan } from '../domain/plan.js';
@@ -63,8 +62,6 @@ export interface ProposeForReadingInput {
 }
 
 export interface ProposeForReadingOptions {
-  businessId?: string;
-  db?: Queryable;
   /**
    * The one step that costs money, injectable so the composition can be
    * tested without an API key — a stand-in for the one step that costs
@@ -107,16 +104,14 @@ export type ProposeResult =
 const NO_RAMP_YET: AutonomyLevel = 'draft_only';
 
 export async function proposeForReading(
+  db: BusinessDb,
   input: ProposeForReadingInput,
   options: ProposeForReadingOptions = {},
 ): Promise<ProposeResult> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const proposer = options.proposer ?? makeProposal;
 
-  const job = await loadJob(input.jobId, {
-    businessId,
-    ...(options.db !== undefined ? { db: options.db } : {}),
-  });
+  const job = await loadJob(db, input.jobId);
   // A job id that does not resolve is not a property of the reading — it is
   // the same class of fault `readDocument` treats as a genuine error rather
   // than a status, per its own header.
@@ -126,7 +121,7 @@ export async function proposeForReading(
 
   const reading = await loadLatestReading(input.documentId, job.provenance, {
     businessId,
-    ...(options.db !== undefined ? { db: options.db } : {}),
+    db,
   });
   if (reading === null || reading.content === null) {
     return { status: 'no_reading' };
@@ -139,8 +134,7 @@ export async function proposeForReading(
     rampLevel: NO_RAMP_YET,
   });
 
-  const record = await saveProposal(
-    {
+  const record = await saveProposal(db, {
       proposalId: `PRP-${ulid()}`,
       readingId: reading.readingId,
       jobId: input.jobId,
@@ -153,9 +147,7 @@ export async function proposeForReading(
       // `src/sdk/proposer.ts` for the incident this guards against.
       model: PROPOSER_MODEL,
       promptVersion: PROPOSAL_PROMPT_VERSION,
-    },
-    { businessId, ...(options.db !== undefined ? { db: options.db } : {}) },
-  );
+    });
 
   if (outcome.status === 'unproposable') {
     return { status: 'unproposable', reason: outcome.reason, record };

@@ -105,8 +105,7 @@ async function installFixture(): Promise<PolicyBundle> {
     })
   ));
   await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 10)
-  await upsertBinding(
-    {
+  await withBusiness(BUSINESS, (db) => upsertBinding(db, {
       system: 'office-mail',
       status: 'live',
       endpoint: null,
@@ -114,24 +113,21 @@ async function installFixture(): Promise<PolicyBundle> {
       provider: null,
       lastOkAt: null,
       lastError: null,
-    },
-    { businessId: BUSINESS, by: 'test' },
-  );
+    }, { by: 'test' }));
   return bundle;
 }
 
 /** A boss-provenance job in `execute`, with `plan` bound to it under the given charter. */
 async function seedReplyJob(bundle: PolicyBundle, plan: Plan): Promise<string> {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
     title: 'תשובה ללקוח',
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  await bindPlanToJob(job.jobId, plan, { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, plan));
   return job.jobId;
 }
 
@@ -142,8 +138,8 @@ async function seedReplyJob(bundle: PolicyBundle, plan: Plan): Promise<string> {
  * adapter path writes).
  */
 async function seedCompletedStep(bundle: PolicyBundle, performed: boolean | null): Promise<string> {
-  const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
-  const binding = await bindPlanToJob(job.jobId, replyPlan('dana@example.com', 'תשובה'), { businessId: BUSINESS });
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
+  const binding = await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, replyPlan('dana@example.com', 'תשובה')));
   if (binding.status !== 'stored') throw new Error(`unexpected plan binding status ${binding.status}`);
   await getPool().query(
     `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id, status, performed)
@@ -166,10 +162,10 @@ describe('listAutonomousActions', () => {
     const bundle = await installFixture();
     const plan = replyPlan('dana@example.com', 'תשובה');
     const jobId = await seedReplyJob(bundle, plan);
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
 
     const sent: MailMessage[] = [];
-    const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    const result = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
     expect(result.ran).toEqual([{ jobId, status: 'done', detail: null }]);
     expect(sent).toHaveLength(1);
 
@@ -205,7 +201,7 @@ describe('listAutonomousActions', () => {
    */
   it('does NOT list a step that went out through an approved card', async () => {
     const bundle = await installFixture();
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
 
     const autonomousPlan = replyPlan('dana@example.com', 'תשובה');
     const autonomousJobId = await seedReplyJob(bundle, autonomousPlan);
@@ -217,7 +213,7 @@ describe('listAutonomousActions', () => {
     const runtime = runtimeWith(sent);
 
     // First pass: the autonomous job sends; the card job parks on an approval.
-    const firstPass = await runDueJobs({ businessId: BUSINESS, runtime, now: NOON });
+    const firstPass = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime, now: NOON }));
     expect(firstPass.ran).toEqual(
       expect.arrayContaining([
         { jobId: autonomousJobId, status: 'done', detail: null },
@@ -231,15 +227,10 @@ describe('listAutonomousActions', () => {
     const [pending] = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb)); // TENANCY-TODO(task 10)
     if (pending === undefined) throw new Error('expected one pending approval');
     expect(pending.jobId).toBe(cardJobId);
-    await applyDecision(
-      pending.approvalId,
-      'approved',
-      { by: 'owner@example.com', channel: 'dashboard' },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (db) => applyDecision(db, pending.approvalId, 'approved', { by: 'owner@example.com', channel: 'dashboard' }));
 
     // Second pass: the card job resumes, spends the now-approved card, and sends.
-    const secondPass = await runDueJobs({ businessId: BUSINESS, runtime, now: NOON });
+    const secondPass = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime, now: NOON }));
     expect(secondPass.ran).toEqual([{ jobId: cardJobId, status: 'done', detail: null }]);
     expect(sent).toHaveLength(2);
 
@@ -260,7 +251,7 @@ describe('listAutonomousActions', () => {
    */
   it('keeps listing an autonomous step after a SIBLING step in the same job spends a card', async () => {
     const bundle = await installFixture();
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
 
     const twoStepPlan = Plan.parse({
       goal: 'reply to a known customer, and separately to a stranger',
@@ -292,7 +283,7 @@ describe('listAutonomousActions', () => {
     const runtime = runtimeWith(sent);
 
     // First pass: s1 sends autonomously; s2 parks the whole job on a card.
-    const firstPass = await runDueJobs({ businessId: BUSINESS, runtime, now: NOON });
+    const firstPass = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime, now: NOON }));
     expect(firstPass.ran).toEqual([{ jobId, status: 'halted', detail: 'awaiting_approval' }]);
     expect(sent).toHaveLength(1);
 
@@ -301,16 +292,11 @@ describe('listAutonomousActions', () => {
 
     const [pending] = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb)); // TENANCY-TODO(task 10)
     if (pending === undefined) throw new Error('expected one pending approval for s2');
-    await applyDecision(
-      pending.approvalId,
-      'approved',
-      { by: 'owner@example.com', channel: 'dashboard' },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (db) => applyDecision(db, pending.approvalId, 'approved', { by: 'owner@example.com', channel: 'dashboard' }));
 
     // Second pass: s1 is skipped as already-completed; s2 resumes, consumes
     // its own card, and sends.
-    const secondPass = await runDueJobs({ businessId: BUSINESS, runtime, now: NOON });
+    const secondPass = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime, now: NOON }));
     expect(secondPass.ran).toEqual([{ jobId, status: 'done', detail: null }]);
     expect(sent).toHaveLength(2);
 

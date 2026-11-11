@@ -33,8 +33,7 @@
  * afterwards and `settleMail` COALESCEs `error`, so the reason survives. A
  * failed DRAFT records nothing: it returns `null` and the poller decides.
  */
-import { config } from '../config.js';
-import { getPool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { MailTriage } from '../domain/mail-triage.js';
 import { Plan } from '../domain/plan.js';
@@ -71,7 +70,6 @@ export interface RaiseMailReplyInput {
 }
 
 export interface RaiseMailReplyOptions {
-  businessId?: string;
   notify?: NotifyTarget;
 }
 
@@ -100,11 +98,12 @@ export type ReplyPayload = {
 };
 
 export async function raiseMailReply(
+  db: BusinessDb,
   input: RaiseMailReplyInput,
   options: RaiseMailReplyOptions = {},
 ): Promise<RaisedReply | null> {
   const { mail, triage, bundle } = input;
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
 
   // Positive checks, before anything costs money. An unparseable sender is
   // '' (Task 3's mapping): no one to answer.
@@ -144,6 +143,7 @@ export async function raiseMailReply(
   };
 
   return raiseReplyCard(
+    db,
     {
       mailId: mail.mailId,
       originalSubject: mail.subject,
@@ -152,7 +152,7 @@ export async function raiseMailReply(
       payload,
       bundle,
     },
-    { businessId, ...(options.notify !== undefined ? { notify: options.notify } : {}) },
+    { ...(options.notify !== undefined ? { notify: options.notify } : {}) },
   );
 }
 
@@ -180,10 +180,11 @@ interface ReplyCardInput {
  * re-raise, so the two can never disagree about what a reply job looks like.
  */
 async function raiseReplyCard(
+  db: BusinessDb,
   input: ReplyCardInput,
-  options: { businessId: string; notify?: NotifyTarget },
+  options: { notify?: NotifyTarget } = {},
 ): Promise<RaisedReply> {
-  const { businessId } = options;
+  const { businessId } = db;
   const recipient = mailboxReplyRecipient(input.payload);
   if (recipient === null) throw new Error('raiseReplyCard: payload is not a mailbox reply');
   const payload = input.payload;
@@ -204,11 +205,10 @@ async function raiseReplyCard(
     ],
   });
 
-  const job: Job = await createJob({
+  const job: Job = await createJob(db, {
     charterVersion: input.bundle.charterVersion,
     // Not a parameter, and not derived from anything a mail says.
     provenance: 'unknown_external',
-    businessId,
     title: `תשובה: ${input.originalSubject}`,
   });
 
@@ -216,15 +216,14 @@ async function raiseReplyCard(
   let approvalId: string | null = null;
   try {
     for (const to of ['understand', 'plan'] as const) {
-      await transition(job.jobId, {
+      await transition(db, job.jobId, {
         to,
         actor: 'orchestrator',
         reason: 'mail reply: drafting a reply to the sender',
-        businessId,
       });
     }
 
-    const bound = await bindPlanToJob(job.jobId, plan, { businessId });
+    const bound = await bindPlanToJob(db, job.jobId, plan);
     if (bound.status === 'conflict') throw new Error(`mail reply: plan conflict on fresh job ${job.jobId}`);
 
     const facts = buildFacts('mail.send', payload, {
@@ -257,23 +256,22 @@ async function raiseReplyCard(
     // send itself produces an action update (`action-updates.ts`).
     if (
       input.retry === undefined &&
-      (await withBusiness(businessId, (bdb) => loadAutonomyMode(bdb))) === 'learn' && // TENANCY-TODO(task 4)
-      (await loadRampLevel('email.reply', { businessId })) === 'auto_notify' &&
+      (await loadAutonomyMode(db)) === 'learn' &&
+      (await loadRampLevel(db, 'email.reply')) === 'auto_notify' &&
       risk.band === 'routine'
     ) {
-      await transition(job.jobId, {
+      await transition(db, job.jobId, {
         to: 'execute',
         actor: 'orchestrator',
         reason: LEARNED_NO_CARD_REASON,
-        businessId,
       });
       await linkReplyJob(input.mailId, job.jobId, { businessId });
       return { replyJobId: job.jobId, approvalId: null };
     }
 
     const who = displayLine(input.displayName ?? '') || recipient;
-    approvalId = await withBusiness(businessId, (bdb) => enqueueApproval( // TENANCY-TODO(task 4)
-      bdb,
+    approvalId = await enqueueApproval(
+      db,
       {
         jobId: job.jobId,
         facts,
@@ -287,12 +285,11 @@ async function raiseReplyCard(
           body,
           ...(input.retry !== undefined ? { retry: input.retry } : {}),
         }),
-      }
-    ));
+      },
+    );
 
     if (options.notify !== undefined) {
-      await notifyOwner(approvalId, options.notify, {
-        businessId,
+      await notifyOwner(db, approvalId, options.notify, {
         jobId: job.jobId,
         facts,
         charterVersion: input.bundle.charterVersion,
@@ -301,11 +298,10 @@ async function raiseReplyCard(
 
     // `resumeAfterDecision` takes `await_approval` to `execute` on approve
     // and to `closed` on deny — the same parking spot `conduct.ts` uses.
-    await transition(job.jobId, {
+    await transition(db, job.jobId, {
       to: 'await_approval',
       actor: 'orchestrator',
       reason: `mail reply: ${approvalId}`,
-      businessId,
     });
 
     await linkReplyJob(input.mailId, job.jobId, { businessId });
@@ -316,7 +312,7 @@ async function raiseReplyCard(
     if (approvalId !== null) {
       const raised = approvalId;
       try {
-        await withBusiness(businessId, (bdb) => cancelPendingApproval(bdb, raised)); // TENANCY-TODO(task 4)
+        await cancelPendingApproval(db, raised);
       } catch {
         // Best effort; `expireOverdue` retires it on schedule regardless.
       }
@@ -325,11 +321,10 @@ async function raiseReplyCard(
     // it on; close it rather than leak it. Best effort: the original error is
     // the one worth surfacing.
     try {
-      await transition(job.jobId, {
+      await transition(db, job.jobId, {
         to: 'failed',
         actor: 'orchestrator',
         reason: `mail reply: ${error instanceof Error ? error.message : String(error)}`,
-        businessId,
       });
     } catch {
       // The job may already have moved; nothing more to do here.
@@ -420,11 +415,12 @@ export interface ReraiseResult {
  * owner checks Sent before approving rather than sending twice.
  */
 export async function reraiseAfterFailedSend(
+  db: BusinessDb,
   input: { bundle: PolicyBundle },
   options: RaiseMailReplyOptions = {},
 ): Promise<ReraiseResult> {
-  const businessId = options.businessId ?? config.businessId;
-  const { rows } = await getPool().query<FailedReplyRow>(
+  const businessId = db.businessId;
+  const { rows } = await db.query<FailedReplyRow>(
     `SELECT m.mail_id, j.job_id, m.subject AS original_subject, m.from_name, m.reply_to,
             a.proposed_input, a.edited_input, a.state, a.expired,
             (EXISTS (
@@ -485,6 +481,7 @@ export async function reraiseAfterFailedSend(
     // says why instead of going quiet.
     try {
       const raised = await raiseReplyCard(
+        db,
         {
           mailId: row.mail_id,
           originalSubject: row.original_subject,
@@ -494,7 +491,7 @@ export async function reraiseAfterFailedSend(
           bundle: input.bundle,
           retry: { mayHaveSent: row.may_have_sent, expired: row.expired },
         },
-        { businessId, ...(options.notify !== undefined ? { notify: options.notify } : {}) },
+        { ...(options.notify !== undefined ? { notify: options.notify } : {}) },
       );
       result.reraised += 1;
       // A re-raise always has a card (`retry` is set), so this is never
@@ -509,7 +506,7 @@ export async function reraiseAfterFailedSend(
       }
     }
   }
-  await reraiseLearnedReplies(input.bundle, businessId, options, result);
+  await reraiseLearnedReplies(db, input.bundle, options, result);
   return result;
 }
 
@@ -531,12 +528,13 @@ interface FailedLearnedRow {
  * stage 8, and the earlier dispatch may well have been delivered.
  */
 async function reraiseLearnedReplies(
+  db: BusinessDb,
   bundle: PolicyBundle,
-  businessId: string,
   options: RaiseMailReplyOptions,
   result: ReraiseResult,
 ): Promise<void> {
-  const { rows } = await getPool().query<FailedLearnedRow>(
+  const { businessId } = db;
+  const { rows } = await db.query<FailedLearnedRow>(
     `SELECT m.mail_id, j.job_id, m.subject AS original_subject, m.from_name, m.reply_to,
             (EXISTS (
                SELECT 1 FROM job_steps s
@@ -563,11 +561,11 @@ async function reraiseLearnedReplies(
            WHERE r.business_id = m.business_id AND r.job_id = j.job_id AND r.status = 'completed'
         )
       ORDER BY m.received_at`,
-    [businessId, MAY_HAVE_SENT_CODES, LEARNED_NO_CARD_REASON],
+    [db.businessId, MAY_HAVE_SENT_CODES, LEARNED_NO_CARD_REASON],
   );
 
   for (const row of rows) {
-    const stored = await loadPlanBody(row.job_id, { businessId });
+    const stored = await loadPlanBody(db, row.job_id);
     const payload = stored?.plan.steps.find((step) => step.id === 'reply')?.input;
     if (payload === undefined || mailboxReplyRecipient(payload) === null) {
       result.skipped += 1;
@@ -577,6 +575,7 @@ async function reraiseLearnedReplies(
 
     try {
       const raised = await raiseReplyCard(
+        db,
         {
           mailId: row.mail_id,
           originalSubject: row.original_subject,
@@ -586,7 +585,7 @@ async function reraiseLearnedReplies(
           bundle,
           retry: { mayHaveSent: row.may_have_sent, expired: false },
         },
-        { businessId, ...(options.notify !== undefined ? { notify: options.notify } : {}) },
+        { ...(options.notify !== undefined ? { notify: options.notify } : {}) },
       );
       result.reraised += 1;
       if (raised.approvalId !== null) result.approvalIds.push(raised.approvalId);

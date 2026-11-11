@@ -8,7 +8,7 @@
  * `runDueJobs`.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withTransaction, withBusiness } from '../db/pool.js';
+import { closePool, getPool, withBusiness, withBusinessTransaction } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -159,21 +159,20 @@ async function seedCommand(o: {
   const plan = o.plan ?? PLAN;
   const planHash = planHashOf(plan);
   charterCounter += 1;
-  const bundle = await withBusiness(businessId, (bdb) => installCharter( // TENANCY-TODO(task 4)
+  const bundle = await withBusiness(businessId, (bdb) => installCharter(
     bdb,
     buildCharter({ version: `2026-08-15.reask-${charterCounter}`, connections: [MAIL_CONNECTION] })
   ));
-  const job = await createJob({
+  const job = await withBusiness(businessId, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId,
     title: 'הצעה לזר',
-  });
+  }));
   await saveInstruction({ jobId: job.jobId, text: INSTRUCTION, textOrigin: 'typed' }, { businessId });
   for (const to of ['understand', 'plan'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId });
+    await withBusiness(businessId, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  await bindPlanToJob(job.jobId, plan, { businessId });
+  await withBusiness(businessId, (db) => bindPlanToJob(db, job.jobId, plan));
   await createConfirmation(
     {
       jobId: job.jobId,
@@ -184,9 +183,8 @@ async function seedCommand(o: {
     { businessId },
   );
   expect(await confirmChoice(job.jobId, planHash, 'p_boss', { businessId })).toBe(true);
-  await transition(job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'setup', businessId });
-  await upsertBinding(
-    {
+  await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'setup' }));
+  await withBusiness(businessId, (db) => upsertBinding(db, {
       system: 'office-mail',
       status: 'live',
       endpoint: null,
@@ -194,17 +192,15 @@ async function seedCommand(o: {
       provider: null,
       lastOkAt: null,
       lastError: null,
-    },
-    { businessId, by: 'test' },
-  );
+    }, { by: 'test' }));
   return { jobId: job.jobId, bundle };
 }
 
 /** A real `adapter_timeout`: the exemption lets the step out, the far end never answers. */
 async function timeOut(jobId: string, bundle: PolicyBundle, businessId = BUSINESS): Promise<void> {
-  const job = await loadJob(jobId, { businessId });
+  const job = await withBusiness(businessId, (db) => loadJob(db, jobId));
   if (job === null) throw new Error('no job');
-  const outcome = await runPlanForJob({
+  const outcome = await withBusiness(job.businessId, (db) => runPlanForJob(db, {
     job,
     bundle,
     plan: PLAN,
@@ -214,9 +210,9 @@ async function timeOut(jobId: string, bundle: PolicyBundle, businessId = BUSINES
     rampLevel: 'draft_only',
     now: NOON,
     adapterTimeoutMs: 25,
-  });
+  }));
   expect(outcome.status).toBe('halted');
-  expect((await loadJob(jobId, { businessId }))?.phase).toBe('followup');
+  expect((await withBusiness(businessId, (db) => loadJob(db, jobId)))?.phase).toBe('followup');
   const { rows } = await getPool().query<{ status: string }>(
     'SELECT status FROM job_step_results WHERE job_id = $1',
     [jobId],
@@ -246,7 +242,7 @@ async function linkToWhatsApp(jobId: string): Promise<string> {
     { businessId: BUSINESS },
   );
   if (message === null) throw new Error('setup: duplicate inbound message id');
-  await linkWhatsAppMessage(jobId, message.id, { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (db) => linkWhatsAppMessage(db, jobId, message.id));
   await settleMessage(message.id, 'handled', {}, { businessId: BUSINESS });
   return message.id;
 }
@@ -260,7 +256,7 @@ async function whatsappLink(jobId: string): Promise<string | null> {
 }
 
 async function backdateDecision(jobId: string): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `UPDATE instruction_confirmations SET decided_at = now() - interval '25 hours' WHERE job_id = $1`,
     [jobId],
   );
@@ -295,7 +291,7 @@ describe('reaskFailedCommands', () => {
     await timeOut(jobId, bundle);
 
     const messenger = fakeMessenger();
-    const result = await reaskFailedCommands({ businessId: BUSINESS, messenger });
+    const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger }));
     expect(result.errored).toEqual([]);
     expect(result.reasked).toHaveLength(1);
     expect(result.sent).toBe(1);
@@ -304,15 +300,15 @@ describe('reaskFailedCommands', () => {
     expect(result.reasked[0]).toEqual({ oldJobId: jobId, newJobId, uncertain: true });
 
     // The old job is failed, for the re-ask.
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
     expect(await lastReason(jobId)).toBe(REASK_REASON);
 
     // The new job: boss, same title, parked in plan, the same plan bound.
-    const fresh = await loadJob(newJobId, { businessId: BUSINESS });
+    const fresh = await withBusiness(BUSINESS, (db) => loadJob(db, newJobId));
     expect(fresh?.phase).toBe('plan');
     expect(fresh?.provenance).toBe('boss');
     expect(fresh?.title).toBe('הצעה לזר');
-    expect((await loadStoredPlan(newJobId, { businessId: BUSINESS }))?.planHash).toBe(PLAN_HASH);
+    expect((await withBusiness(BUSINESS, (db) => loadStoredPlan(db, newJobId)))?.planHash).toBe(PLAN_HASH);
     const { rows: instructions } = await getPool().query<{ text: string; text_origin: string }>(
       'SELECT text, text_origin FROM boss_instructions WHERE job_id = $1',
       [newJobId],
@@ -330,7 +326,7 @@ describe('reaskFailedCommands', () => {
     expect(confirmation?.deliveredAt).toBeInstanceOf(Date);
 
     // A second pass asks nothing more.
-    const again = await reaskFailedCommands({ businessId: BUSINESS, messenger });
+    const again = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger }));
     expect(again).toEqual({ reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] });
     expect(await jobCount()).toBe(2);
     expect(messenger.sent).toHaveLength(1);
@@ -343,8 +339,8 @@ describe('reaskFailedCommands', () => {
 
     const messenger = fakeMessenger();
     const [a, b] = await Promise.all([
-      reaskFailedCommands({ businessId: BUSINESS, messenger }),
-      reaskFailedCommands({ businessId: BUSINESS, messenger }),
+      withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger })),
+      withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger })),
     ]);
     expect(a.reasked.length + b.reasked.length).toBe(1);
     expect([...a.errored, ...b.errored]).toEqual([]);
@@ -361,10 +357,10 @@ describe('reaskFailedCommands', () => {
   it('the schema refuses a second re-ask of the same old job', async () => {
     const { jobId, bundle } = await seedCommand();
     await timeOut(jobId, bundle);
-    await reaskFailedCommands({ businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
 
     // A second job naming the same old one, written behind the sweep's back.
-    const other = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    const other = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
     await expect(
       createConfirmation(
         {
@@ -382,16 +378,16 @@ describe('reaskFailedCommands', () => {
   it('a lost claim after a crash re-asks with the prefix', async () => {
     const { jobId } = await seedCommand();
     const sent: MailMessage[] = [];
-    await runDueJobs({ businessId: BUSINESS, runtime: sendingRuntime(sent), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: sendingRuntime(sent), now: NOON }));
     expect(sent).toHaveLength(1);
     // The crash: the mail is out, the claim stands, the completion is lost.
-    await getPool().query('DELETE FROM job_step_results WHERE job_id = $1', [jobId]);
-    await getPool().query(`UPDATE jobs SET phase = 'execute' WHERE job_id = $1`, [jobId]);
-    await runDueJobs({ businessId: BUSINESS, runtime: sendingRuntime(sent), now: NOON });
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    await testDb().query('DELETE FROM job_step_results WHERE job_id = $1', [jobId]);
+    await testDb().query(`UPDATE jobs SET phase = 'execute' WHERE job_id = $1`, [jobId]);
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: sendingRuntime(sent), now: NOON }));
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
     expect(await lastReason(jobId)).toContain('confirmed_step_already_claimed');
 
-    const result = await reaskFailedCommands({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
     expect(result.reasked).toHaveLength(1);
     expect(result.reasked[0]?.uncertain).toBe(true);
     // No messenger: still written, and counted rather than silent.
@@ -404,20 +400,19 @@ describe('reaskFailedCommands', () => {
 
   it('a confirmation older than 24 hours with the step still to run: a plain question', async () => {
     const { jobId } = await seedCommand();
-    await transition(jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, {
       to: 'followup',
       actor: 'orchestrator',
       reason: 'quiet_hours',
       wakeAt: new Date(Date.now() + 3_600_000),
-      businessId: BUSINESS,
-    });
-    await getPool().query(
+    }));
+    await testDb().query(
       `UPDATE instruction_confirmations SET decided_at = now() - interval '25 hours' WHERE job_id = $1`,
       [jobId],
     );
 
     const messenger = fakeMessenger();
-    const result = await reaskFailedCommands({ businessId: BUSINESS, messenger });
+    const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger }));
     expect(result.reasked).toHaveLength(1);
     expect(result.reasked[0]?.uncertain).toBe(false);
     const newJobId = result.reasked[0]?.newJobId ?? '';
@@ -425,7 +420,7 @@ describe('reaskFailedCommands', () => {
     expect(confirmation?.presentedText.includes(REASK_PREFIX)).toBe(false);
     expect(confirmation?.presentedText.startsWith('לשלוח')).toBe(true);
     expect(messenger.sent.map((m) => m.text)).toEqual([confirmation?.presentedText]);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
   });
 
   it('T6: the re-ask of a mixed plan carries the ledger echo of what is left', async () => {
@@ -445,18 +440,17 @@ describe('reaskFailedCommands', () => {
       ],
     });
     const { jobId } = await seedCommand({ plan: mixed });
-    await transition(jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, {
       to: 'followup',
       actor: 'orchestrator',
       reason: 'quiet_hours',
       wakeAt: new Date(Date.now() + 3_600_000),
-      businessId: BUSINESS,
-    });
-    await getPool().query(
+    }));
+    await testDb().query(
       `UPDATE instruction_confirmations SET decided_at = now() - interval '25 hours' WHERE job_id = $1`,
       [jobId],
     );
-    const result = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });
+    const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger: fakeMessenger() }));
     expect(result.reasked).toHaveLength(1);
     const confirmation = await loadConfirmation(result.reasked[0]?.newJobId ?? '', { businessId: BUSINESS });
     expect(confirmation?.presentedText).toContain('ארשום: ממתינים לצד שני · תשובה מהזר');
@@ -465,7 +459,7 @@ describe('reaskFailedCommands', () => {
   it('a WhatsApp re-ask that was not sent stays undelivered — no messenger, or a failed send', async () => {
     const first = await seedCommand();
     await timeOut(first.jobId, first.bundle);
-    const unsent = await reaskFailedCommands({ businessId: BUSINESS });
+    const unsent = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
     expect(unsent.notConnected).toBe(1);
     const unsentJob = unsent.reasked[0]?.newJobId ?? '';
     expect((await loadConfirmation(unsentJob, { businessId: BUSINESS }))?.deliveredAt).toBeNull();
@@ -478,7 +472,7 @@ describe('reaskFailedCommands', () => {
         return { ok: false, error: 'down' };
       },
     };
-    const failed = await reaskFailedCommands({ businessId: BUSINESS, messenger: failing });
+    const failed = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger: failing }));
     expect(failed.sendFailed).toBe(1);
     const failedJob = failed.reasked[0]?.newJobId ?? '';
     expect((await loadConfirmation(failedJob, { businessId: BUSINESS }))?.deliveredAt).toBeNull();
@@ -491,17 +485,16 @@ describe('reaskFailedCommands', () => {
       steps: TWO_STEP.steps.map((step) => ({ ...step, input: { ...step.input, body: long } })),
     });
     const { jobId } = await seedCommand({ plan });
-    await transition(jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, {
       to: 'followup',
       actor: 'orchestrator',
       reason: 'quiet_hours',
       wakeAt: new Date(Date.now() + 3_600_000),
-      businessId: BUSINESS,
-    });
+    }));
     await backdateDecision(jobId);
 
     const messenger = fakeMessenger();
-    const result = await reaskFailedCommands({ businessId: BUSINESS, messenger });
+    const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger }));
     expect(result.errored).toEqual([]);
     const newJobId = result.reasked[0]?.newJobId ?? '';
     const confirmation = await loadConfirmation(newJobId, { businessId: BUSINESS });
@@ -514,59 +507,58 @@ describe('reaskFailedCommands', () => {
 
   it('a confirmation within 24 hours in followup is left to run', async () => {
     const { jobId } = await seedCommand();
-    await transition(jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, {
       to: 'followup',
       actor: 'orchestrator',
       reason: 'quiet_hours',
       wakeAt: new Date(Date.now() + 3_600_000),
-      businessId: BUSINESS,
-    });
-    const result = await reaskFailedCommands({ businessId: BUSINESS });
+    }));
+    const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
     expect(result.reasked).toEqual([]);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('followup');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('followup');
   });
 
   it('a command job that completed is never re-asked, in any phase', async () => {
     const { jobId } = await seedCommand();
     const sent: MailMessage[] = [];
-    await runDueJobs({ businessId: BUSINESS, runtime: sendingRuntime(sent), now: NOON });
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('verify');
-    expect(await reaskFailedCommands({ businessId: BUSINESS })).toMatchObject({ reasked: [] });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: sendingRuntime(sent), now: NOON }));
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('verify');
+    expect(await withBusiness(BUSINESS, (db) => reaskFailedCommands(db))).toMatchObject({ reasked: [] });
 
     // Claimed AND completed is not "claimed, nothing done" — not even failed.
-    await getPool().query(`UPDATE jobs SET phase = 'failed' WHERE job_id = $1`, [jobId]);
-    expect(await reaskFailedCommands({ businessId: BUSINESS })).toMatchObject({ reasked: [] });
+    await testDb().query(`UPDATE jobs SET phase = 'failed' WHERE job_id = $1`, [jobId]);
+    expect(await withBusiness(BUSINESS, (db) => reaskFailedCommands(db))).toMatchObject({ reasked: [] });
     // Nor an old confirmation with nothing left to run.
-    await getPool().query(`UPDATE jobs SET phase = 'followup' WHERE job_id = $1`, [jobId]);
-    await getPool().query(
+    await testDb().query(`UPDATE jobs SET phase = 'followup' WHERE job_id = $1`, [jobId]);
+    await testDb().query(
       `UPDATE instruction_confirmations SET decided_at = now() - interval '25 hours' WHERE job_id = $1`,
       [jobId],
     );
-    expect(await reaskFailedCommands({ businessId: BUSINESS })).toMatchObject({ reasked: [] });
+    expect(await withBusiness(BUSINESS, (db) => reaskFailedCommands(db))).toMatchObject({ reasked: [] });
     expect(await reasksOf(jobId)).toEqual([]);
   });
 
   it('a job with an unknown row that was not born at the instruction door is not this code’s', async () => {
     const { jobId, bundle } = await seedCommand();
     await timeOut(jobId, bundle);
-    await getPool().query('DELETE FROM boss_instructions WHERE job_id = $1', [jobId]);
+    await testDb().query('DELETE FROM boss_instructions WHERE job_id = $1', [jobId]);
 
-    const result = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });
+    const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger: fakeMessenger() }));
     // Not found at all — not found and then failed on the missing row.
     expect(result).toEqual({ reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] });
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('followup');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('followup');
   });
 
   it('another business is untouched', async () => {
     const { jobId, bundle } = await seedCommand({ businessId: OTHER });
     await timeOut(jobId, bundle, OTHER);
 
-    const result = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });
+    const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger: fakeMessenger() }));
     expect(result).toEqual({ reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] });
-    expect((await loadJob(jobId, { businessId: OTHER }))?.phase).toBe('followup');
+    expect((await withBusiness(OTHER, (db) => loadJob(db, jobId)))?.phase).toBe('followup');
     expect(await reasksOf(jobId)).toEqual([]);
 
-    const own = await reaskFailedCommands({ businessId: OTHER });
+    const own = await withBusiness(OTHER, (db) => reaskFailedCommands(db));
     expect(own.reasked.map((r) => r.oldJobId)).toEqual([jobId]);
     expect(await reasksOf(jobId)).toEqual([{ job_id: own.reasked[0]?.newJobId, business_id: OTHER }]);
   });
@@ -576,8 +568,8 @@ describe('reaskFailedCommands', () => {
     // The state a crash right after moving a (c) job leaves: failed for the
     // re-ask, an old confirmation, nothing claimed.
     await backdateDecision(jobId);
-    await transition(jobId, { to: 'failed', actor: 'orchestrator', reason: REASK_REASON, businessId: BUSINESS });
-    const result = await reaskFailedCommands({ businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'failed', actor: 'orchestrator', reason: REASK_REASON }));
+    const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
     expect(result.reasked).toEqual([{ oldJobId: jobId, newJobId: expect.any(String), uncertain: false }]);
   });
 
@@ -585,7 +577,7 @@ describe('reaskFailedCommands', () => {
     const { jobId, bundle } = await seedCommand({ channel: 'dashboard' });
     await timeOut(jobId, bundle);
     const messenger = fakeMessenger();
-    const result = await reaskFailedCommands({ businessId: BUSINESS, messenger });
+    const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger }));
     expect(result.reasked).toHaveLength(1);
     expect(result.sent).toBe(0);
     expect(result.notConnected).toBe(0);
@@ -607,9 +599,9 @@ describe('reaskFailedCommands', () => {
   it('the reviewer’s probe: s1 sent, s2 timed out, "yes" sends only s2', async () => {
     const { jobId, bundle } = await seedCommand({ plan: TWO_STEP });
     const sent: MailMessage[] = [];
-    const job = await loadJob(jobId, { businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
     if (job === null) throw new Error('no job');
-    const outcome = await runPlanForJob({
+    const outcome = await withBusiness(job.businessId, (db) => runPlanForJob(db, {
       job,
       bundle,
       plan: TWO_STEP,
@@ -619,12 +611,12 @@ describe('reaskFailedCommands', () => {
       rampLevel: 'draft_only',
       now: NOON,
       adapterTimeoutMs: 25,
-    });
+    }));
     expect(outcome.status).toBe('halted');
     expect(sent).toHaveLength(1);
     expect(sent[0]?.to).toContain('first@nowhere.example');
 
-    const result = await reaskFailedCommands({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
     expect(result.errored).toEqual([]);
     const newJobId = result.reasked[0]?.newJobId ?? '';
     const confirmation = await loadConfirmation(newJobId, { businessId: BUSINESS });
@@ -634,15 +626,15 @@ describe('reaskFailedCommands', () => {
     expect(option.plan.steps.map((st) => st.id)).toEqual(['s2']);
     expect(option.plan.steps[0]?.dependsOn).toEqual([]);
     expect(option.planHash).toBe(planHashOf(option.plan));
-    expect((await loadStoredPlan(newJobId, { businessId: BUSINESS }))?.planHash).toBe(option.planHash);
+    expect((await withBusiness(BUSINESS, (db) => loadStoredPlan(db, newJobId)))?.planHash).toBe(option.planHash);
     expect(confirmation.presentedText.startsWith(`${REASK_PREFIX}\n\n${alreadyDoneLine(1)}`)).toBe(true);
     expect(confirmation.presentedText).not.toContain('first@nowhere.example');
 
     // The owner says yes; the new job runs.
     expect(await confirmChoice(newJobId, option.planHash, 'p_boss', { businessId: BUSINESS })).toBe(true);
-    await transition(newJobId, { to: 'execute', actor: 'human', reason: 'command: confirmed', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, newJobId, { to: 'execute', actor: 'human', reason: 'command: confirmed' }));
     const after: MailMessage[] = [];
-    const ran = await runDueJobs({ businessId: BUSINESS, runtime: sendingRuntime(after), now: NOON });
+    const ran = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: sendingRuntime(after), now: NOON }));
     expect(ran.ran).toEqual([{ jobId: newJobId, status: 'done', detail: null }]);
     expect(after).toHaveLength(1);
     expect(after[0]?.to).toContain('second@nowhere.example');
@@ -651,22 +643,21 @@ describe('reaskFailedCommands', () => {
 
   it('arm (c) with s1 completed: the prefix and the already-done line, only s2 asked', async () => {
     const { jobId } = await seedCommand({ plan: TWO_STEP });
-    await withTransaction(async (tx) => {
+    await withBusinessTransaction(BUSINESS, async (tx) => {
       await recordStepCompletion(tx, {
-        jobId, businessId: BUSINESS, planHash: planHashOf(TWO_STEP), stepId: 's1',
+        jobId, planHash: planHashOf(TWO_STEP), stepId: 's1',
         externalId: 'MSG-1', status: 'completed', performed: true,
       });
     });
-    await transition(jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, {
       to: 'followup',
       actor: 'orchestrator',
       reason: 'quiet_hours',
       wakeAt: new Date(Date.now() + 3_600_000),
-      businessId: BUSINESS,
-    });
+    }));
     await backdateDecision(jobId);
 
-    const result = await reaskFailedCommands({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
     expect(result.reasked).toEqual([{ oldJobId: jobId, newJobId: expect.any(String), uncertain: true }]);
     const confirmation = await loadConfirmation(result.reasked[0]?.newJobId ?? '', { businessId: BUSINESS });
     expect(confirmation?.presentedText.startsWith(`${REASK_PREFIX}\n\n${alreadyDoneLine(1)}`)).toBe(true);
@@ -693,13 +684,12 @@ describe('reaskFailedCommands', () => {
 
   it('an expiry the job woke into within the same pass is re-asked once, plainly', async () => {
     const { jobId } = await seedCommand({ channel: 'dashboard' });
-    await transition(jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, {
       to: 'followup',
       actor: 'orchestrator',
       reason: 'quiet_hours',
       wakeAt: new Date(NOON.getTime() - 60_000),
-      businessId: BUSINESS,
-    });
+    }));
     await backdateDecision(jobId);
 
     const sent: MailMessage[] = [];
@@ -718,26 +708,26 @@ describe('reaskFailedCommands', () => {
 
   it('a fresh confirmation that failed for another reason is not re-asked', async () => {
     const { jobId } = await seedCommand();
-    await transition(jobId, { to: 'failed', actor: 'orchestrator', reason: 'forbidden:x', businessId: BUSINESS });
-    expect(await reaskFailedCommands({ businessId: BUSINESS })).toMatchObject({ reasked: [], errored: [] });
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'failed', actor: 'orchestrator', reason: 'forbidden:x' }));
+    expect(await withBusiness(BUSINESS, (db) => reaskFailedCommands(db))).toMatchObject({ reasked: [], errored: [] });
   });
 
   it('a meeting job is never re-asked — its hold is gone and the twin would carry no meetings rows', async () => {
     const { jobId, bundle } = await seedCommand();
     await timeOut(jobId, bundle);
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO meetings (meeting_id, business_id, job_id, step_id, calendar_id, event_id, operation, client_name)
        VALUES ('MT-reask', $1, $2, 's1', 'cal-1', 'hold-1', 'create', 'לקוח')`,
       [BUSINESS, jobId],
     );
-    expect(await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() })).toMatchObject({
+    expect(await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger: fakeMessenger() }))).toMatchObject({
       reasked: [],
       errored: [],
     });
     expect(await reasksOf(jobId)).toEqual([]);
     // The same job without the meetings row is re-asked: the exclusion is the row.
-    await getPool().query(`DELETE FROM meetings WHERE meeting_id = 'MT-reask'`);
-    const again = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });
+    await testDb().query(`DELETE FROM meetings WHERE meeting_id = 'MT-reask'`);
+    const again = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger: fakeMessenger() }));
     expect(again.reasked.map((r) => r.oldJobId)).toEqual([jobId]);
   });
 
@@ -745,7 +735,7 @@ describe('reaskFailedCommands', () => {
     const { jobId, bundle } = await seedCommand();
     const messageId = await linkToWhatsApp(jobId);
     await timeOut(jobId, bundle);
-    const result = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });
+    const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger: fakeMessenger() }));
     expect(await whatsappLink(result.reasked[0]?.newJobId ?? '')).toBe(messageId);
   });
 
@@ -765,7 +755,7 @@ describe('reaskFailedCommands', () => {
       'CREATE TRIGGER reask_test_refuse_link BEFORE UPDATE ON jobs FOR EACH ROW EXECUTE FUNCTION reask_test_refuse_link()',
     );
     try {
-      const result = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });
+      const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger: fakeMessenger() }));
       expect(result.reasked).toEqual([]);
       expect(result.errored.map((e) => e.jobId)).toEqual([jobId]);
       expect(await reasksOf(jobId)).toEqual([]);
@@ -774,7 +764,7 @@ describe('reaskFailedCommands', () => {
       await testDb().query('DROP FUNCTION reask_test_refuse_link()');
     }
     // Nothing is lost: the next pass asks.
-    const again = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });
+    const again = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger: fakeMessenger() }));
     expect(again.reasked.map((r) => r.oldJobId)).toEqual([jobId]);
   });
 
@@ -784,12 +774,12 @@ describe('reaskFailedCommands', () => {
    */
   async function failedAt(decidedAgo: string, failedAgo: string): Promise<string> {
     const { jobId } = await seedCommand();
-    await transition(jobId, { to: 'failed', actor: 'orchestrator', reason: 'forbidden:x', businessId: BUSINESS });
-    await getPool().query(
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'failed', actor: 'orchestrator', reason: 'forbidden:x' }));
+    await testDb().query(
       `UPDATE instruction_confirmations SET decided_at = now() - $2::interval WHERE job_id = $1`,
       [jobId, decidedAgo],
     );
-    await getPool().query(
+    await testDb().query(
       `UPDATE job_steps SET at = now() - $2::interval WHERE job_id = $1 AND to_phase = 'failed'`,
       [jobId, failedAgo],
     );
@@ -798,32 +788,32 @@ describe('reaskFailedCommands', () => {
 
   it('a command that failed inside its 24 hours is not re-asked once the day has passed', async () => {
     const jobId = await failedAt('25 hours', '24 hours 30 minutes');
-    expect(await reaskFailedCommands({ businessId: BUSINESS })).toMatchObject({ reasked: [], errored: [] });
+    expect(await withBusiness(BUSINESS, (db) => reaskFailedCommands(db))).toMatchObject({ reasked: [], errored: [] });
     expect(await reasksOf(jobId)).toEqual([]);
   });
 
   it('a command that failed early, 30 days ago, is not re-asked on deploy', async () => {
     const jobId = await failedAt('30 days 1 hour', '30 days');
-    expect(await reaskFailedCommands({ businessId: BUSINESS })).toMatchObject({ reasked: [], errored: [] });
+    expect(await withBusiness(BUSINESS, (db) => reaskFailedCommands(db))).toMatchObject({ reasked: [], errored: [] });
     expect(await reasksOf(jobId)).toEqual([]);
   });
 
   it('a failure after the 24-hour boundary is re-asked', async () => {
     const jobId = await failedAt('26 hours', '1 hour');
-    const result = await reaskFailedCommands({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
     expect(result.reasked).toEqual([{ oldJobId: jobId, newJobId: expect.any(String), uncertain: false }]);
   });
 
   it('a job bound to a plan other than the confirmed one is refused, not re-asked', async () => {
     const { jobId, bundle } = await seedCommand();
     await timeOut(jobId, bundle);
-    await getPool().query(`UPDATE job_plans SET plan_hash = 'not-the-chosen-hash' WHERE job_id = $1`, [jobId]);
-    const result = await reaskFailedCommands({ businessId: BUSINESS });
+    await testDb().query(`UPDATE job_plans SET plan_hash = 'not-the-chosen-hash' WHERE job_id = $1`, [jobId]);
+    const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
     expect(result.reasked).toEqual([]);
     expect(result.errored).toEqual([
       { jobId, error: `command re-ask: job ${jobId} is bound to not-the-chosen-hash, not the confirmed plan ${PLAN_HASH}` },
     ]);
     expect(await reasksOf(jobId)).toEqual([]);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('followup');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('followup');
   });
 });

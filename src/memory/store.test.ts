@@ -17,12 +17,11 @@ const BUSINESS = 'test-business';
 
 async function aJob(provenance: TrustLevel, title = 'memory'): Promise<string> {
   const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `mem-${title}-${provenance}` }))); // TENANCY-TODO(task 5)
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance,
-    businessId: BUSINESS,
     title,
-  });
+  }));
   return job.jobId;
 }
 

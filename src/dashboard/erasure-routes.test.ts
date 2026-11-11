@@ -108,12 +108,11 @@ function extractPlanHash(html: string): string {
 /** A job whose title names Ronit, plus one memory about her. */
 async function seedRonit(): Promise<{ jobId: string }> {
   const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'screen' }))); // TENANCY-TODO(task 10)
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
     title: `מייל אל ${RONIT}`,
-  });
+  }));
   await writeMemory(
     { jobId: job.jobId, kind: 'entity', subjectKey: RONIT, body: {} },
     { businessId: BUSINESS },
@@ -410,7 +409,7 @@ describe('the erasure routes', () => {
     ).text();
 
     for (const to of ['understand', 'plan', 'await_approval'] as const) {
-      await transition(jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
 
     const res = await fetch(`${baseUrl}/erase/confirm`, {

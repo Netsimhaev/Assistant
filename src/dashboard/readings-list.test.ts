@@ -215,7 +215,7 @@ describe('recentReadings', () => {
   // exercised by a real reading -> proposal -> job -> approval chain.
   it('carries the approval id through a full reading -> proposal -> job -> approval chain', async () => {
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
-    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
 
     await seedDocument(BUSINESS, 'DOC-3');
     await seedReading(BUSINESS, 'DOC-3', 'RD-DOC-3');
@@ -241,7 +241,7 @@ describe('recentReadings', () => {
   // same way `documentForApproval` already breaks its own proposal tie.
   it('breaks a same-timestamp approval tie deterministically, by approval id', async () => {
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
-    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
 
     await seedDocument(BUSINESS, 'DOC-TIE');
     await seedReading(BUSINESS, 'DOC-TIE', 'RD-DOC-TIE');
@@ -290,7 +290,7 @@ describe('recentReadings', () => {
   // Same concern, for the approval lateral's own `a.business_id = r.business_id`.
   it("is not fooled by a foreign business's later approval on the same job", async () => {
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
-    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
 
     await seedDocument(BUSINESS, 'DOC-5');
     await seedReading(BUSINESS, 'DOC-5', 'RD-DOC-5');

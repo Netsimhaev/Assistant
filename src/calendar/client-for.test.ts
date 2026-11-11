@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { writeKeyState } from '../governance/master-key.js';
 import { revokeGrant, writeGrant } from '../governance/oauth-grants.js';
 import { upsertBinding } from '../orchestrator/bindings.js';
@@ -20,8 +20,7 @@ const neverCalled = runtimeWith(async () => {
 });
 
 async function bind(status: 'live' | 'disconnected' = 'live'): Promise<void> {
-  await upsertBinding(
-    {
+  await withBusiness(BUSINESS, (db) => upsertBinding(db, {
       system: CALENDAR_SYSTEM,
       status,
       endpoint: null,
@@ -29,9 +28,7 @@ async function bind(status: 'live' | 'disconnected' = 'live'): Promise<void> {
       provider: 'google',
       lastOkAt: null,
       lastError: null,
-    },
-    { businessId: BUSINESS, by: 'test' },
-  );
+    }, { by: 'test' }));
 }
 
 describe('resolveCalendarAccess', () => {

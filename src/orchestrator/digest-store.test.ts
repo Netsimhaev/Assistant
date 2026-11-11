@@ -1,3 +1,4 @@
+import { withBusiness } from '../db/pool.js';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { resetDatabase } from '../test/db.js';
 import { lastWindowEnd, recentDigests, recordChannel, storeDigest } from './digest-store.js';
@@ -22,11 +23,8 @@ describe('digest store', () => {
    */
   it('reads the body back exactly as it was stored', async () => {
     const body = 'תדריך יומי · 06/10–07/10\n\nלא קרה כלום בתקופה הזו.';
-    const stored = await storeDigest(
-      { window: WINDOW, rendered: { body, hadContent: false } },
-      { businessId: BUSINESS },
-    );
-    const back = await recentDigests({ businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (db) => storeDigest(db, { window: WINDOW, rendered: { body, hadContent: false } }));
+    const back = await withBusiness(BUSINESS, (db) => recentDigests(db));
     expect(back).toHaveLength(1);
     expect(back[0]?.body).toBe(body);
     expect(back[0]?.digestId).toBe(stored.digestId);
@@ -37,28 +35,25 @@ describe('digest store', () => {
    * wanted. "Not sent" and "nothing to send" must not look alike.
    */
   it('leaves an unasked channel null and records an asked one', async () => {
-    const stored = await storeDigest(
-      { window: WINDOW, rendered: { body: 'x', hadContent: true } },
-      { businessId: BUSINESS },
-    );
+    const stored = await withBusiness(BUSINESS, (db) => storeDigest(db, { window: WINDOW, rendered: { body: 'x', hadContent: true } }));
     expect(stored.emailState).toBeNull();
 
-    await recordChannel(stored.digestId, 'email', 'skipped_not_connected', { businessId: BUSINESS });
-    const back = await recentDigests({ businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => recordChannel(db, stored.digestId, 'email', 'skipped_not_connected'));
+    const back = await withBusiness(BUSINESS, (db) => recentDigests(db));
     expect(back[0]?.emailState).toBe('skipped_not_connected');
     expect(back[0]?.whatsappState).toBeNull();
   });
 
   it('reports the last window end per kind, not across kinds', async () => {
-    await storeDigest({ window: WINDOW, rendered: { body: 'a', hadContent: true } }, { businessId: BUSINESS });
-    expect((await lastWindowEnd('daily', { businessId: BUSINESS }))?.toISOString())
+    await withBusiness(BUSINESS, (db) => storeDigest(db, { window: WINDOW, rendered: { body: 'a', hadContent: true } }));
+    expect((await withBusiness(BUSINESS, (db) => lastWindowEnd(db, 'daily')))?.toISOString())
       .toBe(WINDOW.end.toISOString());
-    expect(await lastWindowEnd('weekly', { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => lastWindowEnd(db, 'weekly'))).toBeNull();
   });
 
   it('keeps one business out of another', async () => {
-    await storeDigest({ window: WINDOW, rendered: { body: 'a', hadContent: true } }, { businessId: BUSINESS });
-    expect(await recentDigests({ businessId: 'other-business' })).toEqual([]);
+    await withBusiness(BUSINESS, (db) => storeDigest(db, { window: WINDOW, rendered: { body: 'a', hadContent: true } }));
+    expect(await withBusiness('other-business', (db) => recentDigests(db))).toEqual([]);
   });
 
   /**
@@ -69,7 +64,7 @@ describe('digest store', () => {
    */
   it('throws when asked to record a channel for a digest that does not exist', async () => {
     await expect(
-      recordChannel('DG-nope', 'email', 'sent', { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => recordChannel(db, 'DG-nope', 'email', 'sent')),
     ).rejects.toThrow();
   });
 
@@ -82,15 +77,12 @@ describe('digest store', () => {
    * not prove nothing was written.
    */
   it('refuses to record a channel for a digest that belongs to another business', async () => {
-    const stored = await storeDigest(
-      { window: WINDOW, rendered: { body: 'a', hadContent: true } },
-      { businessId: BUSINESS },
-    );
+    const stored = await withBusiness(BUSINESS, (db) => storeDigest(db, { window: WINDOW, rendered: { body: 'a', hadContent: true } }));
     await expect(
-      recordChannel(stored.digestId, 'email', 'sent', { businessId: 'other-business' }),
+      withBusiness('other-business', (db) => recordChannel(db, stored.digestId, 'email', 'sent')),
     ).rejects.toThrow();
 
-    const back = await recentDigests({ businessId: BUSINESS });
+    const back = await withBusiness(BUSINESS, (db) => recentDigests(db));
     expect(back[0]?.emailState).toBeNull();
   });
 
@@ -101,7 +93,7 @@ describe('digest store', () => {
    * find anything.
    */
   it('does not see another business\'s window end', async () => {
-    await storeDigest({ window: WINDOW, rendered: { body: 'a', hadContent: true } }, { businessId: BUSINESS });
-    expect(await lastWindowEnd('daily', { businessId: 'other-business' })).toBeNull();
+    await withBusiness(BUSINESS, (db) => storeDigest(db, { window: WINDOW, rendered: { body: 'a', hadContent: true } }));
+    expect(await withBusiness('other-business', (db) => lastWindowEnd(db, 'daily'))).toBeNull();
   });
 });

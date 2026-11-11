@@ -75,13 +75,12 @@ async function seedJob(
   provenance: 'boss' | 'unknown_external',
   plan: Plan,
 ): Promise<string> {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion,
     provenance,
-    businessId: BUSINESS,
     title: 'corrections test job',
-  });
-  await bindPlanToJob(job.jobId, plan, { businessId: BUSINESS });
+  }));
+  await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, plan));
   return job.jobId;
 }
 

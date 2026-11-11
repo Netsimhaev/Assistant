@@ -27,7 +27,7 @@ const START = new Date('2026-11-10T08:00:00.000Z'); // Tuesday 10:00 local
 let charterVersion = '';
 
 async function seedMeeting(over: { email?: string | null; verified?: boolean } = {}): Promise<string> {
-  const job = await createJob({ charterVersion, provenance: 'boss', title: 'פגישה', businessId: B });
+  const job = await withBusiness(B, (db) => createJob(db, { charterVersion, provenance: 'boss', title: 'פגישה' }));
   const meetingId = `M-${job.jobId}`;
   await getPool().query(
     `INSERT INTO meetings (meeting_id, business_id, job_id, step_id, calendar_id, event_id, operation, client_name,
@@ -62,10 +62,10 @@ describe('openClientReminder', () => {
     const opened = await openClientReminder({ businessId: B, meetingId, location: 'רחוב הרצל 1, תל אביב' });
     if (!('jobId' in opened)) throw new Error(`expected a job, got ${JSON.stringify(opened)}`);
 
-    const job = await loadJob(opened.jobId, { businessId: B });
+    const job = await withBusiness(B, (db) => loadJob(db, opened.jobId));
     expect(job?.provenance).toBe('boss');
     expect(job?.phase).toBe('execute');
-    const plan = (await loadPlanBody(opened.jobId, { businessId: B }))?.plan;
+    const plan = (await withBusiness(B, (db) => loadPlanBody(db, opened.jobId)))?.plan;
     expect(plan?.steps).toHaveLength(1);
     const step = plan?.steps[0];
     expect(step?.toolName).toBe('mail.send');
@@ -94,7 +94,7 @@ describe('openClientReminder', () => {
     expect((await getPool().query('SELECT 1 FROM boss_instructions WHERE job_id = $1', [jobId])).rowCount).toBe(0);
     expect((await getPool().query('SELECT 1 FROM job_authorizations WHERE job_id = $1', [jobId])).rowCount).toBe(0);
 
-    const plan = (await loadPlanBody(jobId, { businessId: B }))?.plan ?? Plan.parse(null);
+    const plan = (await withBusiness(B, (db) => loadPlanBody(db, jobId)))?.plan ?? Plan.parse(null);
     const step = plan.steps[0];
     if (step === undefined) throw new Error('no step');
     const active = await withBusiness(B, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
@@ -121,10 +121,10 @@ describe('openClientReminder', () => {
     // And the gate, under `ask`, raises the owner's card and sends nothing.
     await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
     const { client, sent, sentNew } = fakeMailboxClient();
-    await runDueJobs({ businessId: B, runtime: mailboxRuntime(client), now: NOW });
+    await withBusiness(B, (db) => runDueJobs(db, { runtime: mailboxRuntime(client), now: NOW }));
     expect(sent).toHaveLength(0);
     expect(sentNew).toHaveLength(0);
-    expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('await_approval');
+    expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('await_approval');
     const cards = await getPool().query(`SELECT 1 FROM approval_requests WHERE job_id = $1 AND state = 'pending'`, [jobId]);
     expect(cards.rowCount).toBe(1);
   });

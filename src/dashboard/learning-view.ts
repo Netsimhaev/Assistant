@@ -16,7 +16,7 @@
  * from here. The cycle is safe because only hoisted function declarations
  * cross it — nothing here reads a `const` from `views.ts` at module load.
  */
-import { getPool, withBusiness, type Queryable } from '../db/pool.js';
+import { withBusiness, type Queryable } from '../db/pool.js';
 import { ActionClass, NEVER_FULLY_AUTONOMOUS } from '../domain/action.js';
 import type { AutonomyLevel } from '../domain/trust.js';
 import { actionClassLabel } from '../domain/labels.js';
@@ -145,7 +145,6 @@ export function orderCards(cards: readonly ClassCard[]): ClassCard[] {
  * read.
  */
 export async function learningSnapshot(o: { businessId: string; db?: Queryable }): Promise<LearningSnapshot> {
-  const db = o.db ?? getPool();
   const businessId = o.businessId;
   const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
   if (active === null) throw new Error('learningSnapshot: no active charter');
@@ -153,17 +152,17 @@ export async function learningSnapshot(o: { businessId: string; db?: Queryable }
 
   const cards: ClassCard[] = [];
   for (const actionClass of ActionClass.options) {
-    const agreementSince = await lastEventAt(actionClass, businessId, db);
+    const agreementSince = await withBusiness(businessId, (bdb) => lastEventAt(bdb, actionClass)); // TENANCY-TODO(task 10)
     const agreement = await withBusiness(businessId, (bdb) => agreementFor(bdb, actionClass, { since: agreementSince })); // TENANCY-TODO(task 10)
     const status = classStatus({
       actionClass,
       charterBase: active.bundle.autonomyBase[actionClass],
-      clampedRamp: await loadRampLevel(actionClass, { businessId, db }),
-      demotions: await demotionCount(actionClass, businessId, db),
+      clampedRamp: await withBusiness(businessId, (bdb) => loadRampLevel(bdb, actionClass)), // TENANCY-TODO(task 10)
+      demotions: await withBusiness(businessId, (bdb) => demotionCount(bdb, actionClass)), // TENANCY-TODO(task 10)
       agreement,
       mode,
     });
-    const since = status === 'acting_alone' ? await lastPromotionAt(actionClass, businessId, db) : null;
+    const since = status === 'acting_alone' ? await withBusiness(businessId, (bdb) => lastPromotionAt(bdb, actionClass)) : null; // TENANCY-TODO(task 10)
     cards.push({ actionClass, agreement, status, since });
   }
 

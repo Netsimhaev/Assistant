@@ -47,7 +47,7 @@ function mailPlan(to: string): Plan {
 }
 
 async function withCharter(): Promise<void> {
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION] }))); // TENANCY-TODO(task 4)
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION] })));
 }
 
 describe('runInstruction', () => {
@@ -63,10 +63,7 @@ describe('runInstruction', () => {
   // Boss command (spec §4): a plan with a classified step is bound and then
   // PARKED in `plan` on a confirmation question, no longer moved to `execute`.
   it('opens a boss job, stores the instruction, binds the plan and parks it', async () => {
-    const result = await runInstruction(
-      { text: 'תשלחי ל-dana@example.com את ההצעה' },
-      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) },
-    );
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי ל-dana@example.com את ההצעה' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) }));
 
     expect(result.status).toBe('needs_confirmation');
     if (result.status !== 'needs_confirmation') throw new Error('unreachable');
@@ -78,13 +75,13 @@ describe('runInstruction', () => {
     expect(jobs.rows[0]?.provenance).toBe('boss');
     expect(jobs.rows[0]?.phase).toBe('plan');
 
-    expect(await loadPlanBody(result.jobId, { businessId: BUSINESS })).not.toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => loadPlanBody(db, result.jobId))).not.toBeNull();
     const stored = await loadInstructionForJob(result.jobId, { businessId: BUSINESS });
     expect(stored?.text).toBe('תשלחי ל-dana@example.com את ההצעה');
   });
 
   it("shows an amount in the question in the charter's currency, never a hard-coded shekel", async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ version: '2026-08-15.usd', currency: 'USD', connections: [MAIL_CONNECTION] })
     ));
@@ -92,20 +89,14 @@ describe('runInstruction', () => {
     const step = base.steps[0];
     if (step === undefined) throw new Error('unreachable');
     const plan: Plan = { ...base, steps: [{ ...step, input: { ...step.input, amountMinor: 12_500 } }] };
-    const result = await runInstruction(
-      { text: 'תשלחי ל-dana@example.com את ההצעה' },
-      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan }) },
-    );
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי ל-dana@example.com את ההצעה' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan }) }));
     if (result.status !== 'needs_confirmation') throw new Error(`unexpected ${result.status}`);
     expect(result.question).toContain('סכום: USD 125');
     expect(result.question).not.toContain('₪');
   });
 
   it('grants a standing authorisation for the address the owner typed', async () => {
-    const result = await runInstruction(
-      { text: 'תשלחי ל-dana@example.com את ההצעה' },
-      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) },
-    );
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי ל-dana@example.com את ההצעה' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) }));
     // A side-effecting plan now waits for the owner's confirmation (spec
     // §4), and the grant is still written as before (spec §10.4) — so the
     // row is what this test reads; the outcome no longer carries `granted`.
@@ -121,22 +112,16 @@ describe('runInstruction', () => {
   });
 
   it('grants nothing when the owner never named the address', async () => {
-    const result = await runInstruction(
-      { text: 'תשלחי לדנה את ההצעה' },
-      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) },
-    );
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לדנה את ההצעה' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) }));
     // The job still waits on its confirmation — only the grant is absent.
     expect(result.status).toBe('needs_confirmation');
-    const { rows } = await getPool().query(`SELECT 1 FROM job_authorizations`);
+    const { rows } = await testDb().query(`SELECT 1 FROM job_authorizations`);
     expect(rows).toHaveLength(0);
   });
 
   it('waits for an answer instead of planning when the planner asks', async () => {
     const asking: Plan = { ...mailPlan('x@example.com'), clarifyingQuestion: 'איזו דנה?' };
-    const result = await runInstruction(
-      { text: 'תשלחי לדנה את ההצעה' },
-      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: asking }) },
-    );
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לדנה את ההצעה' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan: asking }) }));
 
     expect(result.status).toBe('needs_answer');
     if (result.status !== 'needs_answer') throw new Error('unreachable');
@@ -146,13 +131,13 @@ describe('runInstruction', () => {
     // question is not a plan, so it never reaches `plan` or `execute`.
     // (`not.toBe('execute')` would also be satisfied by `undefined` if no row
     // existed at all — assert the actual phase, not the absence of one value.)
-    expect(await loadPlanBody(result.jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => loadPlanBody(db, result.jobId))).toBeNull();
     const jobs = await getPool().query<{ phase: string }>(
       `SELECT phase FROM jobs WHERE job_id = $1`,
       [result.jobId],
     );
     expect(jobs.rows[0]?.phase).toBe('understand');
-    const auths = await getPool().query(`SELECT 1 FROM job_authorizations`);
+    const auths = await testDb().query(`SELECT 1 FROM job_authorizations`);
     expect(auths.rows).toHaveLength(0);
 
     // I3: the question is written down, not merely returned. Without this
@@ -165,19 +150,15 @@ describe('runInstruction', () => {
   });
 
   it('refuses an unparseable plan without opening anything runnable', async () => {
-    const result = await runInstruction(
-      { text: 'תשלחי לדנה' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לדנה' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => ({ status: 'unparseable', raw: '{{', reason: 'bad json' }),
-      },
-    );
+      }));
 
     expect(result.status).toBe('refused');
     if (result.status !== 'refused') throw new Error('unreachable');
-    const { rows } = await getPool().query(`SELECT 1 FROM job_authorizations`);
+    const { rows } = await testDb().query(`SELECT 1 FROM job_authorizations`);
     expect(rows).toHaveLength(0);
     // A refusal that leaves the job anywhere but `failed` is a job nothing in
     // production ever revisits. Deleting the `→ failed` transition would
@@ -194,13 +175,10 @@ describe('runInstruction', () => {
         { ...mailPlan('dana@example.com').steps[0]!, id: 's2', dependsOn: ['s1'] },
       ],
     };
-    const result = await runInstruction(
-      { text: 'תשלחי לדנה' },
-      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: cyclic }) },
-    );
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לדנה' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan: cyclic }) }));
 
     expect(result.status).toBe('refused');
-    expect(await getPool().query(`SELECT 1 FROM job_plans`).then((r) => r.rows)).toHaveLength(0);
+    expect(await testDb().query(`SELECT 1 FROM job_plans`).then((r) => r.rows)).toHaveLength(0);
     // Same reasoning as the unparseable-plan test above: without this, the
     // `→ failed` transition on the DAG-rejection path could be deleted and
     // this test would not notice.
@@ -210,10 +188,7 @@ describe('runInstruction', () => {
 
   it('refuses when no charter is installed', async () => {
     await resetDatabase();
-    const result = await runInstruction(
-      { text: 'תשלחי לדנה' },
-      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) },
-    );
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לדנה' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) }));
     expect(result.status).toBe('refused');
     if (result.status !== 'refused') throw new Error('unreachable');
     // Without this, removing the `active === null` guard entirely still
@@ -225,24 +200,20 @@ describe('runInstruction', () => {
 
   it('refuses an empty instruction', async () => {
     let called = false;
-    const result = await runInstruction(
-      { text: '   ' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: '   ' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => {
           called = true;
           return { status: 'planned', plan: mailPlan('dana@example.com') };
         },
-      },
-    );
+      }));
 
     expect(result.status).toBe('refused');
     if (result.status !== 'refused') throw new Error('unreachable');
     expect(result.reason).toBe('ההוראה ריקה.');
     expect(called).toBe(false);
-    const jobs = await getPool().query(`SELECT 1 FROM jobs`);
+    const jobs = await testDb().query(`SELECT 1 FROM jobs`);
     expect(jobs.rows).toHaveLength(0);
   });
 
@@ -274,10 +245,7 @@ describe('runInstruction', () => {
       ],
     };
 
-    const result = await runInstruction(
-      { text: 'תשלחי ל-dana@example.com את ההצעה ותקבעי איתה פגישה ביום שלישי' },
-      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: twoClassPlan }) },
-    );
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי ל-dana@example.com את ההצעה ותקבעי איתה פגישה ביום שלישי' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan: twoClassPlan }) }));
 
     // Zero grants, not a thrown AuthorizationAlreadyGrantedError out of a
     // function typed to return an outcome, and not a silent pick of whichever
@@ -287,7 +255,7 @@ describe('runInstruction', () => {
     expect(result.status).toBe('needs_confirmation');
     if (result.status !== 'needs_confirmation') throw new Error('unreachable');
 
-    const { rows } = await getPool().query(`SELECT 1 FROM job_authorizations WHERE job_id = $1`, [
+    const { rows } = await testDb().query(`SELECT 1 FROM job_authorizations WHERE job_id = $1`, [
       result.jobId,
     ]);
     expect(rows).toHaveLength(0);
@@ -318,10 +286,7 @@ describe('runInstruction', () => {
       ],
     };
 
-    const result = await runInstruction(
-      { text: 'תשלחי לה וואטסאפ למספר 0521234567' },
-      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: waPlan }) },
-    );
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לה וואטסאפ למספר 0521234567' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan: waPlan }) }));
 
     expect(result.status).toBe('needs_confirmation');
 
@@ -341,18 +306,14 @@ describe('runInstruction', () => {
 
   it('refuses an over-long instruction before creating anything', async () => {
     let called = false;
-    const result = await runInstruction(
-      { text: 'א'.repeat(4001) },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'א'.repeat(4001) }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => {
           called = true;
           return { status: 'planned', plan: mailPlan('dana@example.com') };
         },
-      },
-    );
+      }));
 
     expect(result.status).toBe('refused');
     expect(called, 'the cap exists to stop a paste before it costs money').toBe(false);
@@ -361,7 +322,7 @@ describe('runInstruction', () => {
     // own check. What the check in runInstruction actually buys is that no
     // job is created at all for an over-long paste, rather than a job row
     // that gets created and then has to be marked failed.
-    const jobs = await getPool().query(`SELECT 1 FROM jobs`);
+    const jobs = await testDb().query(`SELECT 1 FROM jobs`);
     expect(jobs.rows).toHaveLength(0);
   });
 
@@ -370,17 +331,13 @@ describe('runInstruction', () => {
     // missing API key, an HTTP error, or a dropped connection throws instead
     // — the ordinary failure mode of a network call. Left uncaught, the job
     // would sit in `understand` forever, a phase nothing in production reads.
-    const result = await runInstruction(
-      { text: 'תשלחי לדנה' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לדנה' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => {
           throw new Error('network is down');
         },
-      },
-    );
+      }));
 
     expect(result.status).toBe('refused');
     const jobs = await getPool().query<{ phase: string }>(`SELECT phase FROM jobs`);
@@ -412,15 +369,12 @@ describe('runInstruction', () => {
       ],
     };
 
-    const result = await runInstruction(
-      { text: 'תעני לדנה' },
-      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mismatchedPlan }) },
-    );
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תעני לדנה' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan: mismatchedPlan }) }));
 
     expect(result.status).toBe('refused');
-    const auths = await getPool().query(`SELECT 1 FROM job_authorizations`);
+    const auths = await testDb().query(`SELECT 1 FROM job_authorizations`);
     expect(auths.rows).toHaveLength(0);
-    const plans = await getPool().query(`SELECT 1 FROM job_plans`);
+    const plans = await testDb().query(`SELECT 1 FROM job_plans`);
     expect(plans.rows).toHaveLength(0);
     const jobs = await getPool().query<{ phase: string }>(`SELECT phase FROM jobs`);
     expect(jobs.rows[0]?.phase).toBe('failed');
@@ -435,13 +389,12 @@ describe('runInstruction', () => {
    * fail this test rather than leaving the suite green.
    */
   it('passes the planner a memory block for an address the instruction names', async () => {
-    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     if (active === null) throw new Error('unreachable');
-    const seedJob = await createJob({
+    const seedJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     await writeMemory(
       {
         jobId: seedJob.jobId,
@@ -454,18 +407,14 @@ describe('runInstruction', () => {
     );
 
     const captured: { request: PlanRequest | null } = { request: null };
-    const result = await runInstruction(
-      { text: 'תשיבי לרונית בכתובת ronit@beta-log.example' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית בכתובת ronit@beta-log.example' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async (request) => {
           captured.request = request;
           return { status: 'planned', plan: mailPlan('ronit@beta-log.example') };
         },
-      },
-    );
+      }));
 
     expect(result.status).toBe('needs_confirmation');
     expect(captured.request?.memoryBlock).toContain('טלפון');
@@ -478,13 +427,12 @@ describe('runInstruction', () => {
    * (see the boss-command block below); past three, today's question stays.
    */
   it('stops and asks when a name fits more than three contacts, and plans nothing', async () => {
-    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     if (active === null) throw new Error('unreachable');
-    const seedJob = await createJob({
+    const seedJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     // Two-word names, matching the fixtures `contact-resolver.test.ts` already
     // uses for this exact pair — a single-word name would collide with itself
     // in `namePartsOf` (full name === its only part) and is not this test's
@@ -517,17 +465,13 @@ describe('runInstruction', () => {
       );
     }
 
-    const outcome = await runInstruction(
-      { text: 'תשיבי לרונית' },
-      {
+    const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => {
           throw new Error('the planner must not be called when the identity is unresolved');
         },
-      },
-    );
+      }));
 
     expect(outcome.status).toBe('needs_answer');
     if (outcome.status !== 'needs_answer') return;
@@ -537,7 +481,7 @@ describe('runInstruction', () => {
     expect(outcome.question).toContain('גמא הרמה');
 
     // Nothing bound — the same resting place the planner's own question uses.
-    expect(await loadPlanBody(outcome.jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => loadPlanBody(db, outcome.jobId))).toBeNull();
     const jobs = await getPool().query<{ phase: string }>(`SELECT phase FROM jobs WHERE job_id = $1`, [
       outcome.jobId,
     ]);
@@ -551,13 +495,12 @@ describe('runInstruction', () => {
    * which both identifies the person and authorises writing to them.
    */
   it('tells the owner to type the address when neither candidate has a distinguishing detail', async () => {
-    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     if (active === null) throw new Error('unreachable');
-    const seedJob = await createJob({
+    const seedJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     await writeMemory(
       {
         jobId: seedJob.jobId,
@@ -577,17 +520,13 @@ describe('runInstruction', () => {
       { businessId: BUSINESS },
     );
 
-    const outcome = await runInstruction(
-      { text: 'תשיבי לרונית' },
-      {
+    const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => {
           throw new Error('the planner must not be called when the identity is unresolved');
         },
-      },
-    );
+      }));
 
     expect(outcome.status).toBe('needs_answer');
     if (outcome.status !== 'needs_answer') return;
@@ -602,13 +541,12 @@ describe('runInstruction', () => {
    * test rather than leaving the suite green.
    */
   it('resolves a name to memory and hands it to the planner', async () => {
-    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     if (active === null) throw new Error('unreachable');
-    const seedJob = await createJob({
+    const seedJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     await writeMemory(
       {
         jobId: seedJob.jobId,
@@ -630,18 +568,14 @@ describe('runInstruction', () => {
     );
 
     let seen: PlanRequest | undefined;
-    const result = await runInstruction(
-      { text: 'תשיבי לרונית' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async (request) => {
           seen = request;
           return { status: 'planned', plan: mailPlan('ronit@beta-log.example') };
         },
-      },
-    );
+      }));
 
     expect(result.status).toBe('needs_confirmation');
     // The value can only have reached the planner via the preference row
@@ -656,13 +590,12 @@ describe('runInstruction', () => {
    * must not stop the job a second time — it proceeds with no memory instead.
    */
   it('does not ask a second time once an answer has come back', async () => {
-    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     if (active === null) throw new Error('unreachable');
-    const seedJob = await createJob({
+    const seedJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     await writeMemory(
       {
         jobId: seedJob.jobId,
@@ -682,16 +615,12 @@ describe('runInstruction', () => {
       { businessId: BUSINESS },
     );
 
-    const outcome = await runInstruction(
-      { text: 'תשיבי לרונית\n\nאני לא זוכר' },
-      {
+    const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית\n\nאני לא זוכר' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         identityAsked: true,
         planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
-      },
-    );
+      }));
 
     expect(outcome.status).not.toBe('needs_answer');
   });
@@ -704,13 +633,12 @@ describe('runInstruction', () => {
    * The sentence must also say what actually works: giving the address.
    */
   it('says so when it proceeds without memory after an answer', async () => {
-    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     if (active === null) throw new Error('unreachable');
-    const seedJob = await createJob({
+    const seedJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     await writeMemory(
       {
         jobId: seedJob.jobId,
@@ -730,16 +658,12 @@ describe('runInstruction', () => {
       { businessId: BUSINESS },
     );
 
-    const outcome = await runInstruction(
-      { text: 'תשיבי לרונית\n\nאני לא זוכר' },
-      {
+    const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית\n\nאני לא זוכר' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         identityAsked: true,
         planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
-      },
-    );
+      }));
 
     // A side-effecting plan ends on its confirmation question, and the note
     // rides that outcome too — otherwise it would be silenced for exactly the
@@ -758,15 +682,11 @@ describe('runInstruction', () => {
    * no note at all.
    */
   it('carries no identity note when nothing was ambiguous', async () => {
-    const outcome = await runInstruction(
-      { text: 'תשלחי ל-dana@example.com את ההצעה' },
-      {
+    const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי ל-dana@example.com את ההצעה' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
-      },
-    );
+      }));
 
     expect(outcome.status).toBe('needs_confirmation');
     if (outcome.status !== 'needs_confirmation') throw new Error('unreachable');
@@ -788,15 +708,11 @@ describe('runInstruction', () => {
   it('plans anyway when the contact read fails, and asks nothing', async () => {
     await testDb().query('ALTER TABLE memories RENAME TO memories_hidden');
     try {
-      const outcome = await runInstruction(
-        { text: 'תשיבי לרונית' },
-        {
+      const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית' }, {
           textOrigin: 'typed',
           channel: 'dashboard',
-          businessId: BUSINESS,
           planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
-        },
-      );
+        }));
 
       expect(outcome.status).toBe('needs_confirmation');
       if (outcome.status !== 'needs_confirmation') throw new Error('unreachable');
@@ -817,18 +733,14 @@ describe('runInstruction', () => {
     await testDb().query('ALTER TABLE memories RENAME TO memories_hidden');
     try {
       let seen: PlanRequest | undefined;
-      const outcome = await runInstruction(
-        { text: 'תשיבי לרונית' },
-        {
+      const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית' }, {
           textOrigin: 'typed',
           channel: 'dashboard',
-          businessId: BUSINESS,
           planner: async (request) => {
             seen = request;
             return { status: 'planned', plan: mailPlan('dana@example.com') };
           },
-        },
-      );
+        }));
 
       expect(outcome.status).toBe('needs_confirmation');
       expect(seen?.memoryBlock).toBeUndefined();
@@ -860,13 +772,12 @@ describe('saying she went ahead without the memory when the planner asks too', (
 
   /** Two people called רונית, so the name cannot be settled from contacts alone. */
   async function seedTwoRonits(): Promise<void> {
-    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     if (active === null) throw new Error('unreachable');
-    const seedJob = await createJob({
+    const seedJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     await writeMemory(
       {
         jobId: seedJob.jobId,
@@ -888,13 +799,12 @@ describe('saying she went ahead without the memory when the planner asks too', (
   }
 
   async function seedTwoMoreRonits(): Promise<void> {
-    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     if (active === null) throw new Error('unreachable');
-    const seedJob = await createJob({
+    const seedJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     for (const [key, name, company] of [
       ['ronit-mizrahi-delta', 'רונית מזרחי', 'דלתא דפוס'],
       ['ronit-peretz-omega', 'רונית פרץ', 'אומגה שיווק'],
@@ -909,19 +819,15 @@ describe('saying she went ahead without the memory when the planner asks too', (
   it('carries the identity note on the planner s own clarifying question', async () => {
     await seedTwoRonits();
 
-    const outcome = await runInstruction(
-      { text: 'תשיבי לרונית\n\nאני לא זוכר' },
-      {
+    const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית\n\nאני לא זוכר' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         identityAsked: true,
         planner: async () => ({
           status: 'planned',
           plan: { ...mailPlan('dana@example.com'), clarifyingQuestion: 'על איזו הצעה מדובר?' },
         }),
-      },
-    );
+      }));
 
     expect(outcome.status).toBe('needs_answer');
     if (outcome.status !== 'needs_answer') throw new Error('unreachable');
@@ -943,17 +849,13 @@ describe('saying she went ahead without the memory when the planner asks too', (
     // distinguishable candidates are planned one by one instead (spec §4.2).
     await seedTwoMoreRonits();
 
-    const outcome = await runInstruction(
-      { text: 'תשיבי לרונית' },
-      {
+    const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => {
           throw new Error('the planner must not be reached on the identity question');
         },
-      },
-    );
+      }));
 
     expect(outcome.status).toBe('needs_answer');
     if (outcome.status !== 'needs_answer') throw new Error('unreachable');
@@ -993,15 +895,11 @@ describe('an instruction whose text came from a recording', () => {
   }
 
   it('plans the instruction but authorises nobody, and the question names the recipient', async () => {
-    const result = await runInstruction(
-      { text: SPOKEN },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: SPOKEN }, {
         textOrigin: 'transcribed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
-      },
-    );
+      }));
 
     // A side-effecting plan now ends on the confirmation question (boss
     // command, spec §4), which shows the owner every recipient before
@@ -1023,7 +921,7 @@ describe('an instruction whose text came from a recording', () => {
       [result.jobId],
     );
     expect(jobs.rows[0]?.phase).toBe('plan');
-    expect(await loadPlanBody(result.jobId, { businessId: BUSINESS })).not.toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => loadPlanBody(db, result.jobId))).not.toBeNull();
 
     // Stored on the row, not merely used in passing: the next hop (an answer
     // joined onto this text) reads it back, and without the column a typed
@@ -1033,15 +931,11 @@ describe('an instruction whose text came from a recording', () => {
   });
 
   it('says nothing about a recording when the owner typed the instruction', async () => {
-    const result = await runInstruction(
-      { text: SPOKEN },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: SPOKEN }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
-      },
-    );
+      }));
 
     expect(result.status).toBe('needs_confirmation');
     if (result.status !== 'needs_confirmation') throw new Error('unreachable');
@@ -1057,7 +951,7 @@ describe('an instruction whose text came from a recording', () => {
     // from today's keystrokes: it survives a recording, and over-tightening
     // here — gating the whole filter on the origin instead of the verbatim
     // arm — fails this test while the first one above stays green.
-    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         version: '2026-08-15.2',
@@ -1066,17 +960,11 @@ describe('an instruction whose text came from a recording', () => {
       })
     ));
 
-    const result = await runInstruction(
-      // No address in the text at all, so nothing but the charter can
-      // authorise this recipient.
-      { text: 'תשלחי לדנה את ההצעה' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לדנה את ההצעה' }, {
         textOrigin: 'transcribed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
-      },
-    );
+      }));
 
     expect(result.status).toBe('needs_confirmation');
     const rows = await getPool().query<{ action_class: string; recipients: string[] }>(
@@ -1126,13 +1014,12 @@ describe('an instruction with a side effect waits for one confirmation', () => {
   }
 
   async function seedJob(provenance: 'boss' | 'unknown_external'): Promise<string> {
-    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     if (active === null) throw new Error('unreachable');
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: active.charter.charterVersion,
       provenance,
-      businessId: BUSINESS,
-    });
+    }));
     return job.jobId;
   }
 
@@ -1178,7 +1065,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
   }
 
   async function everReached(jobId: string, phase: string): Promise<boolean> {
-    const { rows } = await getPool().query(
+    const { rows } = await testDb().query(
       'SELECT 1 FROM job_steps WHERE job_id = $1 AND to_phase = $2',
       [jobId, phase],
     );
@@ -1187,15 +1074,11 @@ describe('an instruction with a side effect waits for one confirmation', () => {
 
   it('binds a side-effecting plan, parks it in plan, and stores one pending confirmation', async () => {
     const plan = mailPlan('dana@example.com');
-    const result = await runInstruction(
-      { text: 'תשלחי ל-dana@example.com את ההצעה' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי ל-dana@example.com את ההצעה' }, {
         textOrigin: 'typed',
         channel: 'whatsapp',
-        businessId: BUSINESS,
         planner: async () => ({ status: 'planned', plan }),
-      },
-    );
+      }));
 
     expect(result.status).toBe('needs_confirmation');
     if (result.status !== 'needs_confirmation') throw new Error('unreachable');
@@ -1214,24 +1097,20 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     expect(result.question).toContain('dana@example.com');
 
     // Single option: already bound, to the same plan the option names.
-    const bound = await loadPlanBody(result.jobId, { businessId: BUSINESS });
+    const bound = await withBusiness(BUSINESS, (db) => loadPlanBody(db, result.jobId));
     expect(bound?.planHash).toBe(planHashOf(plan));
 
     // The confirmation is its own row, not an approval card.
-    const approvals = await getPool().query('SELECT 1 FROM approval_requests');
+    const approvals = await testDb().query('SELECT 1 FROM approval_requests');
     expect(approvals.rows).toHaveLength(0);
   });
 
   it('runs a plan of reads as before, with no question', async () => {
-    const result = await runInstruction(
-      { text: 'מה אנחנו יודעים על dana@example.com?' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'מה אנחנו יודעים על dana@example.com?' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => ({ status: 'planned', plan: recallPlan() }),
-      },
-    );
+      }));
 
     expect(result.status).toBe('planned');
     if (result.status !== 'planned') throw new Error('unreachable');
@@ -1242,18 +1121,14 @@ describe('an instruction with a side effect waits for one confirmation', () => {
   /** Spec §10.10: on the instruction path the catalogue is rendered at `auto`. */
   it('shows the planner the catalogue at auto', async () => {
     const requests: PlanRequest[] = [];
-    await runInstruction(
-      { text: 'תשלחי ל-dana@example.com את ההצעה' },
-      {
+    await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי ל-dana@example.com את ההצעה' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async (request) => {
           requests.push(request);
           return { status: 'planned', plan: mailPlan('dana@example.com') };
         },
-      },
-    );
+      }));
 
     expect(requests).toHaveLength(1);
     expect(requests[0]?.rampLevel).toBe('auto');
@@ -1264,15 +1139,11 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     const text = 'תשלחי לרונית את ההצעה';
     const requests: PlanRequest[] = [];
 
-    const result = await runInstruction(
-      { text },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: perCandidatePlanner(requests),
-      },
-    );
+      }));
 
     expect(result.status).toBe('needs_confirmation');
     if (result.status !== 'needs_confirmation') throw new Error('unreachable');
@@ -1294,9 +1165,9 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     expect(contactsSeen[1]).toContain('ronit.levi@gamma.example');
 
     // Nothing bound until the owner picks; parked in `plan` all the same.
-    expect(await loadPlanBody(result.jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => loadPlanBody(db, result.jobId))).toBeNull();
     expect(await phaseOf(result.jobId)).toBe('plan');
-    const auths = await getPool().query('SELECT 1 FROM job_authorizations');
+    const auths = await testDb().query('SELECT 1 FROM job_authorizations');
     expect(auths.rows).toHaveLength(0);
 
     const confirmation = await loadConfirmation(result.jobId, { businessId: BUSINESS });
@@ -1328,15 +1199,11 @@ describe('an instruction with a side effect waits for one confirmation', () => {
       email: 'ronit.levi@gamma.example',
     });
     const requests: PlanRequest[] = [];
-    const result = await runInstruction(
-      { text: 'תשלחי לרונית את ההצעה' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לרונית את ההצעה' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: perCandidatePlanner(requests),
-      },
-    );
+      }));
 
     if (result.status !== 'needs_confirmation') throw new Error(`unexpected ${result.status}`);
     // Only the real candidate was planned, and the question never names the planted address.
@@ -1351,15 +1218,11 @@ describe('an instruction with a side effect waits for one confirmation', () => {
 
   it('marks a candidate read from a non-boss memory row as unverified', async () => {
     await seedTwoRonits('unknown_external');
-    const result = await runInstruction(
-      { text: 'תשלחי לרונית את ההצעה' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לרונית את ההצעה' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: perCandidatePlanner([]),
-      },
-    );
+      }));
 
     if (result.status !== 'needs_confirmation') throw new Error(`unexpected ${result.status}`);
     const confirmation = await loadConfirmation(result.jobId, { businessId: BUSINESS });
@@ -1376,15 +1239,11 @@ describe('an instruction with a side effect waits for one confirmation', () => {
       name: 'רונית כהן',
       email: 'ronit@beta-log.example',
     });
-    const result = await runInstruction(
-      { text: 'תשלחי לרונית את ההצעה' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לרונית את ההצעה' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => ({ status: 'planned', plan: mailPlan('ronit@beta-log.example') }),
-      },
-    );
+      }));
 
     if (result.status !== 'needs_confirmation') throw new Error(`unexpected ${result.status}`);
     const confirmation = await loadConfirmation(result.jobId, { businessId: BUSINESS });
@@ -1393,12 +1252,9 @@ describe('an instruction with a side effect waits for one confirmation', () => {
 
   it('drops a candidate whose plan is invalid and asks about the other alone, bound', async () => {
     await seedTwoRonits();
-    const result = await runInstruction(
-      { text: 'תשלחי לרונית את ההצעה' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לרונית את ההצעה' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async (request) => {
           if (request.resolvedContact?.includes('ronit.levi@gamma.example')) {
             return { status: 'planned', plan: mailPlan('ronit.levi@gamma.example') };
@@ -1410,8 +1266,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
             plan: { ...broken, steps: [{ ...broken.steps[0]!, dependsOn: ['nope'] }] },
           };
         },
-      },
-    );
+      }));
 
     expect(result.status).toBe('needs_confirmation');
     if (result.status !== 'needs_confirmation') throw new Error('unreachable');
@@ -1419,7 +1274,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     const confirmation = await loadConfirmation(result.jobId, { businessId: BUSINESS });
     expect(confirmation?.options[0]?.label).toContain('רונית לוי');
     // The one left is the ordinary single-option case: bound at once.
-    const bound = await loadPlanBody(result.jobId, { businessId: BUSINESS });
+    const bound = await withBusiness(BUSINESS, (db) => loadPlanBody(db, result.jobId));
     expect(bound?.planHash).toBe(planHashOf(mailPlan('ronit.levi@gamma.example')));
     expect(await phaseOf(result.jobId)).toBe('plan');
   });
@@ -1442,15 +1297,11 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     });
 
     const requests: PlanRequest[] = [];
-    await runInstruction(
-      { text: 'תשלחי לרונית את ההצעה' },
-      {
+    await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לרונית את ההצעה' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: perCandidatePlanner(requests),
-      },
-    );
+      }));
 
     expect(requests).toHaveLength(2);
     const hostile = requests.find((request) => request.resolvedContact?.includes('x@evil.example'));
@@ -1471,15 +1322,11 @@ describe('an instruction with a side effect waits for one confirmation', () => {
   it('fails the job when the confirmation cannot be stored, and says so', async () => {
     await testDb().query('ALTER TABLE instruction_confirmations RENAME TO instruction_confirmations_hidden');
     try {
-      const result = await runInstruction(
-        { text: 'תשלחי ל-dana@example.com את ההצעה' },
-        {
+      const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי ל-dana@example.com את ההצעה' }, {
           textOrigin: 'typed',
           channel: 'dashboard',
-          businessId: BUSINESS,
           planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
-        },
-      );
+        }));
 
       expect(result).toEqual({ status: 'refused', reason: 'לא הצלחתי לשמור את שאלת האישור.' });
       const jobs = await getPool().query<{ phase: string }>(
@@ -1495,12 +1342,9 @@ describe('an instruction with a side effect waits for one confirmation', () => {
   it('asks the first candidate question when every candidate plan asks one (spec §10.9)', async () => {
     await seedTwoRonits();
     let n = 0;
-    const result = await runInstruction(
-      { text: 'תשלחי לרונית את ההצעה' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לרונית את ההצעה' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => {
           n += 1;
           return {
@@ -1508,8 +1352,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
             plan: { ...mailPlan('x@example.com'), clarifyingQuestion: `שאלה ${n}` },
           };
         },
-      },
-    );
+      }));
 
     expect(n).toBe(2);
     expect(result.status).toBe('needs_answer');
@@ -1523,12 +1366,9 @@ describe('an instruction with a side effect waits for one confirmation', () => {
 
   it('asks the identity question when every candidate plan is reads only', async () => {
     await seedTwoRonits();
-    const result = await runInstruction(
-      { text: 'מה אנחנו יודעים על רונית?' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'מה אנחנו יודעים על רונית?' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async (request) => {
           const plan = recallPlan();
           const key = request.resolvedContact?.includes('gamma') ? 'ronit-levi-gamma' : 'ronit-cohen-beta-log';
@@ -1537,8 +1377,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
             plan: { ...plan, steps: [{ ...plan.steps[0]!, input: { subjectKey: key } }] },
           };
         },
-      },
-    );
+      }));
 
     expect(result.status).toBe('needs_answer');
     if (result.status !== 'needs_answer') throw new Error('unreachable');
@@ -1547,27 +1386,23 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     expect(result.question).toContain('רונית לוי');
     expect(await phaseOf(result.jobId)).toBe('understand');
     expect(await loadConfirmation(result.jobId, { businessId: BUSINESS })).toBeNull();
-    expect(await loadPlanBody(result.jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => loadPlanBody(db, result.jobId))).toBeNull();
   });
 
   it('refuses as today when every candidate plan fails', async () => {
     await seedTwoRonits();
-    const result = await runInstruction(
-      { text: 'תשלחי לרונית את ההצעה' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לרונית את ההצעה' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => ({ status: 'unparseable', raw: '{{', reason: 'bad json' }),
-      },
-    );
+      }));
 
     expect(result.status).toBe('refused');
     const jobs = await getPool().query<{ job_id: string; phase: string }>(
       `SELECT job_id, phase FROM jobs WHERE title = 'תשלחי לרונית את ההצעה'`,
     );
     expect(jobs.rows[0]?.phase).toBe('failed');
-    const rows = await getPool().query('SELECT 1 FROM instruction_confirmations');
+    const rows = await testDb().query('SELECT 1 FROM instruction_confirmations');
     expect(rows.rows).toHaveLength(0);
   });
 
@@ -1593,8 +1428,8 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     }
 
     it('hands the planner the open ledger items AFTER the memory block, to every planner call', async () => {
-      const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
-      const job = await createJob({ charterVersion: active!.charter.charterVersion, provenance: 'boss', businessId: BUSINESS, title: 't' });
+      const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
+      const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: active!.charter.charterVersion, provenance: 'boss', title: 't' }));
       const existing = await createLedgerItem(
         {
           family: 'money_in', description: 'פנקס קיים', dueAt: null, dueIsDateOnly: true, importance: 'normal',
@@ -1606,13 +1441,10 @@ describe('an instruction with a side effect waits for one confirmation', () => {
       );
 
       const seen: PlanRequest[] = [];
-      const result = await runInstruction(
-        { text: 'תרשמי חשבונית עבור dana@example.com' },
-        {
-          textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS,
+      const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תרשמי חשבונית עבור dana@example.com' }, {
+          textOrigin: 'typed', channel: 'dashboard', 
           planner: async (req) => { seen.push(req); return { status: 'planned', plan: ledgerPlan() }; },
-        },
-      );
+        }));
       expect(result.status).toBe('planned');
       expect(seen).toHaveLength(1);
       const req = seen[0]!;
@@ -1623,13 +1455,10 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     });
 
     it('carries a non-null ledgerEcho on a planned outcome with a ledger.add step', async () => {
-      const result = await runInstruction(
-        { text: 'תרשמי חשבונית' },
-        {
-          textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS,
+      const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תרשמי חשבונית' }, {
+          textOrigin: 'typed', channel: 'dashboard', 
           planner: async () => ({ status: 'planned', plan: ledgerPlan() }),
-        },
-      );
+        }));
       expect(result.status).toBe('planned');
       if (result.status !== 'planned') throw new Error('unreachable');
       // F-I4b: future tense — the echo is rendered before the steps run.
@@ -1649,8 +1478,8 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     }
 
     async function anItem(description: string): Promise<string> {
-      const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
-      const job = await createJob({ charterVersion: active!.charter.charterVersion, provenance: 'boss', businessId: BUSINESS, title: 't' });
+      const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
+      const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: active!.charter.charterVersion, provenance: 'boss', title: 't' }));
       const created = await createLedgerItem(
         {
           family: 'awaiting_reply', description, dueAt: null, dueIsDateOnly: false, importance: 'normal',
@@ -1676,10 +1505,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
         ledgerStepPlan('ledger.add', { family: 'money_in', description: 'x', bogus: 1 }), // schema (strict)
         ledgerStepPlan('ledger.update', { itemId: 'LI-nope', note: 'x' }), // no such item
       ]) {
-        const result = await runInstruction(
-          { text: 'תרשמי' },
-          { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan }) },
-        );
+        const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תרשמי' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan }) }));
         expect(result.status).toBe('refused');
         if (result.status !== 'refused') throw new Error('unreachable');
         expect(result.reason).toMatch(/פנקס/);
@@ -1688,37 +1514,28 @@ describe('an instruction with a side effect waits for one confirmation', () => {
       const { rows } = await getPool().query<{ phase: string }>(`SELECT phase FROM jobs WHERE title = 'תרשמי'`);
       expect(rows.map((r) => r.phase)).toEqual(['failed', 'failed', 'failed', 'failed']);
       // Control: a valid add of the same shape is planned.
-      const ok = await runInstruction(
-        { text: 'תרשמי' },
-        {
-          textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS,
+      const ok = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תרשמי' }, {
+          textOrigin: 'typed', channel: 'dashboard', 
           planner: async () => ({ status: 'planned', plan: ledgerStepPlan('ledger.add', { family: 'projects', description: 'אתר', dueDate: '2026-12-01' }) }),
-        },
-      );
+        }));
       expect(ok.status).toBe('planned');
     });
 
     it('F-I4a: an update whose stage does not exist is refused up front', async () => {
       const itemId = await anItem('תשובה מדנה');
-      const result = await runInstruction(
-        { text: 'סמני שלב 3' },
-        {
-          textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS,
+      const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'סמני שלב 3' }, {
+          textOrigin: 'typed', channel: 'dashboard', 
           planner: async () => ({ status: 'planned', plan: ledgerStepPlan('ledger.update', { itemId, stagesDone: [3] }) }),
-        },
-      );
+        }));
       expect(result.status).toBe('refused');
     });
 
     it('F-I4b/c: an update echo is future tense and names the item by its description', async () => {
       const itemId = await anItem('תשובה מדנה\nעל ההצעה');
-      const result = await runInstruction(
-        { text: 'עדכני' },
-        {
-          textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS,
+      const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'עדכני' }, {
+          textOrigin: 'typed', channel: 'dashboard', 
           planner: async () => ({ status: 'planned', plan: ledgerStepPlan('ledger.update', { itemId, critical: true }) }),
-        },
-      );
+        }));
       expect(result.status).toBe('planned');
       if (result.status !== 'planned') throw new Error('unreachable');
       expect(result.ledgerEcho).toContain('אעדכן:');
@@ -1727,20 +1544,17 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     });
 
     it('F-I4d: an address the charter knows is not flagged unverified in the echo, as the handler stores it', async () => {
-      await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      await withBusiness(BUSINESS, (bdb) => installCharter(
         bdb,
         buildCharter({ version: 'known-acme', connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'acme.example' })
       ));
       const plan = ledgerStepPlan('ledger.add', { family: 'awaiting_reply', description: 'תשובה', counterpartyEmail: 'dana@acme.example' });
-      const result = await runInstruction(
-        { text: 'תרשמי שמחכה לתשובה מדנה' }, // the address is NOT typed
-        { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan }) },
-      );
+      const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תרשמי שמחכה לתשובה מדנה' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan }) }));
       expect(result.status).toBe('planned');
       if (result.status !== 'planned') throw new Error('unreachable');
       expect(result.ledgerEcho).toContain('ארשום:');
       expect(result.ledgerEcho).not.toContain('כתובת לא מאומתת');
-      await runDueJobs({ businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => runDueJobs(db));
       const { rows } = await getPool().query<{ v: boolean }>(
         `SELECT counterparty_email_verified AS v FROM ledger_items WHERE counterparty_email = 'dana@acme.example'`,
       );
@@ -1753,10 +1567,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
         id: 's2', agent: 'ops.tasks', intent: 'x', toolName: 'ledger.add',
         input: { family: 'awaiting_reply', description: 'תשובה מדנה' }, dependsOn: [], expectedActionClass: null,
       });
-      const result = await runInstruction(
-        { text: 'תשלחי ל-dana@example.com ותרשמי שמחכה לתשובה' },
-        { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan }) },
-      );
+      const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי ל-dana@example.com ותרשמי שמחכה לתשובה' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan }) }));
       expect(result.status).toBe('needs_confirmation');
       if (result.status !== 'needs_confirmation') throw new Error('unreachable');
       expect(result.question).toContain('ארשום: ממתינים לצד שני · תשובה מדנה');
@@ -1808,7 +1619,7 @@ describe('an instruction that asks for a document (document production §5.6)', 
   };
 
   async function doc(name: string, at: string): Promise<void> {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO documents (document_id, business_id, source, original_name, media_type, sha256, byte_size,
                               stored_path, status, created_at)
        VALUES ($1, $2, 'manual', $3, 'application/pdf', $4, 1, 'x', 'extracted', $5)`,
@@ -1821,68 +1632,47 @@ describe('an instruction that asks for a document (document production §5.6)', 
     await doc('מחירון 2026.pdf', '2026-10-01T10:00:00Z');
     const planner = async () => ({ status: 'planned' as const, plan: producePlan(VALID) });
 
-    const first = await runInstruction(
-      { text: 'תכיני טבלת רווח לפי המחירון' },
-      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner },
-    );
+    const first = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תכיני טבלת רווח לפי המחירון' }, { textOrigin: 'typed', channel: 'dashboard', planner }));
     if (first.status !== 'needs_answer') throw new Error(first.status);
     expect(first.question).toContain('מחירון 2026.pdf');
     expect(first.question).toContain('מחירון 2025.pdf');
     expect(first.question).toContain('השיבי בשם הקובץ');
-    expect(await loadPlanBody(first.jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => loadPlanBody(db, first.jobId))).toBeNull();
 
-    const second = await runInstruction(
-      { text: 'תכיני טבלת רווח לפי המחירון\n\nמחירון 2026' },
-      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner, sourceAsked: true },
-    );
+    const second = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תכיני טבלת רווח לפי המחירון\n\nמחירון 2026' }, { textOrigin: 'typed', channel: 'dashboard', planner, sourceAsked: true }));
     expect(second.status).toBe('planned');
   });
 
   it('one matching document asks nothing — the plan runs as a read-only plan', async () => {
     await doc('מחירון 2026.pdf', '2026-10-01T10:00:00Z');
-    const result = await runInstruction(
-      { text: 'תכיני טבלת רווח לפי המחירון' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תכיני טבלת רווח לפי המחירון' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => ({ status: 'planned', plan: producePlan(VALID) }),
-      },
-    );
+      }));
     expect(result.status).toBe('planned');
   });
 
   it('a plan that produces a document and does anything else is refused at the door (§4.2)', async () => {
     const mixed = producePlan({ ...VALID, sourceHints: [] });
     mixed.steps.push({ ...mailPlan('dana@example.com').steps[0]!, id: 's2' });
-    const result = await runInstruction(
-      { text: 'תכיני מסמך ותשלחי לדנה' },
-      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mixed }) },
-    );
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תכיני מסמך ותשלחי לדנה' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan: mixed }) }));
     expect(result).toEqual({ status: 'refused', reason: expect.stringContaining('מסמך') });
     // Control: the production step alone is planned.
-    const alone = await runInstruction(
-      { text: 'תכיני מסמך' },
-      {
+    const alone = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תכיני מסמך' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => ({ status: 'planned', plan: producePlan({ ...VALID, sourceHints: [] }) }),
-      },
-    );
+      }));
     expect(alone.status).toBe('planned');
   });
 
   it('a doc.produce step the handler would refuse is refused at the door', async () => {
-    const result = await runInstruction(
-      { text: 'תכיני מסמך' },
-      {
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תכיני מסמך' }, {
         textOrigin: 'typed',
         channel: 'dashboard',
-        businessId: BUSINESS,
         planner: async () => ({ status: 'planned', plan: producePlan({ ...VALID, format: 'exe' }) }),
-      },
-    );
+      }));
     expect(result.status).toBe('refused');
   });
 });

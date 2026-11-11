@@ -36,12 +36,11 @@ afterAll(async () => {
 
 async function seedMailJob(): Promise<string> {
   const bundle = await installMailboxCharter(BUSINESS);
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'unknown_external',
     title: 'מייל: חשבונית',
-    businessId: BUSINESS,
-  });
+  }));
   const mail = await storedMail(BUSINESS, { fromAddress: SENDER });
   await settleMail(
     mail.mailId,
@@ -92,14 +91,13 @@ async function pollOne(category: MailTriage['categories'], fromAddress: string, 
     attachments: [],
   };
   const triage = (async () => ({ status: 'read', triage: triaged })) as unknown as Triage;
-  return pollMailbox({
-    businessId: BUSINESS,
+  return withBusiness(BUSINESS, (db) => pollMailbox(db, {
     runtime: mailboxRuntime(client),
     client,
     triage,
     drafter: stubDrafter(),
     curator,
-  });
+  }));
 }
 
 describe('curation from mail', () => {
@@ -136,8 +134,7 @@ describe('curation from mail', () => {
       return { status: 'read', triage: t };
     }) as unknown as Triage;
     const documentRoot = await mkdtemp(join(tmpdir(), 'mail-cur-'));
-    const result = await pollMailbox({
-      businessId: BUSINESS,
+    const result = await withBusiness(BUSINESS, (db) => pollMailbox(db, {
       runtime: mailboxRuntime(client),
       client,
       triage,
@@ -147,7 +144,7 @@ describe('curation from mail', () => {
         seenText = brief.text;
         return { candidates: [] };
       },
-    });
+    }));
     expect(result).toMatchObject({ triaged: 1, failed: 0 });
     // …the curator gets the model's summary of it, never the text itself.
     expect(seenText).toContain('ATTACHMENT-SUMMARY-77');
@@ -243,12 +240,11 @@ describe('curation from mail', () => {
 
   it('mail brief carries neither the subject nor the body', async () => {
     const bundle = await installMailboxCharter(BUSINESS);
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'unknown_external',
       title: 'מייל: SUBJECT-CANARY',
-      businessId: BUSINESS,
-    });
+    }));
     const mail = await storedMail(BUSINESS, {
       fromAddress: SENDER,
       subject: 'SUBJECT-CANARY',
@@ -268,12 +264,11 @@ describe('curation from mail', () => {
 
   it('mail brief is null without a sender address', async () => {
     const bundle = await installMailboxCharter(BUSINESS);
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'unknown_external',
       title: 'x',
-      businessId: BUSINESS,
-    });
+    }));
     const mail = await storedMail(BUSINESS, { fromAddress: '' });
     await settleMail(
       mail.mailId,
@@ -289,12 +284,11 @@ describe('curation from mail', () => {
       'SELECT charter_version FROM jobs WHERE job_id = $1',
       [jobId],
     );
-    const staffJob = await createJob({
+    const staffJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: versions[0]!.charter_version,
       provenance: 'staff',
       title: 'seed',
-      businessId: BUSINESS,
-    });
+    }));
     await writeMemory(
       { jobId: staffJob.jobId, kind: 'preference', subjectKey: SENDER, attribute: 'bank', body: { value: 'OLD' }, sourceRef: 'seed' },
       { businessId: BUSINESS },

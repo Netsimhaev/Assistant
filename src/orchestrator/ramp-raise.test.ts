@@ -167,7 +167,7 @@ async function seedReplyJob(plan: Plan = REPLY_PLAN): Promise<{
   jobId: string;
   bundle: Awaited<ReturnType<typeof installCharter>>;
 }> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
     bdb,
     // No `autonomyBase` override. That absence is the entire point of this
     // file — see the module docblock.
@@ -194,20 +194,18 @@ async function seedReplyJob(plan: Plan = REPLY_PLAN): Promise<{
   // raised ramp row change anything", so it needs the dial open to its widest
   // setting first; the clamp itself is `ramp-floor.test.ts`'s job, not this
   // file's.
-  await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
+  await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
 
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
     title: 'ramp-raise',
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
 
-  await upsertBinding(
-    {
+  await withBusiness(BUSINESS, (db) => upsertBinding(db, {
       system: 'office-mail',
       status: 'live',
       endpoint: null,
@@ -215,10 +213,8 @@ async function seedReplyJob(plan: Plan = REPLY_PLAN): Promise<{
       provider: null,
       lastOkAt: null,
       lastError: null,
-    },
-    { businessId: BUSINESS, by: 'test' },
-  );
-  await bindPlanToJob(job.jobId, plan, { businessId: BUSINESS });
+    }, { by: 'test' }));
+  await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, plan));
 
   return { jobId: job.jobId, bundle };
 }
@@ -257,22 +253,22 @@ describe('raising one action class off approve_required, under the charter a rea
   it('asks the owner and sends nothing while the ramp sits at approve_required', async () => {
     const { jobId } = await seedReplyJob();
     // The value this business's row actually holds today.
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
 
     const sent: MailMessage[] = [];
-    const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    const result = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
 
     expect(result.ran).toEqual([{ jobId, status: 'halted', detail: 'awaiting_approval' }]);
     expect(sent).toEqual([]);
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('await_approval');
   });
 
   it('actually sends once the ramp is raised to auto_notify, with nothing else changed', async () => {
     const { jobId } = await seedReplyJob();
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
 
     const sent: MailMessage[] = [];
-    const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    const result = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
 
     expect(result.ran).toEqual([{ jobId, status: 'done', detail: null }]);
     // The assertion that makes this a behaviour test and not a status test:
@@ -280,7 +276,7 @@ describe('raising one action class off approve_required, under the charter a rea
     // plan named.
     expect(sent).toHaveLength(1);
     expect(sent[0]?.to).toContain('dana@example.com');
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('verify');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('verify');
   });
 
   /**
@@ -315,10 +311,10 @@ describe('raising one action class off approve_required, under the charter a rea
    */
   it('asks before replying to an address nothing vouches for, even with the ramp raised', async () => {
     const { jobId } = await seedReplyJob(STRANGER_PLAN);
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
 
     const sent: MailMessage[] = [];
-    const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    const result = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
 
     expect(result.ran).toEqual([{ jobId, status: 'halted', detail: 'awaiting_approval' }]);
     expect(sent).toEqual([]);
@@ -339,14 +335,14 @@ describe('raising one action class off approve_required, under the charter a rea
    */
   it('sends to that same address when the owner’s instruction named it', async () => {
     const { jobId } = await seedReplyJob(STRANGER_PLAN);
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
-    await withBusiness(BUSINESS, (bdb) => grantAuthorization( // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization(
       bdb,
       { jobId, actionClass: 'email.reply', recipients: ['stranger@nowhere.example'] }
     ));
 
     const sent: MailMessage[] = [];
-    const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    const result = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
 
     expect(result.ran).toEqual([{ jobId, status: 'done', detail: null }]);
     expect(sent).toHaveLength(1);
@@ -375,11 +371,11 @@ describe('raising one action class off approve_required, under the charter a rea
    */
   it('goes back to asking as soon as the job has read external content', async () => {
     const { jobId } = await seedReplyJob(STRANGER_PLAN);
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
-    expect(await markContentIngested(jobId, { businessId: BUSINESS })).toBe(1);
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
+    expect(await withBusiness(BUSINESS, (db) => markContentIngested(db, jobId))).toBe(1);
 
     const sent: MailMessage[] = [];
-    const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    const result = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
 
     expect(result.ran).toEqual([{ jobId, status: 'halted', detail: 'awaiting_approval' }]);
     expect(sent).toEqual([]);

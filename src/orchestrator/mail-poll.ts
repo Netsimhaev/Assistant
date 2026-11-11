@@ -74,7 +74,7 @@ import { join } from 'node:path';
 import { appendAudit } from '../audit/log.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { getPool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { ingestDocument } from '../documents/ingest.js';
 import { CSV, DOCX, JSON as JSON_TYPE, MARKDOWN, PDF, TEXT, XLSX } from '../documents/media-type.js';
 import type { DocumentRecord } from '../documents/types.js';
@@ -165,7 +165,6 @@ export interface MailPollResult {
 }
 
 export interface PollMailboxOptions {
-  businessId?: string;
   runtime: Runtime;
   /** Test seam; defaults to the real client for the binding's provider. */
   client?: MailboxClient;
@@ -235,15 +234,15 @@ function clientFor(provider: MailProvider): MailboxClient {
   return provider === 'google' ? createGmailClient() : createGraphClient();
 }
 
-export async function pollMailbox(options: PollMailboxOptions): Promise<MailPollResult | null> {
-  const businessId = options.businessId ?? config.businessId;
+export async function pollMailbox(db: BusinessDb, options: PollMailboxOptions): Promise<MailPollResult | null> {
+  const businessId = db.businessId;
   const now = options.now ?? new Date();
 
   // --- The switch -----------------------------------------------------------
-  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
+  const active = await loadActiveCharter(db);
   if (active === null) return null;
   if (!active.bundle.connections.some((c) => c.system === MAILBOX_SYSTEM)) return null;
-  const binding = (await loadBindings({ businessId })).find((b) => b.system === MAILBOX_SYSTEM);
+  const binding = (await loadBindings(db)).find((b) => b.system === MAILBOX_SYSTEM);
   if (binding === undefined || binding.status !== 'live') return null;
   if (binding.provider !== 'google' && binding.provider !== 'microsoft') return null;
   const cursor = await getCursor({ businessId });
@@ -327,8 +326,8 @@ export async function pollMailbox(options: PollMailboxOptions): Promise<MailPoll
       // `last_error` is overwritten by the next clean pass; the audit row is
       // the durable record that mail between the two cursors was never read.
       // Codes only — no cursor value, no address.
-      await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 4)
-        bdb,
+      await appendAudit(
+        db,
         {
           jobId: null,
           actor: 'orchestrator',
@@ -345,8 +344,8 @@ export async function pollMailbox(options: PollMailboxOptions): Promise<MailPoll
           artifacts: [],
           costMinor: null,
           tokens: null,
-        }
-      ));
+        },
+      );
     } else {
       // transient or rejected: the cursor stays where it was.
       await writeCursor({ lastError: `list_${listed.failure}` });
@@ -367,7 +366,7 @@ export async function pollMailbox(options: PollMailboxOptions): Promise<MailPoll
 
   // --- 3–4. Triage ----------------------------------------------------------
   const pass: PassContext = {
-    businessId,
+    db,
     bundle: active.bundle,
     charterVersion: active.charter.charterVersion,
     client,
@@ -400,14 +399,15 @@ export async function pollMailbox(options: PollMailboxOptions): Promise<MailPoll
   // --- 5. Re-ask about approved sends that did not complete ---------------
   try {
     const reraised = await reraiseAfterFailedSend(
+      db,
       { bundle: active.bundle },
-      { businessId, ...(options.notify !== undefined ? { notify: options.notify } : {}) },
+      { ...(options.notify !== undefined ? { notify: options.notify } : {}) },
     );
     result.reraised = reraised.reraised;
     if (options.notifyBoss !== undefined) {
       for (const approvalId of reraised.approvalIds) {
         try {
-          await presentMailCard(approvalId, options.notifyBoss, { businessId });
+          await presentMailCard(db, approvalId, options.notifyBoss);
         } catch {
           // Never load-bearing: the re-raised card is on the dashboard.
         }
@@ -475,7 +475,8 @@ async function recordBatch(
 }
 
 interface PassContext {
-  businessId: string;
+  /** The business is `db.businessId`. */
+  db: BusinessDb;
   bundle: PolicyBundle;
   charterVersion: string;
   client: MailboxClient;
@@ -494,29 +495,28 @@ interface PassContext {
 }
 
 async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
-  const { businessId, result } = pass;
+  const { db, result } = pass;
+  const { businessId } = db;
   let job: Job | null = null;
   let settled = false;
   try {
     // A mail handled again after a crash (stale claim, or a reset) may still
     // name the triage job the crashed handling opened. Left alone, that job
     // sits in `intake`/`understand`/`plan` forever — phases nothing reads.
-    if (mail.jobId !== null) await failOrphanedJob(mail.jobId, businessId);
+    if (mail.jobId !== null) await failOrphanedJob(db, mail.jobId);
 
-    job = await createJob({
+    job = await createJob(db, {
       charterVersion: pass.charterVersion,
       // Not a parameter, and not derived from anything a mail says.
       provenance: 'unknown_external',
-      businessId,
       title: `מייל: ${mail.subject}`,
     });
     // Written at once, so a crash from here on leaves the job findable.
     await recordMailProgress(mail.mailId, { jobId: job.jobId }, { businessId });
-    await transition(job.jobId, {
+    await transition(db, job.jobId, {
       to: 'understand',
       actor: 'orchestrator',
       reason: 'mail poll: triaging an incoming mail',
-      businessId,
     });
 
     // Before the call, so the reader sees what the attachments say (§9.3).
@@ -617,8 +617,9 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
     if (categories.includes('question') && mail.replyJobId === null) {
       try {
         const raised = await raiseMailReply(
+          db,
           { mail, triage, bundle: pass.bundle, drafter: pass.drafter },
-          { businessId, ...(pass.notify !== undefined ? { notify: pass.notify } : {}) },
+          { ...(pass.notify !== undefined ? { notify: pass.notify } : {}) },
         );
         if (raised !== null) {
           // Only a job raised in THIS handling: `settleMail` COALESCEs, and a
@@ -672,11 +673,10 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
     // The same path `conduct.ts` takes for a job that raises no card: the
     // triage job's work is done here; a reply, if any, lives on its own job.
     for (const to of ['plan', 'closed'] as const) {
-      await transition(job.jobId, {
+      await transition(db, job.jobId, {
         to,
         actor: 'orchestrator',
         reason: 'mail poll: triaged',
-        businessId,
       });
     }
   } catch (error) {
@@ -706,11 +706,10 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
     }
     if (job !== null) {
       try {
-        await transition(job.jobId, {
+        await transition(db, job.jobId, {
           to: 'failed',
           actor: 'orchestrator',
           reason: `mail poll: ${reason}`,
-          businessId,
         });
       } catch {
         // The job may already have moved; nothing more to do here.
@@ -758,20 +757,19 @@ export const ORPHANED_TRIAGE_TITLE = 'מייל נכנס (טיפול שנקטע)'
  * which is the safe half to have done. `transition` opens its own
  * transaction and takes no title, so the two are separate statements.
  */
-async function failOrphanedJob(jobId: string, businessId: string): Promise<void> {
+async function failOrphanedJob(db: BusinessDb, jobId: string): Promise<void> {
   try {
-    await getPool().query('UPDATE jobs SET title = $3 WHERE business_id = $1 AND job_id = $2', [
-      businessId,
+    await db.query('UPDATE jobs SET title = $3 WHERE business_id = $1 AND job_id = $2', [
+      db.businessId,
       jobId,
       ORPHANED_TRIAGE_TITLE,
     ]);
-    const orphan = await loadJob(jobId, { businessId });
+    const orphan = await loadJob(db, jobId);
     if (orphan === null || TERMINAL_PHASES.includes(orphan.phase)) return;
-    await transition(jobId, {
+    await transition(db, jobId, {
       to: 'failed',
       actor: 'orchestrator',
       reason: 'mail poll: handling was interrupted; the mail is being handled again',
-      businessId,
     });
   } catch {
     // Nothing more to do here.
@@ -785,7 +783,7 @@ async function applyLabels(
   jobId: string,
   pass: PassContext,
 ): Promise<string[]> {
-  const { businessId } = pass;
+  const { businessId } = pass.db;
   const applied = [...mail.labelsApplied];
   const wanted = (['invoice', 'question'] as const)
     .filter((c) => categories.includes(c))
@@ -821,8 +819,8 @@ async function applyLabels(
     await recordMailProgress(mail.mailId, { labelsApplied: applied }, { businessId });
     pass.result.labelled += 1;
     // Numbers and hashes only: never the subject, never an address.
-    await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 4)
-      bdb,
+    await appendAudit(
+      pass.db,
       {
         jobId,
         actor: 'intake.triage',
@@ -839,8 +837,8 @@ async function applyLabels(
         artifacts: [],
         costMinor: null,
         tokens: null,
-      }
-    ));
+      },
+    );
   }
   return applied;
 }
@@ -954,7 +952,7 @@ async function recordAttachmentReadings(
   entries: readonly AttachmentEntry[],
   pass: PassContext,
 ): Promise<void> {
-  const { businessId } = pass;
+  const { businessId } = pass.db;
   const shown = shownAttachmentCount(entries.map((e) => e.brief));
   for (const [index, entry] of entries.entries()) {
     const said = index < shown ? triage.attachments.find((a) => a.index === index) : undefined;
@@ -1000,7 +998,7 @@ async function recordAttachmentReadings(
  * first attachment always starts.
  */
 async function ingestAttachments(mail: StoredMail, pass: PassContext): Promise<Map<string, IngestedAttachment>> {
-  const { businessId } = pass;
+  const { businessId } = pass.db;
   const out = new Map<string, IngestedAttachment>();
   const deadline = Date.now() + pass.attachmentBudgetMs;
   let taken = 0;
@@ -1067,7 +1065,7 @@ async function notifyOwner(
   jobId: string,
   pass: PassContext,
 ): Promise<string | null> {
-  const { businessId } = pass;
+  const { businessId } = pass.db;
   if (!isPerson) return null;
   if (!categories.includes('invoice') && !categories.includes('question')) return null;
   // No sender to name — and `raiseMailReply` refuses the card for the same reason.
@@ -1105,8 +1103,8 @@ async function notifyOwner(
 async function presentCardOnWhatsApp(mail: StoredMail, approvalId: string, pass: PassContext): Promise<void> {
   if (pass.notifyBoss === undefined) return;
   try {
-    await presentMailCard(approvalId, pass.notifyBoss, { businessId: pass.businessId });
+    await presentMailCard(pass.db, approvalId, pass.notifyBoss);
   } catch {
-    await noteMailError(mail.mailId, 'card_present_failed', { businessId: pass.businessId });
+    await noteMailError(mail.mailId, 'card_present_failed', { businessId: pass.db.businessId });
   }
 }

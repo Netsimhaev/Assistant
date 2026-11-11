@@ -172,12 +172,11 @@ describe('readDocument', () => {
 
   it('marks the job as having ingested content before the read', async () => {
     const documentId = await anExtractedDocument();
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'לקרוא חשבונית',
-    });
+    }));
     let flagDuringRead: boolean | null = null;
     const reader = async (request: { artifacts: readonly DocumentArtifact[] }): Promise<ReadOutcome> => {
       const { rows } = await getPool().query<{ content_ingested: boolean }>(
@@ -228,12 +227,11 @@ describe('readDocument', () => {
 
   it('marks content ingested on a cache hit too, because the job still receives the document', async () => {
     const documentId = await anExtractedDocument();
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'לקרוא שוב',
-    });
+    }));
     const { reader, calls } = stubReader(JSON.stringify(READING_JSON));
     // First read, with no job, populates the cache.
     await readDocument(

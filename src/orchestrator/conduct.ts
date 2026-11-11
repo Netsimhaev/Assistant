@@ -13,7 +13,7 @@
  */
 import { config } from '../config.js';
 import { loadActiveCharter } from '../charter/store.js';
-import { getPool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { renderArtifactFull } from '../documents/brief.js';
 import { readDocument, type ReadDocumentOptions } from '../documents/read.js';
 import {
@@ -30,9 +30,9 @@ import { bindPlanToJob } from './plan-store.js';
 import { proposalToPlan } from './proposal-to-plan.js';
 import { proposeForReading, type ProposeForReadingOptions } from './propose.js';
 import { raiseProposalApproval, type NotifyTarget } from './proposal-approval.js';
+import { withSessionLockOn } from './session-lock.js';
 
 export interface ConductOptions {
-  businessId?: string;
   /** Defaults to `config.documentReadsPerDay`. */
   readsPerDay?: number;
   /** Most documents to consider in one pass, regardless of the daily ceiling. */
@@ -182,41 +182,34 @@ async function beginVerification(
   ctx: {
     subjectJobId: string;
     documentId: string;
-    businessId: string;
+    db: BusinessDb;
     charterVersion: string;
     verifier: (input: VerifyDraftInput) => Promise<VerifyDraftResult>;
   },
 ): Promise<{ opened: boolean }> {
   let delegatingJobId: string | null = null;
   try {
-    const delegatingJob = await createJob({
+    const delegatingJob = await createJob(ctx.db, {
       charterVersion: ctx.charterVersion,
-      // Not a parameter, and not derived from anything the document or the
-      // proposal says — see `the verification job carries unknown_external as
-      // a literal` in conduct.test.ts.
       provenance: 'unknown_external',
-      businessId: ctx.businessId,
       title: `אימות: ${action.headline}`,
     });
     delegatingJobId = delegatingJob.jobId;
 
-    await transition(delegatingJob.jobId, {
+    await transition(ctx.db, delegatingJob.jobId, {
       to: 'understand',
       actor: 'orchestrator',
       reason: 'conductor: opening gov.verify beside the card',
-      businessId: ctx.businessId,
     });
-    await transition(delegatingJob.jobId, {
+    await transition(ctx.db, delegatingJob.jobId, {
       to: 'plan',
       actor: 'orchestrator',
       reason: 'conductor: binding the one-step judging plan',
-      businessId: ctx.businessId,
     });
-    await transition(delegatingJob.jobId, {
+    await transition(ctx.db, delegatingJob.jobId, {
       to: 'execute',
       actor: 'orchestrator',
       reason: 'conductor: ready for gov.verify to run its checks',
-      businessId: ctx.businessId,
     });
 
     // Bound BEFORE the delegation opens, while the job is still in
@@ -250,7 +243,7 @@ async function beginVerification(
         },
       ],
     };
-    await bindPlanToJob(delegatingJob.jobId, plan, { businessId: ctx.businessId });
+    await bindPlanToJob(ctx.db, delegatingJob.jobId, plan);
 
     // The document's own deterministic extraction, laid out as PLAIN TEXT —
     // never the truncated prompt brief (`renderReadingBrief`), which DROPS
@@ -271,7 +264,7 @@ async function beginVerification(
     // that function's own docblock for what it still does NOT capture
     // (extraction-time caps recorded in `artifact.flags`, which it does not
     // read).
-    const artifacts = await loadArtifacts(ctx.documentId, { businessId: ctx.businessId });
+    const artifacts = await loadArtifacts(ctx.documentId, { businessId: ctx.db.businessId });
     const sources = artifacts.map((artifact) => renderArtifactFull(artifact));
 
     // The delegation itself, unchanged — this task changes what happens
@@ -291,18 +284,17 @@ async function beginVerification(
       question: VERIFICATION_QUESTION,
       answer: null,
       parentEnvelope: null,
-      businessId: ctx.businessId,
+      businessId: ctx.db.businessId,
     });
 
     return { opened: true };
   } catch (err) {
     if (delegatingJobId !== null) {
       try {
-        await transition(delegatingJobId, {
+        await transition(ctx.db, delegatingJobId, {
           to: 'failed',
           actor: 'orchestrator',
           reason: `conductor: verification threw: ${err instanceof Error ? err.message : String(err)}`,
-          businessId: ctx.businessId,
         });
       } catch {
         // Best-effort, the same posture the document job's own sibling catch
@@ -360,9 +352,10 @@ async function recordReadFailureSafely(
 }
 
 export async function conductPendingDocuments(
+  db: BusinessDb,
   options: ConductOptions = {},
 ): Promise<ConductResult> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const readsPerDay = options.readsPerDay ?? config.documentReadsPerDay;
   const limit = options.limit ?? 10;
 
@@ -381,15 +374,15 @@ export async function conductPendingDocuments(
   // across that wire for the whole pass is the mistake `runDueJobs`
   // (`run-due.ts`) already documents avoiding, for the same reason: a ten-
   // connection pool does not survive two concurrent passes each parking a
-  // transaction behind an external call. The lock is taken on a client
-  // checked out for exactly this purpose and released in a `finally`.
+  // transaction behind an external call. The lock is taken on `db`, the very
+  // connection the pass runs on (`withSessionLockOn`), and released in a
+  // `finally`.
   //
   // **Where the parity with `run-due.ts` stops, stated because an earlier
   // version of this comment claimed more than the code does (M9).** What is
-  // genuinely shared is the `finally` block's shape: the unlock attempt and
-  // the release kept apart so `release` is called exactly once, and a failed
-  // unlock destroying the connection rather than returning a session that
-  // still holds the lock. The checkout scope is *not* shared. `run-due`
+  // genuinely shared is the unlock: a failed unlock destroying the
+  // connection rather than returning a session that still holds the lock
+  // (`withSessionLockOn`). The checkout scope is *not* shared. `run-due`
   // checks out and releases one connection per job, so a slow job holds one
   // pool slot for its own duration; this function holds a single connection
   // for the whole pass — every document, every model call inside it. On a
@@ -403,32 +396,19 @@ export async function conductPendingDocuments(
   // and the same waiting documents, and can turn one document into two jobs,
   // two proposals and two cards for the owner to answer (I3).
   const lockScope = `conductor:${businessId}`;
-  const client = await getPool().connect();
-  let holdsLock = false;
-  try {
-    const lock = await client.query<{ locked: boolean }>(
-      'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
-      [lockScope],
-    );
-    if (lock.rows[0]?.locked !== true) {
-      // Another pass already holds this business's lock. Zero result, same
-      // as "nothing to do" — the caller cannot tell the difference, and does
-      // not need to: the next pass will pick this back up.
-      return result;
-    }
-    holdsLock = true;
+  await withSessionLockOn(db, lockScope, async () => {
 
     // No charter, no reasoning: the bundle is what the proposer's catalogue
     // and the risk engine's ceilings are both derived from. `evaluateToolCall`
     // treats an absent charter as fatal for the same reason.
-    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
-    if (active === null) return result;
+    const active = await loadActiveCharter(db);
+    if (active === null) return;
 
     const alreadyToday = await readingsToday({ businessId });
     let remaining = readsPerDay - alreadyToday;
     if (remaining <= 0) {
       result.ceilingReached = true;
-      return result;
+      return;
     }
 
     const waiting = await documentsAwaitingRead(limit, { businessId });
@@ -464,20 +444,17 @@ export async function conductPendingDocuments(
       let stage = 'creating the job';
 
       try {
-        job = await createJob({
+        job = await createJob(db, {
           charterVersion: active.charter.charterVersion,
-          // Not a parameter, and not derived from anything a document says.
           provenance: 'unknown_external',
-          businessId,
           title: `מסמך: ${document.originalName}`,
         });
 
         stage = 'transitioning to understand';
-        await transition(job.jobId, {
+        await transition(db, job.jobId, {
           to: 'understand',
           actor: 'orchestrator',
           reason: 'conductor: reading an ingested document',
-          businessId,
         });
 
         stage = 'reading the document';
@@ -496,32 +473,26 @@ export async function conductPendingDocuments(
 
         if (read.status !== 'read') {
           await recordReadFailureSafely(document.documentId, `read: ${read.status}`, businessId);
-          await transition(job.jobId, {
+          await transition(db, job.jobId, {
             to: 'failed',
             actor: 'orchestrator',
             reason: `conductor: ${read.status}`,
-            businessId,
           });
           result.failed += 1;
           continue;
         }
 
         stage = 'transitioning to plan';
-        await transition(job.jobId, {
+        await transition(db, job.jobId, {
           to: 'plan',
           actor: 'orchestrator',
           reason: 'conductor: proposing from the reading',
-          businessId,
         });
 
         stage = 'proposing from the reading';
-        const proposed = await proposeForReading(
-          { documentId: document.documentId, jobId: job.jobId, bundle: active.bundle },
-          {
-            businessId,
+        const proposed = await proposeForReading(db, { documentId: document.documentId, jobId: job.jobId, bundle: active.bundle }, {
             ...(options.proposer !== undefined ? { proposer: options.proposer } : {}),
-          },
-        );
+          });
 
         if (proposed.status !== 'proposed') {
           await recordReadFailureSafely(
@@ -529,11 +500,10 @@ export async function conductPendingDocuments(
             `propose: ${proposed.status}`,
             businessId,
           );
-          await transition(job.jobId, {
+          await transition(db, job.jobId, {
             to: 'failed',
             actor: 'orchestrator',
             reason: `conductor: ${proposed.status}`,
-            businessId,
           });
           result.failed += 1;
           continue;
@@ -571,36 +541,31 @@ export async function conductPendingDocuments(
               });
         if (compiled !== null) {
           stage = 'binding the compiled plan';
-          await bindPlanToJob(job.jobId, compiled, { businessId });
+          await bindPlanToJob(db, job.jobId, compiled);
         }
 
         stage = 'raising the approval';
-        const approvalId = await raiseProposalApproval(
-          { jobId: job.jobId, proposal: proposed.proposal, bundle: active.bundle },
-          { businessId, ...(options.notify !== undefined ? { notify: options.notify } : {}) },
-        );
+        const approvalId = await raiseProposalApproval(db, { jobId: job.jobId, proposal: proposed.proposal, bundle: active.bundle }, { ...(options.notify !== undefined ? { notify: options.notify } : {}) });
 
         if (approvalId === null) {
           // A stance with nothing to approve. The proposal is stored and the
           // owner sees it on the readings screen; the job has nowhere further
           // to go, so it closes rather than sitting in `plan` forever.
           stage = 'closing a proposal with no action';
-          await transition(job.jobId, {
+          await transition(db, job.jobId, {
             to: 'closed',
             actor: 'orchestrator',
             reason: 'conductor: proposal carries no action',
-            businessId,
           });
           result.readOnly += 1;
           continue;
         }
 
         stage = 'transitioning to await_approval';
-        await transition(job.jobId, {
+        await transition(db, job.jobId, {
           to: 'await_approval',
           actor: 'orchestrator',
           reason: `conductor: ${approvalId}`,
-          businessId,
         });
         result.carded += 1;
 
@@ -616,7 +581,7 @@ export async function conductPendingDocuments(
           const verified = await beginVerification(proposed.proposal.action, {
             subjectJobId: job.jobId,
             documentId: document.documentId,
-            businessId,
+            db,
             charterVersion: active.charter.charterVersion,
             verifier: options.verifier ?? verifyDraft,
           });
@@ -641,11 +606,10 @@ export async function conductPendingDocuments(
         // throw) must not escape and re-break the batch a second time.
         if (job !== null) {
           try {
-            await transition(job.jobId, {
+            await transition(db, job.jobId, {
               to: 'failed',
               actor: 'orchestrator',
               reason: `conductor: threw while ${stage}: ${message}`,
-              businessId,
             });
           } catch {
             // Best-effort. The document is already marked failed above; a
@@ -656,34 +620,9 @@ export async function conductPendingDocuments(
       }
     }
 
-    return result;
-  } finally {
-    if (holdsLock) {
-      // The unlock attempt and the release are kept apart so `release` is
-      // called exactly once on every path, mirroring `run-due.ts`'s own
-      // reasoning: nesting `client.release()` in the `try` and
-      // `client.release(err)` in a `catch` would release twice if `release`
-      // itself ever threw.
-      let unlockError: unknown;
-      try {
-        await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [lockScope]);
-      } catch (error) {
-        unlockError = error;
-      }
-      if (unlockError === undefined) {
-        client.release();
-      } else {
-        // A session-scoped advisory lock lives on the session, not the pool
-        // slot. A plain release after a failed unlock would return a session
-        // that still holds this business's lock to the pool, silently
-        // locking every future pass out of it. Passing the error tells `pg`
-        // to destroy the connection instead of pooling it.
-        client.release(
-          unlockError instanceof Error ? unlockError : new Error(String(unlockError)),
-        );
-      }
-    } else {
-      client.release();
-    }
-  }
+  });
+  // Not locked: another pass already holds this business's lock. Zero
+  // result, same as "nothing to do" — the caller cannot tell the
+  // difference, and does not need to: the next pass will pick this back up.
+  return result;
 }

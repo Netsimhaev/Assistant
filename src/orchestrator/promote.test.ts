@@ -20,7 +20,7 @@
  * carries the weight in the two dial tests.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness, type Queryable } from '../db/pool.js';
+import { closePool, getPool, withBusiness, type BusinessDb } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -104,7 +104,7 @@ async function card(
 ): Promise<void> {
   sequence += 1;
   const jobId = `J-promote-${sequence}`;
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO mail_messages
        (mail_id, business_id, provider_message_id, thread_id, from_address, subject,
         received_at, body_text, state, reply_job_id)
@@ -114,11 +114,11 @@ async function card(
   const input = { to: 'dana@example.com', body: `card-${sequence}` };
   const facts = factsFor(actionClass, input);
   const risk = await assessRisk(facts, bundle);
-  const approvalId = await withBusiness(BUSINESS, (bdb) => enqueueApproval( // TENANCY-TODO(task 4)
+  const approvalId = await withBusiness(BUSINESS, (bdb) => enqueueApproval(
     bdb,
     { facts, risk, proposedInput: input, summary: 'שליחת מייל', jobId }
   ));
-  await withBusiness(BUSINESS, (bdb) => decide( // TENANCY-TODO(task 4)
+  await withBusiness(BUSINESS, (bdb) => decide(
     bdb,
     approvalId,
     outcome,
@@ -128,7 +128,7 @@ async function card(
   // `decide` stamps `decided_at` with SQL now(); overwriting with a value that
   // strictly increases with `sequence` keeps the order unambiguous, and choosing
   // the epoch places the card before or after the ramp events this file writes.
-  await getPool().query(`UPDATE approval_requests SET decided_at = $1 WHERE approval_id = $2`, [
+  await testDb().query(`UPDATE approval_requests SET decided_at = $1 WHERE approval_id = $2`, [
     new Date((opts.epoch ?? PAST) + sequence * 1_000).toISOString(),
     approvalId,
   ]);
@@ -208,18 +208,16 @@ function planDeclaring(actionClass: ActionClass): Plan {
 
 /** A job that reached `failed`, carrying a bound plan that declares `actionClass`. */
 async function failedJobDeclaring(actionClass: ActionClass): Promise<string> {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
-  });
-  await bindPlanToJob(job.jobId, planDeclaring(actionClass), { businessId: BUSINESS });
-  await transition(job.jobId, {
+  }));
+  await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, planDeclaring(actionClass)));
+  await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
     to: 'failed',
     actor: 'orchestrator',
     reason: 'channel_unavailable',
-    businessId: BUSINESS,
-  });
+  }));
   return job.jobId;
 }
 
@@ -227,7 +225,7 @@ describe('the evaluation pass', () => {
   beforeEach(async () => {
     await resetDatabase();
     sequence = 0;
-    bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+    bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
   });
   afterAll(async () => {
     await closePool();
@@ -239,50 +237,50 @@ describe('the evaluation pass', () => {
    * so the first evaluation demonstrably ran and the dial is what held it.
    */
   it('does not move anything while the dial is off, however clean the record', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
     await cleanRun('email.reply', MIN_SAMPLES + 5);
 
-    const result = await evaluateAutonomy({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(result.promoted).toEqual([]);
     // The assertions that matter: the row itself did not move, and no event
     // was recorded. `loadRampLevel` alone could not tell — the dial clamps it
     // to `draft_only` whatever is stored.
     expect(await storedLevel('email.reply')).toBe('approve_required');
     expect(await events('email.reply')).toEqual([]);
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('draft_only');
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('draft_only');
 
     // Positive control: only the dial changes.
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toContain('email.reply');
   });
 
   /** Spec §3: `ask` measures, it does not climb. Same positive control. */
   it('does not promote on the dial at ask — measuring is not climbing', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
     await cleanRun('email.reply', MIN_SAMPLES);
 
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual([]);
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toEqual([]);
     expect(await storedLevel('email.reply')).toBe('approve_required');
     expect(await events('email.reply')).toEqual([]);
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('approve_required');
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('approve_required');
 
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toContain('email.reply');
     expect(await storedLevel('email.reply')).toBe('auto_notify');
   });
 
   /** Spec §5.1. The one earned rung in the system. */
   it('promotes one step at learn once the owner agreed enough', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
     await cleanRun('email.reply', MIN_SAMPLES);
 
-    const result = await evaluateAutonomy({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(result.promoted).toContain('email.reply');
     expect(result.demoted).toEqual([]);
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('auto_notify');
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('auto_notify');
     expect(await storedLevel('email.reply')).toBe('auto_notify');
   });
 
@@ -293,51 +291,51 @@ describe('the evaluation pass', () => {
    * control per case, not a return-value-only assertion).
    */
   it('does not promote on four verdicts, however clean — and does on the fifth', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
     await cleanRun('email.reply', MIN_SAMPLES - 1);
 
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual([]);
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toEqual([]);
     expect(await storedLevel('email.reply')).toBe('approve_required');
     expect(await events('email.reply')).toEqual([]);
 
     await cleanRun('email.reply', 1);
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual(['email.reply']);
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toEqual(['email.reply']);
   });
 
   it('does not promote on 4 of 5 (80%)', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
     await verdicts('email.reply', 4, 1);
 
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual([]);
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toEqual([]);
     expect(await storedLevel('email.reply')).toBe('approve_required');
     expect(await events('email.reply')).toEqual([]);
 
     // Control: one more agreement makes it 5 of 6, which clears 80%.
     await cleanRun('email.reply', 1);
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual(['email.reply']);
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toEqual(['email.reply']);
   });
 
   it('exactly 80% does not promote (8 of 10) — the threshold is strict', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
     await verdicts('email.reply', 8, 2);
 
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual([]);
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toEqual([]);
     expect(await storedLevel('email.reply')).toBe('approve_required');
 
     // Control: 9 of 11 is 81.8%.
     await cleanRun('email.reply', 1);
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual(['email.reply']);
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toEqual(['email.reply']);
   });
 
   it('promotes on 5 of 6, and the event row says how many and what percent', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
     await verdicts('email.reply', 5, 1);
 
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual(['email.reply']);
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toEqual(['email.reply']);
     expect(await newestReason('email.reply')).toBe('5 מתוך 6 הכרעות אחרונות (83%)');
   });
 
@@ -348,16 +346,16 @@ describe('the evaluation pass', () => {
    * pass, which would make "has this fallen twice" count promotions too.
    */
   it('writes one event row per move, which is what the demotion count reads', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
     await cleanRun('email.reply', MIN_SAMPLES);
 
-    await evaluateAutonomy({ businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(await events('email.reply')).toEqual([
       { direction: 'promote', from_level: 'approve_required', to_level: 'auto_notify' },
     ]);
 
-    const again = await evaluateAutonomy({ businessId: BUSINESS });
+    const again = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(again.promoted).toEqual([]);
     expect(await events('email.reply')).toHaveLength(1);
   });
@@ -371,19 +369,19 @@ describe('the evaluation pass', () => {
    * because that is the level the class was actually stored at.
    */
   it('logs the row it actually held as from_level, not the level the dial clamped to', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'auto', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto'));
     // The clamp is doing real work here: the gate never sees 'auto' under
     // `learn`, only the ceiling.
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('auto_notify');
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('auto_notify');
 
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO autonomy_marks (mark_id, business_id, job_id, step_id, action_class, note, marked_by)
        VALUES ('AM-test-raw-from', $1, 'J-test', 'S-test', 'email.reply', 'טעות', 'owner@example.com')`,
       [BUSINESS],
     );
 
-    const result = await evaluateAutonomy({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(result.demoted).toContain('email.reply');
     expect(await events('email.reply')).toEqual([
       { direction: 'demote', from_level: 'auto', to_level: 'approve_required' },
@@ -399,34 +397,34 @@ describe('the evaluation pass', () => {
    * biting and not the machinery being dead.
    */
   it('demotes on an owner mark, and the window starts again', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
     await cleanRun('email.reply', MIN_SAMPLES);
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toContain('email.reply');
 
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO autonomy_marks
          (mark_id, business_id, job_id, step_id, action_class, note, marked_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
       ['MK-1', BUSINESS, 'J-x', 's1', 'email.reply', 'זו הייתה טעות', 'p_boss'],
     );
 
-    const fall = await evaluateAutonomy({ businessId: BUSINESS });
+    const fall = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(fall.demoted).toContain('email.reply');
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('approve_required');
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('approve_required');
     expect(await storedLevel('email.reply')).toBe('approve_required');
 
     // The window starts again: the five approvals that earned the first
     // promotion were all decided before the demotion and must not earn a
     // second one.
-    const stale = await evaluateAutonomy({ businessId: BUSINESS });
+    const stale = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(stale.promoted).toEqual([]);
     expect(await storedLevel('email.reply')).toBe('approve_required');
     expect(await events('email.reply')).toHaveLength(2);
 
     // Positive control: five decided after the demotion do earn it.
     await cleanRun('email.reply', MIN_SAMPLES, { epoch: FUTURE });
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toContain('email.reply');
     expect(await storedLevel('email.reply')).toBe('auto_notify');
   });
 
@@ -436,16 +434,16 @@ describe('the evaluation pass', () => {
    * declares the class.
    */
   it('demotes on a failed job with no human involved at all', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
     await cleanRun('email.reply', MIN_SAMPLES);
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toContain('email.reply');
 
     await failedJobDeclaring('email.reply');
 
-    const fall = await evaluateAutonomy({ businessId: BUSINESS });
+    const fall = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(fall.demoted).toContain('email.reply');
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('approve_required');
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('approve_required');
     expect(await storedLevel('email.reply')).toBe('approve_required');
     // No human touched it: the demotion came from the job record alone.
     const { rows } = await getPool().query<{ n: string }>(
@@ -461,34 +459,34 @@ describe('the evaluation pass', () => {
    * row, and only the one without demotes.
    */
   it('a failed boss command does not demote; the same failure without an instruction does', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
     await cleanRun('email.reply', MIN_SAMPLES);
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toContain('email.reply');
 
     const command = await failedJobDeclaring('email.reply');
     await saveInstruction({ jobId: command, text: 'תעני לדנה', textOrigin: 'typed' }, { businessId: BUSINESS });
 
-    const held = await evaluateAutonomy({ businessId: BUSINESS });
+    const held = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(held.demoted).toEqual([]);
     expect(await storedLevel('email.reply')).toBe('auto_notify');
 
     await failedJobDeclaring('email.reply');
-    const fall = await evaluateAutonomy({ businessId: BUSINESS });
+    const fall = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(fall.demoted).toContain('email.reply');
     expect(await storedLevel('email.reply')).toBe('approve_required');
   });
 
   it('a mark on a boss-command step does not demote; the same mark on another job does', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
     await cleanRun('email.reply', MIN_SAMPLES);
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toContain('email.reply');
 
-    const command = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    const command = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
     await saveInstruction({ jobId: command.jobId, text: 'תעני לדנה', textOrigin: 'typed' }, { businessId: BUSINESS });
     const mark = async (markId: string, jobId: string): Promise<void> => {
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO autonomy_marks
            (mark_id, business_id, job_id, step_id, action_class, note, marked_by)
          VALUES ($1,$2,$3,$4,$5,$6,$7)`,
@@ -497,12 +495,12 @@ describe('the evaluation pass', () => {
     };
     await mark('MK-cmd', command.jobId);
 
-    const held = await evaluateAutonomy({ businessId: BUSINESS });
+    const held = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(held.demoted).toEqual([]);
     expect(await storedLevel('email.reply')).toBe('auto_notify');
 
     await mark('MK-other', 'J-other');
-    const fall = await evaluateAutonomy({ businessId: BUSINESS });
+    const fall = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(fall.demoted).toContain('email.reply');
     expect(await storedLevel('email.reply')).toBe('approve_required');
   });
@@ -514,11 +512,11 @@ describe('the evaluation pass', () => {
    * re-evaluating the same evidence is the positive control.
    */
   it('stops climbing after two demotions, even on a perfect record', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
     const before = new Date(PAST - 60_000).toISOString();
     for (const id of ['AE-1', 'AE-2']) {
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO autonomy_events
            (event_id, business_id, action_class, direction, from_level, to_level, reason, at)
          VALUES ($1,$2,'email.reply','demote','auto_notify','approve_required','טעות',$3)`,
@@ -527,15 +525,15 @@ describe('the evaluation pass', () => {
     }
     await cleanRun('email.reply', MIN_SAMPLES);
 
-    const result = await evaluateAutonomy({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(result.promoted).toEqual([]);
     expect(await storedLevel('email.reply')).toBe('approve_required');
     expect(await events('email.reply')).toHaveLength(2);
 
     // Control: with only one demotion on record the same evidence promotes, so
     // the fall count is what held it and the evidence was sufficient.
-    await getPool().query(`DELETE FROM autonomy_events WHERE event_id = 'AE-2'`);
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual(['email.reply']);
+    await testDb().query(`DELETE FROM autonomy_events WHERE event_id = 'AE-2'`);
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toEqual(['email.reply']);
   });
 
   /**
@@ -544,20 +542,20 @@ describe('the evaluation pass', () => {
    * positive control.
    */
   it('never promotes above auto_notify', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
     await cleanRun('email.reply', MIN_SAMPLES);
 
-    const result = await evaluateAutonomy({ businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(result.promoted).toEqual([]);
     expect(result.demoted).toEqual([]);
     expect(await storedLevel('email.reply')).toBe('auto_notify');
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('auto_notify');
+    expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('auto_notify');
     expect(await events('email.reply')).toEqual([]);
 
     // Control: the same evidence does move a class that sits one rung lower.
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual(['email.reply']);
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toEqual(['email.reply']);
   });
 
   /**
@@ -571,8 +569,8 @@ describe('the evaluation pass', () => {
    * half — that it runs LAST — with evidence that pass itself produces.
    */
   it('is wired into schedulerPass, not merely exported', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
     await cleanRun('email.reply', MIN_SAMPLES);
 
     // `inbox: null` keeps both document-conductor loops off: this test is
@@ -600,11 +598,11 @@ describe('the evaluation pass', () => {
    * job") answers neither half of "why was this class demoted on Tuesday".
    */
   it('records which signal demoted the class, not a disjunction of both', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
     await failedJobDeclaring('email.reply');
 
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).demoted).toContain('email.reply');
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).demoted).toContain('email.reply');
     const reason = await newestReason('email.reply');
     expect(reason).toContain('משימה שנכשלה');
     expect(reason).not.toContain('סימון');
@@ -621,17 +619,17 @@ describe('the evaluation pass', () => {
    * demote, so the window is what moved and not the signal.
    */
   it('ignores a failure that predates a hand-raised level, and heeds one after it', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
     await failedJobDeclaring('email.reply');
-    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
 
-    const first = await evaluateAutonomy({ businessId: BUSINESS });
+    const first = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(first.demoted).toEqual([]);
     expect(await storedLevel('email.reply')).toBe('auto_notify');
     expect(await events('email.reply')).toEqual([]);
 
     await failedJobDeclaring('email.reply');
-    expect((await evaluateAutonomy({ businessId: BUSINESS })).demoted).toContain('email.reply');
+    expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).demoted).toContain('email.reply');
     expect(await storedLevel('email.reply')).toBe('approve_required');
   });
 
@@ -651,8 +649,8 @@ describe('the evaluation pass', () => {
    * for: a cleanup that can fail is not a cleanup.
    */
   it('rolls the level back when the audit entry cannot be written', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
-    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'approve_required'));
     await cleanRun('email.reply', MIN_SAMPLES);
 
     await testDb().query(`
@@ -672,7 +670,7 @@ describe('the evaluation pass', () => {
         FOR EACH ROW EXECUTE FUNCTION refuse_autonomy_audit()
       `);
 
-      const blocked = await evaluateAutonomy({ businessId: BUSINESS });
+      const blocked = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
       expect(blocked.promoted).toEqual([]);
       // Nothing half-happened: the level is untouched and no event row exists.
       expect(await storedLevel('email.reply')).toBe('approve_required');
@@ -685,7 +683,7 @@ describe('the evaluation pass', () => {
     }
 
     // Positive control: with the obstacle gone, the same evidence promotes.
-    const after = await evaluateAutonomy({ businessId: BUSINESS });
+    const after = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(after.promoted).toContain('email.reply');
     expect(after.errored).toEqual([]);
     expect(await storedLevel('email.reply')).toBe('auto_notify');
@@ -696,23 +694,26 @@ describe('the evaluation pass', () => {
    * like nothing being due either.
    */
   it('isolates a class whose evaluation throws, and names it in errored', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
     await cleanRun('email.reply', MIN_SAMPLES);
     await cleanRun('email.initiate', MIN_SAMPLES);
 
     // A connection that refuses every statement carrying this one class. The
     // cast is for `pg`'s overloaded `query` signature only — the body does no
     // narrowing of its own.
-    const refusing: Queryable = {
-      query: ((text: string, params?: unknown[]) => {
-        if (Array.isArray(params) && params.includes('email.reply')) {
-          return Promise.reject(new Error('injected read failure'));
-        }
-        return getPool().query(text, params as unknown[]);
-      }) as Queryable['query'],
-    };
-
-    const result = await evaluateAutonomy({ businessId: BUSINESS, db: refusing });
+    const result = await withBusiness(BUSINESS, (db) => {
+      const refusing: BusinessDb = {
+        businessId: db.businessId,
+        inTransaction: db.inTransaction,
+        query: ((text: string, params?: unknown[]) => {
+          if (Array.isArray(params) && params.includes('email.reply')) {
+            return Promise.reject(new Error('injected read failure'));
+          }
+          return db.query(text, params as unknown[]);
+        }) as BusinessDb['query'],
+      };
+      return evaluateAutonomy(refusing);
+    });
     expect(result.errored).toEqual(['email.reply']);
     expect(result.promoted).toEqual(['email.initiate']);
     expect(await storedLevel('email.reply')).toBeUndefined();

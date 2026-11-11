@@ -25,8 +25,8 @@ vi.mock('./plan-store.js', async (importOriginal) => {
   };
 });
 
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { Plan } from '../domain/plan.js';
@@ -89,13 +89,13 @@ const versions = new Map<string, string>();
 async function parkedJob(options: ConfirmationOption[], businessId = BUSINESS): Promise<string> {
   let version = versions.get(businessId);
   if (version === undefined) {
-    version = (await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter()))).charterVersion; // TENANCY-TODO(task 4)
+    version = (await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter()))).charterVersion;
     versions.set(businessId, version);
   }
-  const job = await createJob({ charterVersion: version, provenance: 'boss', businessId });
+  const job = await withBusiness(businessId, (db) => createJob(db, { charterVersion: version, provenance: 'boss' }));
   await saveInstruction({ jobId: job.jobId, text: 'תשלחי לדנה', textOrigin: 'typed' }, { businessId });
-  await transition(job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't', businessId });
-  await transition(job.jobId, { to: 'plan', actor: 'orchestrator', reason: 't', businessId });
+  await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't' }));
+  await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'plan', actor: 'orchestrator', reason: 't' }));
   await createConfirmation(
     { jobId: job.jobId, options, presentedText: 'שאלה', channel: 'whatsapp' },
     { businessId },
@@ -104,11 +104,11 @@ async function parkedJob(options: ConfirmationOption[], businessId = BUSINESS): 
 }
 
 async function phaseOf(jobId: string, businessId = BUSINESS): Promise<string | undefined> {
-  return (await loadJob(jobId, { businessId }))?.phase;
+  return (await withBusiness(businessId, (db) => loadJob(db, jobId)))?.phase;
 }
 
 async function stepsTo(jobId: string, to: string): Promise<number> {
-  const { rows } = await getPool().query('SELECT 1 FROM job_steps WHERE job_id = $1 AND to_phase = $2', [
+  const { rows } = await testDb().query('SELECT 1 FROM job_steps WHERE job_id = $1 AND to_phase = $2', [
     jobId,
     to,
   ]);
@@ -133,11 +133,11 @@ describe('the settle sweep loses a race to the owner', () => {
     expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
     race.afterRead = async () => {
       // applyConfirmation's second half, from the dashboard.
-      await bindChosenPlan(jobId, HASH_A, by);
-      await transition(jobId, { to: 'execute', actor: 'human', reason: 'command: confirmed', businessId: BUSINESS });
+      await withBusiness(TEST_BUSINESS, (db) => bindChosenPlan(db, jobId, HASH_A));
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'execute', actor: 'human', reason: 'command: confirmed' }));
     };
 
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [], skipped: [jobId], errored: [] });
+    expect(await withBusiness(TEST_BUSINESS, (db) => settleDecidedConfirmations(db))).toEqual({ settled: [], skipped: [jobId], errored: [] });
     expect(race.afterRead).toBeNull();
     expect(await phaseOf(jobId)).toBe('execute');
     expect(await stepsTo(jobId, 'failed')).toBe(0);
@@ -147,24 +147,24 @@ describe('the settle sweep loses a race to the owner', () => {
     const jobId = await parkedJob([SINGLE]);
     expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
     race.afterRead = async () => {
-      await bindPlanToJob(jobId, PLAN_A, by);
-      await transition(jobId, { to: 'execute', actor: 'human', reason: 'command: confirmed', businessId: BUSINESS });
+      await withBusiness(TEST_BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN_A));
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'execute', actor: 'human', reason: 'command: confirmed' }));
     };
 
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [], skipped: [jobId], errored: [] });
+    expect(await withBusiness(TEST_BUSINESS, (db) => settleDecidedConfirmations(db))).toEqual({ settled: [], skipped: [jobId], errored: [] });
     expect(await phaseOf(jobId)).toBe('execute');
     expect(await stepsTo(jobId, 'failed')).toBe(0);
   });
 
   it('single option, bound: the owner moves it to execute first — skipped quietly, not errored', async () => {
     const jobId = await parkedJob([SINGLE]);
-    await bindPlanToJob(jobId, PLAN_A, by);
+    await withBusiness(TEST_BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN_A));
     expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
     race.afterRead = async () => {
-      await transition(jobId, { to: 'execute', actor: 'human', reason: 'command: confirmed', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'execute', actor: 'human', reason: 'command: confirmed' }));
     };
 
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [], skipped: [jobId], errored: [] });
+    expect(await withBusiness(TEST_BUSINESS, (db) => settleDecidedConfirmations(db))).toEqual({ settled: [], skipped: [jobId], errored: [] });
     expect(await stepsTo(jobId, 'execute')).toBe(1);
   });
 });
@@ -176,7 +176,7 @@ describe('the settle sweep stays in its own business', () => {
     const theirs = await parkedJob([SINGLE], OTHER);
     await cancelConfirmation(theirs, 'owner', { businessId: OTHER });
 
-    expect(await settleDecidedConfirmations(by)).toEqual({
+    expect(await withBusiness(TEST_BUSINESS, (db) => settleDecidedConfirmations(db))).toEqual({
       settled: [{ jobId: mine, to: 'closed' }],
       skipped: [],
       errored: [],
@@ -189,12 +189,12 @@ describe('transition expectFrom', () => {
   it('moves only from the expected phase, and writes nothing otherwise', async () => {
     const jobId = await parkedJob([SINGLE]);
     await expect(
-      transition(jobId, { to: 'closed', actor: 'system', reason: 'x', businessId: BUSINESS, expectFrom: 'execute' }),
+      withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'closed', actor: 'system', reason: 'x', expectFrom: 'execute' })),
     ).rejects.toBeInstanceOf(PhaseMovedError);
     expect(await phaseOf(jobId)).toBe('plan');
     expect(await stepsTo(jobId, 'closed')).toBe(0);
 
-    await transition(jobId, { to: 'closed', actor: 'system', reason: 'x', businessId: BUSINESS, expectFrom: 'plan' });
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'closed', actor: 'system', reason: 'x', expectFrom: 'plan' }));
     expect(await phaseOf(jobId)).toBe('closed');
   });
 });

@@ -27,8 +27,7 @@
  * content, the same reasoning `recordWhatsAppHealthNotifyFailure`
  * (`scheduler.ts`) and `executeErasure` already give for those values.
  */
-import { config } from '../config.js';
-import { getPool, type BusinessDb } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 
@@ -37,26 +36,22 @@ export const MAIL_BODY_RETENTION_DAYS = 365;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export async function scrubOldMailBodies(
-  options: { businessId?: string; now?: Date } = {},
+  db: BusinessDb,
+  options: { now?: Date } = {},
 ): Promise<{ scrubbed: number }> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const now = options.now ?? new Date();
   const cutoff = new Date(now.getTime() - MAIL_BODY_RETENTION_DAYS * DAY_MS);
 
-  const client = await getPool().connect();
-  let failed = false;
-  try {
-    await client.query('BEGIN');
-    const { rowCount } = await client.query(
+  return transaction(db, async (tx) => {
+    const { rowCount } = await tx.query(
       `UPDATE mail_messages SET body_text = NULL, body_scrubbed_at = $3
         WHERE business_id = $1 AND received_at < $2 AND body_text IS NOT NULL`,
       [businessId, cutoff.toISOString(), now.toISOString()],
     );
     const scrubbed = rowCount ?? 0;
     if (scrubbed > 0) {
-      // The raw client is inside the BEGIN above; viewed as a BusinessDb in a
-      // transaction so the audit row joins it.
-      const tx: BusinessDb = { businessId, inTransaction: true, query: client.query.bind(client) }; // TENANCY-TODO(task 4)
+      // Joins the transaction above, so the scrub and its audit row land together.
       await appendAudit(
         tx,
         {
@@ -69,17 +64,6 @@ export async function scrubOldMailBodies(
         },
       );
     }
-    await client.query('COMMIT');
     return { scrubbed };
-  } catch (error) {
-    failed = true;
-    try {
-      await client.query('ROLLBACK');
-    } catch {
-      // The connection is already broken; the original error is the one to surface.
-    }
-    throw error;
-  } finally {
-    client.release(failed);
-  }
+  });
 }

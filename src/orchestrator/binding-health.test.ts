@@ -88,15 +88,14 @@ function writePlan(): Plan {
 }
 
 async function jobInExecute(bundle: PolicyBundle) {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  const loaded = await loadJob(job.jobId, { businessId: BUSINESS });
+  const loaded = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
   if (loaded === null) throw new Error('job vanished');
   return loaded;
 }
@@ -127,19 +126,16 @@ afterAll(async () => {
 
 describe('the binding health fields get a writer', () => {
   it('stamps last_ok_at on success and clears the error', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ connections: [CRM_CONNECTION], autonomyBase: { 'crm.write': 'auto' } })
     ));
     // Seeded with a stale error and no last_ok_at, so a success genuinely has
     // to change both — not merely leave them at values that already matched.
-    await upsertBinding(
-      { ...LIVE, lastError: 'stale_failure — from an earlier run' },
-      { businessId: BUSINESS, by: 'p_boss' },
-    );
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, { ...LIVE, lastError: 'stale_failure — from an earlier run' }, { by: 'p_boss' }));
     const job = await jobInExecute(bundle);
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: writePlan(),
@@ -151,7 +147,7 @@ describe('the binding health fields get a writer', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('done');
 
@@ -161,16 +157,16 @@ describe('the binding health fields get a writer', () => {
   });
 
   it('records the classified code on failure, never the credential value', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ connections: [CRM_CONNECTION], autonomyBase: { 'crm.write': 'auto' } })
     ));
-    await upsertBinding(LIVE, { businessId: BUSINESS, by: 'p_boss' });
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, LIVE, { by: 'p_boss' }));
     const job = await jobInExecute(bundle);
 
     const SENTINEL = 'SENTINEL-TOKEN-DO-NOT-LEAK';
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: writePlan(),
@@ -193,7 +189,7 @@ describe('the binding health fields get a writer', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('halted');
 
@@ -210,14 +206,14 @@ describe('the binding health fields get a writer', () => {
   });
 
   it('leaves status live on a transient failure', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ connections: [CRM_CONNECTION], autonomyBase: { 'crm.write': 'auto' } })
     ));
-    await upsertBinding(LIVE, { businessId: BUSINESS, by: 'p_boss' });
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, LIVE, { by: 'p_boss' }));
     const job = await jobInExecute(bundle);
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: writePlan(),
@@ -234,7 +230,7 @@ describe('the binding health fields get a writer', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('halted');
 
@@ -262,11 +258,11 @@ describe('the binding health fields get a writer', () => {
  */
 describe('a 401 from the resource call invalidates the cached credential', () => {
   it('calls credentials.invalidate with the resolved ref and business id on an "unauthorized" failure', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ connections: [CRM_CONNECTION], autonomyBase: { 'crm.write': 'auto' } })
     ));
-    await upsertBinding(LIVE, { businessId: BUSINESS, by: 'p_boss' });
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, LIVE, { by: 'p_boss' }));
     const job = await jobInExecute(bundle);
 
     const invalidated: Array<{ ref: string; businessId: string }> = [];
@@ -279,7 +275,7 @@ describe('a 401 from the resource call invalidates the cached credential', () =>
       },
     };
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: writePlan(),
@@ -299,7 +295,7 @@ describe('a 401 from the resource call invalidates the cached credential', () =>
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('halted');
     // Positive half: the failure genuinely reached `performStep` and the
@@ -309,11 +305,11 @@ describe('a 401 from the resource call invalidates the cached credential', () =>
   });
 
   it('does not call invalidate for a failure code other than "unauthorized"', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ connections: [CRM_CONNECTION], autonomyBase: { 'crm.write': 'auto' } })
     ));
-    await upsertBinding(LIVE, { businessId: BUSINESS, by: 'p_boss' });
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, LIVE, { by: 'p_boss' }));
     const job = await jobInExecute(bundle);
 
     const invalidated: Array<{ ref: string; businessId: string }> = [];
@@ -326,7 +322,7 @@ describe('a 401 from the resource call invalidates the cached credential', () =>
       },
     };
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: writePlan(),
@@ -343,7 +339,7 @@ describe('a 401 from the resource call invalidates the cached credential', () =>
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('halted');
     expect(invalidated).toEqual([]);
@@ -367,11 +363,11 @@ describe('a 401 from the resource call invalidates the cached credential', () =>
  */
 describe('a concurrent-revoke race during a refresh gets a readable, correctly-terminal code', () => {
   it('classifies OAuthGrantError as oauth_grant_revoked, not adapter_threw', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ connections: [CRM_CONNECTION], autonomyBase: { 'crm.write': 'auto' } })
     ));
-    await upsertBinding(LIVE, { businessId: BUSINESS, by: 'p_boss' });
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, LIVE, { by: 'p_boss' }));
     const job = await jobInExecute(bundle);
 
     const credentials: CredentialSource = {
@@ -380,7 +376,7 @@ describe('a concurrent-revoke race during a refresh gets a readable, correctly-t
       },
     };
 
-    const result = await runPlan({
+    const result = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan: writePlan(),
@@ -393,7 +389,7 @@ describe('a concurrent-revoke race during a refresh gets a readable, correctly-t
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
 
     expect(result.status).toBe('halted');
     if (result.status !== 'halted') throw new Error('unreachable — asserted above');
@@ -402,7 +398,7 @@ describe('a concurrent-revoke race during a refresh gets a readable, correctly-t
     // a plain, unmapped `Error` would have produced.
     expect(result.reason).toBe('oauth_grant_revoked');
 
-    const job2 = await loadJob(job.jobId, { businessId: BUSINESS });
+    const job2 = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(job2?.phase).toBe('failed');
   });
 });

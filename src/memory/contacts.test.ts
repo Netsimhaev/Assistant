@@ -11,12 +11,11 @@ const BUSINESS = 'test-business';
 
 async function bossJob(version: string): Promise<string> {
   const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version }))); // TENANCY-TODO(task 5)
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
     title: 'seed',
-    businessId: BUSINESS,
-  });
+  }));
   return job.jobId;
 }
 

@@ -19,9 +19,9 @@ const BUSINESS = 'test-business';
 const OTHER = 'other-business';
 
 async function charterFor(businessId: string): Promise<string> {
-  const active = await withBusiness(businessId, (bdb) => activeCharterVersion(bdb)); // TENANCY-TODO(task 4)
+  const active = await withBusiness(businessId, (bdb) => activeCharterVersion(bdb));
   if (active !== null) return active;
-  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter({ version: `ledger-${businessId}` }))); // TENANCY-TODO(task 4)
+  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter({ version: `ledger-${businessId}` })));
   return bundle.charterVersion;
 }
 
@@ -30,12 +30,11 @@ async function aJob(
 ): Promise<string> {
   const businessId = options.businessId ?? BUSINESS;
   const charterVersion = await charterFor(businessId);
-  const job = await createJob({
+  const job = await withBusiness(businessId, (db) => createJob(db, {
     charterVersion,
     provenance: options.provenance ?? 'boss',
-    businessId,
     title: 'ledger',
-  });
+  }));
   const text = options.instruction === undefined ? 'תזכירי לי לגבות מדנה' : options.instruction;
   if (text !== null) {
     await saveInstruction({ jobId: job.jobId, text, textOrigin: options.origin ?? 'typed' }, { businessId });
@@ -69,11 +68,7 @@ describe('ledger.add / ledger.update', () => {
 
   it('adds an item from a boss instruction job', async () => {
     const jobId = await aJob();
-    const out = await runLocalTool(
-      'ledger.add',
-      { family: 'money_in', description: 'לגבות מדנה על הפרויקט', dueDate: '2026-12-01', amountMinor: 120000 },
-      { jobId, businessId: BUSINESS },
-    );
+    const out = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'money_in', description: 'לגבות מדנה על הפרויקט', dueDate: '2026-12-01', amountMinor: 120000 }, { ...{ jobId }, db }));
     expect(out.performed).toBe(true);
     expect(out['family']).toBe('money_in');
 
@@ -88,11 +83,7 @@ describe('ledger.add / ledger.update', () => {
 
   it('keeps an explicit time and marks the due as timed', async () => {
     const jobId = await aJob();
-    const out = await runLocalTool(
-      'ledger.add',
-      { family: 'meetings', description: 'פגישה עם דנה', dueDate: '2026-12-01', dueTime: '14:30' },
-      { jobId, businessId: BUSINESS },
-    );
+    const out = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'meetings', description: 'פגישה עם דנה', dueDate: '2026-12-01', dueTime: '14:30' }, { ...{ jobId }, db }));
     const item = await loadLedgerItem(String(out['itemId']), { businessId: BUSINESS });
     expect(item?.dueAt?.toISOString()).toBe(localToInstant('2026-12-01', '14:30', 'Asia/Jerusalem').toISOString());
     expect(item?.dueIsDateOnly).toBe(false);
@@ -101,7 +92,7 @@ describe('ledger.add / ledger.update', () => {
   it('refuses a boss job with no instruction row', async () => {
     const jobId = await aJob({ instruction: null });
     const code = await refusalCode(() =>
-      runLocalTool('ledger.add', { family: 'money_in', description: 'x' }, { jobId, businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'money_in', description: 'x' }, { ...{ jobId }, db })),
     );
     expect(code).toBe('ledger_not_boss_instruction');
     expect(await itemCount()).toBe(0);
@@ -110,7 +101,7 @@ describe('ledger.add / ledger.update', () => {
   it('refuses an unknown_external job, even one carrying an instruction row', async () => {
     const jobId = await aJob({ provenance: 'unknown_external' });
     const code = await refusalCode(() =>
-      runLocalTool('ledger.add', { family: 'money_in', description: 'x' }, { jobId, businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'money_in', description: 'x' }, { ...{ jobId }, db })),
     );
     expect(code).toBe('ledger_not_boss_instruction');
     expect(await itemCount()).toBe(0);
@@ -120,7 +111,7 @@ describe('ledger.add / ledger.update', () => {
     const jobId = await aJob({ businessId: OTHER });
     await charterFor(BUSINESS);
     const code = await refusalCode(() =>
-      runLocalTool('ledger.add', { family: 'money_in', description: 'x' }, { jobId, businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'money_in', description: 'x' }, { ...{ jobId }, db })),
     );
     expect(code).toBe('ledger_not_boss_instruction');
     expect(await itemCount()).toBe(0);
@@ -128,16 +119,12 @@ describe('ledger.add / ledger.update', () => {
 
   it('assertLedgerWriter passes a boss job with an instruction row', async () => {
     const jobId = await aJob();
-    await expect(assertLedgerWriter(jobId, BUSINESS, getPool())).resolves.toBeUndefined();
+    await expect(withBusiness(BUSINESS, (db) => assertLedgerWriter(db, jobId))).resolves.toBeUndefined();
   });
 
   it('email typed in a typed instruction is verified', async () => {
     const jobId = await aJob({ instruction: 'תזכירי לי לגבות מדנה dana@acme.example עד ראשון' });
-    const out = await runLocalTool(
-      'ledger.add',
-      { family: 'money_in', description: 'לגבות', counterpartyName: 'דנה', counterpartyEmail: 'Dana@Acme.example' },
-      { jobId, businessId: BUSINESS },
-    );
+    const out = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'money_in', description: 'לגבות', counterpartyName: 'דנה', counterpartyEmail: 'Dana@Acme.example' }, { ...{ jobId }, db }));
     expect(out['counterpartyEmailVerified']).toBe(true);
     const item = await loadLedgerItem(String(out['itemId']), { businessId: BUSINESS });
     expect(item?.counterpartyEmailVerified).toBe(true);
@@ -148,11 +135,7 @@ describe('ledger.add / ledger.update', () => {
       instruction: 'תזכירי לי לגבות מדנה dana@acme.example עד ראשון',
       origin: 'transcribed',
     });
-    const out = await runLocalTool(
-      'ledger.add',
-      { family: 'money_in', description: 'לגבות', counterpartyEmail: 'dana@acme.example' },
-      { jobId, businessId: BUSINESS },
-    );
+    const out = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'money_in', description: 'לגבות', counterpartyEmail: 'dana@acme.example' }, { ...{ jobId }, db }));
     expect(out.performed).toBe(true);
     expect(out['counterpartyEmailVerified']).toBe(false);
     const item = await loadLedgerItem(String(out['itemId']), { businessId: BUSINESS });
@@ -162,11 +145,7 @@ describe('ledger.add / ledger.update', () => {
 
   it('email absent from the instruction text is not verified', async () => {
     const jobId = await aJob({ instruction: 'תזכירי לי לגבות מדנה עד ראשון' });
-    const out = await runLocalTool(
-      'ledger.add',
-      { family: 'money_in', description: 'לגבות', counterpartyEmail: 'dana@acme.example' },
-      { jobId, businessId: BUSINESS },
-    );
+    const out = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'money_in', description: 'לגבות', counterpartyEmail: 'dana@acme.example' }, { ...{ jobId }, db }));
     expect(out.performed).toBe(true);
     expect(out['counterpartyEmailVerified']).toBe(false);
   });
@@ -174,22 +153,14 @@ describe('ledger.add / ledger.update', () => {
   it('refuses a phone number the planner put in counterpartyEmail, even one the owner typed', async () => {
     const jobId = await aJob({ instruction: 'תזכירי לי לחזור לדנה +972501234567 מחר' });
     const code = await refusalCode(() =>
-      runLocalTool(
-        'ledger.add',
-        { family: 'awaiting_reply', description: 'לחזור לדנה', counterpartyEmail: '+972501234567' },
-        { jobId, businessId: BUSINESS },
-      ),
+      withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'awaiting_reply', description: 'לחזור לדנה', counterpartyEmail: '+972501234567' }, { ...{ jobId }, db })),
     );
     expect(code).toBe('local_tool_bad_input');
     expect(await itemCount()).toBe(0);
   });
 
   async function addWithDomain(jobId: string, extra: Record<string, unknown> = {}) {
-    const out = await runLocalTool(
-      'ledger.add',
-      { family: 'awaiting_reply', description: 'תשובה מאקמי', counterpartyDomain: 'Acme.example', ...extra },
-      { jobId, businessId: BUSINESS },
-    );
+    const out = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'awaiting_reply', description: 'תשובה מאקמי', counterpartyDomain: 'Acme.example', ...extra }, { ...{ jobId }, db }));
     const item = await loadLedgerItem(String(out['itemId']), { businessId: BUSINESS });
     return { out, item };
   }
@@ -247,17 +218,13 @@ describe('ledger.add / ledger.update', () => {
   it('projects without dueDate is refused', async () => {
     const jobId = await aJob();
     const code = await refusalCode(() =>
-      runLocalTool('ledger.add', { family: 'projects', description: 'מצגת למשקיעים' }, { jobId, businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'projects', description: 'מצגת למשקיעים' }, { ...{ jobId }, db })),
     );
     expect(code).toBe('local_tool_bad_input');
     expect(await itemCount()).toBe(0);
 
     // And the same payload with a deadline goes through: the refusal was the deadline.
-    const out = await runLocalTool(
-      'ledger.add',
-      { family: 'projects', description: 'מצגת למשקיעים', dueDate: '2026-12-20', stages: ['טיוטה', 'עיצוב'] },
-      { jobId, businessId: BUSINESS },
-    );
+    const out = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'projects', description: 'מצגת למשקיעים', dueDate: '2026-12-20', stages: ['טיוטה', 'עיצוב'] }, { ...{ jobId }, db }));
     const item = await loadLedgerItem(String(out['itemId']), { businessId: BUSINESS });
     expect(item?.stages).toEqual([
       { title: 'טיוטה', done: false },
@@ -268,11 +235,7 @@ describe('ledger.add / ledger.update', () => {
   it('refuses a date that does not exist, before anything is written', async () => {
     const jobId = await aJob();
     const code = await refusalCode(() =>
-      runLocalTool(
-        'ledger.add',
-        { family: 'money_in', description: 'x', dueDate: '2026-02-30' },
-        { jobId, businessId: BUSINESS },
-      ),
+      withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'money_in', description: 'x', dueDate: '2026-02-30' }, { ...{ jobId }, db })),
     );
     expect(code).toBe('local_tool_bad_input');
     expect(await itemCount()).toBe(0);
@@ -281,11 +244,7 @@ describe('ledger.add / ledger.update', () => {
   it('refuses a malformed counterparty domain', async () => {
     const jobId = await aJob();
     const code = await refusalCode(() =>
-      runLocalTool(
-        'ledger.add',
-        { family: 'awaiting_reply', description: 'x', counterpartyDomain: '*.acme.example' },
-        { jobId, businessId: BUSINESS },
-      ),
+      withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'awaiting_reply', description: 'x', counterpartyDomain: '*.acme.example' }, { ...{ jobId }, db })),
     );
     expect(code).toBe('local_tool_bad_input');
     expect(await itemCount()).toBe(0);
@@ -293,38 +252,22 @@ describe('ledger.add / ledger.update', () => {
 
   it('allows money_in with an amount and no reference', async () => {
     const jobId = await aJob();
-    const out = await runLocalTool(
-      'ledger.add',
-      { family: 'money_in', description: 'x', amountMinor: 5000 },
-      { jobId, businessId: BUSINESS },
-    );
+    const out = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'money_in', description: 'x', amountMinor: 5000 }, { ...{ jobId }, db }));
     expect(out.performed).toBe(true);
   });
 
   it('critical rule marks importance', async () => {
     const jobId = await aJob();
     await addCriticalRule({ kind: 'family', family: 'money_in' }, { businessId: BUSINESS, by: 'owner' });
-    const ruled = await runLocalTool(
-      'ledger.add',
-      { family: 'money_in', description: 'x' },
-      { jobId, businessId: BUSINESS },
-    );
+    const ruled = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'money_in', description: 'x' }, { ...{ jobId }, db }));
     expect(ruled['importance']).toBe('critical');
     const ruledItem = await loadLedgerItem(String(ruled['itemId']), { businessId: BUSINESS });
     expect(ruledItem?.importanceManual).toBe(false);
 
-    const other = await runLocalTool(
-      'ledger.add',
-      { family: 'meetings', description: 'y' },
-      { jobId, businessId: BUSINESS },
-    );
+    const other = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'meetings', description: 'y' }, { ...{ jobId }, db }));
     expect(other['importance']).toBe('normal');
 
-    const manual = await runLocalTool(
-      'ledger.add',
-      { family: 'meetings', description: 'z', critical: true },
-      { jobId, businessId: BUSINESS },
-    );
+    const manual = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'meetings', description: 'z', critical: true }, { ...{ jobId }, db }));
     expect(manual['importance']).toBe('critical');
     const manualItem = await loadLedgerItem(String(manual['itemId']), { businessId: BUSINESS });
     expect(manualItem?.importanceManual).toBe(true);
@@ -332,17 +275,9 @@ describe('ledger.add / ledger.update', () => {
 
   it('updates an item: stages done, new due date, note', async () => {
     const jobId = await aJob();
-    const added = await runLocalTool(
-      'ledger.add',
-      { family: 'projects', description: 'מצגת', dueDate: '2026-12-20', stages: ['טיוטה', 'עיצוב'] },
-      { jobId, businessId: BUSINESS },
-    );
+    const added = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'projects', description: 'מצגת', dueDate: '2026-12-20', stages: ['טיוטה', 'עיצוב'] }, { ...{ jobId }, db }));
     const itemId = String(added['itemId']);
-    const out = await runLocalTool(
-      'ledger.update',
-      { itemId, stagesDone: [1], dueDate: '2026-12-27', note: 'הטיוטה מוכנה' },
-      { jobId, businessId: BUSINESS },
-    );
+    const out = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.update', { itemId, stagesDone: [1], dueDate: '2026-12-27', note: 'הטיוטה מוכנה' }, { ...{ jobId }, db }));
     expect(out.performed).toBe(true);
     const item = await loadLedgerItem(itemId, { businessId: BUSINESS });
     expect(item?.stages).toEqual([
@@ -354,17 +289,9 @@ describe('ledger.add / ledger.update', () => {
 
   it('update refuses a stage number out of range', async () => {
     const jobId = await aJob();
-    const added = await runLocalTool(
-      'ledger.add',
-      { family: 'projects', description: 'מצגת', dueDate: '2026-12-20', stages: ['טיוטה'] },
-      { jobId, businessId: BUSINESS },
-    );
+    const added = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'projects', description: 'מצגת', dueDate: '2026-12-20', stages: ['טיוטה'] }, { ...{ jobId }, db }));
     const code = await refusalCode(() =>
-      runLocalTool(
-        'ledger.update',
-        { itemId: String(added['itemId']), stagesDone: [2] },
-        { jobId, businessId: BUSINESS },
-      ),
+      withBusiness(BUSINESS, (db) => runLocalTool('ledger.update', { itemId: String(added['itemId']), stagesDone: [2] }, { ...{ jobId }, db })),
     );
     expect(code).toBe('local_tool_bad_input');
   });
@@ -393,11 +320,7 @@ describe('ledger.add / ledger.update', () => {
     );
     const jobId = await aJob();
     const code = await refusalCode(() =>
-      runLocalTool(
-        'ledger.update',
-        { itemId: foreign.itemId, description: 'נחטף' },
-        { jobId, businessId: BUSINESS },
-      ),
+      withBusiness(BUSINESS, (db) => runLocalTool('ledger.update', { itemId: foreign.itemId, description: 'נחטף' }, { ...{ jobId }, db })),
     );
     expect(code).toBe('ledger_item_not_found');
     const untouched = await loadLedgerItem(foreign.itemId, { businessId: OTHER });
@@ -407,7 +330,7 @@ describe('ledger.add / ledger.update', () => {
   it('update refuses a job that is not a boss instruction', async () => {
     const jobId = await aJob({ instruction: null });
     const code = await refusalCode(() =>
-      runLocalTool('ledger.update', { itemId: 'LI-nothing', description: 'x' }, { jobId, businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => runLocalTool('ledger.update', { itemId: 'LI-nothing', description: 'x' }, { ...{ jobId }, db })),
     );
     expect(code).toBe('ledger_not_boss_instruction');
   });

@@ -721,7 +721,7 @@ async function handleConnections(res: ServerResponse, businessId: string, sessio
   }
 
   const [bindings, grants] = await Promise.all([
-    loadBindings({ businessId }),
+    withBusiness(businessId, (db) => loadBindings(db)), // TENANCY-TODO(task 10)
     listGrants(businessId),
   ]);
 
@@ -823,7 +823,7 @@ async function handleDigestGet(
   error?: string,
 ): Promise<void> {
   const settings = await loadDigestSettings({ businessId });
-  const stored = await recentDigests({ businessId });
+  const stored = await withBusiness(businessId, (db) => recentDigests(db)); // TENANCY-TODO(task 10)
 
   let active: ActiveCharter | null;
   let liveUnavailable: string | undefined;
@@ -857,7 +857,7 @@ async function handleDigestGet(
     const now = new Date();
     const start = liveWindowStart(settings, kind, now, timeZone);
     const window = { kind, start, end: now, windowsCovered: 1 };
-    const rendered = renderDigest(await collectDigestFacts(window, ceilings, { businessId }));
+    const rendered = renderDigest(await withBusiness(businessId, (db) => collectDigestFacts(db, window, ceilings))); // TENANCY-TODO(task 10)
     live = { body: rendered.body, windowLabel: `${formatWindowStart(start, timeZone)} – עכשיו` };
   }
 
@@ -1112,7 +1112,7 @@ async function openOnInstructScreen(
   businessId: string,
 ): Promise<{ confirmations: PendingConfirmation[]; pending: PendingQuestion[] }> {
   const waiting = await pendingQuestions({ businessId });
-  const confirmations = await dashboardConfirmations({ businessId });
+  const confirmations = await withBusiness(businessId, (db) => dashboardConfirmations(db)); // TENANCY-TODO(task 10)
   return {
     confirmations: confirmations.map((c) => ({
       jobId: c.jobId,
@@ -1253,17 +1253,13 @@ async function handleInstructPost(
   }
 
   const calendar = doorOptions.calendar === undefined ? undefined : await doorOptions.calendar();
-  const outcome = await runInstruction(
-    { text },
-    {
-      businessId,
+  const outcome = await withBusiness(businessId, (db) => runInstruction(db, { text }, { // TENANCY-TODO(task 10)
       textOrigin: 'typed',
       channel: 'dashboard',
       ...(attachedDocumentIds.length > 0 ? { attachedDocumentIds } : {}),
       ...(doorOptions.planner !== undefined ? { planner: doorOptions.planner } : {}),
       ...(calendar !== undefined ? { calendar } : {}),
-    },
-  );
+    }));
   await renderInstructionOutcome(res, session, outcome, businessId);
 }
 
@@ -1668,9 +1664,7 @@ async function handleInstructConfirm(
     reading = { kind: 'confirm', planHash };
   }
 
-  const outcome = await applyConfirmation(jobId, reading, `dashboard:${session.username}`, {
-    businessId,
-  });
+  const outcome = await withBusiness(businessId, (db) => applyConfirmation(db, jobId, reading, `dashboard:${session.username}`)); // TENANCY-TODO(task 10)
   if (outcome === 'executing' || outcome === 'cancelled') return redirect(res, '/');
   sendHtml(
     res,
@@ -1706,7 +1700,7 @@ async function answerUnderClaim(
   // `handleInstructAnswer`'s docblock for the two ways skipping this check
   // broke. Read under the claim, so a concurrent request cannot move the
   // phase between this read and the transition at the end.
-  const job = await loadJob(jobId, { businessId });
+  const job = await withBusiness(businessId, (db) => loadJob(db, jobId)); // TENANCY-TODO(task 10)
   if (job === null) return sendHtml(res, 404, renderNotFound());
   if (job.phase !== 'understand') {
     return sendHtml(
@@ -1761,18 +1755,15 @@ async function answerUnderClaim(
     );
   }
 
-  const outcome = await runInstruction(
-    { text: `${instruction.text}\n\n${answer}` },
-    {
-      businessId,
-      // The answer above was typed into this form, but the text being planned
-      // is the JOIN of it and the parked instruction — and that instruction
-      // can have arrived as a WhatsApp voice note, whose text nobody typed.
-      // Positive, both halves: typed only if the stored half was typed too.
-      // Without this read, a typed answer to a question raised by a recording
-      // would launder the recorded half's addresses into "the owner typed
-      // this himself" one hop later, which is the whole defect the origin
-      // rule closes — reached through the dashboard rather than the door.
+  // The answer above was typed into this form, but the text being planned
+  // is the JOIN of it and the parked instruction — and that instruction
+  // can have arrived as a WhatsApp voice note, whose text nobody typed.
+  // Positive, both halves: typed only if the stored half was typed too.
+  // Without this read, a typed answer to a question raised by a recording
+  // would launder the recorded half's addresses into "the owner typed
+  // this himself" one hop later, which is the whole defect the origin
+  // rule closes — reached through the dashboard rather than the door.
+  const outcome = await withBusiness(businessId, async (db) => runInstruction(db, { text: `${instruction.text}\n\n${answer}` }, { // TENANCY-TODO(task 10)
       textOrigin: instruction.textOrigin === 'typed' ? 'typed' : 'transcribed',
       // A confirmation question is answered where it was asked (boss
       // command, spec §4) — this is the dashboard.
@@ -1791,20 +1782,18 @@ async function answerUnderClaim(
       // schedule routing stays OFF: the joined text is not a schedule question,
       // and one in the answer alone was handled read-only before the claim.
       ...(calendar !== undefined ? { calendar, scheduleRouting: false, answerTo: { jobId, answer } } : {}),
-    },
-  );
+    }));
 
   // The parked job always leaves `understand`; only the destination and the
   // reason differ. See this route's docblock on why a refusal CLOSES it
   // rather than leaving it parked — the answer is already recorded, so a job
   // left behind is open, invisible to `GET /instruct`, and never reported.
   if (outcome.status === 'refused') {
-    await transition(jobId, {
+    await withBusiness(businessId, (db) => transition(db, jobId, { // TENANCY-TODO(task 10)
       to: 'closed',
       actor: 'human',
       reason: REASON_ANSWER_REFUSED_HERE,
-      businessId,
-    });
+    }));
     return sendHtml(
       res,
       400,
@@ -1820,12 +1809,11 @@ async function answerUnderClaim(
   // outcome cannot come from here and there is always a replacement job.
   if (outcome.status === 'answered') return renderInstructionOutcome(res, session, outcome, businessId);
 
-  await transition(jobId, {
+  await withBusiness(businessId, (db) => transition(db, jobId, { // TENANCY-TODO(task 10)
     to: 'failed',
     actor: 'human',
     reason: reasonForSupersededJob(outcome),
-    businessId,
-  });
+  }));
 
   await renderInstructionOutcome(res, session, outcome, businessId);
 }
@@ -2358,7 +2346,7 @@ async function mailReplyOptions(
 
 /** The provider on the business's `mailbox` binding, or `null` when none is bound. */
 async function mailboxProviderOf(businessId: string): Promise<string | null> {
-  const bindings = await loadBindings({ businessId });
+  const bindings = await withBusiness(businessId, (db) => loadBindings(db)); // TENANCY-TODO(task 10)
   return bindings.find((b) => b.system === MAILBOX_SYSTEM)?.provider ?? null;
 }
 
@@ -2740,7 +2728,7 @@ async function handleDecision(
     // The job-phase half of `applyDecision`, run after the signature
     // transaction commits: `transition` opens its own transaction and takes
     // `FOR UPDATE` on the job row, so it cannot join the one above.
-    await resumeAfterDecision(decided, session.username, { businessId });
+    await withBusiness(businessId, (db) => resumeAfterDecision(db, decided, session.username)); // TENANCY-TODO(task 10)
     return redirect(res, '/');
   }
 
@@ -2805,19 +2793,14 @@ async function handleDecision(
     );
   }
 
-  await applyDecision(
-    approvalId,
-    // `applyDecision` only knows 'approved' | 'denied' — a signature is an
-    // extra act performed before this, not a third outcome it records itself.
-    outcome === 'denied' ? 'denied' : 'approved',
-    {
+  // `applyDecision` only knows 'approved' | 'denied' — a signature is an
+  // extra act performed before this, not a third outcome it records itself.
+  await withBusiness(businessId, (db) => applyDecision(db, approvalId, outcome === 'denied' ? 'denied' : 'approved', { // TENANCY-TODO(task 10)
       by: session.username,
       channel: 'dashboard',
       ...(note !== undefined ? { note } : {}),
       ...(edit.editedInput !== undefined ? { editedInput: edit.editedInput } : {}),
-    },
-    { businessId },
-  );
+    }));
 
   redirect(res, '/');
 }

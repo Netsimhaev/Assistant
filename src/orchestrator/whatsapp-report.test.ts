@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withTransaction, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, getPool, withBusiness, withBusinessTransaction } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
@@ -68,27 +68,26 @@ async function install(
   overrides: Parameters<typeof buildCharter>[0] = {},
 ): Promise<PolicyBundle> {
   charterCounter += 1;
-  return withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+  return withBusiness(BUSINESS, (bdb) => installCharter(
     bdb,
     buildCharter({ ...overrides, version: `wa-report-${charterCounter}` })
   ));
 }
 
 async function reload(jobId: string): Promise<Job> {
-  const loaded = await loadJob(jobId, { businessId: BUSINESS });
+  const loaded = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
   if (loaded === null) throw new Error('job vanished');
   return loaded;
 }
 
 /** A job walked through to `execute`, the same shape `runDueJobs` hands `runPlan`. */
 async function jobInExecute(bundle: PolicyBundle, provenance: TrustLevel = 'boss'): Promise<Job> {
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance,
-    businessId: BUSINESS,
-  });
+  }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
   return reload(job.jobId);
 }
@@ -113,7 +112,7 @@ async function linkToWhatsApp(jobId: string): Promise<{ messageId: string }> {
     { businessId: BUSINESS },
   );
   if (message === null) throw new Error('setup: duplicate inbound message id');
-  await linkWhatsAppMessage(jobId, message.id, { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (db) => linkWhatsAppMessage(db, jobId, message.id));
   await settleMessage(message.id, 'handled', {}, { businessId: BUSINESS });
   return { messageId: message.id };
 }
@@ -219,7 +218,7 @@ describe('reportWhatsAppJobs', () => {
       ],
     });
 
-    const run = await runPlanForJob({
+    const run = await withBusiness(job.businessId, (db) => runPlanForJob(db, {
       job,
       bundle,
       plan,
@@ -228,15 +227,15 @@ describe('reportWhatsAppJobs', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
     expect(run.status).toBe('done');
 
-    const closed = await closeVerifiedJobs({ businessId: BUSINESS });
+    const closed = await withBusiness(BUSINESS, (db) => closeVerifiedJobs(db));
     expect(closed.closed).toContain(job.jobId);
     expect((await reload(job.jobId)).phase).toBe('closed');
 
     const messenger = fakeMessenger();
-    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const report = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
 
     expect(report.reported).toBe(1);
     expect(report.errored).toEqual([]);
@@ -291,7 +290,7 @@ describe('reportWhatsAppJobs', () => {
       ],
     });
 
-    const run = await runPlan({
+    const run = await withBusiness(job.businessId, (db) => runPlan(db, {
       job,
       bundle,
       plan,
@@ -301,15 +300,15 @@ describe('reportWhatsAppJobs', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
     expect(run.status).toBe('done');
     expect(sent).toHaveLength(1);
 
-    const closed = await closeVerifiedJobs({ businessId: BUSINESS });
+    const closed = await withBusiness(BUSINESS, (db) => closeVerifiedJobs(db));
     expect(closed.closed).toContain(job.jobId);
 
     const messenger = fakeMessenger();
-    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const report = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
 
     expect(report.reported).toBe(1);
     expect(messenger.sentTexts[0]).toBe(PERFORMED_TEXT);
@@ -335,23 +334,23 @@ describe('reportWhatsAppJobs', () => {
       goal: 'ליצור קובץ',
       steps: [{ id: 's1', agent: 'prod.docs', intent: 'x', toolName: 'file.write', input: {} }],
     });
-    const binding = await bindPlanToJob(job.jobId, plan, { businessId: BUSINESS });
+    const binding = await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, plan));
     if (binding.status === 'conflict') throw new Error('unreachable');
 
-    await withTransaction(async (tx) => {
+    await withBusinessTransaction(BUSINESS, async (tx) => {
       await recordStepCompletion(tx, {
-        jobId: job.jobId, businessId: BUSINESS, planHash: binding.planHash, stepId: 's1',
+        jobId: job.jobId, planHash: binding.planHash, stepId: 's1',
         externalId: null, status: 'unknown', performed: null,
       });
     });
-    await transition(job.jobId, { to: 'verify', actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'verify', actor: 'orchestrator', reason: 'setup' }));
 
-    const closed = await closeVerifiedJobs({ businessId: BUSINESS });
+    const closed = await withBusiness(BUSINESS, (db) => closeVerifiedJobs(db));
     expect(closed.failed.map((f) => f.jobId)).toContain(job.jobId);
     expect((await reload(job.jobId)).phase).toBe('failed');
 
     const messenger = fakeMessenger();
-    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const report = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
 
     expect(report.reported).toBe(1);
     expect(messenger.sentTexts[0]).toBe(FAILED_GENERIC_TEXT);
@@ -371,10 +370,10 @@ describe('reportWhatsAppJobs', () => {
     await linkToWhatsApp(job.jobId);
 
     const rawReason = 'credential_unavailable — OFFICE_MAIL';
-    await transition(job.jobId, { to: 'failed', actor: 'orchestrator', reason: rawReason, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'failed', actor: 'orchestrator', reason: rawReason }));
 
     const messenger = fakeMessenger();
-    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const report = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
 
     expect(report.reported).toBe(1);
     expect(messenger.sentTexts[0]).toBe(failedText(rawReason));
@@ -390,26 +389,24 @@ describe('reportWhatsAppJobs', () => {
    */
   it('does not misattribute a non-failure reason on the branch-5 catch-all', async () => {
     const bundle = await install();
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     await linkToWhatsApp(job.jobId);
-    await transition(job.jobId, { to: 'understand', actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'understand', actor: 'orchestrator', reason: 'setup' }));
 
     // `understand → closed` directly, no bound plan at all — the record
     // cannot possibly support a "performed" claim, so this lands on branch 5
     // regardless of what the transition's own reason says.
-    await transition(job.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'closed',
       actor: 'orchestrator',
       reason: 'closed after the curator pass',
-      businessId: BUSINESS,
-    });
+    }));
 
     const messenger = fakeMessenger();
-    await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
 
     expect(messenger.sentTexts[0]).toBe(FAILED_GENERIC_TEXT);
     expect(messenger.sentTexts[0]).not.toContain('curator');
@@ -458,7 +455,7 @@ describe('reportWhatsAppJobs', () => {
       ],
     });
 
-    const first = await runPlan({
+    const first = await withBusiness(job.businessId, (db) => runPlan(db, {
       job, bundle, plan,
       registry: new AdapterRegistry([mail]),
       bindings: [MAIL_LIVE],
@@ -466,7 +463,7 @@ describe('reportWhatsAppJobs', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
     expect(first.status).toBe('halted');
     expect((await reload(job.jobId)).phase).toBe('await_approval');
 
@@ -479,9 +476,9 @@ describe('reportWhatsAppJobs', () => {
 
     // Pass 1: the interim notice.
     const messenger = fakeMessenger();
-    const interimReport = await reportWhatsAppJobs({
-      messenger, businessId: BUSINESS, dashboardBaseUrl: 'http://127.0.0.1:9999',
-    });
+    const interimReport = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, {
+      messenger, dashboardBaseUrl: 'http://127.0.0.1:9999',
+    }));
     expect(interimReport.reported).toBe(1);
     expect(messenger.sentTexts[0]).toBe(
       awaitingApprovalText(`http://127.0.0.1:9999/a/${approvalId}`),
@@ -489,14 +486,14 @@ describe('reportWhatsAppJobs', () => {
     expect(await messageState(messageId)).toBe('reported_interim');
 
     // Pass 2: nothing changed — no duplicate interim notice.
-    const secondPass = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const secondPass = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
     expect(secondPass.reported).toBe(0);
     expect(messenger.sentTexts).toHaveLength(1);
     expect(await messageState(messageId)).toBe('reported_interim');
 
     // The owner approves from the dashboard; the plan runs to completion.
-    await applyDecision(approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }, { businessId: BUSINESS });
-    const second = await runPlan({
+    await withBusiness(BUSINESS, (db) => applyDecision(db, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
+    const second = await withBusiness(BUSINESS, async (db) => runPlan(db, {
       job: await reload(job.jobId), bundle, plan,
       registry: new AdapterRegistry([mail]),
       bindings: [MAIL_LIVE],
@@ -504,22 +501,22 @@ describe('reportWhatsAppJobs', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
     expect(second.status).toBe('done');
     expect(sent).toHaveLength(1);
-    await closeVerifiedJobs({ businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => closeVerifiedJobs(db));
     expect((await reload(job.jobId)).phase).toBe('closed');
 
     // Pass 3: the real, terminal report — the one the owner was actually
     // waiting for.
-    const terminalReport = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const terminalReport = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
     expect(terminalReport.reported).toBe(1);
     expect(messenger.sentTexts).toHaveLength(2);
     expect(messenger.sentTexts[1]).toBe(PERFORMED_TEXT);
     expect(await messageState(messageId)).toBe('reported');
 
     // And report-once holds for the terminal claim too.
-    const fourthPass = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const fourthPass = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
     expect(fourthPass.reported).toBe(0);
     expect(messenger.sentTexts).toHaveLength(2);
   });
@@ -566,7 +563,7 @@ describe('reportWhatsAppJobs', () => {
       ],
     });
 
-    const run = await runPlan({
+    const run = await withBusiness(job.businessId, (db) => runPlan(db, {
       job, bundle, plan,
       registry: new AdapterRegistry([mail]),
       bindings: [MAIL_LIVE],
@@ -574,7 +571,7 @@ describe('reportWhatsAppJobs', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
     expect(run.status).toBe('halted');
 
     const { rows } = await getPool().query<{ approval_id: string }>(
@@ -586,11 +583,11 @@ describe('reportWhatsAppJobs', () => {
 
     // `decide` alone — the row leaves `pending`, but the job's own phase is
     // untouched (still `await_approval`), the exact race window named above.
-    await withBusiness(BUSINESS, (bdb) => decide(bdb, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' })); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => decide(bdb, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
     expect((await reload(job.jobId)).phase).toBe('await_approval');
 
     const messenger = fakeMessenger();
-    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const report = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
 
     expect(report.reported).toBe(0);
     expect(report.deferred).toBe(1);
@@ -639,7 +636,7 @@ describe('reportWhatsAppJobs', () => {
       ],
     });
 
-    const run = await runPlan({
+    const run = await withBusiness(job.businessId, (db) => runPlan(db, {
       job, bundle, plan,
       registry: new AdapterRegistry([mail]),
       bindings: [MAIL_LIVE],
@@ -647,7 +644,7 @@ describe('reportWhatsAppJobs', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
     expect(run.status).toBe('halted');
 
     const { rows } = await getPool().query<{ approval_id: string }>(
@@ -659,13 +656,13 @@ describe('reportWhatsAppJobs', () => {
 
     // The fuse burned out, but `expireOverdue` has not swept it yet — still
     // `state = 'pending'`, just past its own `expires_at`.
-    await getPool().query(
+    await testDb().query(
       `UPDATE approval_requests SET expires_at = now() - interval '1 hour' WHERE approval_id = $1`,
       [approvalId],
     );
 
     const messenger = fakeMessenger();
-    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const report = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
 
     expect(report.reported).toBe(0);
     expect(report.deferred).toBe(1);
@@ -719,7 +716,7 @@ describe('reportWhatsAppJobs', () => {
       ],
     });
 
-    const run = await runPlan({
+    const run = await withBusiness(job.businessId, (db) => runPlan(db, {
       job, bundle, plan,
       registry: new AdapterRegistry([mail]),
       bindings: [MAIL_LIVE],
@@ -727,7 +724,7 @@ describe('reportWhatsAppJobs', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
     expect(run.status).toBe('halted');
     expect((await reload(job.jobId)).phase).toBe('await_approval');
 
@@ -739,9 +736,9 @@ describe('reportWhatsAppJobs', () => {
     if (approvalId === undefined) throw new Error('expected a queued approval');
 
     const messenger = fakeMessenger();
-    const report = await reportWhatsAppJobs({
-      messenger, businessId: BUSINESS, dashboardBaseUrl: 'http://127.0.0.1:9999',
-    });
+    const report = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, {
+      messenger, dashboardBaseUrl: 'http://127.0.0.1:9999',
+    }));
 
     expect(report.reported).toBe(1);
     expect(report.deferred).toBe(0);
@@ -768,7 +765,7 @@ describe('reportWhatsAppJobs', () => {
       steps: [{ id: 's1', agent: 'prod.docs', intent: 'x', toolName: 'file.write', input: { path: 'x', content: 'x' } }],
     });
 
-    const run = await runPlan({
+    const run = await withBusiness(job.businessId, (db) => runPlan(db, {
       job, bundle, plan,
       registry: new AdapterRegistry([]),
       bindings: [],
@@ -776,12 +773,12 @@ describe('reportWhatsAppJobs', () => {
       counterpartyTags: [],
       rampLevel: 'draft_only',
       now: NOON,
-    });
+    }));
     expect(run.status).toBe('halted');
     expect((await reload(job.jobId)).phase).toBe('failed');
 
     const messenger = fakeMessenger();
-    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const report = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
 
     expect(report.reported).toBe(1);
     expect(messenger.sentTexts[0]).toBe(NOT_PERMITTED_TEXT);
@@ -818,7 +815,7 @@ describe('reportWhatsAppJobs', () => {
       steps: [{ id: 's1', agent: 'prod.docs', intent: 'x', toolName: 'file.write', input: { path: 'x', content: 'x' } }],
     });
 
-    const run = await runPlan({
+    const run = await withBusiness(job.businessId, (db) => runPlan(db, {
       job, bundle, plan,
       registry: new AdapterRegistry([]),
       bindings: [],
@@ -826,7 +823,7 @@ describe('reportWhatsAppJobs', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
-    });
+    }));
     expect(run.status).toBe('halted');
     if (run.status !== 'halted') throw new Error('unreachable');
     // Not an autonomy-ramp denial this time — a hard, unconditional
@@ -837,7 +834,7 @@ describe('reportWhatsAppJobs', () => {
     expect((await reload(job.jobId)).phase).toBe('failed');
 
     const messenger = fakeMessenger();
-    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const report = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
 
     expect(report.reported).toBe(1);
     expect(messenger.sentTexts[0]).toBe(NOT_PERMITTED_TEXT);
@@ -877,7 +874,7 @@ describe('reportWhatsAppJobs', () => {
       ],
     });
 
-    const run = await runPlan({
+    const run = await withBusiness(job.businessId, (db) => runPlan(db, {
       job, bundle, plan,
       registry: new AdapterRegistry([stallingMailAdapter()]),
       bindings: [MAIL_LIVE],
@@ -886,7 +883,7 @@ describe('reportWhatsAppJobs', () => {
       rampLevel: 'auto',
       now: NOON,
       adapterTimeoutMs: 25,
-    });
+    }));
     expect(run.status).toBe('halted');
     if (run.status !== 'halted') throw new Error('unreachable');
     expect(run.reason).toBe('deferred');
@@ -897,7 +894,7 @@ describe('reportWhatsAppJobs', () => {
     // `classifyJob` takes `phase` as a plain argument — simulating the job
     // having reached `failed` (as `closeVerifiedJobs` would eventually leave
     // it) without needing to actually resolve the hang first.
-    const verdict = asReport(await classifyJob(job.jobId, 'failed', BUSINESS));
+    const verdict = asReport(await withBusiness(BUSINESS, (db) => classifyJob(db, job.jobId, 'failed')));
     expect(verdict.outcome).toBe('failed');
     expect(verdict.outcome).not.toBe('not_implemented');
 
@@ -914,19 +911,18 @@ describe('reportWhatsAppJobs', () => {
     const job = await jobInExecute(bundle);
     await linkToWhatsApp(job.jobId);
 
-    await transition(job.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'failed',
       actor: 'orchestrator',
       reason: 'שגיאה חד-פעמית',
-      businessId: BUSINESS,
-    });
+    }));
 
     const messenger = fakeMessenger();
-    const first = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const first = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
     expect(first.reported).toBe(1);
     expect(messenger.sentTexts).toHaveLength(1);
 
-    const second = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const second = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
     expect(second.reported).toBe(0);
     // Nothing new sent — the second call found no unreported candidate at all.
     expect(messenger.sentTexts).toHaveLength(1);
@@ -934,27 +930,24 @@ describe('reportWhatsAppJobs', () => {
 
   it('ignores jobs that did not come from WhatsApp', async () => {
     const bundle = await install();
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
-    });
+    }));
     // Never linked — `whatsapp_message_id` stays NULL.
-    await transition(job.jobId, {
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'understand',
       actor: 'orchestrator',
       reason: 'setup',
-      businessId: BUSINESS,
-    });
-    await transition(job.jobId, {
+    }));
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'closed',
       actor: 'orchestrator',
       reason: 'closed outside the door entirely',
-      businessId: BUSINESS,
-    });
+    }));
 
     const messenger = fakeMessenger();
-    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const report = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
 
     expect(report.reported).toBe(0);
     expect(messenger.sentTexts).toHaveLength(0);
@@ -974,7 +967,7 @@ describe('reportWhatsAppJobs', () => {
     // Left in `execute` on purpose — no further transition.
 
     const messenger = fakeMessenger();
-    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const report = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
 
     expect(report.reported).toBe(0);
     expect(messenger.sentTexts).toHaveLength(0);
@@ -997,28 +990,28 @@ describe('reportWhatsAppJobs', () => {
       goal: 'x',
       steps: [{ id: 's1', agent: 'prod.docs', intent: 'x', toolName: 'file.write', input: {} }],
     });
-    const binding = await bindPlanToJob(poison.jobId, poisonPlan, { businessId: BUSINESS });
+    const binding = await withBusiness(BUSINESS, (db) => bindPlanToJob(db, poison.jobId, poisonPlan));
     if (binding.status === 'conflict') throw new Error('unreachable');
     // Corrupt the stored plan body in place so `loadPlanBody` throws when
     // this pass reaches it.
-    await getPool().query(
+    await testDb().query(
       `UPDATE job_plans SET plan = '{"not":"a plan"}'::jsonb WHERE job_id = $1`,
       [poison.jobId],
     );
-    await transition(poison.jobId, {
-      to: 'failed', actor: 'orchestrator', reason: 'irrelevant', businessId: BUSINESS,
-    });
+    await withBusiness(BUSINESS, (db) => transition(db, poison.jobId, {
+      to: 'failed', actor: 'orchestrator', reason: 'irrelevant', 
+    }));
 
     // Created after the poison job, so `ORDER BY updated_at ASC` places it
     // second — exactly the position the starvation bug would never reach.
     const healthy = await jobInExecute(bundle);
     await linkToWhatsApp(healthy.jobId);
-    await transition(healthy.jobId, {
-      to: 'failed', actor: 'orchestrator', reason: 'שגיאה רגילה', businessId: BUSINESS,
-    });
+    await withBusiness(BUSINESS, (db) => transition(db, healthy.jobId, {
+      to: 'failed', actor: 'orchestrator', reason: 'שגיאה רגילה', 
+    }));
 
     const messenger = fakeMessenger();
-    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const report = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
 
     expect(report.errored).toEqual([poison.jobId]);
     expect(report.reported).toBe(1);
@@ -1050,19 +1043,19 @@ describe('classifyJob', () => {
 
   async function jobWithBoundPlan(): Promise<{ jobId: string; planHash: string }> {
     const bundle = await install();
-    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
     for (const to of ['understand', 'plan', 'execute'] as const) {
-      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
-    await bindPlanToJob(job.jobId, PLAN, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, PLAN));
     return { jobId: job.jobId, planHash: planHashOf(PLAN) };
   }
 
   it('branch 1 outranks the phase — not_implemented regardless of what the phase says', async () => {
     const { jobId, planHash } = await jobWithBoundPlan();
-    await withTransaction(async (tx) => {
+    await withBusinessTransaction(BUSINESS, async (tx) => {
       await recordStepCompletion(tx, {
-        jobId, businessId: BUSINESS, planHash, stepId: 's1',
+        jobId, planHash, stepId: 's1',
         externalId: null, status: 'completed', performed: false,
       });
     });
@@ -1071,24 +1064,24 @@ describe('classifyJob', () => {
     // re-reads the row itself, so passing `'closed'` here exercises branch 1
     // against the phase branch 4 would otherwise have claimed, without
     // needing the job to actually be there.
-    const verdict = asReport(await classifyJob(jobId, 'closed', BUSINESS));
+    const verdict = asReport(await withBusiness(BUSINESS, (db) => classifyJob(db, jobId, 'closed')));
     expect(verdict.outcome).toBe('not_implemented');
   });
 
   it('branch 4 requires every declared step to have a completed row, not just some', async () => {
     const { jobId, planHash } = await jobWithBoundPlan();
     // No row at all for 's1' — the only declared step.
-    const verdict = asReport(await classifyJob(jobId, 'closed', BUSINESS));
+    const verdict = asReport(await withBusiness(BUSINESS, (db) => classifyJob(db, jobId, 'closed')));
     expect(verdict.outcome).toBe('failed');
     expect(verdict.failReason).toBeNull();
 
-    await withTransaction(async (tx) => {
+    await withBusinessTransaction(BUSINESS, async (tx) => {
       await recordStepCompletion(tx, {
-        jobId, businessId: BUSINESS, planHash, stepId: 's1',
+        jobId, planHash, stepId: 's1',
         externalId: null, status: 'completed', performed: true,
       });
     });
-    const second = asReport(await classifyJob(jobId, 'closed', BUSINESS));
+    const second = asReport(await withBusiness(BUSINESS, (db) => classifyJob(db, jobId, 'closed')));
     expect(second.outcome).toBe('performed');
   });
 
@@ -1106,25 +1099,25 @@ describe('classifyJob', () => {
   it('treats an honestly-unknown row differently from a genuinely not-performed one', async () => {
     // Case A: performed: false, status: completed — must trigger branch 1.
     const a = await jobWithBoundPlan();
-    await withTransaction(async (tx) => {
+    await withBusinessTransaction(BUSINESS, async (tx) => {
       await recordStepCompletion(tx, {
-        jobId: a.jobId, businessId: BUSINESS, planHash: a.planHash, stepId: 's1',
+        jobId: a.jobId, planHash: a.planHash, stepId: 's1',
         externalId: null, status: 'completed', performed: false,
       });
     });
-    const verdictA = asReport(await classifyJob(a.jobId, 'failed', BUSINESS));
+    const verdictA = asReport(await withBusiness(BUSINESS, (db) => classifyJob(db, a.jobId, 'failed')));
     expect(verdictA.outcome).toBe('not_implemented');
 
     // Case B: performed: null, status: unknown — must NOT trigger branch 1,
     // and must not be mistaken for "not implemented" either (ruling 4).
     const b = await jobWithBoundPlan();
-    await withTransaction(async (tx) => {
+    await withBusinessTransaction(BUSINESS, async (tx) => {
       await recordStepCompletion(tx, {
-        jobId: b.jobId, businessId: BUSINESS, planHash: b.planHash, stepId: 's1',
+        jobId: b.jobId, planHash: b.planHash, stepId: 's1',
         externalId: null, status: 'unknown', performed: null,
       });
     });
-    const verdictB = asReport(await classifyJob(b.jobId, 'failed', BUSINESS));
+    const verdictB = asReport(await withBusiness(BUSINESS, (db) => classifyJob(db, b.jobId, 'failed')));
     expect(verdictB.outcome).toBe('failed');
   });
 
@@ -1137,14 +1130,14 @@ describe('classifyJob', () => {
    */
   it('defers an await_approval job with no live approval row, regardless of any recorded step', async () => {
     const { jobId } = await jobWithBoundPlan();
-    await withTransaction(async (tx) => {
+    await withBusinessTransaction(BUSINESS, async (tx) => {
       await recordStepCompletion(tx, {
-        jobId, businessId: BUSINESS, planHash: planHashOf(PLAN), stepId: 's1',
+        jobId, planHash: planHashOf(PLAN), stepId: 's1',
         externalId: null, status: 'completed', performed: false,
       });
     });
 
-    const verdict = await classifyJob(jobId, 'await_approval', BUSINESS);
+    const verdict = await withBusiness(BUSINESS, (db) => classifyJob(db, jobId, 'await_approval'));
     expect(verdict.status).toBe('defer');
   });
 });
@@ -1264,14 +1257,14 @@ describe('reportWhatsAppJobs — boss commands (spec §4.6)', () => {
     reaskOf?: string;
   }): Promise<string> {
     const bundle = await install();
-    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
     if (o.instruction) {
       await saveInstruction({ jobId: job.jobId, text: 'תשלחי לדנה', textOrigin: 'typed' }, { businessId: BUSINESS });
     }
     for (const to of ['understand', 'plan'] as const) {
-      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
-    const binding = await bindPlanToJob(job.jobId, SEND_PLAN, { businessId: BUSINESS });
+    const binding = await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, SEND_PLAN));
     if (binding.status === 'conflict') throw new Error('setup: plan conflict');
     await createConfirmation(
       {
@@ -1286,10 +1279,10 @@ describe('reportWhatsAppJobs — boss commands (spec §4.6)', () => {
     if (o.confirm) {
       expect(await confirmChoice(job.jobId, binding.planHash, 'p_boss', { businessId: BUSINESS })).toBe(true);
     }
-    await transition(job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
-    await withTransaction(async (tx) => {
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'setup' }));
+    await withBusinessTransaction(BUSINESS, async (tx) => {
       await recordStepCompletion(tx, {
-        jobId: job.jobId, businessId: BUSINESS, planHash: binding.planHash, stepId: 's1',
+        jobId: job.jobId, planHash: binding.planHash, stepId: 's1',
         externalId: 'MSG-1', status: 'completed', performed: true,
       });
     });
@@ -1298,7 +1291,7 @@ describe('reportWhatsAppJobs — boss commands (spec §4.6)', () => {
 
   async function close(jobId: string): Promise<void> {
     for (const to of ['verify', 'remember', 'closed'] as const) {
-      await transition(jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
   }
 
@@ -1307,7 +1300,7 @@ describe('reportWhatsAppJobs — boss commands (spec §4.6)', () => {
     await close(jobId);
     await linkToWhatsApp(jobId);
     const messenger = fakeMessenger();
-    await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
     expect(PERFORMED_ON_CONFIRMATION_TEXT).toBe('בוצע לפי אישורך.');
     expect(messenger.sentTexts).toEqual([PERFORMED_ON_CONFIRMATION_TEXT]);
   });
@@ -1319,35 +1312,35 @@ describe('reportWhatsAppJobs — boss commands (spec §4.6)', () => {
     const notConfirmed = await seed({ instruction: true, confirm: false });
     for (const jobId of [noInstruction, notConfirmed]) {
       await close(jobId);
-      expect(asReport(await classifyJob(jobId, 'closed', BUSINESS)).outcome).toBe('performed');
+      expect(asReport(await withBusiness(BUSINESS, (db) => classifyJob(db, jobId, 'closed'))).outcome).toBe('performed');
     }
     const confirmed = await seed({ instruction: true, confirm: true });
     await close(confirmed);
-    expect(asReport(await classifyJob(confirmed, 'closed', BUSINESS)).outcome).toBe('performed_on_confirmation');
+    expect(asReport(await withBusiness(BUSINESS, (db) => classifyJob(db, confirmed, 'closed'))).outcome).toBe('performed_on_confirmation');
     // Closed only: a halted job, even with every step done, is not "done on your word".
-    expect(asReport(await classifyJob(confirmed, 'halted', BUSINESS)).outcome).toBe('performed');
+    expect(asReport(await withBusiness(BUSINESS, (db) => classifyJob(db, confirmed, 'halted'))).outcome).toBe('performed');
     await linkToWhatsApp(noInstruction);
     const messenger = fakeMessenger();
-    await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
     expect(messenger.sentTexts).toEqual([PERFORMED_TEXT]);
   });
 
   it('a re-asked job is not reported; its successor reports once on the same message', async () => {
     const oldJobId = await seed({ instruction: true, confirm: true });
-    await transition(oldJobId, { to: 'failed', actor: 'orchestrator', reason: 'adapter_timeout', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, oldJobId, { to: 'failed', actor: 'orchestrator', reason: 'adapter_timeout' }));
     const { messageId } = await linkToWhatsApp(oldJobId);
     const newJobId = await seed({ instruction: true, confirm: true, reaskOf: oldJobId });
-    await linkWhatsAppMessage(newJobId, messageId, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => linkWhatsAppMessage(db, newJobId, messageId));
 
     // The old job has failed and the successor is still running: nothing.
     const messenger = fakeMessenger();
-    await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
     expect(messenger.sentTexts).toEqual([]);
     expect(await messageState(messageId)).toBe('handled');
 
     await close(newJobId);
-    await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
-    await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
+    await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
     expect(messenger.sentTexts).toEqual([PERFORMED_ON_CONFIRMATION_TEXT]);
     expect(messenger.sentJobIds).toEqual([newJobId]);
     expect(await messageState(messageId)).toBe('reported');
@@ -1355,11 +1348,11 @@ describe('reportWhatsAppJobs — boss commands (spec §4.6)', () => {
 
   it('a job failed for a re-ask still being built is not reported as failed', async () => {
     const jobId = await seed({ instruction: true, confirm: true });
-    await transition(jobId, { to: 'followup', actor: 'orchestrator', reason: 'x', businessId: BUSINESS });
-    await transition(jobId, { to: 'failed', actor: 'orchestrator', reason: REASK_REASON, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'followup', actor: 'orchestrator', reason: 'x' }));
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'failed', actor: 'orchestrator', reason: REASK_REASON }));
     await linkToWhatsApp(jobId);
     const messenger = fakeMessenger();
-    await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
     expect(messenger.sentTexts).toEqual([]);
   });
 });
@@ -1391,32 +1384,32 @@ describe('reportWhatsAppJobs — document production (spec §4)', () => {
   async function producedJob(queued: boolean): Promise<string> {
     const bundle = await install();
     const job = await jobInExecute(bundle);
-    await bindPlanToJob(job.jobId, PRODUCE_PLAN, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, PRODUCE_PLAN));
     await linkToWhatsApp(job.jobId);
     if (queued) {
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO document_productions (production_id, business_id, origin_job_id, instruction_text, text_origin,
                                            format, language, kind, destination, stage)
          VALUES ($1, $2, $3, 'מכתב', 'typed', 'docx', 'he', 'letter', '{"mode":"save","folder":null}', 'ready')`,
         [`DP-${job.jobId}`, BUSINESS, job.jobId],
       );
     }
-    await transition(job.jobId, { to: 'followup', actor: 'orchestrator', reason: 'parked', businessId: BUSINESS });
-    await transition(job.jobId, { to: 'closed', actor: 'orchestrator', reason: 'produced', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'followup', actor: 'orchestrator', reason: 'parked' }));
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'closed', actor: 'orchestrator', reason: 'produced' }));
     return job.jobId;
   }
 
   it('a job whose only step is doc.produce and that queued a production is not reported — the card is the report', async () => {
     await producedJob(true);
     const messenger = fakeMessenger();
-    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const report = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
     expect(report.reported).toBe(0);
     expect(messenger.sentTexts).toEqual([]);
 
     // Control: the same job with no production row (the handler refused
     // before queueing) IS reported — the exclusion keys on the production.
     const refused = await producedJob(false);
-    const second = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    const second = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
     expect(second.reported).toBe(1);
     expect(messenger.sentJobIds).toEqual([refused]);
   });

@@ -40,11 +40,10 @@ async function aReading(): Promise<string> {
 }
 
 async function aJob() {
-  return createJob({
+  return withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'unknown_external',
-    businessId: BUSINESS,
-  });
+  }));
 }
 
 // Every proposal needs a real job to satisfy the `job_id` foreign key, and
@@ -64,7 +63,7 @@ function newProposal(readingId: string, overrides: Partial<NewProposal> = {}): N
 
 beforeEach(async () => {
   await resetDatabase();
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
   DEFAULT_JOB_ID = (await aJob()).jobId;
 });
 afterAll(async () => { await closePool(); });
@@ -72,86 +71,72 @@ afterAll(async () => { await closePool(); });
 describe('saveProposal', () => {
   it('stores a proposal and hands it back', async () => {
     const readingId = await aReading();
-    const record = await saveProposal(newProposal(readingId), { businessId: BUSINESS });
+    const record = await withBusiness(BUSINESS, (db) => saveProposal(db, newProposal(readingId)));
     expect(record.status).toBe('proposed');
     expect(record.content?.headline).toBe('אשיב לדנה');
   });
 
   it('stores an unproposable outcome, because a failed attempt is a fact', async () => {
     const readingId = await aReading();
-    const record = await saveProposal(
-      newProposal(readingId, { status: 'unproposable', reason: 'no JSON object', content: null }),
-      { businessId: BUSINESS },
-    );
+    const record = await withBusiness(BUSINESS, (db) => saveProposal(db, newProposal(readingId, { status: 'unproposable', reason: 'no JSON object', content: null })));
     expect(record.reason).toBe('no JSON object');
     expect(record.content).toBeNull();
   });
 
   it('stores a second proposal for the same reading rather than replacing the first', async () => {
     const readingId = await aReading();
-    const first = await saveProposal(newProposal(readingId), { businessId: BUSINESS });
-    const second = await saveProposal(newProposal(readingId), { businessId: BUSINESS });
+    const first = await withBusiness(BUSINESS, (db) => saveProposal(db, newProposal(readingId)));
+    const second = await withBusiness(BUSINESS, (db) => saveProposal(db, newProposal(readingId)));
     expect(second.proposalId).not.toBe(first.proposalId);
-    const all = await loadProposalsForReading(readingId, { businessId: BUSINESS });
+    const all = await withBusiness(BUSINESS, (db) => loadProposalsForReading(db, readingId));
     expect(all).toHaveLength(2);
   });
 
   it('refuses a proposed row with no content', async () => {
     const readingId = await aReading();
     await expect(
-      saveProposal(newProposal(readingId, { content: null }), { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => saveProposal(db, newProposal(readingId, { content: null }))),
     ).rejects.toThrow();
   });
 
   it('refuses an unproposable row that carries content', async () => {
     const readingId = await aReading();
     await expect(
-      saveProposal(
-        newProposal(readingId, { status: 'unproposable', reason: 'no JSON object', content: PROPOSAL }),
-        { businessId: BUSINESS },
-      ),
+      withBusiness(BUSINESS, (db) => saveProposal(db, newProposal(readingId, { status: 'unproposable', reason: 'no JSON object', content: PROPOSAL }))),
     ).rejects.toThrow();
   });
 
   it('does not cross the business boundary', async () => {
     const readingId = await aReading();
-    await saveProposal(newProposal(readingId), { businessId: BUSINESS });
-    expect(await loadProposalsForReading(readingId, { businessId: 'other' })).toEqual([]);
+    await withBusiness(BUSINESS, (db) => saveProposal(db, newProposal(readingId)));
+    expect(await withBusiness('other', (db) => loadProposalsForReading(db, readingId))).toEqual([]);
   });
 
   it('carries the raw model text back on a proposed row', async () => {
     const readingId = await aReading();
-    const record = await saveProposal(
-      newProposal(readingId, { raw: '{"stance": "act", "headline": "..."}' }),
-      { businessId: BUSINESS },
-    );
+    const record = await withBusiness(BUSINESS, (db) => saveProposal(db, newProposal(readingId, { raw: '{"stance": "act", "headline": "..."}' })));
     expect(record.raw).toBe('{"stance": "act", "headline": "..."}');
   });
 
   it('carries the raw model text back on an unproposable row, for diagnosis', async () => {
     const readingId = await aReading();
-    const record = await saveProposal(
-      newProposal(readingId, {
+    const record = await withBusiness(BUSINESS, (db) => saveProposal(db, newProposal(readingId, {
         status: 'unproposable',
         reason: 'no JSON object',
         content: null,
         raw: 'זו לא תשובת JSON תקינה',
-      }),
-      { businessId: BUSINESS },
-    );
+      })));
     expect(record.raw).toBe('זו לא תשובת JSON תקינה');
   });
 
   it('records which job the proposal was made for', async () => {
     const readingId = await aReading();
-    const job = await createJob({
-      charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS,
-    });
-    const record = await saveProposal(
-      newProposal(readingId, { jobId: job.jobId }), { businessId: BUSINESS },
-    );
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
+      charterVersion: bundle.charterVersion, provenance: 'boss', 
+    }));
+    const record = await withBusiness(BUSINESS, (db) => saveProposal(db, newProposal(readingId, { jobId: job.jobId })));
     expect(record.jobId).toBe(job.jobId);
-    const all = await loadProposalsForReading(readingId, { businessId: BUSINESS });
+    const all = await withBusiness(BUSINESS, (db) => loadProposalsForReading(db, readingId));
     expect(all[0]?.jobId).toBe(job.jobId);
   });
 });

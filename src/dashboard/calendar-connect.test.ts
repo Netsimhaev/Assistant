@@ -127,10 +127,7 @@ async function connectLive(): Promise<void> {
     },
     key,
   );
-  await upsertBinding(
-    { system: CALENDAR_SYSTEM, status: 'live', endpoint: null, credentialRef: 'OAUTH_CALENDAR', provider: 'google', lastOkAt: null, lastError: null },
-    { businessId: BUSINESS, by: 'test' },
-  );
+  await withBusiness(BUSINESS, (db) => upsertBinding(db, { system: CALENDAR_SYSTEM, status: 'live', endpoint: null, credentialRef: 'OAUTH_CALENDAR', provider: 'google', lastOkAt: null, lastError: null }, { by: 'test' }));
 }
 
 describe('calendar sign page', () => {
@@ -216,10 +213,7 @@ describe('the way back', () => {
     await seedProviderApp('google');
     await installSignedCalendar('google');
     await connectLive();
-    await upsertBinding(
-      { system: CALENDAR_SYSTEM, status: 'disconnected', endpoint: null, credentialRef: 'OAUTH_CALENDAR', provider: 'google', lastOkAt: null, lastError: null },
-      { businessId: BUSINESS, by: 'test' },
-    );
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, { system: CALENDAR_SYSTEM, status: 'disconnected', endpoint: null, credentialRef: 'OAUTH_CALENDAR', provider: 'google', lastOkAt: null, lastError: null }, { by: 'test' }));
     const baseUrl = await startServer();
     const cookie = await login(baseUrl);
     const status = await (await fetch(`${baseUrl}/connections/calendar`, { headers: { cookie } })).text();

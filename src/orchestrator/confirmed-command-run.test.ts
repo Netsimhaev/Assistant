@@ -19,7 +19,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { loadAutonomyMode } from '../governance/autonomy-mode.js';
@@ -82,27 +82,26 @@ function runtimeWith(sent: MailMessage[]): Runtime {
 }
 
 async function seedCommand(options: { confirm: boolean }): Promise<string> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
     bdb,
     buildCharter({ version: '2026-08-15.confirmed-run', connections: [MAIL_CONNECTION] })
   ));
-  expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off'); // TENANCY-TODO(task 4)
+  expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off');
   expect(bundle.autonomyBase['email.initiate']).toBe('approve_required');
 
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
     title: 'confirmed-command',
-  });
+  }));
   await saveInstruction(
     { jobId: job.jobId, text: 'תשלחי ל-stranger@nowhere.example את ההצעה', textOrigin: 'typed' },
     { businessId: BUSINESS },
   );
   for (const to of ['understand', 'plan'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
-  await bindPlanToJob(job.jobId, PLAN, { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, PLAN));
   const planHash = planHashOf(PLAN);
   await createConfirmation(
     {
@@ -116,10 +115,9 @@ async function seedCommand(options: { confirm: boolean }): Promise<string> {
   if (options.confirm) {
     expect(await confirmChoice(job.jobId, planHash, 'p_boss', { businessId: BUSINESS })).toBe(true);
   }
-  await transition(job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+  await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'setup' }));
 
-  await upsertBinding(
-    {
+  await withBusiness(BUSINESS, (db) => upsertBinding(db, {
       system: 'office-mail',
       status: 'live',
       endpoint: null,
@@ -127,9 +125,7 @@ async function seedCommand(options: { confirm: boolean }): Promise<string> {
       provider: null,
       lastOkAt: null,
       lastError: null,
-    },
-    { businessId: BUSINESS, by: 'test' },
-  );
+    }, { by: 'test' }));
   return job.jobId;
 }
 
@@ -140,7 +136,7 @@ describe('a confirmed boss command through the scheduler runner', () => {
   it('without the confirmation, the same step sends nothing under dial off', async () => {
     const jobId = await seedCommand({ confirm: false });
     const sent: MailMessage[] = [];
-    const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    const result = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
 
     expect(result.ran).toHaveLength(1);
     expect(result.ran[0]?.status).not.toBe('done');
@@ -156,13 +152,13 @@ describe('a confirmed boss command through the scheduler runner', () => {
     const jobId = await seedCommand({ confirm: true });
     const sent: MailMessage[] = [];
 
-    const first = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    const first = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
     expect(first.ran).toEqual([{ jobId, status: 'done', detail: null }]);
     expect(sent).toHaveLength(1);
     expect(sent[0]?.to).toContain('stranger@nowhere.example');
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('verify');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('verify');
 
-    const second = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    const second = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
     expect(second.ran).toEqual([]);
     expect(sent).toHaveLength(1);
   });
@@ -170,15 +166,15 @@ describe('a confirmed boss command through the scheduler runner', () => {
   it('a crash after the send and before the completion is recorded does not send twice', async () => {
     const jobId = await seedCommand({ confirm: true });
     const sent: MailMessage[] = [];
-    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
     expect(sent).toHaveLength(1);
 
     // Rewind to the state such a crash leaves behind: the mail is out, the
     // claim stands, and nothing recorded the step as completed.
-    await getPool().query('DELETE FROM job_step_results WHERE job_id = $1', [jobId]);
-    await getPool().query(`UPDATE jobs SET phase = 'execute' WHERE job_id = $1`, [jobId]);
+    await testDb().query('DELETE FROM job_step_results WHERE job_id = $1', [jobId]);
+    await testDb().query(`UPDATE jobs SET phase = 'execute' WHERE job_id = $1`, [jobId]);
 
-    const again = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+    const again = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(sent), now: NOON }));
     expect(again.ran).toHaveLength(1);
     expect(again.ran[0]?.status).not.toBe('done');
     expect(sent).toHaveLength(1);

@@ -2,7 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { config } from '../config.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { compileCharter } from '../charter/compile.js';
@@ -34,13 +34,12 @@ import type { TrustLevel } from '../domain/trust.js';
 const BUSINESS = 'test-business';
 
 async function aJob(provenance: TrustLevel = 'boss', tag = 'lt'): Promise<string> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `${tag}-${provenance}` }))); // TENANCY-TODO(task 4)
-  const job = await createJob({
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `${tag}-${provenance}` })));
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance,
-    businessId: BUSINESS,
     title: 'local tools',
-  });
+  }));
   return job.jobId;
 }
 
@@ -55,11 +54,7 @@ describe('the local tool executor', () => {
 
   it('records an entity and says what it recorded', async () => {
     const jobId = await aJob();
-    const out = await runLocalTool(
-      'memory.write_entity',
-      { entityId: 'c_812', attributes: { name: 'אלפא', phone: '03-5551234' } },
-      { jobId, businessId: BUSINESS },
-    );
+    const out = await withBusiness(BUSINESS, (db) => runLocalTool('memory.write_entity', { entityId: 'c_812', attributes: { name: 'אלפא', phone: '03-5551234' } }, { ...{ jobId }, db }));
 
     expect(out['recorded']).toBe(true);
     expect(out['subject']).toBe('c_812');
@@ -71,11 +66,7 @@ describe('the local tool executor', () => {
   it('records a preference and replaces it on a second write', async () => {
     const jobId = await aJob();
     const write = (value: string) =>
-      runLocalTool(
-        'memory.upsert_preference',
-        { subject: 'c_812', preference: 'meeting_time', value },
-        { jobId, businessId: BUSINESS },
-      );
+      withBusiness(BUSINESS, (db) => runLocalTool('memory.upsert_preference', { subject: 'c_812', preference: 'meeting_time', value }, { ...{ jobId }, db }));
 
     await write('בוקר');
     await write('אחר הצהריים');
@@ -90,17 +81,9 @@ describe('the local tool executor', () => {
 
   it('recalls what an earlier step recorded, in the same shape a plan can read', async () => {
     const jobId = await aJob();
-    await runLocalTool(
-      'memory.write_chunk',
-      { subject: 'c_812', text: 'מעדיפים אספקה בבוקר' },
-      { jobId, businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (db) => runLocalTool('memory.write_chunk', { subject: 'c_812', text: 'מעדיפים אספקה בבוקר' }, { ...{ jobId }, db }));
 
-    const out = await runLocalTool(
-      'memory.recall',
-      { subject: 'c_812' },
-      { jobId, businessId: BUSINESS },
-    );
+    const out = await withBusiness(BUSINESS, (db) => runLocalTool('memory.recall', { subject: 'c_812' }, { ...{ jobId }, db }));
 
     expect(out['count']).toBe(1);
     const memories = out['memories'] as { body: Record<string, unknown> }[];
@@ -121,22 +104,10 @@ describe('the local tool executor', () => {
     const ownerJob = await aJob('boss', 'owner');
     const documentJob = await aJob('unknown_external', 'doc');
 
-    await runLocalTool(
-      'memory.write_chunk',
-      { subject: 'c_900', text: 'הבעלים קבע' },
-      { jobId: ownerJob, businessId: BUSINESS },
-    );
-    await runLocalTool(
-      'memory.write_chunk',
-      { subject: 'c_900', text: 'המסמך טען' },
-      { jobId: documentJob, businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (db) => runLocalTool('memory.write_chunk', { subject: 'c_900', text: 'הבעלים קבע' }, { ...{ jobId: ownerJob }, db }));
+    await withBusiness(BUSINESS, (db) => runLocalTool('memory.write_chunk', { subject: 'c_900', text: 'המסמך טען' }, { ...{ jobId: documentJob }, db }));
 
-    const out = await runLocalTool(
-      'memory.recall',
-      { subject: 'c_900' },
-      { jobId: ownerJob, businessId: BUSINESS },
-    );
+    const out = await withBusiness(BUSINESS, (db) => runLocalTool('memory.recall', { subject: 'c_900' }, { ...{ jobId: ownerJob }, db }));
 
     const memories = out['memories'] as { body: Record<string, unknown>; provenance: string }[];
     expect(memories).toHaveLength(2);
@@ -147,41 +118,25 @@ describe('the local tool executor', () => {
 
   it('retires a memory and reports how many it touched', async () => {
     const jobId = await aJob();
-    await runLocalTool(
-      'memory.write_entity',
-      { entityId: 'c_gone', attributes: { name: 'ספק' } },
-      { jobId, businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (db) => runLocalTool('memory.write_entity', { entityId: 'c_gone', attributes: { name: 'ספק' } }, { ...{ jobId }, db }));
 
-    const out = await runLocalTool(
-      'memory.retire',
-      { kind: 'entity', subject: 'c_gone', reason: 'הספק סגר' },
-      { jobId, businessId: BUSINESS },
-    );
+    const out = await withBusiness(BUSINESS, (db) => runLocalTool('memory.retire', { kind: 'entity', subject: 'c_gone', reason: 'הספק סגר' }, { ...{ jobId }, db }));
     expect(out['retired']).toBe(1);
 
     // Retiring nothing is a result, not a failure: the world was already in
     // the state asked for.
-    const again = await runLocalTool(
-      'memory.retire',
-      { kind: 'entity', subject: 'c_gone', reason: 'שוב' },
-      { jobId, businessId: BUSINESS },
-    );
+    const again = await withBusiness(BUSINESS, (db) => runLocalTool('memory.retire', { kind: 'entity', subject: 'c_gone', reason: 'שוב' }, { ...{ jobId }, db }));
     expect(again['retired']).toBe(0);
   });
 
   it('fails the step on a payload it cannot use, naming the field', async () => {
     const jobId = await aJob();
     await expect(
-      runLocalTool('memory.write_entity', { attributes: {} }, { jobId, businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => runLocalTool('memory.write_entity', { attributes: {} }, { ...{ jobId }, db })),
     ).rejects.toBeInstanceOf(StepChannelError);
 
     await expect(
-      runLocalTool(
-        'memory.write_entity',
-        { entityId: 'c_1', attributes: 'a string, not an object' },
-        { jobId, businessId: BUSINESS },
-      ),
+      withBusiness(BUSINESS, (db) => runLocalTool('memory.write_entity', { entityId: 'c_1', attributes: 'a string, not an object' }, { ...{ jobId }, db })),
     ).rejects.toThrow(/attributes/);
   });
 
@@ -195,11 +150,7 @@ describe('the local tool executor', () => {
     const jobId = await aJob();
     for (const key of ['__proto__', 'constructor', 'prototype']) {
       await expect(
-        runLocalTool(
-          'memory.write_entity',
-          { entityId: key, attributes: { x: 1 } },
-          { jobId, businessId: BUSINESS },
-        ),
+        withBusiness(BUSINESS, (db) => runLocalTool('memory.write_entity', { entityId: key, attributes: { x: 1 } }, { ...{ jobId }, db })),
       ).rejects.toBeInstanceOf(StepChannelError);
     }
   });
@@ -213,7 +164,7 @@ describe('the local tool executor', () => {
    */
   it('says a tool is unimplemented rather than failing or pretending', async () => {
     const jobId = await aJob();
-    const out = await runLocalTool('template.render', { templateId: 'x' }, { jobId, businessId: BUSINESS });
+    const out = await withBusiness(BUSINESS, (db) => runLocalTool('template.render', { templateId: 'x' }, { ...{ jobId }, db }));
     expect(out).toEqual({ performed: false, reason: 'not_implemented', tool: 'template.render' });
   });
 
@@ -225,7 +176,7 @@ describe('the local tool executor', () => {
   it('does not treat an inherited object property as a handler', async () => {
     const jobId = await aJob();
     for (const name of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
-      const out = await runLocalTool(name, {}, { jobId, businessId: BUSINESS });
+      const out = await withBusiness(BUSINESS, (db) => runLocalTool(name, {}, { ...{ jobId }, db }));
       expect(out['performed']).toBe(false);
       expect(out['reason']).toBe('not_implemented');
     }
@@ -249,20 +200,19 @@ describe('the local tool executor', () => {
    * "the assistant remembers between steps", stated as behaviour.
    */
   it('is reached by a real plan, and the second step reads what the first wrote', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ version: 'local-e2e', autonomyBase: { 'memory.write_longterm': 'auto' } })
     ));
-    const job = await createJob({
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
-      businessId: BUSINESS,
       title: 'remember then recall',
-    });
+    }));
     for (const to of ['understand', 'plan', 'execute'] as const) {
-      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
-    const fresh = await loadJob(job.jobId, { businessId: BUSINESS });
+    const fresh = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     if (fresh === null) throw new Error('job vanished');
 
     const plan = Plan.parse({
@@ -288,7 +238,7 @@ describe('the local tool executor', () => {
       ],
     });
 
-    const result = await runPlan({
+    const result = await withBusiness(fresh.businessId, (db) => runPlan(db, {
       job: fresh,
       bundle,
       plan,
@@ -298,7 +248,7 @@ describe('the local tool executor', () => {
       counterpartyTags: [],
       rampLevel: 'auto',
       now: new Date('2026-08-18T09:00:00.000Z'),
-    });
+    }));
 
     expect(result.status).toBe('done');
     if (result.status !== 'done') throw new Error('expected done');
@@ -433,11 +383,7 @@ describe('the local tool executor', () => {
       );
       const bundle = compileCharter(buildCharter({ version: 'docfetch-v1' }));
 
-      const out = await runLocalTool(
-        'doc.fetch',
-        { documentId, question: 'מה המסמך מבקש?' },
-        { jobId, businessId: BUSINESS, bundle, reader },
-      );
+      const out = await withBusiness(BUSINESS, (db) => runLocalTool('doc.fetch', { documentId, question: 'מה המסמך מבקש?' }, { ...{ jobId, bundle, reader }, db }));
 
       expect(out['performed']).toBe(true);
       expect(out['status']).toBe('read');
@@ -467,7 +413,7 @@ describe('the local tool executor', () => {
         throw new Error('must not be called for a document with no artifacts');
       };
 
-      const out = await runLocalTool('doc.fetch', { documentId }, { jobId, businessId: BUSINESS, bundle, reader });
+      const out = await withBusiness(BUSINESS, (db) => runLocalTool('doc.fetch', { documentId }, { ...{ jobId, bundle, reader }, db }));
       expect(out).toEqual({ performed: false, reason: 'no_artifacts' });
       expect(called).toBe(false);
     });
@@ -475,7 +421,7 @@ describe('the local tool executor', () => {
     it('throws a clear internal error when the caller forgot to supply a bundle', async () => {
       const jobId = await aJob('unknown_external', 'docfetch3');
       await expect(
-        runLocalTool('doc.fetch', { documentId: 'doc-x' }, { jobId, businessId: BUSINESS }),
+        withBusiness(BUSINESS, (db) => runLocalTool('doc.fetch', { documentId: 'doc-x' }, { ...{ jobId }, db })),
       ).rejects.toThrow(/bundle/);
     });
 
@@ -483,7 +429,7 @@ describe('the local tool executor', () => {
       const jobId = await aJob('unknown_external', 'docfetch4');
       const bundle = compileCharter(buildCharter({ version: 'docfetch-v4' }));
       await expect(
-        runLocalTool('doc.fetch', { question: 'מה זה?' }, { jobId, businessId: BUSINESS, bundle }),
+        withBusiness(BUSINESS, (db) => runLocalTool('doc.fetch', { question: 'מה זה?' }, { ...{ jobId, bundle }, db })),
       ).rejects.toBeInstanceOf(StepChannelError);
     });
 
@@ -500,7 +446,7 @@ describe('the local tool executor', () => {
       const bundle = compileCharter(buildCharter({ version: 'docfetch-v5' }));
 
       for (let i = 0; i < config.documentReadsPerDay; i++) {
-        await getPool().query(
+        await testDb().query(
           `INSERT INTO document_readings (
              reading_id, business_id, document_id, status, reason, content,
              provenance, model, prompt_version, brief_hash
@@ -512,7 +458,7 @@ describe('the local tool executor', () => {
       const { reader, callCount } = stubReader(JSON.stringify({ summary: 'x', findings: [], intents: [], unreadable: [] }));
       let caught: unknown;
       try {
-        await runLocalTool('doc.fetch', { documentId }, { jobId, businessId: BUSINESS, bundle, reader });
+        await withBusiness(BUSINESS, (db) => runLocalTool('doc.fetch', { documentId }, { ...{ jobId, bundle, reader }, db }));
       } catch (error) {
         caught = error;
       }
@@ -546,7 +492,7 @@ describe('the local tool executor', () => {
         );
         let caught: unknown;
         try {
-          await runLocalTool('doc.fetch', { documentId: 'doc-any' }, { jobId, businessId: BUSINESS, bundle, reader });
+          await withBusiness(BUSINESS, (db) => runLocalTool('doc.fetch', { documentId: 'doc-any' }, { ...{ jobId, bundle, reader }, db }));
         } catch (error) {
           caught = error;
         }
@@ -570,15 +516,14 @@ describe('the local tool executor', () => {
    */
   describe('agent.request_help', () => {
     async function parentJobInExecute(): Promise<{ jobId: string; bundle: ReturnType<typeof compileCharter> }> {
-      const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `req-help-${ulid()}` }))); // TENANCY-TODO(task 4)
-      const job = await createJob({
+      const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `req-help-${ulid()}` })));
+      const job = await withBusiness(BUSINESS, (db) => createJob(db, {
         charterVersion: bundle.charterVersion,
         provenance: 'boss',
-        businessId: BUSINESS,
         title: 'delegating job',
-      });
+      }));
       for (const to of ['understand', 'plan', 'execute'] as const) {
-        await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+        await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
       }
       return { jobId: job.jobId, bundle };
     }
@@ -587,16 +532,12 @@ describe('the local tool executor', () => {
       const { jobId, bundle } = await parentJobInExecute();
       const documentId = `DOC-${ulid()}`;
 
-      const out = await runLocalTool(
-        'agent.request_help',
-        {
+      const out = await withBusiness(BUSINESS, (db) => runLocalTool('agent.request_help', {
           to: 'know.reader',
           intent: 'read_for_question',
           payload: { question: 'מה המסמך הזה מבקש?' },
           contextRefs: [{ kind: 'document', documentId }],
-        },
-        { jobId, businessId: BUSINESS, bundle, agent: 'comms.email' },
-      );
+        }, { ...{ jobId, bundle, agent: 'comms.email' }, db }));
 
       expect(out['performed']).toBe(true);
       expect(out['status']).toBe('delegated');
@@ -604,11 +545,11 @@ describe('the local tool executor', () => {
       expect(typeof out['childJobId']).toBe('string');
       expect(typeof out['envelopeId']).toBe('string');
 
-      const parent = await loadJob(jobId, { businessId: BUSINESS });
+      const parent = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
       expect(parent?.phase).toBe('followup');
       expect(parent?.awaitingEnvelopeId).toBe(out['envelopeId']);
 
-      const child = await loadJob(out['childJobId'] as string, { businessId: BUSINESS });
+      const child = await withBusiness(BUSINESS, (db) => loadJob(db, out['childJobId'] as string));
       expect(child?.phase).toBe('execute');
     });
 
@@ -634,7 +575,7 @@ describe('the local tool executor', () => {
       };
       const ctx = { jobId, businessId: BUSINESS, bundle, agent: 'comms.email' as const };
 
-      const first = await runLocalTool('agent.request_help', input, ctx);
+      const first = await withBusiness(TEST_BUSINESS, (db) => runLocalTool('agent.request_help', input, { ...ctx, db }));
       expect(first['status']).toBe('delegated');
       const envelopeId = first['envelopeId'] as string;
       const childJobId = first['childJobId'] as string;
@@ -644,16 +585,16 @@ describe('the local tool executor', () => {
       // this test deliberately does NOT go through it, to isolate what the
       // handler does when no `result` envelope exists at all), and the SAME
       // step runs again.
-      await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'test resume', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'execute', actor: 'orchestrator', reason: 'test resume' }));
 
-      const second = await runLocalTool('agent.request_help', input, ctx);
+      const second = await withBusiness(TEST_BUSINESS, (db) => runLocalTool('agent.request_help', input, { ...ctx, db }));
       expect(second['performed']).toBe(false);
       expect(second['status']).toBe('pending');
       expect(second['parked']).toBe(true);
       expect(second['envelopeId']).toBe(envelopeId);
       expect(second['childJobId']).toBe(childJobId);
 
-      const parent = await loadJob(jobId, { businessId: BUSINESS });
+      const parent = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
       expect(parent?.phase).toBe('followup');
       // The SAME envelope id — not cleared, not a new one — so
       // `resumeDelegatedJobs` keeps watching this exact delegation.
@@ -670,7 +611,7 @@ describe('the local tool executor', () => {
       expect(stepRows[0]?.envelope_id).toBe(envelopeId);
 
       // The child itself is untouched by any of this.
-      const child = await loadJob(childJobId, { businessId: BUSINESS });
+      const child = await withBusiness(BUSINESS, (db) => loadJob(db, childJobId));
       expect(child?.phase).toBe('execute');
     });
 
@@ -691,13 +632,13 @@ describe('the local tool executor', () => {
       };
       const ctx = { jobId, businessId: BUSINESS, bundle, agent: 'comms.email' as const };
 
-      const first = await runLocalTool('agent.request_help', input, ctx);
+      const first = await withBusiness(TEST_BUSINESS, (db) => runLocalTool('agent.request_help', input, { ...ctx, db }));
       const childJobId = first['childJobId'] as string;
 
       // A well-formed result, written directly rather than through
       // `resumeDelegatedJobs` — isolating what THIS handler does with one,
       // not re-testing the writer.
-      await withBusiness(BUSINESS, (bdb) => writeEnvelope( // TENANCY-TODO(task 4)
+      await withBusiness(BUSINESS, (bdb) => writeEnvelope(
         bdb,
         {
           v: 1,
@@ -724,8 +665,8 @@ describe('the local tool executor', () => {
         { parentJobId: childJobId }
       ));
 
-      await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'test resume', businessId: BUSINESS });
-      const second = await runLocalTool('agent.request_help', input, ctx);
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'execute', actor: 'orchestrator', reason: 'test resume' }));
+      const second = await withBusiness(TEST_BUSINESS, (db) => runLocalTool('agent.request_help', input, { ...ctx, db }));
       expect(second['performed']).toBe(true);
       expect(second['status']).toBe('answered');
       expect(second['outcome']).toBe('succeeded');
@@ -750,11 +691,11 @@ describe('the local tool executor', () => {
       };
       const ctx = { jobId, businessId: BUSINESS, bundle, agent: 'comms.email' as const };
 
-      const first = await runLocalTool('agent.request_help', input, ctx);
+      const first = await withBusiness(TEST_BUSINESS, (db) => runLocalTool('agent.request_help', input, { ...ctx, db }));
       const childJobId = first['childJobId'] as string;
 
       // A malformed result — `outcome` is not one of the closed union.
-      await withBusiness(BUSINESS, (bdb) => writeEnvelope( // TENANCY-TODO(task 4)
+      await withBusiness(BUSINESS, (bdb) => writeEnvelope(
         bdb,
         {
           v: 1,
@@ -781,11 +722,11 @@ describe('the local tool executor', () => {
         { parentJobId: childJobId }
       ));
 
-      await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'test resume', businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'execute', actor: 'orchestrator', reason: 'test resume' }));
 
       let caught: unknown;
       try {
-        await runLocalTool('agent.request_help', input, ctx);
+        await withBusiness(TEST_BUSINESS, (db) => runLocalTool('agent.request_help', input, { ...ctx, db }));
       } catch (error) {
         caught = error;
       }
@@ -836,23 +777,19 @@ describe('the local tool executor', () => {
         idempotencyKey: `IDEM-${ulid()}`,
         createdAt: new Date().toISOString(),
       };
-      await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, ancestorEnvelope, { parentJobId: 'JOB-some-grandparent' })); // TENANCY-TODO(task 4)
-      await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, ancestorEnvelope.id, middleJobId)); // TENANCY-TODO(task 4)
+      await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, ancestorEnvelope, { parentJobId: 'JOB-some-grandparent' }));
+      await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, ancestorEnvelope.id, middleJobId));
 
       const documentId = `DOC-${ulid()}`;
-      const out = await runLocalTool(
-        'agent.request_help',
-        {
+      const out = await withBusiness(BUSINESS, (db) => runLocalTool('agent.request_help', {
           to: 'know.reader',
           intent: 'read_for_question',
           payload: { question: 'מה המסמך הזה מבקש?' },
           contextRefs: [{ kind: 'document', documentId }],
-        },
-        { jobId: middleJobId, businessId: BUSINESS, bundle, agent: 'comms.email' },
-      );
+        }, { ...{ jobId: middleJobId, bundle, agent: 'comms.email' }, db }));
 
       expect(out['status']).toBe('delegated');
-      const envelope = await withBusiness(BUSINESS, (bdb) => loadEnvelope(bdb, out['envelopeId'] as string)); // TENANCY-TODO(task 4)
+      const envelope = await withBusiness(BUSINESS, (bdb) => loadEnvelope(bdb, out['envelopeId'] as string));
       expect(envelope?.hops).toBe(4); // ancestor's 3 + 1, never 0 + 1
       expect(envelope?.correlationId).toBe('JOB-root-of-the-tree'); // inherited, not middleJobId
       expect(envelope?.constraints.provenanceCeiling).toBe('unknown_external');
@@ -890,10 +827,10 @@ describe('the local tool executor', () => {
           },
         ],
       });
-      const job = await loadJob(jobId, { businessId: BUSINESS });
+      const job = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
       if (job === null) throw new Error('job vanished');
 
-      const result = await runPlan({
+      const result = await withBusiness(job.businessId, (db) => runPlan(db, {
         job,
         bundle,
         plan,
@@ -902,7 +839,7 @@ describe('the local tool executor', () => {
         credentials: envCredentials({}, 'TEST_CRED_'),
         counterpartyTags: [],
         rampLevel: 'auto',
-      });
+      }));
 
       expect(result.status).toBe('halted');
       if (result.status !== 'halted') throw new Error('expected halted');
@@ -910,7 +847,7 @@ describe('the local tool executor', () => {
       expect(result.steps).toHaveLength(1);
       expect(result.steps[0]?.outcome.status).toBe('parked');
 
-      const parent = await loadJob(jobId, { businessId: BUSINESS });
+      const parent = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
       expect(parent?.phase).toBe('followup');
       expect(parent?.awaitingEnvelopeId).not.toBeNull();
     });
@@ -961,36 +898,33 @@ describe('the local tool executor', () => {
       childJobId: string;
       bundle: ReturnType<typeof compileCharter>;
     }> {
-      const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `verify-${ulid()}` }))); // TENANCY-TODO(task 4)
+      const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `verify-${ulid()}` })));
 
       // `unknown_external`, the literal `conduct.ts` hard-codes for the
       // delegating job — and therefore the provenance the saved reading must
       // carry, since `loadLatestReading` is keyed on it.
-      const parent = await createJob({
+      const parent = await withBusiness(BUSINESS, (db) => createJob(db, {
         charterVersion: bundle.charterVersion,
         provenance: 'unknown_external',
-        businessId: BUSINESS,
         title: 'אימות: טיוטה',
-      });
+      }));
       for (const to of ['understand', 'plan', 'execute'] as const) {
-        await transition(parent.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+        await withBusiness(BUSINESS, (db) => transition(db, parent.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
       }
 
       // The job whose draft is judged — never the same row as the delegating
       // job, the separation `VerifyDraftInput.subjectJobId` insists on.
-      const subject = await createJob({
+      const subject = await withBusiness(BUSINESS, (db) => createJob(db, {
         charterVersion: bundle.charterVersion,
         provenance: 'unknown_external',
-        businessId: BUSINESS,
         title: 'הטיוטה שנבדקת',
-      });
+      }));
 
-      const child = await createJob({
+      const child = await withBusiness(BUSINESS, (db) => createJob(db, {
         charterVersion: bundle.charterVersion,
         provenance: 'unknown_external',
-        businessId: BUSINESS,
         title: 'know.reader',
-      });
+      }));
 
       const documentId = `DOC-${ulid()}`;
       await insertOrGetDocument(
@@ -1072,14 +1006,14 @@ describe('the local tool executor', () => {
       };
       // `parentJobId` is the DELEGATING job — the column the handler looks the
       // request up by.
-      await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, request, { parentJobId: parent.jobId })); // TENANCY-TODO(task 4)
-      await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, request.id, child.jobId)); // TENANCY-TODO(task 4)
+      await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, request, { parentJobId: parent.jobId }));
+      await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, request.id, child.jobId));
 
       if (outcome !== null) {
         // Exactly the shape `resumeDelegatedJobs`'s `writeResultAndWake`
         // writes, including `parentJobId: childJobId` — which is why the
         // handler's `kind = 'help_request'` predicate has work to do.
-        await withBusiness(BUSINESS, (bdb) => writeEnvelope( // TENANCY-TODO(task 4)
+        await withBusiness(BUSINESS, (bdb) => writeEnvelope(
           bdb,
           {
             v: 1,
@@ -1126,15 +1060,11 @@ describe('the local tool executor', () => {
         return stubJudge(input);
       };
 
-      const outcome = await runLocalTool(
-        'assert.evaluate',
-        { subjectJobId, documentId, draftText: 'שלום, מאשר את ההצעה.', question: VERIFICATION_QUESTION },
-        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: capturing },
-      );
+      const outcome = await withBusiness(BUSINESS, (db) => runLocalTool('assert.evaluate', { subjectJobId, documentId, draftText: 'שלום, מאשר את ההצעה.', question: VERIFICATION_QUESTION }, { ...{ jobId: parentJobId, bundle, agent: 'gov.verify', verifier: capturing }, db }));
 
       // Proves the handler RAN, not merely that nothing bad happened.
       expect(outcome).toMatchObject({ performed: true, status: 'judged' });
-      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toMatchObject({ // TENANCY-TODO(task 4)
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toMatchObject({
         status: 'judged',
       });
 
@@ -1161,14 +1091,10 @@ describe('the local tool executor', () => {
         judgeCalls += 1;
         return stubJudge(input);
       };
-      const outcome = await runLocalTool(
-        'assert.evaluate',
-        { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
-        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: counting },
-      );
+      const outcome = await withBusiness(BUSINESS, (db) => runLocalTool('assert.evaluate', { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION }, { ...{ jobId: parentJobId, bundle, agent: 'gov.verify', verifier: counting }, db }));
       expect(outcome).toMatchObject({ performed: true, status: 'not_judged', reason: 'failed' });
       expect(judgeCalls).toBe(0);
-      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toEqual({ // TENANCY-TODO(task 4)
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toEqual({
         status: 'not_judged',
         reason: 'failed',
       });
@@ -1185,14 +1111,10 @@ describe('the local tool executor', () => {
         judgeCalls += 1;
         return stubJudge(input);
       };
-      const outcome = await runLocalTool(
-        'assert.evaluate',
-        { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
-        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: counting },
-      );
+      const outcome = await withBusiness(BUSINESS, (db) => runLocalTool('assert.evaluate', { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION }, { ...{ jobId: parentJobId, bundle, agent: 'gov.verify', verifier: counting }, db }));
       expect(judgeCalls).toBe(0);
       expect(outcome).toMatchObject({ status: 'not_judged', reason: 'timeout' });
-      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toEqual({ // TENANCY-TODO(task 4)
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toEqual({
         status: 'not_judged',
         reason: 'timeout',
       });
@@ -1202,11 +1124,7 @@ describe('the local tool executor', () => {
       const { parentJobId, subjectJobId, documentId, bundle } = await seedUnansweredDelegation();
       let caught: unknown;
       try {
-        await runLocalTool(
-          'assert.evaluate',
-          { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
-          { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: stubJudge },
-        );
+        await withBusiness(BUSINESS, (db) => runLocalTool('assert.evaluate', { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION }, { ...{ jobId: parentJobId, bundle, agent: 'gov.verify', verifier: stubJudge }, db }));
       } catch (error) {
         caught = error;
       }
@@ -1216,7 +1134,7 @@ describe('the local tool executor', () => {
       expect(typed.retryable).toBe(false);
       // A refusal files nothing — the card must keep reading "still running",
       // not "gave up", while the helper may yet answer.
-      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toBeNull(); // TENANCY-TODO(task 4)
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toBeNull();
     });
 
     /**
@@ -1256,15 +1174,11 @@ describe('the local tool executor', () => {
         return stubJudge(input);
       };
 
-      const outcome = await runLocalTool(
-        'assert.evaluate',
-        { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
-        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: counting },
-      );
+      const outcome = await withBusiness(BUSINESS, (db) => runLocalTool('assert.evaluate', { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION }, { ...{ jobId: parentJobId, bundle, agent: 'gov.verify', verifier: counting }, db }));
 
       expect(outcome).toMatchObject({ performed: true, status: 'not_judged', reason: 'unreadable' });
       expect(judgeCalls).toBe(0);
-      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toEqual({ // TENANCY-TODO(task 4)
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toEqual({
         status: 'not_judged',
         reason: 'unreadable',
       });
@@ -1288,20 +1202,16 @@ describe('the local tool executor', () => {
         return stubJudge(input);
       };
 
-      const outcome = await runLocalTool(
-        'assert.evaluate',
-        {
+      const outcome = await withBusiness(BUSINESS, (db) => runLocalTool('assert.evaluate', {
           subjectJobId,
           documentId: unreadDocumentId,
           draftText: 'טיוטה',
           question: VERIFICATION_QUESTION,
-        },
-        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: counting },
-      );
+        }, { ...{ jobId: parentJobId, bundle, agent: 'gov.verify', verifier: counting }, db }));
 
       expect(outcome).toMatchObject({ performed: true, status: 'not_judged', reason: 'unreadable' });
       expect(judgeCalls).toBe(0);
-      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toEqual({ // TENANCY-TODO(task 4)
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toEqual({
         status: 'not_judged',
         reason: 'unreadable',
       });
@@ -1326,24 +1236,19 @@ describe('the local tool executor', () => {
 
       let caught: unknown;
       try {
-        await runLocalTool(
-          'assert.evaluate',
-          { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
-          {
+        await withBusiness(BUSINESS, (db) => runLocalTool('assert.evaluate', { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION }, { ...{
             jobId: parentJobId,
-            businessId: BUSINESS,
             bundle,
             agent: 'gov.verify',
             verifier: delegatingAgain,
-          },
-        );
+          }, db }));
       } catch (error) {
         caught = error;
       }
       expect(caught).toBeInstanceOf(StepChannelError);
       expect((caught as StepChannelError).code).toBe('verification_delegated_again');
       expect((caught as StepChannelError).retryable).toBe(false);
-      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toBeNull(); // TENANCY-TODO(task 4)
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toBeNull();
     });
 
     /**
@@ -1354,7 +1259,7 @@ describe('the local tool executor', () => {
     it('refuses a result envelope whose payload cannot be read', async () => {
       const { parentJobId, subjectJobId, documentId, childJobId, bundle } =
         await seedUnansweredDelegation();
-      await withBusiness(BUSINESS, (bdb) => writeEnvelope( // TENANCY-TODO(task 4)
+      await withBusiness(BUSINESS, (bdb) => writeEnvelope(
         bdb,
         {
           v: 1,
@@ -1383,17 +1288,13 @@ describe('the local tool executor', () => {
 
       let caught: unknown;
       try {
-        await runLocalTool(
-          'assert.evaluate',
-          { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
-          { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: stubJudge },
-        );
+        await withBusiness(BUSINESS, (db) => runLocalTool('assert.evaluate', { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION }, { ...{ jobId: parentJobId, bundle, agent: 'gov.verify', verifier: stubJudge }, db }));
       } catch (error) {
         caught = error;
       }
       expect(caught).toBeInstanceOf(StepChannelError);
       expect((caught as StepChannelError).code).toBe('delegation_result_corrupted');
-      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toBeNull(); // TENANCY-TODO(task 4)
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toBeNull();
     });
 
     it('rejects a payload that names no subject job, without reaching the judge', async () => {
@@ -1405,11 +1306,7 @@ describe('the local tool executor', () => {
       };
       let caught: unknown;
       try {
-        await runLocalTool(
-          'assert.evaluate',
-          { documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
-          { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: counting },
-        );
+        await withBusiness(BUSINESS, (db) => runLocalTool('assert.evaluate', { documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION }, { ...{ jobId: parentJobId, bundle, agent: 'gov.verify', verifier: counting }, db }));
       } catch (error) {
         caught = error;
       }
@@ -1422,18 +1319,21 @@ describe('the local tool executor', () => {
     it('running twice files one verdict, not two', async () => {
       const { parentJobId, subjectJobId, documentId, bundle } =
         await seedAnsweredDelegation('succeeded');
-      const args = [
-        'assert.evaluate',
-        { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
-        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: stubJudge },
-      ] as const;
-      const first = await runLocalTool(...args);
-      const second = await runLocalTool(...args);
+      const run = () =>
+        withBusiness(BUSINESS, (db) =>
+          runLocalTool(
+            'assert.evaluate',
+            { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
+            { jobId: parentJobId, db, bundle, agent: 'gov.verify', verifier: stubJudge },
+          ),
+        );
+      const first = await run();
+      const second = await run();
       // Both runs judged — the count below is about the row, not about one of
       // the two calls having quietly refused.
       expect(first).toMatchObject({ performed: true, status: 'judged' });
       expect(second).toMatchObject({ performed: true, status: 'judged' });
-      const { rows } = await getPool().query(
+      const { rows } = await testDb().query(
         `SELECT count(*)::int AS n FROM verification_verdicts WHERE business_id = $1 AND job_id = $2`,
         [BUSINESS, subjectJobId],
       );

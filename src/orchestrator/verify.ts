@@ -24,12 +24,12 @@
  * `run-plan.ts`); closing on top of that would record success for an action
  * nobody can say happened.
  */
-import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { curateJob } from '../memory/curate.js';
 import type { Curator } from '../sdk/curator.js';
 import { loadJob, transition } from './jobs.js';
 import { loadPlanBody, stepResults } from './plan-store.js';
+import { withSessionLock } from './session-lock.js';
 
 /** A job this pass stopped instead of closing, and why. */
 export interface HaltedJob {
@@ -113,9 +113,10 @@ interface DueJobRow {
  * phase, right before the job is closed — see `closeJob`'s own docblock for
  * what it does and does not guarantee.
  *
- * Per-job isolation, the session-scoped advisory lock, the re-read under that
- * lock, and destroying the connection on a failed unlock are all the same as
- * `runDueJobs`, and that function's docblock argues each one.
+ * Per-job isolation, the session-scoped advisory lock (`withSessionLock`, on
+ * the job's own connection), the re-read under that lock, and destroying the
+ * connection on a failed unlock are all the same as `runDueJobs`, and that
+ * function's docblock argues each one.
  *
  * `options.curator` exists so a test can inject a stub and observe that the
  * call actually happened, the same reason `runPlan` takes `bindings` as a
@@ -125,12 +126,13 @@ interface DueJobRow {
  * callers pass nothing and get `curateWithModel`, `curateJob`'s own default.
  */
 export async function closeVerifiedJobs(
-  options: { businessId?: string; limit?: number; curator?: Curator } = {},
+  db: BusinessDb,
+  options: { limit?: number; curator?: Curator } = {},
 ): Promise<CloseVerifiedResult> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const limit = options.limit ?? 20;
 
-  const { rows } = await getPool().query<DueJobRow>(
+  const { rows } = await db.query<DueJobRow>(
     `SELECT job_id, phase FROM jobs
       WHERE business_id = $1
         AND phase IN ('verify', 'remember')
@@ -154,24 +156,12 @@ export async function closeVerifiedJobs(
   for (const row of rows) {
     const jobId = row.job_id;
     const lockScope = `verify:${businessId}:${jobId}`;
-    const client = await getPool().connect();
-    let holdsLock = false;
     try {
-      try {
-        const lock = await client.query<{ locked: boolean }>(
-          'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
-          [lockScope],
-        );
-        if (lock.rows[0]?.locked !== true) {
-          result.lockedOut.push(jobId);
-          continue;
-        }
-        holdsLock = true;
-
-        const job = await loadJob(jobId, { businessId });
+      const locked = await withSessionLock(businessId, lockScope, async (jobDb) => {
+        const job = await loadJob(jobDb, jobId);
         if (job === null || (job.phase !== 'verify' && job.phase !== 'remember')) {
           result.phaseMoved.push(jobId);
-          continue;
+          return;
         }
 
         // Found here on a pass that picks up after a crash between the two
@@ -183,18 +173,18 @@ export async function closeVerifiedJobs(
         // curation for it — only the last hop, closing, is left. The
         // docblock above says why this phase is scanned at all.
         if (job.phase === 'remember') {
-          await closeJob(jobId, businessId);
+          await closeJob(jobDb, jobId);
           result.closed.push(jobId);
-          continue;
+          return;
         }
 
-        const stored = await loadPlanBody(jobId, { businessId });
+        const stored = await loadPlanBody(jobDb, jobId);
         if (stored === null) {
           result.unbound.push(jobId);
-          continue;
+          return;
         }
 
-        const recorded = await stepResults(jobId, stored.planHash, { businessId });
+        const recorded = await stepResults(jobDb, jobId, stored.planHash);
         const byStep = new Map(recorded.map((step) => [step.stepId, step]));
 
         const unknown = stored.plan.steps
@@ -204,9 +194,9 @@ export async function closeVerifiedJobs(
           const detail =
             `outcome unknown for ${unknown.join(', ')} — the call went out and no ` +
             'authoritative answer came back; nothing confirms it happened';
-          await failJob(jobId, businessId, detail);
+          await failJob(jobDb, jobId, detail);
           result.failed.push({ jobId, detail });
-          continue;
+          return;
         }
 
         const unrecorded = stored.plan.steps
@@ -216,16 +206,15 @@ export async function closeVerifiedJobs(
           const detail =
             `no result recorded for ${unrecorded.join(', ')} — a step with no row is ` +
             'not a step that went well';
-          await failJob(jobId, businessId, detail);
+          await failJob(jobDb, jobId, detail);
           result.failed.push({ jobId, detail });
-          continue;
+          return;
         }
 
-        await transition(jobId, {
+        await transition(jobDb, jobId, {
           to: 'remember',
           actor: 'orchestrator',
           reason: 'all steps completed — no acceptance criteria were evaluated',
-          businessId,
         });
 
         // The curator runs in the `remember` hop it was always meant for.
@@ -242,39 +231,18 @@ export async function closeVerifiedJobs(
           result.curationSkipped.push({ jobId, reason: curation.skipped });
         }
 
-        await closeJob(jobId, businessId);
+        await closeJob(jobDb, jobId);
         result.closed.push(jobId);
-      } catch (error) {
-        // This job's failure must not take the rest of the pass down with it.
-        // Nothing was decided, so this is `errored` and never a disposition
-        // invented to fill the gap.
-        result.errored.push({
-          jobId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    } finally {
-      if (holdsLock) {
-        // The unlock attempt and the release are kept apart so `release` is
-        // called exactly once on every path, and a failed unlock destroys the
-        // connection rather than returning a session to the pool that still
-        // holds this job's lock. `runDueJobs` argues both at length.
-        let unlockError: unknown;
-        try {
-          await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [lockScope]);
-        } catch (error) {
-          unlockError = error;
-        }
-        if (unlockError === undefined) {
-          client.release();
-        } else {
-          client.release(
-            unlockError instanceof Error ? unlockError : new Error(String(unlockError)),
-          );
-        }
-      } else {
-        client.release();
-      }
+      });
+      if (!locked.locked) result.lockedOut.push(jobId);
+    } catch (error) {
+      // This job's failure must not take the rest of the pass down with it.
+      // Nothing was decided, so this is `errored` and never a disposition
+      // invented to fill the gap.
+      result.errored.push({
+        jobId,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -299,15 +267,14 @@ export async function closeVerifiedJobs(
  * answer. This function only ever records that the job reached `closed`,
  * not that anything in particular was remembered along the way.
  */
-async function closeJob(jobId: string, businessId: string): Promise<void> {
-  await transition(jobId, {
+async function closeJob(db: BusinessDb, jobId: string): Promise<void> {
+  await transition(db, jobId, {
     to: 'closed',
     actor: 'orchestrator',
     reason: 'closed after the curator pass',
-    businessId,
   });
 }
 
-async function failJob(jobId: string, businessId: string, reason: string): Promise<void> {
-  await transition(jobId, { to: 'failed', actor: 'orchestrator', reason, businessId });
+async function failJob(db: BusinessDb, jobId: string, reason: string): Promise<void> {
+  await transition(db, jobId, { to: 'failed', actor: 'orchestrator', reason });
 }

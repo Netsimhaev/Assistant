@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { XlsxSpec } from '../domain/document-spec.js';
 import { documentKindLabel } from '../domain/labels.js';
 import { saveDocumentSettings } from '../governance/document-settings.js';
@@ -268,7 +268,7 @@ describe('doc.save handler', () => {
   }
 
   function save(input: Record<string, unknown>) {
-    return runLocalTool('doc.save', input, { jobId: JOB, businessId: B });
+    return withBusiness(B, (db) => runLocalTool('doc.save', input, { ...{ jobId: JOB }, db }));
   }
 
   async function refusal(input: Record<string, unknown>): Promise<StepChannelError> {

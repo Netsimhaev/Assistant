@@ -63,7 +63,7 @@
  * are excluded from it.
  */
 import { config } from '../config.js';
-import type { Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { isClosureCommand, SUGGESTED_CLOSURE_VERB } from '../governance/closure-command.js';
 import {
   claimAnswer,
@@ -147,18 +147,16 @@ function withinQuestionWindow(
  * (`whatsapp-door.ts`, spec §10.11): a "כן" with a confirmation AND a
  * clarifying question open cannot say which it answers.
  */
-export async function answerableWhatsAppQuestions(input: {
-  businessId: string;
-  now?: number;
-  windowMinutes?: number;
-  db?: Queryable;
-}): Promise<InstructionRecord[]> {
+export async function answerableWhatsAppQuestions(
+  db: BusinessDb,
+  input: { now?: number; windowMinutes?: number } = {},
+): Promise<InstructionRecord[]> {
   const nowMs = input.now ?? Date.now();
   const windowMinutes = input.windowMinutes ?? config.whatsappQuestionWindowMinutes;
   const open = await pendingQuestions({
-    businessId: input.businessId,
+    businessId: db.businessId,
     channel: 'whatsapp',
-    ...(input.db !== undefined ? { db: input.db } : {}),
+    db,
   });
   return open.filter((record) => withinQuestionWindow(record, nowMs, windowMinutes));
 }
@@ -171,20 +169,17 @@ export async function answerableWhatsAppQuestions(input: {
  * `now` and `windowMinutes` are injectable so a test can prove the window in
  * both directions without waiting one out; production passes neither.
  */
-export async function decideWhatsAppRoute(input: {
-  text: string;
-  businessId: string;
-  now?: number;
-  windowMinutes?: number;
-  db?: Queryable;
-}): Promise<WhatsAppRoute> {
+export async function decideWhatsAppRoute(
+  db: BusinessDb,
+  input: { text: string; now?: number; windowMinutes?: number },
+): Promise<WhatsAppRoute> {
   const nowMs = input.now ?? Date.now();
   const windowMinutes = input.windowMinutes ?? config.whatsappQuestionWindowMinutes;
 
   const open = await pendingQuestions({
-    businessId: input.businessId,
+    businessId: db.businessId,
     channel: 'whatsapp',
-    ...(input.db !== undefined ? { db: input.db } : {}),
+    db,
   });
 
   // Closure is read BEFORE the window is applied, and that is deliberate: a
@@ -213,13 +208,13 @@ export async function decideWhatsAppRoute(input: {
  * `recordAnswer` it replaced is gone.
  */
 export async function claimAsAnswer(
+  db: BusinessDb,
   instruction: InstructionRecord,
   answer: string,
-  options: { businessId: string; db?: Queryable },
 ): Promise<boolean> {
   return claimAnswer(instruction.instructionId, answer, {
-    businessId: options.businessId,
-    ...(options.db !== undefined ? { db: options.db } : {}),
+    businessId: db.businessId,
+    db,
   });
 }
 
@@ -250,20 +245,18 @@ export async function claimAsAnswer(
  * saying it is finished. Neither is the orchestrator deciding on its own.
  */
 export async function retireOpenInstruction(
+  db: BusinessDb,
   instruction: InstructionRecord,
-  options: { to: 'closed' | 'failed'; reason: string; businessId: string },
+  options: { to: 'closed' | 'failed'; reason: string },
 ): Promise<void> {
-  const messageId = await whatsAppMessageOf(instruction.jobId, {
-    businessId: options.businessId,
-  });
+  const messageId = await whatsAppMessageOf(db, instruction.jobId);
   if (messageId !== null) {
-    await claimForReport(messageId, 'terminal', { businessId: options.businessId });
+    await claimForReport(messageId, 'terminal', { businessId: db.businessId });
   }
-  await transition(instruction.jobId, {
+  await transition(db, instruction.jobId, {
     to: options.to,
     actor: 'human',
     reason: options.reason,
-    businessId: options.businessId,
   });
 }
 

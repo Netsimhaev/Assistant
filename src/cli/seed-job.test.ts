@@ -56,8 +56,8 @@ describe('seedMailJob', () => {
       businessId: BUSINESS,
     });
 
-    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('execute');
-    const stored = await loadPlanBody(jobId, { businessId: BUSINESS });
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('execute');
+    const stored = await withBusiness(BUSINESS, (db) => loadPlanBody(db, jobId));
     expect(stored?.plan.steps).toHaveLength(1);
     expect(stored?.plan.steps[0]?.toolName).toBe('mail.send');
     expect(stored?.plan.steps[0]?.expectedActionClass).toBe('email.initiate');

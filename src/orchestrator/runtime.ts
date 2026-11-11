@@ -656,7 +656,7 @@ export async function buildRuntime(
   // 30 seconds, which is an architecture decision for a later task, not a
   // line in this fix round. See `docs/live-thread-runbook.md`.
   const charter = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 8)
-  const bindings = await loadBindings();
+  const bindings = await withBusiness(config.businessId, (db) => loadBindings(db)); // TENANCY-TODO(task 8)
   const connectionBySystem = new Map(
     (charter?.charter.connections ?? []).map((connection) => [connection.system, connection] as const),
   );

@@ -21,12 +21,11 @@ type StepSpec = Pick<PlanStep, 'id' | 'agent' | 'toolName' | 'input'> & { intent
 
 async function seedJob(title: string): Promise<string> {
   const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'curation' }))); // TENANCY-TODO(task 5)
-  const job = await createJob({
+  const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
     title,
-  });
+  }));
   return job.jobId;
 }
 
@@ -35,7 +34,7 @@ async function bindSteps(jobId: string, goal: string, steps: StepSpec[]): Promis
     goal,
     steps: steps.map((step) => ({ intent: 'לבצע', ...step })),
   });
-  await bindPlanToJob(jobId, plan, { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (db) => bindPlanToJob(db, jobId, plan));
 }
 
 async function seedJobWithPlan(toolName: string, input: Record<string, unknown>): Promise<string> {
@@ -82,8 +81,7 @@ async function seedReadingForJob(jobId: string, content: Reading): Promise<void>
     action: null,
     clarifyingQuestion: null,
   };
-  await saveProposal(
-    {
+  await withBusiness(BUSINESS, (db) => saveProposal(db, {
       proposalId: `PRP-${ulid()}`,
       readingId: record.readingId,
       jobId,
@@ -93,9 +91,7 @@ async function seedReadingForJob(jobId: string, content: Reading): Promise<void>
       raw: '{}',
       model: 'sonnet',
       promptVersion: 'v1',
-    },
-    { businessId: BUSINESS },
-  );
+    }));
 }
 
 describe('the brief the curator is asked about', () => {
