@@ -903,7 +903,7 @@ describe('a reply the assistant has LEARNED goes without a card (owner ruling H1
     expect((await mailRow(mail.mailId)).reply_job_id).toBe(raised.replyJobId);
 
     const { client, sent } = fakeClient();
-    await schedulerPass({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON, inbox: null });
+    await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { runtime: runtimeWith(client), now: NOON, inbox: null }));
 
     expect(sent).toHaveLength(1);
     expect(await approvalCount()).toBe(0);
@@ -990,7 +990,7 @@ describe('a reply the assistant has LEARNED goes without a card (owner ruling H1
     // Due now; one pass with a provider that would answer.
     await testDb().query(`UPDATE jobs SET wake_at = $2 WHERE job_id = $1`, [replyJobId, new Date(NOON.getTime() - 60_000)]);
     const { client, sent } = fakeClient();
-    await schedulerPass({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON, inbox: null });
+    await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { runtime: runtimeWith(client), now: NOON, inbox: null }));
     expect(sent).toHaveLength(0);
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, replyJobId)))?.phase).toBe('failed');
     expect(await approvalCount()).toBe(0);

@@ -256,7 +256,7 @@ describe('doc.produce', () => {
     const parked = await withBusiness(B, (db) => loadJob(db, job.jobId));
     expect(parked?.phase).toBe('followup');
     expect(parked?.wakeAt).toBeNull();
-    const woke = await tick({ businessId: B, now: new Date('2099-01-01T00:00:00Z') });
+    const woke = await withBusiness(B, (passDb) => tick(passDb, { now: new Date('2099-01-01T00:00:00Z') }));
     expect(woke.skipped).toBe(false);
     expect(woke.wokenJobs).not.toContain(job.jobId);
     expect((await withBusiness(B, (db) => loadJob(db, job.jobId)))?.phase).toBe('followup');

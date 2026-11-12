@@ -238,8 +238,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
 
   it('runs neither loop and returns nulls when WhatsApp is not configured', async () => {
     await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
-    const pass = await schedulerPass({
-      businessId: BUSINESS,
+    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, {
       now: NOON,
       inbox: null,
       runtime: {
@@ -248,7 +247,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
         warnings: [],
         // No `whatsapp` field at all.
       },
-    });
+    }));
     expect(pass.whatsappDoor).toBeNull();
     expect(pass.whatsappReport).toBeNull();
     expect(pass.whatsappError).toBeNull();
@@ -292,8 +291,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
     gateway.enqueue(principalMessage('תשלחי לדנה'));
     const sent: MailMessage[] = [];
 
-    const pass = await schedulerPass({
-      businessId: BUSINESS,
+    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, {
       now: NOON,
       inbox: null,
       runtime: runtimeWith(sent, gateway),
@@ -301,7 +299,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
       // would not run in this pass (boss command, spec §4). The ordering
       // under test — door, run, close, report — is the same either way.
       whatsappPlanner: plannedWithRecallPlan,
-    });
+    }));
 
     expect(pass.whatsappError).toBeNull();
     expect(pass.whatsappDoor?.instructed).toBe(1);
@@ -323,8 +321,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
   /** A charter this process cannot read must skip BOTH loops, not the pass. */
   it('skips both loops and reports why when there is no active charter', async () => {
     const gateway = createFakeGateway();
-    const pass = await schedulerPass({
-      businessId: STALE_CHARTER_BUSINESS,
+    const pass = await withBusiness(STALE_CHARTER_BUSINESS, (passDb) => schedulerPass(passDb, {
       now: NOON,
       inbox: null,
       runtime: {
@@ -333,7 +330,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
         warnings: [],
         whatsapp: { gateway },
       },
-    });
+    }));
     expect(pass.whatsappDoor).toBeNull();
     expect(pass.whatsappReport).toBeNull();
     expect(pass.whatsappError).not.toBeNull();
@@ -362,13 +359,13 @@ describe('schedulerPass — WhatsApp wiring', () => {
     // Pass 1 — the gateway starts out connected (the fake's own default).
     // This is the FIRST observation this process ever makes, never itself a
     // transition, so nothing is sent yet.
-    await schedulerPass({ businessId: HEALTH_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(HEALTH_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(0);
     expect(gateway.sent).toHaveLength(0);
 
     // Pass 2 — the bridge drops.
     gateway.setHealth({ state: 'reconnecting', since: NOON.toISOString() });
-    await schedulerPass({ businessId: HEALTH_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(HEALTH_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(1);
     expect(calls[0]?.subject).toContain('וואטסאפ');
     expect(calls[0]?.body).toContain('התנתק');
@@ -376,7 +373,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
     expect(gateway.sent).toHaveLength(0);
 
     // Pass 3 — still disconnected. No second email for the same outage.
-    await schedulerPass({ businessId: HEALTH_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(HEALTH_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(1);
   });
 
@@ -400,12 +397,12 @@ describe('schedulerPass — WhatsApp wiring', () => {
     };
 
     // Pass 1 — connected baseline, no transition yet.
-    await schedulerPass({ businessId: HEALTH_FAIL_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(HEALTH_FAIL_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
 
     // Pass 2 — the bridge drops, and the send fails.
     gateway.setHealth({ state: 'reconnecting', since: NOON.toISOString() });
     failNext();
-    await schedulerPass({ businessId: HEALTH_FAIL_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(HEALTH_FAIL_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(1); // the attempt was made
 
     const incidents = (await withBusiness(HEALTH_FAIL_BUSINESS, (bdb) => queryAudit(bdb, { kind: 'incident' }))).filter((row) =>
@@ -416,7 +413,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
 
     // Pass 3 — still disconnected, and this time delivery succeeds. If the
     // failed attempt had been treated as "handled", this would stay at 1.
-    await schedulerPass({ businessId: HEALTH_FAIL_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(HEALTH_FAIL_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(2); // retried, not swallowed
   });
 
@@ -429,8 +426,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
     };
     gateway.enqueue(principalMessage('תשלחי לדנה'));
 
-    const pass = await schedulerPass({
-      businessId: DOOR_THROWS_BUSINESS,
+    const pass = await withBusiness(DOOR_THROWS_BUSINESS, (passDb) => schedulerPass(passDb, {
       now: NOON,
       inbox: null,
       runtime: {
@@ -440,7 +436,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
         whatsapp: { gateway },
       },
       whatsappPlanner: plannedWithMailPlan,
-    });
+    }));
 
     expect(pass.whatsappError).toBeNull();
     expect(pass.whatsappDoor?.instructed).toBe(1);
@@ -477,8 +473,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
       },
     };
 
-    const pass = await schedulerPass({
-      businessId: HEALTH_READ_FAIL_BUSINESS,
+    const pass = await withBusiness(HEALTH_READ_FAIL_BUSINESS, (passDb) => schedulerPass(passDb, {
       now: NOON,
       inbox: null,
       runtime: {
@@ -487,7 +482,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
         warnings: [],
         whatsapp: { gateway: throwingGateway },
       },
-    });
+    }));
 
     expect(pass.whatsappError).not.toBeNull();
     expect(pass.whatsappDoor).toBeNull();
@@ -521,24 +516,24 @@ describe('schedulerPass — WhatsApp wiring', () => {
     };
 
     // Pass 1 — connected baseline.
-    await schedulerPass({ businessId: ONCE_PER_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(ONCE_PER_OUTAGE_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
 
     // Pass 2 — outage 1 begins (since = T1); the send fails.
     const t1 = NOON.toISOString();
     gateway.setHealth({ state: 'reconnecting', since: t1 });
     failNext();
-    await schedulerPass({ businessId: ONCE_PER_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(ONCE_PER_OUTAGE_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(await whatsappHealthIncidents(ONCE_PER_OUTAGE_BUSINESS)).toHaveLength(1);
 
     // Pass 3 — still outage 1 (same `since`), the send fails again. Retried,
     // but NOT a second row.
     failNext();
-    await schedulerPass({ businessId: ONCE_PER_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(ONCE_PER_OUTAGE_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(2);
     expect(await whatsappHealthIncidents(ONCE_PER_OUTAGE_BUSINESS)).toHaveLength(1);
 
     // Pass 4 — still outage 1, this time delivery succeeds. Still no second row.
-    await schedulerPass({ businessId: ONCE_PER_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(ONCE_PER_OUTAGE_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(3);
     expect(await whatsappHealthIncidents(ONCE_PER_OUTAGE_BUSINESS)).toHaveLength(1);
 
@@ -548,7 +543,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
     const t2 = new Date(NOON.getTime() + 2).toISOString();
     gateway.setHealth({ state: 'reconnecting', since: t2 });
     failNext();
-    await schedulerPass({ businessId: ONCE_PER_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(ONCE_PER_OUTAGE_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(4);
     expect(await whatsappHealthIncidents(ONCE_PER_OUTAGE_BUSINESS)).toHaveLength(2);
   });
@@ -585,16 +580,16 @@ describe('schedulerPass — WhatsApp wiring', () => {
     };
 
     // Pass 1 — connected baseline.
-    await schedulerPass({ businessId: NO_SENDALERT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(NO_SENDALERT_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
 
     // Pass 2 — the bridge drops; nothing can be sent.
     gateway.setHealth({ state: 'reconnecting', since: NOON.toISOString() });
-    await schedulerPass({ businessId: NO_SENDALERT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(NO_SENDALERT_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(0);
     expect(await whatsappHealthIncidents(NO_SENDALERT_BUSINESS)).toHaveLength(1);
 
     // Pass 3 — still no `sendAlert`, same outage. Must NOT write a second row.
-    await schedulerPass({ businessId: NO_SENDALERT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(NO_SENDALERT_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(await whatsappHealthIncidents(NO_SENDALERT_BUSINESS)).toHaveLength(1);
 
     // The operator fixes SMTP mid-run — `sendAlert` becomes available on the
@@ -606,7 +601,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
 
     // Pass 4 — still the same outage (same `since`). Must now be delivered —
     // the earlier unconfigured passes must not have been treated as "handled".
-    await schedulerPass({ businessId: NO_SENDALERT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(NO_SENDALERT_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(1);
     expect(await whatsappHealthIncidents(NO_SENDALERT_BUSINESS)).toHaveLength(1);
   });
@@ -633,27 +628,27 @@ describe('schedulerPass — WhatsApp wiring', () => {
     };
 
     // Pass 1 — connected baseline.
-    await schedulerPass({ businessId: PROBE_THROW_MID_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(PROBE_THROW_MID_OUTAGE_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
 
     // Pass 2 — the outage begins; the send fails. One row.
     const since = NOON.toISOString();
     gateway.setHealth({ state: 'reconnecting', since });
     failNext();
-    await schedulerPass({ businessId: PROBE_THROW_MID_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(PROBE_THROW_MID_OUTAGE_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(await whatsappHealthIncidents(PROBE_THROW_MID_OUTAGE_BUSINESS)).toHaveLength(1);
 
     // Pass 3 — the PROBE itself throws (not the send). Must be a total no-op.
     gateway.health = (): Promise<never> => {
       throw new Error('probe flaked mid-outage');
     };
-    await schedulerPass({ businessId: PROBE_THROW_MID_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(PROBE_THROW_MID_OUTAGE_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(1); // no send attempt was even made this pass
 
     // Pass 4 — the probe recovers, SAME outage, and this time delivery
     // succeeds. If pass 3 had reset the bookkeeping, this would be read as a
     // brand-new outage and write a SECOND row.
     gateway.health = async () => ({ state: 'reconnecting', since });
-    await schedulerPass({ businessId: PROBE_THROW_MID_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(PROBE_THROW_MID_OUTAGE_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(2);
     expect(await whatsappHealthIncidents(PROBE_THROW_MID_OUTAGE_BUSINESS)).toHaveLength(1);
   });
@@ -685,7 +680,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
 
     // The VERY FIRST pass this process ever runs for this business — no
     // prior record exists at all — and the bridge is already down.
-    await schedulerPass({ businessId: DOWN_AT_BOOT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(DOWN_AT_BOOT_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(1);
   });
 
@@ -713,19 +708,19 @@ describe('schedulerPass — WhatsApp wiring', () => {
     };
 
     // Pass 1 — connected baseline.
-    await schedulerPass({ businessId: WORSENING_WORD_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(WORSENING_WORD_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
 
     // Pass 2 — the outage begins as 'reconnecting' (since = T1), delivered.
     const since = NOON.toISOString();
     gateway.setHealth({ state: 'reconnecting', since });
-    await schedulerPass({ businessId: WORSENING_WORD_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(WORSENING_WORD_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(1);
 
     // Pass 3 — SAME `since`, but the word worsens to 'banned'. Must alert
     // again — this is a materially different, more serious fact, not a
     // retry of something already told.
     gateway.setHealth({ state: 'banned', since });
-    await schedulerPass({ businessId: WORSENING_WORD_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(WORSENING_WORD_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(2);
     expect(calls[1]?.body).toContain('banned');
   });
@@ -752,8 +747,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
     gateway.enqueue(principalMessage('תשלחי לדנה'));
 
     const started = Date.now();
-    const pass = await schedulerPass({
-      businessId: HEALTH_HANG_BUSINESS,
+    const pass = await withBusiness(HEALTH_HANG_BUSINESS, (passDb) => schedulerPass(passDb, {
       now: NOON,
       inbox: null,
       runtime: {
@@ -763,7 +757,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
         whatsapp: { gateway },
       },
       whatsappPlanner: plannedWithMailPlan,
-    });
+    }));
     const elapsedMs = Date.now() - started;
 
     expect(elapsedMs).toBeLessThan(9_000);
@@ -800,34 +794,34 @@ describe('schedulerPass — WhatsApp wiring', () => {
     };
 
     // Pass 1 — connected baseline.
-    await schedulerPass({ businessId: DISTINCT_BODY_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(DISTINCT_BODY_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
 
     // Pass 2 — outage 1 begins (since = T1, state = 'reconnecting'); the
     // send fails, so a retry of the SAME outage happens on pass 3.
     const t1 = NOON.toISOString();
     gateway.setHealth({ state: 'reconnecting', since: t1 });
     failNext();
-    await schedulerPass({ businessId: DISTINCT_BODY_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(DISTINCT_BODY_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(1);
 
     // Pass 3 — still outage 1 (same `since`, same word), delivery succeeds.
     // This is a RETRY of the SAME outage — the body must be byte-identical
     // to pass 2's, or a real transport would (correctly) refuse to treat it
     // as a duplicate and the owner would get a second email for one outage.
-    await schedulerPass({ businessId: DISTINCT_BODY_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(DISTINCT_BODY_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(2);
     expect(calls[1]?.body).toBe(calls[0]?.body);
 
     // Pass 4 — reconnect, to close out outage 1 cleanly.
     gateway.setHealth({ state: 'connected', since: new Date(NOON.getTime() + 1).toISOString() });
-    await schedulerPass({ businessId: DISTINCT_BODY_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(DISTINCT_BODY_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
 
     // Pass 5 — outage 2 begins, with the IDENTICAL state word 'reconnecting'
     // but a DIFFERENT `since`. This must produce a DIFFERENT body than
     // outage 1's — the exact property that was missing before this fix.
     const t2 = new Date(NOON.getTime() + 2).toISOString();
     gateway.setHealth({ state: 'reconnecting', since: t2 });
-    await schedulerPass({ businessId: DISTINCT_BODY_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(DISTINCT_BODY_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(3);
     expect(calls[2]?.body).not.toBe(calls[0]?.body);
   });
@@ -864,18 +858,18 @@ describe('schedulerPass — WhatsApp wiring', () => {
     };
 
     // Pass 1 — connected baseline.
-    await schedulerPass({ businessId: SAME_INSTANT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(SAME_INSTANT_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
 
     // Pass 2 — the outage begins, `since` spelled in UTC `Z` form.
     gateway.setHealth({ state: 'reconnecting', since: '2026-08-18T09:00:00.000Z' });
-    await schedulerPass({ businessId: SAME_INSTANT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(SAME_INSTANT_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(1);
 
     // Pass 3 — the SAME outage, same literal instant, spelled with an
     // explicit `+03:00` offset instead of `Z`. Must be read as the SAME
     // episode — no second call, not a second call with a duplicate body.
     gateway.setHealth({ state: 'reconnecting', since: '2026-08-18T12:00:00.000+03:00' });
-    await schedulerPass({ businessId: SAME_INSTANT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    await withBusiness(SAME_INSTANT_BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: baseRuntime }));
     expect(calls).toHaveLength(1);
   });
 });

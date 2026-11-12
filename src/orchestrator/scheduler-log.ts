@@ -3,12 +3,13 @@
  *
  * Pulled into its own module (Task 10 fix round 1, F4) so it can be imported
  * by a test without importing `run-scheduler.ts` itself — that file runs
- * side-effecting top-level code the moment it is loaded (`buildRuntime()`,
- * a first `schedulerPass()`, `startScheduler()`, `process.on`), which a unit
+ * side-effecting top-level code the moment it is loaded (`buildServerRuntime()`,
+ * `startScheduler()` over `runAllBusinesses`, `process.on`), which a unit
  * test on `logErrored` alone must not trigger. `run-scheduler.ts` imports
  * this and calls it; nothing else changes about how or when it runs.
  */
 import type { SchedulerPassResult } from './scheduler.js';
+import type { TenantPassReport } from './tenants.js';
 
 /**
  * A job stuck in `execute` — one `runDueJobs` threw on, one with no plan
@@ -31,7 +32,14 @@ import type { SchedulerPassResult } from './scheduler.js';
  * a terminal disposition for those (an attempt counter, a dead-letter phase)
  * is still a policy call for its own change.
  */
-export function logErrored(result: SchedulerPassResult): void {
+export function logErrored(result: SchedulerPassResult, businessId?: string): void {
+  // Every line names the business it is about once the scheduler runs more
+  // than one (spec §5.3). Shadowing `console` keeps each line below as it was.
+  const prefix = businessId === undefined ? '' : `[${businessId}] `;
+  const console = {
+    log: (message: string): void => globalThis.console.log(`${prefix}${message}`),
+    error: (message: string): void => globalThis.console.error(`${prefix}${message}`),
+  };
   // A folder that is missing, unreadable, or blocked by a plain file where a
   // directory belongs (see `scheduler.ts`'s docblock above `schedulerPass`)
   // is recorded here, once per pass for as long as it persists — never
@@ -315,4 +323,31 @@ let productionNoticeLogged = false;
 /** Test seam: forget that the "did not run" line was printed. */
 export function resetProductionNoticeForTests(): void {
   productionNoticeLogged = false;
+}
+
+/**
+ * The one line `run-scheduler.ts` prints after every interval (spec §5.3):
+ * `N businesses, ran X, failed Y, skipped Z` — plus a line per failed
+ * business naming its id and how it failed (`threw` / `deadline`), and the
+ * count the interval's budget did not reach. Business ids and counts only,
+ * never anything a business's pass was holding: a pass that threw is
+ * reported by kind, not by its error message.
+ */
+export function tenantPassLines(report: TenantPassReport): string[] {
+  const total =
+    report.ran.length + report.failed.length + report.skippedInFlight.length + report.notReached.length;
+  const lines = [
+    `${total} businesses, ran ${report.ran.length}, failed ${report.failed.length}, ` +
+      `skipped ${report.skippedInFlight.length}` +
+      (report.notReached.length > 0 ? `, not reached ${report.notReached.length}` : ''),
+  ];
+  for (const f of report.failed) lines.push(`business ${f.businessId}: pass failed (${f.reason})`);
+  for (const id of report.skippedInFlight) lines.push(`business ${id}: previous pass still running — skipped`);
+  return lines;
+}
+
+export function logTenantPass(report: TenantPassReport): void {
+  const [summary, ...rest] = tenantPassLines(report);
+  if (summary !== undefined) console.log(summary);
+  for (const line of rest) console.error(line);
 }

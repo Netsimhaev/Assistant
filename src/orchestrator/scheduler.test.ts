@@ -16,7 +16,7 @@ import { schedulerPass, startScheduler, tick } from './scheduler.js';
 import { applyDecision } from './resume.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { envCredentials } from './credentials.js';
-import type { Runtime } from './runtime.js';
+import { buildServerRuntime, type Runtime } from './runtime.js';
 import { MasterKeyError } from '../governance/master-key.js';
 import { getCursor, setCursor } from '../mail/inbox-store.js';
 import type { MailboxClient } from '../mail/providers/types.js';
@@ -102,17 +102,17 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
     expect(asleep?.phase).toBe('followup');
 
     // Too early — the window has not closed yet.
-    const early = await tick({ businessId: BUSINESS, now: NIGHT });
+    const early = await withBusiness(BUSINESS, (passDb) => tick(passDb, { now: NIGHT }));
     expect(early.wokenJobs).toEqual([]);
 
-    const later = await tick({ businessId: BUSINESS, now: NOON });
+    const later = await withBusiness(BUSINESS, (passDb) => tick(passDb, { now: NOON }));
     expect(later.wokenJobs).toEqual([job.jobId]);
 
     const awake = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(awake?.phase).toBe('execute');
     // Woken once, not every tick thereafter.
     expect(awake?.wakeAt).toBeNull();
-    expect((await tick({ businessId: BUSINESS, now: NOON })).wokenJobs).toEqual([]);
+    expect((await withBusiness(BUSINESS, (passDb) => tick(passDb, { now: NOON }))).wokenJobs).toEqual([]);
   });
 
   it('the woken job then actually sends, in the morning', async () => {
@@ -126,7 +126,7 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
     let sent = 0;
 
     await withBusiness(job.businessId, (db) => executeStep(db, { ...STEP, job, bundle, perform: async () => { sent += 1; return NOTHING; }, now: NIGHT }));
-    await tick({ businessId: BUSINESS, now: NOON });
+    await withBusiness(BUSINESS, (passDb) => tick(passDb, { now: NOON }));
 
     const awake = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     if (awake === null) throw new Error('job vanished');
@@ -165,7 +165,7 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
       [queued.approvalId],
     );
 
-    const result = await tick({ businessId: BUSINESS, now: NOON });
+    const result = await withBusiness(BUSINESS, (passDb) => tick(passDb, { now: NOON }));
 
     expect(result.expiredApprovals).toEqual([queued.approvalId]);
     expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, queued.approvalId)))?.state).toBe(
@@ -190,7 +190,7 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
     }));
     if (queued.status !== 'awaiting_approval') throw new Error('unreachable');
 
-    const result = await tick({ businessId: BUSINESS, now: NOON });
+    const result = await withBusiness(BUSINESS, (passDb) => tick(passDb, { now: NOON }));
 
     expect(result.expiredApprovals).toEqual([]);
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId)))?.phase).toBe(
@@ -202,8 +202,8 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
     await install();
     // Both ticks race for the same advisory lock; exactly one does the work.
     const [a, b] = await Promise.all([
-      tick({ businessId: BUSINESS, now: NOON }),
-      tick({ businessId: BUSINESS, now: NOON }),
+      withBusiness(BUSINESS, (passDb) => tick(passDb, { now: NOON })),
+      withBusiness(BUSINESS, (passDb) => tick(passDb, { now: NOON })),
     ]);
     expect([a.skipped, b.skipped].filter(Boolean).length).toBeGreaterThanOrEqual(1);
   });
@@ -222,9 +222,8 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
       warnings: [],
     };
     const handle = startScheduler({
-      businessId: BUSINESS,
       intervalMs: 50,
-      runtime: inert,
+      pass: () => withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { runtime: inert })),
       onError: (error) => errors.push(error),
     });
 
@@ -283,30 +282,28 @@ describe('a human decision restarts the job it was blocking', () => {
 /**
  * The branch three other test files stopped exercising.
  *
- * `schedulerPass` and `runDueJobs` both default to `options.runtime ??
- * (await buildRuntime())`, and `buildRuntime` now refuses outright when there
- * is no master key — an installation with no secrets must fail at startup,
- * not one customer's send at a time. `promote.test.ts`, `scheduler.test.ts`
- * (above) and `scheduler-conducts.test.ts` all correctly swapped that default
- * for an injected inert runtime, which left the default itself covered
- * nowhere at all.
+ * `schedulerPass` once defaulted to building its own runtime, and the build
+ * refuses outright when there is no master key — an installation with no
+ * secrets must fail at startup, not one customer's send at a time.
+ * `promote.test.ts`, `scheduler.test.ts` (above) and
+ * `scheduler-conducts.test.ts` all correctly injected an inert runtime, which
+ * left the default itself covered nowhere at all.
  *
- * So: one pass with no runtime injected and no key path in the environment.
- * The refusal is the assertion.
+ * Since the multi-tenant scheduler (Task 9) the pass has no default: its
+ * runtime is required, and the one place the server half is built from the
+ * process environment is `run-scheduler.ts`'s `buildServerRuntime()`, once,
+ * before any business runs. So: that build, with no key path in the
+ * environment. The refusal is the assertion.
  */
 describe('a pass with no master key refuses rather than running blind', () => {
-  it("propagates buildRuntime's refusal out of schedulerPass", async () => {
+  it("the scheduler process's server build refuses without a key path", async () => {
     const previous = process.env['CREDENTIAL_KEY_PATH'];
     delete process.env['CREDENTIAL_KEY_PATH'];
     try {
-      await expect(
-        schedulerPass({ businessId: BUSINESS, now: NOON, inbox: null }),
-      ).rejects.toThrow(MasterKeyError);
+      await expect(buildServerRuntime()).rejects.toThrow(MasterKeyError);
       // Named, so a MasterKeyError arriving from some other check cannot
       // stand in for the one this test is about.
-      await expect(
-        schedulerPass({ businessId: BUSINESS, now: NOON, inbox: null }),
-      ).rejects.toThrow(/CREDENTIAL_KEY_PATH/);
+      await expect(buildServerRuntime()).rejects.toThrow(/CREDENTIAL_KEY_PATH/);
     } finally {
       if (previous === undefined) delete process.env['CREDENTIAL_KEY_PATH'];
       else process.env['CREDENTIAL_KEY_PATH'] = previous;
@@ -384,7 +381,7 @@ describe('a delegation resumes in the same pass it is freed', () => {
     // The critical assertion: ONE schedulerPass both wakes the parent
     // (`resumeDelegatedJobs`) and re-runs its plan (`runDueJobs`) in the SAME
     // pass, and the parent completes rather than being marked `failed`.
-    const pass = await schedulerPass({ businessId: BUSINESS, now: NOON, inbox: null, runtime });
+    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime }));
 
     expect(pass.delegated.resumed).toEqual([job.jobId]);
     expect(pass.delegated.errored).toEqual([]);
@@ -417,7 +414,7 @@ describe('the digest field on SchedulerPassResult', () => {
       credentials: envCredentials({}, 'TEST_CRED_'),
       warnings: [],
     };
-    const pass = await schedulerPass({ businessId: BUSINESS, now: NOON, inbox: null, runtime: inert });
+    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: inert }));
     expect(pass.digest).toBeNull();
   });
 
@@ -429,7 +426,7 @@ describe('the digest field on SchedulerPassResult', () => {
       credentials: envCredentials({}, 'TEST_CRED_'),
       warnings: [],
     };
-    const pass = await schedulerPass({ businessId: BUSINESS, now: NOON, inbox: null, runtime: inert });
+    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: inert }));
     expect(pass.digest).not.toBeNull();
     expect(pass.digest?.produced).toHaveLength(1);
     expect(pass.digest?.produced[0]?.kind).toBe('daily');
@@ -451,7 +448,7 @@ describe('the mail field on SchedulerPassResult', () => {
 
   it('is null, with no error, when no mailbox is connected', async () => {
     await install();
-    const pass = await schedulerPass({ businessId: BUSINESS, now: NOON, inbox: null, runtime: inert() });
+    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: inert() }));
     expect(pass.mail).toBeNull();
     expect(pass.mailError).toBeNull();
   });
@@ -465,7 +462,7 @@ describe('the mail field on SchedulerPassResult', () => {
        VALUES ('M-old', $1, 'pm-old', 't', 'a@b.example', 's', $2, 'גוף ישן')`,
       [BUSINESS, old.toISOString()],
     );
-    const pass = await schedulerPass({ businessId: BUSINESS, now: NOON, inbox: null, runtime: inert() });
+    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: inert() }));
     expect(pass.mailRetention).toEqual({ scrubbed: 1 });
     expect(pass.mailRetentionError).toBeNull();
     const { rows } = await getPool().query<{ body_text: string | null }>(
@@ -488,15 +485,14 @@ describe('the mail field on SchedulerPassResult', () => {
     } as unknown as MailboxClient;
     const triage: Triage = async () => ({ status: 'read', triage: QUESTION_TRIAGE });
 
-    const pass = await schedulerPass({
-      businessId: BUSINESS,
+    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, {
       now: MAIL_NOON,
       inbox: null,
       runtime: inert(),
       mailClient: client,
       mailTriage: triage,
       mailDrafter: stubDrafter(),
-    });
+    }));
 
     expect(pass.mailError).toBeNull();
     expect(pass.mail).toMatchObject({ status: 'ok', recorded: 1, triaged: 1, drafts: 1 });
@@ -535,14 +531,13 @@ describe('the document production loop runs in the pass, right after the plans',
   it('does not run (null, not zeros) without production tools, and the request ends failed instead of waiting', async () => {
     const bundle = await install();
     const id = await queuedProduction(bundle);
-    const unavailable = await schedulerPass({
-      businessId: BUSINESS,
+    const unavailable = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, {
       now: NOON,
       runtime: inert({ available: false, sofficePath: null, chromiumPath: null }),
-    });
+    }));
     expect(unavailable.documentProductions).toBeNull();
     expect(unavailable.documentProductionsError).toBeNull();
-    const absent = await schedulerPass({ businessId: BUSINESS, now: NOON, runtime: inert() });
+    const absent = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, runtime: inert() }));
     expect(absent.documentProductions).toBeNull();
     const { loadProduction } = await import('../production/store.js');
     const p = await withBusiness(BUSINESS, (db) => loadProduction(db, id));
@@ -559,7 +554,7 @@ describe('the document production loop runs in the pass, right after the plans',
     const id = await queuedProduction(bundle);
     const root = await mkdtemp(join(tmpdir(), 'sched-produced-'));
     try {
-      const production: NonNullable<Parameters<typeof schedulerPass>[0]>['production'] = {
+      const production: Parameters<typeof schedulerPass>[1]['production'] = {
           documentRoot: root,
           drafter: async () => ({
             status: 'drafted',
@@ -591,12 +586,12 @@ describe('the document production loop runs in the pass, right after the plans',
       };
       // Pass 1: draft, build and check 1. Check 2 (the judge, 120s) does not fit
       // the rest of a 120s budget, so it waits for the next pass (loop.ts, Budget).
-      const first = await schedulerPass({ businessId: BUSINESS, now: NOON, runtime: inert(), production });
+      const first = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, runtime: inert(), production }));
       expect(first.documentProductionsError).toBeNull();
       expect(first.documentProductions).toMatchObject({ ready: 0, errored: [] });
       const { loadProduction } = await import('../production/store.js');
       expect((await withBusiness(BUSINESS, (db) => loadProduction(db, id)))?.stage).toBe('check2');
-      const result = await schedulerPass({ businessId: BUSINESS, now: NOON, runtime: inert(), production });
+      const result = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, runtime: inert(), production }));
       expect(result.documentProductions).toMatchObject({ ready: 1, errored: [] });
       expect((await withBusiness(BUSINESS, (db) => loadProduction(db, id)))?.stage).toBe('ready');
     } finally {

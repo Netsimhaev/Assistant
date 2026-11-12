@@ -683,7 +683,7 @@ describe('scheduler expiry', () => {
     const fresh = await parkedJob();
     await ask(fresh, [SINGLE]);
 
-    const result = await schedulerPass({ businessId: BUSINESS, runtime: inertRuntime(), inbox: null });
+    const result = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { runtime: inertRuntime(), inbox: null }));
 
     expect(result.expiredConfirmations).toEqual([stale]);
     expect(result.settledConfirmations).toEqual({ settled: [{ jobId: stale, to: 'closed' }], skipped: [], errored: [] });
@@ -704,7 +704,7 @@ describe('scheduler expiry', () => {
     await presentedAt(gone, new Date(Date.now() - 31 * 60_000));
     await withBusiness(BUSINESS, (db) => transition(db, gone, { to: 'closed', actor: 'system', reason: 'other' }));
 
-    const result = await schedulerPass({ businessId: BUSINESS, runtime: inertRuntime(), inbox: null });
+    const result = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { runtime: inertRuntime(), inbox: null }));
 
     expect(result.expiredConfirmations).toEqual([gone]);
     expect(result.settledConfirmations).toEqual({ settled: [], skipped: [], errored: [] });

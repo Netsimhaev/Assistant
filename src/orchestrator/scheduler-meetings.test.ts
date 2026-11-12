@@ -50,7 +50,7 @@ describe('schedulerPass meetings sweep', () => {
       [B, job.jobId, new Date('2026-11-10T08:00:00Z'), new Date('2026-11-10T09:00:00Z')],
     );
 
-    const pass = await schedulerPass({ businessId: B, runtime: runtime(), now: NOW, inbox: null });
+    const pass = await withBusiness(B, (passDb) => schedulerPass(passDb, { runtime: runtime(), now: NOW, inbox: null }));
 
     expect(pass.meetingsError).toBeNull();
     expect(pass.meetings).toMatchObject({ activated: 1, abandoned: 0, remindersOpened: 0 });
@@ -62,7 +62,7 @@ describe('schedulerPass meetings sweep', () => {
 
   it('a sweep with nothing to do reports zeros, not null', async () => {
     await installMailboxCharter(B);
-    const pass = await schedulerPass({ businessId: B, runtime: runtime(), now: NOW, inbox: null });
+    const pass = await withBusiness(B, (passDb) => schedulerPass(passDb, { runtime: runtime(), now: NOW, inbox: null }));
     expect(pass.meetingsError).toBeNull();
     expect(pass.meetings).toMatchObject({ activated: 0, abandoned: 0, responsesChanged: 0, holdsReleased: 0 });
   });

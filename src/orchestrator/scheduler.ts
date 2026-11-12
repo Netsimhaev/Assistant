@@ -6,8 +6,7 @@ import { runLedgerPass } from '../ledger/pass.js';
 import type { LedgerPassResult } from '../ledger/pass.js';
 import { runNudgeDrafter } from '../sdk/nudge-drafter.js';
 import type { NudgeDrafter } from '../sdk/nudge-drafter.js';
-import { config } from '../config.js';
-import { getPool, withTransaction, withBusiness } from '../db/pool.js';
+import { transaction, withBusiness, type BusinessDb } from '../db/pool.js';
 import { expireOverdue } from '../governance/approvals.js';
 import { expireConfirmations } from '../governance/instruction-confirmations.js';
 import { settleDecidedConfirmations } from './command-confirm.js';
@@ -49,7 +48,6 @@ import {
   type ReraiseResult,
 } from '../production/card.js';
 import type { RunDueResult } from './run-due.js';
-import { buildServerRuntime, businessRuntime } from './runtime.js';
 import { closeVerifiedJobs } from './verify.js';
 import { syncMeetings, type MeetingSyncResult } from '../meetings/sync.js';
 import type { CalendarClient } from '../calendar/types.js';
@@ -80,13 +78,16 @@ export interface TickResult {
  * logic inside it is not.
  */
 export async function tick(
-  options: { businessId?: string; now?: Date; limit?: number } = {},
+  db: BusinessDb,
+  options: { now?: Date; limit?: number } = {},
 ): Promise<TickResult> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const now = options.now ?? new Date();
   const limit = options.limit ?? 50;
 
-  return withTransaction(async (tx) => {
+  // The lock is held on `db`'s own transaction; the work below runs on
+  // connections of its own (see `expireApprovals`), as it always has.
+  return transaction(db, async (tx) => {
     // Only one scheduler works a business at a time. `try` rather than a
     // blocking wait: a second scheduler should skip this tick and come back,
     // not queue up behind the first and then repeat its work.
@@ -118,7 +119,7 @@ async function expireApprovals(businessId: string, limit: number): Promise<strin
   // is a single atomic UPDATE ... RETURNING, and joining it to the tick's
   // transaction would hold the scheduler lock across every job transition
   // below, each of which opens a transaction of its own.
-  const expired = await withBusiness(businessId, (bdb) => expireOverdue(bdb)); // TENANCY-TODO(task 9)
+  const expired = await withBusiness(businessId, (bdb) => expireOverdue(bdb));
 
   const ids: string[] = [];
   for (const approval of expired.slice(0, limit)) {
@@ -126,10 +127,10 @@ async function expireApprovals(businessId: string, limit: number): Promise<strin
     if (approval.jobId === null) continue;
 
     const approvalJobId = approval.jobId;
-    const job = await withBusiness(businessId, (db) => loadJob(db, approvalJobId)); // TENANCY-TODO(task 9)
+    const job = await withBusiness(businessId, (db) => loadJob(db, approvalJobId));
     if (job === null || job.phase !== 'await_approval') continue;
 
-    await withBusiness(businessId, (db) => transition(db, job.jobId, { // TENANCY-TODO(task 9)
+    await withBusiness(businessId, (db) => transition(db, job.jobId, {
       to: 'followup',
       actor: 'system',
       reason: `approval_expired:${approval.approvalId}`,
@@ -144,7 +145,7 @@ async function wakeDueJobs(
   now: Date,
   limit: number,
 ): Promise<string[]> {
-  const { rows } = await getPool().query<{ job_id: string; phase: string }>(
+  const { rows } = await withBusiness(businessId, (db) => db.query<{ job_id: string; phase: string }>(
     `SELECT job_id, phase FROM jobs
       WHERE business_id = $1
         AND closed_at IS NULL
@@ -153,7 +154,7 @@ async function wakeDueJobs(
       ORDER BY wake_at ASC
       LIMIT $3`,
     [businessId, now, limit],
-  );
+  ));
 
   const woken: string[] = [];
   for (const row of rows) {
@@ -161,7 +162,7 @@ async function wakeDueJobs(
     // ours to advance, and `transition` would reject it anyway — checking here
     // keeps one stale row from aborting the whole tick.
     if (row.phase !== 'followup') continue;
-    await withBusiness(businessId, (db) => transition(db, row.job_id, { // TENANCY-TODO(task 9)
+    await withBusiness(businessId, (db) => transition(db, row.job_id, {
       to: 'execute',
       actor: 'system',
       reason: 'wake_at reached',
@@ -308,7 +309,7 @@ async function recordWhatsAppHealthNotifyFailure(
   reason: string,
 ): Promise<void> {
   try {
-    await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 9)
+    await withBusiness(businessId, (bdb) => appendAudit(
       bdb,
       {
         actor: 'system',
@@ -855,8 +856,8 @@ export interface SchedulerPassResult {
  * error not caught there propagates the same way), so the call is wrapped
  * here rather than left to reach the caller. Letting it escape would stop
  * `conduct`, `due` and `verified` from running for as long as the path stays
- * broken — every interval, forever — and would crash `run-scheduler.ts`'s
- * unguarded startup call outright. `scanError` carries the message so an
+ * broken — every interval, forever — and would turn that business's whole
+ * pass into a `scheduler_pass_failed` (`tenants.ts`). `scanError` carries the message so an
  * operator watching the process log sees it; `scan` stays `null`, the same
  * value an absent inbox produces, because no scan result exists either way.
  *
@@ -866,11 +867,17 @@ export interface SchedulerPassResult {
  * they are finer-grained than the tick's lock.
  */
 export async function schedulerPass(
+  db: BusinessDb,
   options: {
-    businessId?: string;
     now?: Date;
     limit?: number;
-    runtime?: Runtime;
+    /**
+     * Required: the business's runtime, built by the caller from the server
+     * half (`businessRuntime(server, db)`). There is no default build here —
+     * a pass that assembled its own would read the master key per business,
+     * per pass, and would hide which server half the business ran under.
+     */
+    runtime: Runtime;
     /** Defaults to `runtime.inbox` — present only when the business turned its inbox on. */
     inbox?: string | null;
     documentRoot?: string;
@@ -921,16 +928,30 @@ export async function schedulerPass(
     calendarClient?: CalendarClient;
     /** Test seams for the production loop; production leaves them unset and uses the runtime's tools. */
     production?: Pick<RunProductionsOptions, 'drafter' | 'judge' | 'printer' | 'renderer' | 'onFinished' | 'documentRoot' | 'pdfAssets'>;
-  } = {},
+  },
 ): Promise<SchedulerPassResult> {
-  const businessId = options.businessId ?? config.businessId;
-  const tickResult = await tick(options);
+  // The business comes from `db`, and only from `db`.
+  const businessId = db.businessId;
+  // Every stage below runs on a connection of its own for this business,
+  // never on `db` and never two at once (stages are awaited one by one). Two
+  // reasons. A stage that breaks its connection — an aborted transaction, a
+  // failed session-lock unlock, which `withSessionLockOn` answers by leaving
+  // the session in a `BEGIN` so it is destroyed — must not poison the stages
+  // after it; the conductor (`conductPendingDocuments`) does exactly that on
+  // a failed unlock, so it must never share a connection with anything else.
+  // And it is what each stage already did before the pass took a `db`.
+  const stage = <T>(fn: (stageDb: BusinessDb) => Promise<T>): Promise<T> =>
+    withBusiness(businessId, fn);
+  const tickResult = await tick(db, {
+    ...(options.now !== undefined ? { now: options.now } : {}),
+    ...(options.limit !== undefined ? { limit: options.limit } : {}),
+  });
 
   // First after the tick, and the order matters: a child that closed on the
   // previous pass wakes its parent at the top of this one, so the parent runs
   // in this very pass through `runDueJobs` below. Run it after the plans
   // instead and every delegation would cost a full extra interval.
-  const delegated = await withBusiness(businessId, (db) => resumeDelegatedJobs(db, options)); // TENANCY-TODO(task 9)
+  const delegated = await stage((db) => resumeDelegatedJobs(db, options));
 
   // Before the WhatsApp door: expire questions past their window, then move
   // on every job parked in `plan` whose confirmation is no longer pending —
@@ -941,18 +962,16 @@ export async function schedulerPass(
   let settledConfirmations: SettleResult = { settled: [], skipped: [], errored: [] };
   let expiredConfirmationsError: string | null = null;
   try {
-    expiredConfirmations = await withBusiness(businessId, (db) => expireConfirmations(db)); // TENANCY-TODO(task 9)
-    settledConfirmations = await withBusiness(businessId, (db) => settleDecidedConfirmations(db)); // TENANCY-TODO(task 9)
+    expiredConfirmations = await stage((db) => expireConfirmations(db));
+    settledConfirmations = await stage((db) => settleDecidedConfirmations(db));
   } catch (err) {
     expiredConfirmationsError = err instanceof Error ? err.message : String(err);
   }
 
-  // Built once per pass and reused everywhere below — `due` and the
-  // conductor loops need it too, and a second runtime build here would both
-  // waste the work and risk two registries disagreeing.
-  const runtime =
-    options.runtime ??
-    (await withBusiness(businessId, async (db) => businessRuntime(await buildServerRuntime(), db))); // TENANCY-TODO(task 9)
+  // Built once per pass by the caller and reused everywhere below — `due` and
+  // the conductor loops need it too, and a second runtime build here would
+  // both waste the work and risk two registries disagreeing.
+  const runtime = options.runtime;
 
   // The door, right after `resumeDelegatedJobs` and before the conductor
   // loops — see `SchedulerPassResult.whatsappDoor`'s own docblock. Guarded on
@@ -982,7 +1001,7 @@ export async function schedulerPass(
   let whatsappMessenger: BossMessenger | null = null;
   if (runtime.whatsapp !== undefined) {
     try {
-      const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 9)
+      const active = await stage((bdb) => loadActiveCharter(bdb));
       if (active === null) {
         throw new Error(
           `schedulerPass: no active charter for business ${businessId} — refusing to run the WhatsApp loops`,
@@ -1012,7 +1031,7 @@ export async function schedulerPass(
 
       const doorGateway = runtime.whatsapp.gateway;
       const doorMessenger = whatsappMessenger;
-      whatsappDoor = await withBusiness(businessId, (db) => runWhatsAppDoor(db, { // TENANCY-TODO(task 9)
+      whatsappDoor = await stage((db) => runWhatsAppDoor(db, {
         gateway: doorGateway,
         messenger: doorMessenger,
         // Fix round 1, F11 — the SAME charter load this block already did
@@ -1047,7 +1066,7 @@ export async function schedulerPass(
   let mailError: string | null = null;
   try {
     const messenger = whatsappMessenger;
-    mail = await withBusiness(businessId, (db) => pollMailbox(db, { // TENANCY-TODO(task 9)
+    mail = await stage((db) => pollMailbox(db, {
       runtime,
       ...(options.mailClient !== undefined ? { client: options.mailClient } : {}),
       ...(options.mailTriage !== undefined ? { triage: options.mailTriage } : {}),
@@ -1075,7 +1094,7 @@ export async function schedulerPass(
   let ledgerEvidenceError: string | null = null;
   let ledgerError: string | null = null;
   try {
-    ledgerHasCharter = (await withBusiness(businessId, (bdb) => activeCharterVersion(bdb))) !== null; // TENANCY-TODO(task 9)
+    ledgerHasCharter = (await stage((bdb) => activeCharterVersion(bdb))) !== null;
   } catch (err) {
     // Could not even tell whether a charter is active: neither ledger stage
     // runs, and both say why. The rest of the pass is unaffected.
@@ -1085,7 +1104,7 @@ export async function schedulerPass(
   }
   if (ledgerHasCharter) {
     try {
-      ledgerEvidence = await withBusiness(businessId, (db) => closeLedgerByEvidence(db, { // TENANCY-TODO(task 9)
+      ledgerEvidence = await stage((db) => closeLedgerByEvidence(db, {
         ...(runtime.notify?.sendAlert !== undefined ? { sendAlert: runtime.notify.sendAlert } : {}),
         ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
         ...(runtime.notify !== undefined ? { dashboardBaseUrl: runtime.notify.dashboardBaseUrl } : {}),
@@ -1114,7 +1133,7 @@ export async function schedulerPass(
   let conduct: ConductResult | null = null;
   if (inbox !== null) {
     try {
-      scan = await withBusiness(businessId, (db) => scanInbox(db, { // TENANCY-TODO(task 9)
+      scan = await stage((db) => scanInbox(db, {
         inbox,
         ...(options.documentRoot !== undefined ? { documentRoot: options.documentRoot } : {}),
       }));
@@ -1129,7 +1148,7 @@ export async function schedulerPass(
       scanError = err instanceof Error ? err.message : String(err);
     }
 
-    conduct = await withBusiness(businessId, (db) => conductPendingDocuments(db, { // TENANCY-TODO(task 9)
+    conduct = await stage((db) => conductPendingDocuments(db, {
       ...conductOptions,
       // The conductor writes approvals without passing through the gate, and
       // the gate was carrying the notification. Threaded here so a conductor
@@ -1141,7 +1160,7 @@ export async function schedulerPass(
   // `...options` here, not `conductOptions`: this is the path `judge` belongs
   // on. `verifier` rides along and is ignored — `runDueJobs` declares no such
   // field, and the judging step reads `judge` alone.
-  const due = await withBusiness(businessId, (db) => runDueJobs(db, { ...options, runtime })); // TENANCY-TODO(task 9)
+  const due = await stage((db) => runDueJobs(db, { ...options, runtime }));
 
   // Right after the plans (spec §5.5): a production `doc.produce` queued
   // this very pass is drafted now. Its own time budget bounds how long the
@@ -1160,7 +1179,7 @@ export async function schedulerPass(
   let documentProductions: RunProductionsResult | null = null;
   let documentProductionsError: string | null = null;
   try {
-    documentProductions = await withBusiness(businessId, (db) => runDocumentProductions(db, { // TENANCY-TODO(task 9)
+    documentProductions = await stage((db) => runDocumentProductions(db, {
       ...(options.now !== undefined ? { now: options.now } : {}),
       ...(runtime.production !== undefined ? { production: runtime.production } : {}),
       ...(options.documentRoot !== undefined ? { documentRoot: options.documentRoot } : {}),
@@ -1181,7 +1200,7 @@ export async function schedulerPass(
   let reasked: ReaskResult = { reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] };
   let reaskError: string | null = null;
   try {
-    reasked = await withBusiness(businessId, (db) => reaskFailedCommands(db, { // TENANCY-TODO(task 9)
+    reasked = await stage((db) => reaskFailedCommands(db, {
       ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
     }));
   } catch (err) {
@@ -1197,11 +1216,11 @@ export async function schedulerPass(
   let deliveriesReraised: ReraiseResult | null = null;
   let deliveriesReraisedError: string | null = null;
   try {
-    deliveriesReraised = await withBusiness(businessId, (db) => reraiseFailedDeliveries(db, cardSeams)); // TENANCY-TODO(task 9)
+    deliveriesReraised = await stage((db) => reraiseFailedDeliveries(db, cardSeams));
   } catch (err) {
     deliveriesReraisedError = err instanceof Error ? err.message : String(err);
   }
-  const verified = await withBusiness(businessId, (db) => closeVerifiedJobs(db, options)); // TENANCY-TODO(task 9)
+  const verified = await stage((db) => closeVerifiedJobs(db, options));
 
   // The meetings sweep, after the closes and before the ledger pass — see
   // `SchedulerPassResult.meetings`. Guarded: a sweep that threw must not hide
@@ -1209,7 +1228,7 @@ export async function schedulerPass(
   let meetings: MeetingSyncResult | null = null;
   let meetingsError: string | null = null;
   try {
-    meetings = await withBusiness(businessId, (db) => syncMeetings(db, { // TENANCY-TODO(task 9)
+    meetings = await stage((db) => syncMeetings(db, {
       runtime,
       ...(options.now !== undefined ? { now: options.now } : {}),
       ...(runtime.notify?.sendAlert !== undefined ? { sendAlert: runtime.notify.sendAlert } : {}),
@@ -1228,7 +1247,7 @@ export async function schedulerPass(
   let ledger: LedgerPassResult | null = null;
   if (ledgerHasCharter) {
     try {
-      ledger = await withBusiness(businessId, (db) => runLedgerPass(db, { // TENANCY-TODO(task 9)
+      ledger = await stage((db) => runLedgerPass(db, {
         ...(options.now !== undefined ? { now: options.now } : {}),
         ...(runtime.notify?.sendAlert !== undefined ? { sendAlert: runtime.notify.sendAlert } : {}),
         ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
@@ -1246,7 +1265,7 @@ export async function schedulerPass(
   let mailRetention: { scrubbed: number } | null = null;
   let mailRetentionError: string | null = null;
   try {
-    mailRetention = await withBusiness(businessId, (db) => scrubOldMailBodies(db, { // TENANCY-TODO(task 9)
+    mailRetention = await stage((db) => scrubOldMailBodies(db, {
       ...(options.now !== undefined ? { now: options.now } : {}),
     }));
   } catch (err) {
@@ -1260,7 +1279,7 @@ export async function schedulerPass(
   // process cannot parse skips this loop too, never only the door.
   if (runtime.whatsapp !== undefined && whatsappMessenger !== null) {
     try {
-      whatsappReport = await withBusiness(businessId, (db) => reportWhatsAppJobs(db, { // TENANCY-TODO(task 9)
+      whatsappReport = await stage((db) => reportWhatsAppJobs(db, {
         messenger: whatsappMessenger,
         ...(runtime.notify !== undefined
           ? { dashboardBaseUrl: runtime.notify.dashboardBaseUrl }
@@ -1282,7 +1301,7 @@ export async function schedulerPass(
   let autonomy: AutonomyPassResult = { promoted: [], demoted: [], errored: [] };
   let autonomyError: string | null = null;
   try {
-    autonomy = await withBusiness(businessId, (db) => evaluateAutonomy(db)); // TENANCY-TODO(task 9)
+    autonomy = await stage((db) => evaluateAutonomy(db));
   } catch (err) {
     autonomyError = err instanceof Error ? err.message : String(err);
   }
@@ -1295,10 +1314,10 @@ export async function schedulerPass(
   // `runDigests` itself reloads the settings (it has no way to be handed the
   // ones already read here without widening its signature past what Tasks
   // 1–5 fixed), and is never called at all when they say `off`.
-  const digestSettings = await withBusiness(businessId, (db) => loadDigestSettings(db)); // TENANCY-TODO(task 9)
+  const digestSettings = await stage((db) => loadDigestSettings(db));
   let digest: DigestRunResult | null = null;
   if (digestSettings.schedule !== 'off') {
-    digest = await withBusiness(businessId, (db) => runDigests(db, { // TENANCY-TODO(task 9)
+    digest = await stage((db) => runDigests(db, {
       ...(options.now !== undefined ? { now: options.now } : {}),
       // `runtime.notify?.sendAlert` — the SAME email seam `checkWhatsAppHealth`
       // above already sends the bridge-outage alert through, never a second,
@@ -1324,7 +1343,7 @@ export async function schedulerPass(
   };
   let actionUpdatesError: string | null = null;
   try {
-    actionUpdates = await withBusiness(businessId, (db) => dispatchActionUpdates(db, { // TENANCY-TODO(task 9)
+    actionUpdates = await stage((db) => dispatchActionUpdates(db, {
       ...(options.now !== undefined ? { now: options.now } : {}),
       ...(runtime.notify?.sendAlert !== undefined ? { sendAlert: runtime.notify.sendAlert } : {}),
       ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
@@ -1378,7 +1397,9 @@ export interface SchedulerHandle {
 }
 
 /**
- * Run `schedulerPass` on an interval until stopped.
+ * Run a pass on an interval until stopped. In production the pass is
+ * `runAllBusinesses` (`tenants.ts`) — every active business, each in
+ * isolation; the loop itself knows nothing about businesses.
  *
  * Polling Postgres rather than pg-boss. The roadmap names pg-boss and it is
  * the right answer for throughput, but the work here is a handful of rows a
@@ -1388,20 +1409,20 @@ export interface SchedulerHandle {
  * Ticks never overlap: the in-flight guard means a slow pass delays the next
  * one instead of running two at once.
  */
-export function startScheduler(
+export function startScheduler<R>(
   options: {
-    businessId?: string;
     intervalMs?: number;
-    runtime?: Runtime;
+    /** One pass. Never called while the previous one is still running. */
+    pass: () => Promise<R>;
     /**
      * Called after every pass that completed without throwing — including a
      * pass whose `due.errored` is non-empty. `runDueJobs` isolates a per-job
      * failure into `errored` rather than throwing (see its own docblock), so
      * a stuck job never reaches `onError`; this is the only hook that sees it.
      */
-    onResult?: (result: SchedulerPassResult) => void;
+    onResult?: (result: R) => void;
     onError?: (error: unknown) => void;
-  } = {},
+  },
 ): SchedulerHandle {
   const intervalMs = options.intervalMs ?? 30_000;
   let running = false;
@@ -1411,12 +1432,8 @@ export function startScheduler(
   const run = async (): Promise<void> => {
     if (running || stopped) return;
     running = true;
-    const businessId = options.businessId;
-    const runtime = options.runtime;
-    inFlight = schedulerPass({
-      ...(businessId === undefined ? {} : { businessId }),
-      ...(runtime === undefined ? {} : { runtime }),
-    })
+    inFlight = options
+      .pass()
       .then((result) => {
         options.onResult?.(result);
       })

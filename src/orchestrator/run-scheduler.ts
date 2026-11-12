@@ -2,49 +2,76 @@
  * The scheduler as a process.
  *
  * Nothing in the system wakes a deferred job, expires an unanswered approval,
- * or runs a plan that is ready to go unless this is running: each pass calls
- * `schedulerPass`, which ticks (waking due jobs, expiring overdue approvals)
- * and then runs every job that pass left sitting in `execute`. It is
- * deliberately dull: one pass on a timer, a signal handler, and a log line
- * per pass that found something worth telling an operator about.
+ * or runs a plan that is ready to go unless this is running: each interval
+ * calls `runAllBusinesses`, which runs `schedulerPass` for every active
+ * business on this server, each on its own connection, with its own runtime,
+ * deadline and catch (spec §5.3). Each pass ticks (waking due jobs, expiring
+ * overdue approvals) and then runs every job that pass left sitting in
+ * `execute`. It is deliberately dull: one interval on a timer, a signal
+ * handler, a summary line per interval (`N businesses, ran X, failed Y,
+ * skipped Z`) and a line per pass that found something worth telling an
+ * operator about. Business ids and counts only — never a business's content.
  *
  *   npm run scheduler
  */
-import { config } from '../config.js';
-import { closePool, withBusiness } from '../db/pool.js';
-import { schedulerPass, startScheduler } from './scheduler.js';
-import { logErrored } from './scheduler-log.js';
-import { buildServerRuntime, businessRuntime } from './runtime.js';
+import { closePool } from '../db/pool.js';
+import { closePlatformPool } from '../db/platform-pool.js';
+import { startScheduler } from './scheduler.js';
+import { logErrored, logTenantPass } from './scheduler-log.js';
+import { buildServerRuntime } from './runtime.js';
+import {
+  SCHEDULER_BUSINESS_DEADLINE_MS,
+  SCHEDULER_INTERVAL_MS,
+  runAllBusinesses,
+  type TenantLoopState,
+} from './tenants.js';
 
-const intervalMs = Number(process.env['SCHEDULER_INTERVAL_MS'] ?? 30_000);
-
-console.log(
-  `scheduler starting for ${config.businessId}, every ${Math.round(intervalMs / 1000)}s`,
+const intervalMs = Number(process.env['SCHEDULER_INTERVAL_MS'] ?? SCHEDULER_INTERVAL_MS);
+const perBusinessDeadlineMs = Number(
+  process.env['SCHEDULER_BUSINESS_DEADLINE_MS'] ?? SCHEDULER_BUSINESS_DEADLINE_MS,
 );
 
-// The server half once per process; the business half from that business's
-// settings. Built once here until the per-business loop rebuilds it every
-// pass (the next step of the multi-tenant plan).
+console.log(
+  `scheduler starting, every ${Math.round(intervalMs / 1000)}s, ` +
+    `${Math.round(perBusinessDeadlineMs / 1000)}s per business`,
+);
+
+// The server half once per process; the business half is rebuilt from each
+// business's own settings on every pass (`businessRuntime`, in the loop).
 const server = await buildServerRuntime();
 for (const warning of server.warnings) console.warn(`warning: ${warning}`);
-const runtime = await withBusiness(config.businessId, (db) => businessRuntime(server, db)); // TENANCY-TODO(task 9)
-for (const warning of runtime.warnings) console.warn(`warning: ${warning}`);
 
-// One pass before the loop, so a misconfiguration surfaces immediately rather
-// than at the first interval.
-const first = await schedulerPass({ runtime });
-if (first.tick.skipped) {
-  console.log('another scheduler holds the lock; this one will keep polling');
-}
-logErrored(first);
+// Kept across intervals: who still has a pass in the air, and where the
+// previous interval stopped when its budget ran out.
+const state: TenantLoopState = { inFlight: new Set(), resumeFrom: null };
+
+// A business's own warnings (a missing mail setting, say) are printed the
+// first time they are seen, not on every pass.
+const warned = new Set<string>();
 
 const handle = startScheduler({
-  businessId: config.businessId,
   intervalMs,
-  runtime,
-  onResult: logErrored,
+  pass: () =>
+    runAllBusinesses(server, {
+      perBusinessDeadlineMs,
+      state,
+      budgetMs: intervalMs,
+      onPass: (businessId, result, warnings) => {
+        for (const warning of warnings) {
+          const key = `${businessId}\u0000${warning}`;
+          if (warned.has(key)) continue;
+          warned.add(key);
+          console.warn(`[${businessId}] warning: ${warning}`);
+        }
+        if (result.tick.skipped) {
+          console.log(`[${businessId}] another scheduler holds the lock; this one will keep polling`);
+        }
+        logErrored(result, businessId);
+      },
+    }),
+  onResult: logTenantPass,
   onError: (error) => {
-    console.error('scheduler pass failed:', error instanceof Error ? error.message : error);
+    console.error('scheduler interval failed:', error instanceof Error ? error.message : error);
   },
 });
 
@@ -52,9 +79,10 @@ let shuttingDown = false;
 const shutdown = async (signal: string): Promise<void> => {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`\n${signal} — finishing the current tick, then stopping`);
+  console.log(`\n${signal} — finishing the current interval, then stopping`);
   await handle.stop();
   await closePool();
+  await closePlatformPool();
   process.exit(0);
 };
 

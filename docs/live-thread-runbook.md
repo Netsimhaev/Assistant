@@ -473,3 +473,4 @@ trace — עם ההודעה בעברית של החריגה.
 | הסוד `OFFICE_MAIL` (במאגר, לא משתנה סביבה) | כן, לכל `credential_ref` בשם `OFFICE_MAIL` | אין | `storedCredentials` — מוקצה עם `npm run secret put OFFICE_MAIL <מפעיל>` |
 | `DASHBOARD_PORT`, `DASHBOARD_HOST`, `DASHBOARD_TRUST_PROXY`, `DASHBOARD_ALLOW_PUBLIC_BIND` | לא | `4173`, `127.0.0.1`, כבוי, כבוי | `run-dashboard.ts` |
 | `SCHEDULER_INTERVAL_MS` | לא | `30000` | `run-scheduler.ts` |
+| `SCHEDULER_BUSINESS_DEADLINE_MS` | לא | `120000` | `run-scheduler.ts` — כמה זמן ממתינים לסבב של עסק אחד לפני שעוברים לבא |

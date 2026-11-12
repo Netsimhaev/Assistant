@@ -173,7 +173,6 @@ describe('the verification loop, end to end through schedulerPass', () => {
 
       let readerCalls = 0;
       const options = {
-        businessId: BUSINESS,
         inbox,
         reader: async () => {
           readerCalls += 1;
@@ -191,7 +190,7 @@ describe('the verification loop, end to end through schedulerPass', () => {
       // The conductor reads, cards, and opens verification; `verifyDraft`
       // delegates and parks the `gov.verify` job; `runDueJobs` runs the
       // child's one `doc.fetch` step and `closeVerifiedJobs` closes it.
-      const pass1 = await schedulerPass(options);
+      const pass1 = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, options));
 
       expect(readerCalls).toBe(1);
       expect(pass1.conduct?.carded).toBe(1);
@@ -227,7 +226,7 @@ describe('the verification loop, end to end through schedulerPass', () => {
       // `resumeDelegatedJobs` writes the `result` envelope and wakes the
       // parent to `execute`; `runDueJobs` runs `assert.evaluate` in the same
       // pass; `closeVerifiedJobs` closes it in the same pass again.
-      const pass2 = await schedulerPass(options);
+      const pass2 = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, options));
 
       expect(pass2.delegated.resumed).toEqual([verifyJobId]);
       expect(pass2.delegated.timedOut).toEqual([]);
@@ -262,7 +261,7 @@ describe('the verification loop, end to end through schedulerPass', () => {
       // ---- Pass 3 -------------------------------------------------------
       // A settled loop must stay settled: nothing left to resume, nothing
       // left to run, no second judge call, no second envelope.
-      const pass3 = await schedulerPass(options);
+      const pass3 = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, options));
       expect(pass3.delegated.resumed).toEqual([]);
       expect(pass3.due.ran).toEqual([]);
       expect(judgeCalls).toBe(1);
@@ -315,8 +314,7 @@ describe('the verification loop, end to end through schedulerPass', () => {
         };
       };
 
-      const pass = await schedulerPass({
-        businessId: BUSINESS,
+      const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, {
         inbox,
         reader: async () => ({
           status: 'read' as const,
@@ -328,7 +326,7 @@ describe('the verification loop, end to end through schedulerPass', () => {
         proposer: async () => ({ status: 'proposed' as const, proposal: ACTING, raw: '{}' }),
         judge,
         runtime: runtime(),
-      });
+      }));
 
       expect(pass.conduct?.carded).toBe(1);
       expect(pass.conduct?.verificationFailed).toBe(0);
