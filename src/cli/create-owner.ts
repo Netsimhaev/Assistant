@@ -18,7 +18,8 @@
  * another business already holds is refused before any prompt.
  */
 import { DatabaseError } from 'pg';
-import { createOwner, normaliseLogin } from '../dashboard/auth.js';
+import { createOwner } from '../dashboard/auth.js';
+import { normaliseLogin } from '../tenancy/login.js';
 import { issueRecoveryCodes } from '../dashboard/recovery.js';
 import { withBusiness } from '../db/pool.js';
 import { EMAIL_SHAPE } from '../governance/typed-recipients.js';

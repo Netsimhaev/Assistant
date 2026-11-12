@@ -253,12 +253,13 @@ function credentialRefForSystem(system: string): string {
  * command that needs it"), rather than a value cached across requests that
  * a key rotation could silently outlive.
  */
-async function loadKeyForRequest(credentialKeyPath: string | undefined): Promise<Buffer> {
+async function loadKeyForRequest(db: BusinessDb, credentialKeyPath: string | undefined): Promise<Buffer> {
   if (credentialKeyPath === undefined || credentialKeyPath.length === 0) {
     throw new MasterKeyError('CREDENTIAL_KEY_PATH אינו מוגדר — אין מפתח לפתוח בו את הסודות');
   }
   const key = await loadMasterKey(credentialKeyPath);
-  await verifyKeyState(key);
+  // On the request's own connection, never a second one (Task 10 fix round 2).
+  await verifyKeyState(key, { db, businessId: db.businessId });
   return key;
 }
 
@@ -370,7 +371,7 @@ export async function oauthCeremonyPreflight(
   const businessId = db.businessId;
   let key: Buffer;
   try {
-    key = await loadKeyForRequest(credentialKeyPath);
+    key = await loadKeyForRequest(db, credentialKeyPath);
   } catch {
     return KEY_UNAVAILABLE_MESSAGE;
   }
@@ -489,7 +490,7 @@ export async function handleOAuthStart(
 
   let key: Buffer;
   try {
-    key = await loadKeyForRequest(options.credentialKeyPath);
+    key = await loadKeyForRequest(db, options.credentialKeyPath);
   } catch {
     return sendHtml(
       res,
@@ -660,7 +661,7 @@ export async function handleOAuthCallback(
 
   let key: Buffer;
   try {
-    key = await loadKeyForRequest(options.credentialKeyPath);
+    key = await loadKeyForRequest(db, options.credentialKeyPath);
   } catch {
     return sendHtml(
       res,
@@ -882,7 +883,7 @@ export async function handleOAuthRevoke(
   let key: Buffer | null = null;
   let keyUnavailable = false;
   try {
-    key = await loadKeyForRequest(options.credentialKeyPath);
+    key = await loadKeyForRequest(db, options.credentialKeyPath);
   } catch {
     // The local revoke below must still proceed even without a working
     // master key -- it is authoritative for us regardless of whether we can

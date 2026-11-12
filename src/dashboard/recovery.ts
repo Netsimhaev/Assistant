@@ -2,7 +2,8 @@ import { randomBytes } from 'node:crypto';
 import { transaction, type BusinessDb, type Queryable } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
-import { hashPassword, verifyPassword, revokeAllSessions, normaliseLogin, DECOY_HASH, DECOY_SALT } from './auth.js';
+import { hashPassword, verifyPassword, revokeAllSessions, DECOY_HASH, DECOY_SALT } from './auth.js';
+import { normaliseLogin } from '../tenancy/login.js';
 import { recordUnknownUserFailure, unknownUserLocked } from './unknown-user-throttle.js';
 
 /** 128 bits of code, encoded as hex — the same size as a session token. */

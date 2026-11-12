@@ -1,6 +1,7 @@
 import { createHash, randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { isValidBusinessId, transaction, type BusinessDb, type Queryable } from '../db/pool.js';
+import { normaliseLogin } from '../tenancy/login.js';
 import { recordUnknownUserFailure, unknownUserLocked } from './unknown-user-throttle.js';
 
 const scrypt = promisify(scryptCb) as (
@@ -87,15 +88,6 @@ export function sessionBinding(sessionValue: string): string {
   return hashToken(sessionValue);
 }
 
-/**
- * The login as it is stored and matched: trimmed and lower-cased, the same
- * normalisation `resolveLogin` (src/tenancy/platform.ts) and the unique index
- * on `lower(login)` (migration 066) use. One function, so the three cannot
- * disagree about whether `" Dana@X.example "` is `dana@x.example`.
- */
-export function normaliseLogin(login: string): string {
-  return login.trim().toLowerCase();
-}
 
 /**
  * The session cookie's value: `<businessId>.<token>` (spec §5.5).

@@ -488,8 +488,11 @@ export async function businessRuntime(server: ServerRuntime, db: BusinessDb): Pr
     // Resolved here once only to know whether to build the notifier at all —
     // the closures below resolve it again on every send, so a rotated
     // password takes effect on the next notification. A throw propagates
-    // (see this function's docblock).
-    const stored = to === null ? null : await credentials.resolve(notifyRef, businessId);
+    // (see this function's docblock). On the `db` this runtime is being built
+    // on: its caller holds that connection, and a second acquire here is
+    // hold-and-wait. The send-time closures below run after `db` is released,
+    // so they resolve on their own connection, as before.
+    const stored = to === null ? null : await credentials.resolve(notifyRef, businessId, db);
     if (to === null) {
       warnings.push(
         `no approval notifier: notify_to not set — approvals will ` +
@@ -604,10 +607,11 @@ export async function businessRuntime(server: ServerRuntime, db: BusinessDb): Pr
         `WhatsApp channel will not run; messages will neither be received nor sent`,
     );
   } else {
-    const [instanceCredential, tokenCredential] = await Promise.all([
-      credentials.resolve(GREEN_API_INSTANCE_ID_REF, businessId),
-      credentials.resolve(GREEN_API_TOKEN_REF, businessId),
-    ]);
+    // On the caller's `db`, one after the other: two queries in flight on one
+    // connection interleave, and a fresh connection each would be the nested
+    // acquire the caller's held connection must not wait behind.
+    const instanceCredential = await credentials.resolve(GREEN_API_INSTANCE_ID_REF, businessId, db);
+    const tokenCredential = await credentials.resolve(GREEN_API_TOKEN_REF, businessId, db);
     if (instanceCredential === null || tokenCredential === null) {
       const unresolvedGreenApiRefs: string[] = [];
       if (instanceCredential === null) unresolvedGreenApiRefs.push(GREEN_API_INSTANCE_ID_REF);

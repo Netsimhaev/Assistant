@@ -97,11 +97,13 @@ type Calendars =
   | { listed: false; reason: string };
 
 /** The real credential source, built from the master key the way `buildServerRuntime` builds it; `null` when no usable key. */
-async function realCredentials(credentialKeyPath: string | undefined): Promise<CredentialSource | null> {
+async function realCredentials(db: BusinessDb, credentialKeyPath: string | undefined): Promise<CredentialSource | null> {
   if (credentialKeyPath === undefined || credentialKeyPath.length === 0) return null;
   try {
     const key = await loadMasterKey(credentialKeyPath);
-    await verifyKeyState(key);
+    // On this request's connection: a second acquire while it is held is
+    // hold-and-wait (Task 10 fix round 2).
+    await verifyKeyState(key, { db, businessId: db.businessId });
     return oauthCredentials({
       key,
       fallback: storedCredentials(key),
@@ -125,15 +127,16 @@ async function realCredentials(credentialKeyPath: string | undefined): Promise<C
  * schedule questions, exactly as when nothing is connected.
  */
 export async function calendarWiring(
+  db: BusinessDb,
   options: MeetingRouteOptions,
 ): Promise<{ runtime: { credentials: CredentialSource }; client?: CalendarClient } | undefined> {
-  const credentials = options.calendarCredentials ?? (await realCredentials(options.credentialKeyPath));
+  const credentials = options.calendarCredentials ?? (await realCredentials(db, options.credentialKeyPath));
   if (credentials === null) return undefined;
   return { runtime: { credentials }, ...(options.calendarClient !== undefined ? { client: options.calendarClient } : {}) };
 }
 
 async function listAccountCalendars(db: BusinessDb, options: MeetingRouteOptions): Promise<Calendars> {
-  const credentials = options.calendarCredentials ?? (await realCredentials(options.credentialKeyPath));
+  const credentials = options.calendarCredentials ?? (await realCredentials(db, options.credentialKeyPath));
   if (credentials === null) return { listed: false, reason: NOT_CONNECTED };
   const access = await resolveCalendarAccess(db, {
     runtime: { credentials },
@@ -538,7 +541,7 @@ async function charterZone(db: BusinessDb): Promise<{ timeZone: string; charterV
 
 async function loadTomorrow(db: BusinessDb, timeZone: string, options: MeetingRouteOptions): Promise<Tomorrow> {
   const businessId = db.businessId;
-  const wiring = await calendarWiring(options);
+  const wiring = await calendarWiring(db, options);
   if (wiring === undefined) return { ok: false, reason: CALENDAR_NOT_CONNECTED_REPLY };
   const access = await resolveCalendarAccess(db, {
     runtime: wiring.runtime,
@@ -836,7 +839,7 @@ export async function handleMeetingNewPost(
 
   // Without a calendar the door would not route the meeting and the text would
   // fall to the general planner: refuse here instead.
-  const calendar = await calendarWiring(options);
+  const calendar = await calendarWiring(db, options);
   if (calendar === undefined) return refuse(CALENDAR_NOT_CONNECTED_REPLY);
 
   const outcome = await runInstruction(db, { text: built.text }, { textOrigin: 'typed', channel: 'dashboard', calendar, meetingRequest: built.request });

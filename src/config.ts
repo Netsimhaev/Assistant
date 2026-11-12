@@ -119,17 +119,17 @@ export const config = {
       ? withLogin(testDatabaseUrl, testLogins.app)
       : required('DATABASE_URL'),
   /**
-   * The BYPASSRLS login, for the named cross-business operations only
-   * (`src/db/platform-pool.ts`). Required outside tests: a deploy that forgot
-   * it must not quietly reuse the app login for cross-business work.
-   */
-  /**
    * Connections in the APPLICATION pool (`getPool`/`withBusiness`). Each
    * authenticated dashboard request holds one for its whole life, so this is
    * the bound on concurrent requests plus the scheduler's work (see `pool.ts`).
    * Zero is refused: a pool of none serves nothing.
    */
   databasePoolMax: atLeastOne('DATABASE_POOL_MAX', 20),
+  /**
+   * The BYPASSRLS login, for the named cross-business operations only
+   * (`src/db/platform-pool.ts`). Required outside tests: a deploy that forgot
+   * it must not quietly reuse the app login for cross-business work.
+   */
   databasePlatformUrl:
     testDatabaseUrl !== null && testLogins !== null
       ? withLogin(testDatabaseUrl, testLogins.platform)

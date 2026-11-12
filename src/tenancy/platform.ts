@@ -1,5 +1,5 @@
 import { closePlatformPool, withPlatform } from '../db/platform-pool.js';
-import { normaliseLogin } from '../dashboard/auth.js';
+import { normaliseLogin } from './login.js';
 
 /**
  * Close the platform pool on shutdown, for a process outside the modules that
@@ -35,7 +35,7 @@ export async function listActiveBusinesses(): Promise<string[]> {
  * password check, the failure counters, the lock) runs inside that
  * business's own `withBusiness`, on the app role, never here.
  *
- * Normalised by `normaliseLogin` (dashboard/auth.ts), the one function the
+ * Normalised by `normaliseLogin` (./login.ts), the one function the
  * stored value and the index's `lower(login)` agree with: `" Dana@X.example "`
  * and `dana@x.example` are one mailbox.
  */

@@ -12,6 +12,9 @@ import { calendarConnection } from '../charter/amend-calendar.js';
 import { installCharter } from '../charter/store.js';
 import { __setAppPoolMaxForTest, closePool, getPool, withBusiness } from '../db/pool.js';
 import { randomBytes } from 'node:crypto';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { config } from '../config.js';
 import { KEY_BYTES, writeKeyState } from '../governance/master-key.js';
 import { putSecret, storedCredentials } from '../governance/credential-store.js';
@@ -165,6 +168,41 @@ describe('GET /meetings/settings', () => {
       expect(await res.text()).toContain('משפחה');
     } finally {
       await __setAppPoolMaxForTest(config.databasePoolMax);
+    }
+  });
+
+  /**
+   * Task 10 fix round 2: the same bound through the REAL wiring — no injected
+   * credential source, a master-key file configured, so the page builds its
+   * own sources (`realCredentials`) and checks the key (`verifyKeyState`)
+   * first. That check used to fall back to a fresh pool connection while the
+   * request's was held.
+   */
+  it('renders with an app pool of one connection through the real key check and credential sources', async () => {
+    const key = randomBytes(KEY_BYTES);
+    const dir = await mkdtemp(join(tmpdir(), 'meeting-pool-'));
+    const keyPath = join(dir, 'master.key');
+    await writeFile(keyPath, key, { mode: 0o600 });
+    try {
+      await writeKeyState(key, 'KEY-pool-test');
+      // The row `verifyKeyState` reads for this business, so the check really opens it.
+      await withBusiness(BUSINESS, (db) => writeKeyState(key, 'KEY-pool-test', { businessId: BUSINESS, db }));
+      await withBusiness(BUSINESS, (db) => putSecret(db, { ref: 'OAUTH_CALENDAR', value: 'stored-token', updatedBy: 'test' }, key));
+      await bindCalendar();
+      server = createServer({ port: 0, calendarClient: clientListing(CALENDARS), credentialKeyPath: keyPath });
+      await once(server, 'listening');
+      const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      const cookie = await login(baseUrl);
+      await __setAppPoolMaxForTest(1);
+      try {
+        const res = await fetch(`${baseUrl}/meetings/settings`, { headers: { cookie } });
+        expect(res.status).toBe(200);
+        expect(await res.text()).toContain('משפחה');
+      } finally {
+        await __setAppPoolMaxForTest(config.databasePoolMax);
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 

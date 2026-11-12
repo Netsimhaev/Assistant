@@ -200,6 +200,7 @@ describe('both doors pass the calendar', () => {
     expect((server.match(/\.\.\.\(calendar !== undefined \? \{ calendar \} : \{\}\)/g) ?? []).length).toBe(1);
     // The answer route: calendar for the meeting door, schedule routing off.
     expect(server).toMatch(/calendar !== undefined \? \{ calendar, scheduleRouting: false, answerTo: \{ jobId, answer \} \}/);
-    expect(server).toMatch(/calendar: \(\) => calendarWiring\(meetingOptions\)/);
+    // Resolved on the request's own connection (Task 10 fix round 2).
+    expect(server).toMatch(/calendar: \(db\) => calendarWiring\(db, meetingOptions\)/);
   });
 });

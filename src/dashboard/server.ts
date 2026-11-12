@@ -302,7 +302,7 @@ export interface DashboardOptions {
 /** What the document screens and the upload need from `createServer`'s options. */
 interface InstructionDoorOptions extends DocumentRouteOptions {
   /** Calendar access for the schedule answer, resolved per request (the credential source is built lazily). Absent: no schedule routing. */
-  calendar?: () => Promise<RunInstructionOptions['calendar']>;
+  calendar?: (db: BusinessDb) => Promise<RunInstructionOptions['calendar']>;
   planner?: (request: PlanRequest) => Promise<PlanOutcome>;
   uploadMaxBytes?: number;
 }
@@ -1332,7 +1332,7 @@ async function handleInstructPost(
     attachedDocumentIds.push(ingested.documentId);
   }
 
-  const calendar = doorOptions.calendar === undefined ? undefined : await doorOptions.calendar();
+  const calendar = doorOptions.calendar === undefined ? undefined : await doorOptions.calendar(db);
   const outcome = await runInstruction(db, { text }, {
       textOrigin: 'typed',
       channel: 'dashboard',
@@ -1624,7 +1624,7 @@ async function handleInstructAnswer(
   // A schedule question typed into the answer box is a READ, judged on the new
   // text alone and BEFORE any claim: the parked question stays open and
   // unclaimed, and nothing is parsed together with the parked half.
-  const calendar = doorOptions.calendar === undefined ? undefined : await doorOptions.calendar();
+  const calendar = doorOptions.calendar === undefined ? undefined : await doorOptions.calendar(db);
   if (calendar !== undefined) {
     const active = await loadActiveCharter(db);
     if (active !== null) {
@@ -3471,7 +3471,7 @@ export function createServer(options: DashboardOptions = {}): Server {
     };
     const doorOptions: InstructionDoorOptions = {
       production: options.production ?? productionToolsFromEnv(),
-      calendar: () => calendarWiring(meetingOptions),
+      calendar: (db) => calendarWiring(db, meetingOptions),
       ...(options.planner !== undefined ? { planner: options.planner } : {}),
       ...(options.uploadMaxBytes !== undefined ? { uploadMaxBytes: options.uploadMaxBytes } : {}),
     };
