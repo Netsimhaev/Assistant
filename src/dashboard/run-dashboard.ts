@@ -8,10 +8,14 @@
  * reverse proxy in front of it that does. Getting that wrong does not fail
  * loudly: a `Secure` cookie sent over plain HTTP is silently never returned
  * by the browser, so a misdeployment just stops authenticating anyone.
+ *
+ * One process serves every business on the server (spec §5.5): the login
+ * address decides the business, and every request after it runs inside the
+ * business its session names. There is no business setting here.
  */
 import type { AddressInfo } from 'node:net';
-import { config } from '../config.js';
 import { closePool } from '../db/pool.js';
+import { closePlatform } from '../tenancy/platform.js';
 import { createServer } from './server.js';
 
 const port = Number(process.env['DASHBOARD_PORT'] ?? 4173);
@@ -33,7 +37,6 @@ const trustProxy = process.env['DASHBOARD_TRUST_PROXY'] === '1';
 const allowNonLoopbackBind = process.env['DASHBOARD_ALLOW_PUBLIC_BIND'] === '1';
 
 const server = createServer({
-  businessId: config.businessId,
   host,
   port,
   trustProxy,
@@ -43,7 +46,7 @@ const server = createServer({
 server.on('listening', () => {
   const address = server.address() as AddressInfo;
   console.log(
-    `dashboard listening on http://${address.address}:${address.port} for ${config.businessId}`,
+    `dashboard listening on http://${address.address}:${address.port} for every business on this server`,
   );
 });
 
@@ -56,6 +59,7 @@ const shutdown = async (signal: string): Promise<void> => {
     server.close((err) => (err ? reject(err) : resolve()));
   });
   await closePool();
+  await closePlatform();
   process.exit(0);
 };
 

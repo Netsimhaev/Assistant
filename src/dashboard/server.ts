@@ -16,8 +16,7 @@ import { createServer as createHttpServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { z } from 'zod';
 import { ulid } from 'ulid';
-import { config } from '../config.js';
-import { getPool, withBusiness } from '../db/pool.js';
+import { withBusiness, withNoBusiness, type BusinessDb } from '../db/pool.js';
 import { ApprovalNotDecidableError, getApproval, pendingApprovals } from '../governance/approvals.js';
 import type { ApprovalRequest } from '../governance/approvals.js';
 import { DocumentAlreadySignedError, loadSignature } from '../governance/signatures.js';
@@ -142,14 +141,19 @@ import type { VerifyOutcome } from '../documents/verify.js';
 import { canonicalHash } from '../util/canonical.js';
 import {
   login,
+  loginUnknown,
+  parseSessionCookie,
   revokeAllSessions,
+  sessionCookieValue,
   setPassword,
   startSession,
   verifyCurrentPassword,
   verifySessionDetails,
   SESSION_HOURS,
 } from './auth.js';
-import { redeemRecoveryCode, remainingCodes } from './recovery.js';
+import { redeemRecoveryCode, redeemUnknown, remainingCodes } from './recovery.js';
+import { resolveLogin } from '../tenancy/platform.js';
+import { getBusiness } from '../tenancy/businesses.js';
 import { issueCsrfToken, verifyCsrfToken } from './csrf.js';
 import {
   handleDocumentAddress,
@@ -187,6 +191,8 @@ import {
   renderPendingList,
   renderReadings,
   renderServerError,
+  renderSuspended,
+  SUSPENDED_MESSAGE,
 } from './views.js';
 import type { CharterReadStatus, PendingConfirmation, PendingQuestion } from './views.js';
 import type { ErasurePrefill } from './views.js';
@@ -197,8 +203,12 @@ const MIN_PASSWORD_LENGTH = 10;
 /** Refuses a form body past this size before it is ever parsed. */
 const MAX_BODY_BYTES = 64 * 1024;
 
+/**
+ * One server for every business (spec §5.5): there is no business option. The
+ * business of every authenticated request is the one its session cookie names
+ * and its session row confirms, read inside that business's `withBusiness`.
+ */
 export interface DashboardOptions {
-  businessId?: string;
   /**
    * Permission to bind an interface other than loopback. Off by default, and
    * `assertBindableHost` refuses loudly without it.
@@ -328,8 +338,8 @@ interface InstructionDoorOptions extends DocumentRouteOptions {
  * care about is a POST, which `Lax` withholds the cookie from cross-site
  * regardless — see `SECURITY_HEADERS`'s own docblock.
  */
-function sessionCookie(token: string): string {
-  return `${SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_MAX_AGE_SECONDS}`;
+function sessionCookie(businessId: string, token: string): string {
+  return `${SESSION_COOKIE}=${sessionCookieValue(businessId, token)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_MAX_AGE_SECONDS}`;
 }
 
 function clearedCookie(): string {
@@ -471,15 +481,39 @@ function redirect(res: ServerResponse, location: string, headers: Record<string,
   res.end();
 }
 
+/**
+ * `sessionId` is the whole cookie value, `<businessId>.<token>`: what the
+ * CSRF token and an OAuth `state` row are bound to. Binding them to the
+ * value, business part included, means a token issued under one business
+ * never verifies under another.
+ */
 type Session = { sessionId: string; username: string; mustChangePassword: boolean };
 
-/** `null` when there is no valid session at all — distinct from a valid one that just needs a password change. */
-async function loadSession(req: IncomingMessage, businessId: string): Promise<Session | null> {
-  const sid = parseCookies(req.headers.cookie)[SESSION_COOKIE];
-  if (!sid) return null;
-  const details = await verifySessionDetails(sid, { businessId });
+/**
+ * The cookie's business and token, or `null` — no cookie, or one that does
+ * not parse (an old token-only cookie from before migration 066 among them:
+ * logged out, never an error page, Review Focus 6).
+ */
+function sessionCookieFrom(req: IncomingMessage): { value: string; businessId: string; token: string } | null {
+  const value = parseCookies(req.headers.cookie)[SESSION_COOKIE];
+  if (!value) return null;
+  const parsed = parseSessionCookie(value);
+  return parsed === null ? null : { value, ...parsed };
+}
+
+/**
+ * `null` when there is no valid session at all — distinct from a valid one
+ * that just needs a password change. Read on `db`, the connection of the
+ * cookie's own business: a forged business part looks the token up in the
+ * wrong business and finds nothing.
+ */
+async function loadSession(
+  db: BusinessDb,
+  cookie: { value: string; token: string },
+): Promise<Session | null> {
+  const details = await verifySessionDetails(db, cookie.token);
   if (!details) return null;
-  return { sessionId: sid, username: details.username, mustChangePassword: details.mustChangePassword };
+  return { sessionId: cookie.value, username: details.username, mustChangePassword: details.mustChangePassword };
 }
 
 function noteFrom(form: URLSearchParams): string | undefined {
@@ -491,36 +525,65 @@ async function handleLoginGet(res: ServerResponse): Promise<void> {
   sendHtml(res, 200, renderLogin());
 }
 
+/**
+ * The login form: an email and a password, or an email and a recovery code.
+ * The email alone decides the business (spec §5.5):
+ *
+ *   1. `resolveLogin` — the one cross-business read, on the platform role,
+ *      returning the business id and its status and nothing else.
+ *   2. No such address: the failure goes to the server-wide unknown-login
+ *      bucket, on a connection with no business, and the reply is the same
+ *      generic failure a wrong password gets.
+ *   3. A suspended business is refused here, before any password or code is
+ *      checked — nothing is spent from the account's failure budget either.
+ *   4. Otherwise everything — the hash check, the counters and the lock, the
+ *      new session — runs inside that business's own `withBusiness`.
+ */
 async function handleLoginPost(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
   trustProxy: boolean,
 ): Promise<void> {
   const form = await readFormBody(req);
-  const username = form.get('username') ?? '';
+  const email = form.get('email') ?? '';
   const code = form.get('code');
   const password = form.get('password');
+  const withCode = code !== null && code.length > 0;
 
-  if (code !== null && code.length > 0) {
-    const result = await redeemRecoveryCode({
-      username,
-      code,
-      businessId,
-      sourceAddress: clientAddress(req, trustProxy),
-    });
-    if (!result.ok) {
-      return sendHtml(res, 401, renderLogin({ error: 'קוד שגוי, כבר נוצל, או שהמערכת נעולה זמנית.' }));
-    }
-    const token = await startSession(username, { businessId, mustChangePassword: true });
-    return redirect(res, '/password', { 'Set-Cookie': sessionCookie(token) });
-  }
-
-  if (password === null || password.length === 0) {
+  if (!withCode && (password === null || password.length === 0)) {
     return sendHtml(res, 400, renderLogin({ error: 'יש להזין סיסמה או קוד שחזור.' }));
   }
 
-  const result = await login({ username, password, businessId });
+  const resolved = await resolveLogin(email);
+  if (resolved !== null && resolved.status !== 'active') {
+    return sendHtml(res, 403, renderLogin({ error: SUSPENDED_MESSAGE }));
+  }
+
+  if (withCode) {
+    const codeRefused = (): void =>
+      sendHtml(res, 401, renderLogin({ error: 'קוד שגוי, כבר נוצל, או שהמערכת נעולה זמנית.' }));
+    if (resolved === null) {
+      await withNoBusiness((db) => redeemUnknown(db, code));
+      return codeRefused();
+    }
+    const token = await withBusiness(resolved.businessId, async (db) => {
+      const result = await redeemRecoveryCode(db, {
+        login: email,
+        code,
+        sourceAddress: clientAddress(req, trustProxy),
+      });
+      if (!result.ok) return null;
+      return startSession(db, result.username, { mustChangePassword: true });
+    });
+    if (token === null) return codeRefused();
+    return redirect(res, '/password', { 'Set-Cookie': sessionCookie(resolved.businessId, token) });
+  }
+
+  const typed = password ?? '';
+  const result =
+    resolved === null
+      ? await withNoBusiness((db) => loginUnknown(db, typed))
+      : await withBusiness(resolved.businessId, (db) => login(db, { login: email, password: typed }));
   if (!result.ok) {
     const message =
       result.code === 'locked'
@@ -528,8 +591,10 @@ async function handleLoginPost(
         : 'שם משתמש או סיסמה שגויים.';
     return sendHtml(res, 401, renderLogin({ error: message }));
   }
+  // `loginUnknown` never succeeds, so a success always has a business.
+  if (resolved === null) return sendHtml(res, 401, renderLogin({ error: 'שם משתמש או סיסמה שגויים.' }));
 
-  redirect(res, '/', { 'Set-Cookie': sessionCookie(result.sessionId) });
+  redirect(res, '/', { 'Set-Cookie': sessionCookie(resolved.businessId, result.sessionId) });
 }
 
 /**
@@ -561,9 +626,10 @@ async function handlePasswordGet(res: ServerResponse, session: Session): Promise
 async function handlePasswordPost(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
 ): Promise<void> {
+  const businessId = db.businessId;
   const form = await readFormBody(req);
   const csrf = issueCsrfToken(session.sessionId);
   const requireCurrent = requiresCurrentPassword(session);
@@ -580,7 +646,7 @@ async function handlePasswordPost(
     const current = form.get('current') ?? '';
     const ok =
       current.length > 0 &&
-      (await verifyCurrentPassword({ username: session.username, password: current, businessId }));
+      (await verifyCurrentPassword(db, { username: session.username, password: current }));
     if (!ok) return view(403, 'הסיסמה הנוכחית שגויה.');
   }
 
@@ -596,21 +662,21 @@ async function handlePasswordPost(
   // Revokes every open session, including this one — a fresh, ordinary
   // session (mustChangePassword: false) replaces it right after, so the
   // owner lands back in the app instead of at a login form.
-  await setPassword({ username: session.username, password, businessId });
-  const token = await startSession(session.username, { businessId, mustChangePassword: false });
-  redirect(res, '/', { 'Set-Cookie': sessionCookie(token) });
+  await setPassword(db, { username: session.username, password });
+  const token = await startSession(db, session.username, { mustChangePassword: false });
+  redirect(res, '/', { 'Set-Cookie': sessionCookie(businessId, token) });
 }
 
 async function handlePendingList(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   modeFailed = false,
 ): Promise<void> {
-  const [approvals, remaining] = await Promise.all([
-    withBusiness(businessId, (bdb) => pendingApprovals(bdb)), // TENANCY-TODO(task 10)
-    remainingCodes(session.username, { businessId }),
-  ]);
+  // Sequential, never `Promise.all`: both read on this request's one
+  // connection, and two queries in flight on it interleave.
+  const approvals = await pendingApprovals(db);
+  const remaining = await remainingCodes(db, session.username);
   sendHtml(
     res,
     200,
@@ -621,8 +687,8 @@ async function handlePendingList(
 /** How many recent readings the "מה קראתי" screen shows. */
 const READINGS_LIST_LIMIT = 50;
 
-async function handleReadings(res: ServerResponse, businessId: string, session: Session): Promise<void> {
-  const rows = await recentReadings(READINGS_LIST_LIMIT, { businessId });
+async function handleReadings(res: ServerResponse, db: BusinessDb, session: Session): Promise<void> {
+  const rows = await recentReadings(db, READINGS_LIST_LIMIT);
   sendHtml(res, 200, renderReadings(rows, issueCsrfToken(session.sessionId)));
 }
 
@@ -646,8 +712,8 @@ const CONVERSATION_LIMIT = 200;
  * first), so when there is one row too many the one being dropped is the
  * single OLDEST of the fetched batch — `fetched.slice(1)` — not the newest.
  */
-async function handleConversation(res: ServerResponse, businessId: string, session: Session): Promise<void> {
-  const fetched = await withBusiness(businessId, (db) => conversation(db, { limit: CONVERSATION_LIMIT + 1 })); // TENANCY-TODO(task 10)
+async function handleConversation(res: ServerResponse, db: BusinessDb, session: Session): Promise<void> {
+  const fetched = await conversation(db, { limit: CONVERSATION_LIMIT + 1 });
   const truncated = fetched.length > CONVERSATION_LIMIT;
   const messages = truncated ? fetched.slice(fetched.length - CONVERSATION_LIMIT) : fetched;
   sendHtml(res, 200, renderConversation({ messages, csrf: issueCsrfToken(session.sessionId), truncated }));
@@ -661,8 +727,8 @@ async function handleConversation(res: ServerResponse, businessId: string, sessi
  * itself enforces on any caller — rather than a smaller default meant for a
  * single recall during planning.
  */
-async function handleMemory(res: ServerResponse, businessId: string, session: Session): Promise<void> {
-  const memories = await withBusiness(businessId, (db) => recallMemories(db, { limit: MAX_RECALL })); // TENANCY-TODO(task 10)
+async function handleMemory(res: ServerResponse, db: BusinessDb, session: Session): Promise<void> {
+  const memories = await recallMemories(db, { limit: MAX_RECALL });
   sendHtml(res, 200, renderMemory(memories, issueCsrfToken(session.sessionId)));
 }
 
@@ -704,10 +770,10 @@ async function handleMemory(res: ServerResponse, businessId: string, session: Se
  * must not also mean avoiding the log line an operator would find for
  * `/readings` or `/memory` and not for this one.
  */
-async function handleConnections(res: ServerResponse, businessId: string, session: Session): Promise<void> {
+async function handleConnections(res: ServerResponse, db: BusinessDb, session: Session): Promise<void> {
   let charterStatus: CharterReadStatus;
   let connections: CharterConnection[];
-  const probe = await withBusiness(businessId, (bdb) => probeActiveCharter(bdb)); // TENANCY-TODO(task 10)
+  const probe = await probeActiveCharter(db);
   if (!probe.ok) {
     console.error('connections screen: could not read the active charter:', probe.reason);
     charterStatus = 'unreadable';
@@ -720,10 +786,9 @@ async function handleConnections(res: ServerResponse, businessId: string, sessio
     connections = probe.active.charter.connections;
   }
 
-  const [bindings, grants] = await Promise.all([
-    withBusiness(businessId, (db) => loadBindings(db)), // TENANCY-TODO(task 10)
-    withBusiness(businessId, (db) => listGrants(db)), // TENANCY-TODO(task 10)
-  ]);
+  // Sequential, never `Promise.all` — one connection per request.
+  const bindings = await loadBindings(db);
+  const grants = await listGrants(db);
 
   sendHtml(
     res,
@@ -818,17 +883,17 @@ const CHARTER_UNREADABLE_TEXT = 'התקנון החתום אינו קריא כר�
  */
 async function handleDigestGet(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   error?: string,
 ): Promise<void> {
-  const settings = await withBusiness(businessId, (db) => loadDigestSettings(db)); // TENANCY-TODO(task 10)
-  const stored = await withBusiness(businessId, (db) => recentDigests(db)); // TENANCY-TODO(task 10)
+  const settings = await loadDigestSettings(db);
+  const stored = await recentDigests(db);
 
   let active: ActiveCharter | null;
   let liveUnavailable: string | undefined;
   try {
-    active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    active = await loadActiveCharter(db);
     if (active === null) liveUnavailable = CHARTER_NONE_TEXT;
   } catch (err) {
     active = null;
@@ -857,7 +922,7 @@ async function handleDigestGet(
     const now = new Date();
     const start = liveWindowStart(settings, kind, now, timeZone);
     const window = { kind, start, end: now, windowsCovered: 1 };
-    const rendered = renderDigest(await withBusiness(businessId, (db) => collectDigestFacts(db, window, ceilings))); // TENANCY-TODO(task 10)
+    const rendered = renderDigest(await collectDigestFacts(db, window, ceilings));
     live = { body: rendered.body, windowLabel: `${formatWindowStart(start, timeZone)} – עכשיו` };
   }
 
@@ -917,7 +982,7 @@ const DigestSettingsForm = z.object({
 async function handleDigestSettingsPost(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
 ): Promise<void> {
   const form = await readFormBody(req);
@@ -933,18 +998,18 @@ async function handleDigestSettingsPost(
   });
 
   if (!parsed.success) {
-    return handleDigestGet(res, businessId, session, 'יש לבחור ערכים תקינים בכל שדות התדריך.');
+    return handleDigestGet(res, db, session, 'יש לבחור ערכים תקינים בכל שדות התדריך.');
   }
 
   const toEmail = form.get('toEmail') === 'on';
   const toWhatsApp = form.get('toWhatsApp') === 'on';
 
   try {
-    await withBusiness(businessId, (db) => setDigestSettings(db, { ...parsed.data, toEmail, toWhatsApp }, session.username)); // TENANCY-TODO(task 10)
+    await setDigestSettings(db, { ...parsed.data, toEmail, toWhatsApp }, session.username);
   } catch {
     return handleDigestGet(
       res,
-      businessId,
+      db,
       session,
       'השעה או היום שנבחרו אינם בטווח התקין — יש לבחור שעה בין 00 ל-23 ויום בין ראשון לשבת.',
     );
@@ -1001,7 +1066,7 @@ export async function renderInstructionOutcome(
   res: ServerResponse,
   session: Session,
   outcome: Awaited<ReturnType<typeof runInstruction>>,
-  businessId: string,
+  db: BusinessDb,
 ): Promise<void> {
   const csrf = issueCsrfToken(session.sessionId);
 
@@ -1031,7 +1096,7 @@ export async function renderInstructionOutcome(
   // `planHash` it was shown with — and a cancel. The options come from the
   // stored row, the same row `POST /instruct/:jobId/confirm` checks against.
   if (outcome.status === 'needs_confirmation') {
-    const confirmation = await withBusiness(businessId, (db) => loadConfirmation(db, outcome.jobId)); // TENANCY-TODO(task 10)
+    const confirmation = await loadConfirmation(db, outcome.jobId);
     sendHtml(
       res,
       200,
@@ -1088,7 +1153,7 @@ export async function renderInstructionOutcome(
  */
 async function handleInstructGet(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
 ): Promise<void> {
   sendHtml(
@@ -1096,7 +1161,7 @@ async function handleInstructGet(
     200,
     renderInstruct({
       csrf: issueCsrfToken(session.sessionId),
-      ...(await openOnInstructScreen(businessId)),
+      ...(await openOnInstructScreen(db)),
     }),
   );
 }
@@ -1109,10 +1174,10 @@ async function handleInstructGet(
  * never takes the buttons away.
  */
 async function openOnInstructScreen(
-  businessId: string,
+  db: BusinessDb,
 ): Promise<{ confirmations: PendingConfirmation[]; pending: PendingQuestion[] }> {
-  const waiting = await withBusiness(businessId, (db) => pendingQuestions(db)); // TENANCY-TODO(task 10)
-  const confirmations = await withBusiness(businessId, (db) => dashboardConfirmations(db)); // TENANCY-TODO(task 10)
+  const waiting = await pendingQuestions(db);
+  const confirmations = await dashboardConfirmations(db);
   return {
     confirmations: confirmations.map((c) => ({
       jobId: c.jobId,
@@ -1144,7 +1209,7 @@ async function openOnInstructScreen(
 async function handleInstructPost(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   documentRoot: string | undefined,
   doorOptions: InstructionDoorOptions = {},
@@ -1208,7 +1273,7 @@ async function handleInstructPost(
     // entrances cannot drift, and every form it emits posts to an absolute
     // path (`/erase/preview`, `/erase/confirm`, `/erase/keep`) so they work
     // unchanged from a page served at `/instruct`.
-    return sendErasureScreenFor(res, businessId, session, documentRoot, {
+    return sendErasureScreenFor(res, db, session, documentRoot, {
       identifier: forget.identifier,
       onDate: forget.onDate,
     });
@@ -1241,7 +1306,7 @@ async function handleInstructPost(
   }
   const attachedDocumentIds: string[] = [];
   if (upload !== null) {
-    const ingested = await ingestUpload(upload, businessId, documentRoot);
+    const ingested = await ingestUpload(upload, db, documentRoot);
     if (!ingested.ok) {
       return sendHtml(
         res,
@@ -1253,14 +1318,14 @@ async function handleInstructPost(
   }
 
   const calendar = doorOptions.calendar === undefined ? undefined : await doorOptions.calendar();
-  const outcome = await withBusiness(businessId, (db) => runInstruction(db, { text }, { // TENANCY-TODO(task 10)
+  const outcome = await runInstruction(db, { text }, {
       textOrigin: 'typed',
       channel: 'dashboard',
       ...(attachedDocumentIds.length > 0 ? { attachedDocumentIds } : {}),
       ...(doorOptions.planner !== undefined ? { planner: doorOptions.planner } : {}),
       ...(calendar !== undefined ? { calendar } : {}),
-    }));
-  await renderInstructionOutcome(res, session, outcome, businessId);
+    });
+  await renderInstructionOutcome(res, session, outcome, db);
 }
 
 /** Room for the form fields and multipart framing beside the one file. */
@@ -1335,18 +1400,18 @@ async function readUploadBody(
  */
 async function ingestUpload(
   file: MultipartFile,
-  businessId: string,
+  db: BusinessDb,
   documentRoot: string | undefined,
 ): Promise<{ ok: true; documentId: string } | { ok: false; reason: string }> {
   const dir = await mkdtemp(join(tmpdir(), 'dashboard-upload-'));
   try {
     const path = join(dir, 'upload');
     await writeFile(path, file.bytes, { flag: 'wx' });
-    const record = await withBusiness(businessId, (db) => ingestDocument( // TENANCY-TODO(task 10)
+    const record = await ingestDocument(
       db,
       { path, source: 'instruction', originalName: file.filename },
       { ...(documentRoot !== undefined ? { documentRoot } : {}) },
-    ));
+    );
     if (record.status === 'rejected' || (record.status === 'stored' && record.reason !== null)) {
       return { ok: false, reason: record.reason ?? 'הקובץ נדחה בקליטה.' };
     }
@@ -1438,48 +1503,34 @@ export function reasonForSupersededJob(
  * turned away immediately with something the owner can read, never queued
  * behind a multi-second model call and then allowed to repeat it.
  *
- * **Session-scoped, on a client of its own.** The window this covers is a
- * live call to the Agent SDK. What that buys is narrower than it sounds:
- * `pg_try_advisory_lock` is session-scoped, not transaction-scoped, so the
- * connection itself is checked out of the pool for the whole call regardless
- * — a concurrent answer POST on a different job occupies its own connection
- * for as long as its model call runs, same as this one does. What is avoided
- * is an open *transaction* held across that call: no row locks, no held MVCC
- * snapshot, nothing blocking `VACUUM` for minutes while the network call
- * runs. The release mirrors `run-due.ts` exactly: a failed unlock hands the
- * connection back to `pg` as an error so the session is destroyed rather
- * than pooled while still holding the lock.
+ * **Session-scoped, on the request's own connection.** The window this
+ * covers is a live call to the Agent SDK. What that buys is narrower than it
+ * sounds: `pg_try_advisory_lock` is session-scoped, not transaction-scoped,
+ * and the request holds its one connection (`withBusiness`, one per
+ * authenticated request) for the whole call regardless — a concurrent answer
+ * POST on a different job occupies its own connection for as long as its
+ * model call runs, same as this one does. What is avoided is an open
+ * *transaction* held across that call: no row locks, no held MVCC snapshot,
+ * nothing blocking `VACUUM` for minutes while the network call runs. The
+ * lock is always released before the connection goes back: an unlock that
+ * fails is rethrown, and a connection whose unlock fails is one whose
+ * `RESET` in `withBusiness` fails too, so it is destroyed rather than pooled
+ * while still holding the lock.
  */
 async function withJobClaim<T>(
+  db: BusinessDb,
   scope: string,
   body: () => Promise<T>,
 ): Promise<{ claimed: true; value: T } | { claimed: false }> {
-  const client = await getPool().connect();
-  let holdsLock = false;
+  const lock = await db.query<{ locked: boolean }>(
+    'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
+    [scope],
+  );
+  if (lock.rows[0]?.locked !== true) return { claimed: false };
   try {
-    const lock = await client.query<{ locked: boolean }>(
-      'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
-      [scope],
-    );
-    if (lock.rows[0]?.locked !== true) return { claimed: false };
-    holdsLock = true;
     return { claimed: true, value: await body() };
   } finally {
-    if (holdsLock) {
-      let unlockError: unknown;
-      try {
-        await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [scope]);
-      } catch (error) {
-        unlockError = error;
-      }
-      if (unlockError === undefined) {
-        client.release();
-      } else {
-        client.release(unlockError instanceof Error ? unlockError : new Error(String(unlockError)));
-      }
-    } else {
-      client.release();
-    }
+    await db.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [scope]);
   }
 }
 
@@ -1547,17 +1598,18 @@ async function withJobClaim<T>(
 async function handleInstructAnswer(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   jobId: string,
   doorOptions: InstructionDoorOptions = {},
 ): Promise<void> {
+  const businessId = db.businessId;
   const form = await readFormBody(req);
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
     return sendHtml(res, 403, renderForbidden());
   }
 
-  const instruction = await withBusiness(businessId, (db) => loadInstructionForJob(db, jobId)); // TENANCY-TODO(task 10)
+  const instruction = await loadInstructionForJob(db, jobId);
   if (instruction === null) return sendHtml(res, 404, renderNotFound());
 
   // A schedule question typed into the answer box is a READ, judged on the new
@@ -1565,15 +1617,15 @@ async function handleInstructAnswer(
   // unclaimed, and nothing is parsed together with the parked half.
   const calendar = doorOptions.calendar === undefined ? undefined : await doorOptions.calendar();
   if (calendar !== undefined) {
-    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    const active = await loadActiveCharter(db);
     if (active !== null) {
-      const schedule = await withBusiness(businessId, (db) => answerScheduleQuery(db, { // TENANCY-TODO(task 10)
+      const schedule = await answerScheduleQuery(db, {
         text: form.get('answer') ?? '',
         timeZone: active.charter.identity.timezone,
         operations: active.charter.operations,
         runtime: calendar.runtime,
         ...(calendar.client !== undefined ? { client: calendar.client } : {}),
-      }));
+      });
       if (schedule !== null) {
         return sendHtml(
           res,
@@ -1597,8 +1649,8 @@ async function handleInstructAnswer(
   // `failed → failed` is illegal, so `transition` threw uncaught to the 500
   // handler. Two authorised plans for one answer, and an error saying
   // nothing happened.
-  const claim = await withJobClaim(`instruct-answer:${businessId}:${jobId}`, async () =>
-    answerUnderClaim(res, businessId, session, jobId, instruction, form.get('answer') ?? '', calendar),
+  const claim = await withJobClaim(db, `instruct-answer:${businessId}:${jobId}`, async () =>
+    answerUnderClaim(res, db, session, jobId, instruction, form.get('answer') ?? '', calendar),
   );
   if (!claim.claimed) {
     sendHtml(
@@ -1636,7 +1688,7 @@ const CONFIRMATION_UNKNOWN_OPTION = 'האפשרות שנבחרה אינה אחת
 async function handleInstructConfirm(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   jobId: string,
 ): Promise<void> {
@@ -1645,7 +1697,7 @@ async function handleInstructConfirm(
     return sendHtml(res, 403, renderForbidden());
   }
 
-  const confirmation = await withBusiness(businessId, (db) => loadConfirmation(db, jobId)); // TENANCY-TODO(task 10)
+  const confirmation = await loadConfirmation(db, jobId);
   if (confirmation === null) return sendHtml(res, 404, renderNotFound());
 
   const csrf = issueCsrfToken(session.sessionId);
@@ -1658,18 +1710,18 @@ async function handleInstructConfirm(
       return sendHtml(
         res,
         400,
-        renderInstruct({ csrf, error: CONFIRMATION_UNKNOWN_OPTION, ...(await openOnInstructScreen(businessId)) }),
+        renderInstruct({ csrf, error: CONFIRMATION_UNKNOWN_OPTION, ...(await openOnInstructScreen(db)) }),
       );
     }
     reading = { kind: 'confirm', planHash };
   }
 
-  const outcome = await withBusiness(businessId, (db) => applyConfirmation(db, jobId, reading, `dashboard:${session.username}`)); // TENANCY-TODO(task 10)
+  const outcome = await applyConfirmation(db, jobId, reading, `dashboard:${session.username}`);
   if (outcome === 'executing' || outcome === 'cancelled') return redirect(res, '/');
   sendHtml(
     res,
     409,
-    renderInstruct({ csrf, error: CONFIRMATION_ALREADY_DECIDED, ...(await openOnInstructScreen(businessId)) }),
+    renderInstruct({ csrf, error: CONFIRMATION_ALREADY_DECIDED, ...(await openOnInstructScreen(db)) }),
   );
 }
 
@@ -1684,7 +1736,7 @@ async function handleInstructConfirm(
  */
 async function answerUnderClaim(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   jobId: string,
   // Named fields rather than the whole `InstructionRecord`, as this
@@ -1700,7 +1752,7 @@ async function answerUnderClaim(
   // `handleInstructAnswer`'s docblock for the two ways skipping this check
   // broke. Read under the claim, so a concurrent request cannot move the
   // phase between this read and the transition at the end.
-  const job = await withBusiness(businessId, (db) => loadJob(db, jobId)); // TENANCY-TODO(task 10)
+  const job = await loadJob(db, jobId);
   if (job === null) return sendHtml(res, 404, renderNotFound());
   if (job.phase !== 'understand') {
     return sendHtml(
@@ -1743,7 +1795,7 @@ async function answerUnderClaim(
   // round 1), so the guard lives with the function rather than in the
   // assumption that every caller holds a lock. A `false` here means the row
   // was answered between the phase read above and this line.
-  const took = await withBusiness(businessId, (db) => claimAnswer(db, instruction.instructionId, answer)); // TENANCY-TODO(task 10)
+  const took = await claimAnswer(db, instruction.instructionId, answer);
   if (!took) {
     return sendHtml(
       res,
@@ -1763,7 +1815,7 @@ async function answerUnderClaim(
   // would launder the recorded half's addresses into "the owner typed
   // this himself" one hop later, which is the whole defect the origin
   // rule closes — reached through the dashboard rather than the door.
-  const outcome = await withBusiness(businessId, async (db) => runInstruction(db, { text: `${instruction.text}\n\n${answer}` }, { // TENANCY-TODO(task 10)
+  const outcome = await runInstruction(db, { text: `${instruction.text}\n\n${answer}` }, {
       textOrigin: instruction.textOrigin === 'typed' ? 'typed' : 'transcribed',
       // A confirmation question is answered where it was asked (boss
       // command, spec §4) — this is the dashboard.
@@ -1776,24 +1828,24 @@ async function answerUnderClaim(
       sourceAsked: true,
       // The files the owner attached to the original instruction stay his
       // sources on the second pass (document production D14).
-      attachedDocumentIds: await withBusiness(businessId, (db) => attachedDocumentsForJob(db, jobId)), // TENANCY-TODO(task 10)
+      attachedDocumentIds: await attachedDocumentsForJob(db, jobId),
       // Calendar access for the meeting door: an answer to a meeting question
       // (which meeting, "תזיזי את X", another window) goes back to it. The
       // schedule routing stays OFF: the joined text is not a schedule question,
       // and one in the answer alone was handled read-only before the claim.
       ...(calendar !== undefined ? { calendar, scheduleRouting: false, answerTo: { jobId, answer } } : {}),
-    }));
+    });
 
   // The parked job always leaves `understand`; only the destination and the
   // reason differ. See this route's docblock on why a refusal CLOSES it
   // rather than leaving it parked — the answer is already recorded, so a job
   // left behind is open, invisible to `GET /instruct`, and never reported.
   if (outcome.status === 'refused') {
-    await withBusiness(businessId, (db) => transition(db, jobId, { // TENANCY-TODO(task 10)
+    await transition(db, jobId, {
       to: 'closed',
       actor: 'human',
       reason: REASON_ANSWER_REFUSED_HERE,
-    }));
+    });
     return sendHtml(
       res,
       400,
@@ -1807,15 +1859,15 @@ async function answerUnderClaim(
   // The answer pass never routes a schedule question (`calendar` is passed for
   // the meeting door, but with `scheduleRouting: false`), so an `answered`
   // outcome cannot come from here and there is always a replacement job.
-  if (outcome.status === 'answered') return renderInstructionOutcome(res, session, outcome, businessId);
+  if (outcome.status === 'answered') return renderInstructionOutcome(res, session, outcome, db);
 
-  await withBusiness(businessId, (db) => transition(db, jobId, { // TENANCY-TODO(task 10)
+  await transition(db, jobId, {
     to: 'failed',
     actor: 'human',
     reason: reasonForSupersededJob(outcome),
-  }));
+  });
 
-  await renderInstructionOutcome(res, session, outcome, businessId);
+  await renderInstructionOutcome(res, session, outcome, db);
 }
 
 // --- The erasure screen (spec §4, §6, §7). --------------------------------
@@ -1997,7 +2049,7 @@ function prefillFor(anchor: ErasureAnchor): ErasurePrefill {
  */
 async function sendErasureEntry(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   status: number,
   overrides: { error?: string; prefill?: ErasurePrefill } = {},
@@ -2009,7 +2061,7 @@ async function sendErasureEntry(
       csrf: issueCsrfToken(session.sessionId),
       anchorLabel: '',
       plan: null,
-      kept: await withBusiness(businessId, (bdb) => listKept(bdb)), // TENANCY-TODO(task 10)
+      kept: await listKept(db),
       ...(overrides.error === undefined ? {} : { error: overrides.error }),
       ...(overrides.prefill === undefined ? {} : { prefill: overrides.prefill }),
     }),
@@ -2023,13 +2075,13 @@ async function sendErasureEntry(
  */
 async function sendErasurePreview(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   anchor: ErasureAnchor,
   documentRoot: string | undefined,
   overrides: { plan?: ErasurePlan; error?: string } = {},
 ): Promise<void> {
-  const plan = overrides.plan ?? (await resolvePlan(anchor, businessId, documentRoot));
+  const plan = overrides.plan ?? (await resolvePlan(anchor, db, documentRoot));
   sendHtml(
     res,
     200,
@@ -2038,7 +2090,7 @@ async function sendErasurePreview(
       anchorLabel: anchorLabelFor(anchor),
       plan,
       planHash: planFingerprint(plan),
-      timeZone: await charterTimeZone(businessId),
+      timeZone: await charterTimeZone(db),
       prefill: prefillFor(anchor),
       ...(overrides.error === undefined ? {} : { error: overrides.error }),
     }),
@@ -2050,9 +2102,9 @@ async function sendErasurePreview(
  * read. `loadActiveCharter`, locally caught — never `probeActiveCharter`, which
  * is reserved for the install path and the readiness report.
  */
-async function charterTimeZone(businessId: string): Promise<string | null> {
+async function charterTimeZone(db: BusinessDb): Promise<string | null> {
   try {
-    return (await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)))?.charter.identity.timezone ?? null; // TENANCY-TODO(task 10)
+    return (await loadActiveCharter(db))?.charter.identity.timezone ?? null;
   } catch {
     return null;
   }
@@ -2066,10 +2118,10 @@ async function charterTimeZone(businessId: string): Promise<string | null> {
  */
 async function resolvePlan(
   anchor: ErasureAnchor,
-  businessId: string,
+  db: BusinessDb,
   documentRoot: string | undefined,
 ): Promise<ErasurePlan> {
-  return withBusiness(businessId, (db) => buildErasurePlan(db, anchor, documentRoot === undefined ? {} : { documentRoot })); // TENANCY-TODO(task 10)
+  return buildErasurePlan(db, anchor, documentRoot === undefined ? {} : { documentRoot });
 }
 
 /**
@@ -2081,12 +2133,12 @@ async function resolvePlan(
 async function handleEraseGet(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   documentRoot: string | undefined,
 ): Promise<void> {
   const params = new URL(req.url ?? '/erase', 'http://dashboard.local').searchParams;
-  await sendErasureScreenFor(res, businessId, session, documentRoot, {
+  await sendErasureScreenFor(res, db, session, documentRoot, {
     identifier: params.get('identifier'),
     onDate: params.get('onDate'),
   });
@@ -2103,27 +2155,27 @@ async function handleEraseGet(
  */
 async function sendErasureScreenFor(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   documentRoot: string | undefined,
   prefill: { identifier: string | null; onDate: string | null },
 ): Promise<void> {
   const identifier = (prefill.identifier ?? '').trim();
   if (identifier !== '') {
-    return sendErasurePreview(res, businessId, session, { kind: 'contact', identifier }, documentRoot);
+    return sendErasurePreview(res, db, session, { kind: 'contact', identifier }, documentRoot);
   }
 
   const onDate = prefill.onDate ?? '';
   const window: ErasurePrefill = /^\d{4}-\d{2}-\d{2}$/.test(onDate)
     ? { fromIso: `${onDate}T00:00`, toIso: `${onDate}T23:59` }
     : {};
-  await sendErasureEntry(res, businessId, session, 200, { prefill: window });
+  await sendErasureEntry(res, db, session, 200, { prefill: window });
 }
 
 async function handleErasePreview(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   documentRoot: string | undefined,
 ): Promise<void> {
@@ -2134,8 +2186,8 @@ async function handleErasePreview(
 
   const anchor = anchorFromForm(form);
   if (anchor === null)
-    return sendErasureEntry(res, businessId, session, 400, { error: ANCHOR_UNREADABLE });
-  await sendErasurePreview(res, businessId, session, anchor, documentRoot);
+    return sendErasureEntry(res, db, session, 400, { error: ANCHOR_UNREADABLE });
+  await sendErasurePreview(res, db, session, anchor, documentRoot);
 }
 
 /**
@@ -2151,7 +2203,7 @@ async function handleErasePreview(
 async function handleEraseConfirm(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   documentRoot: string | undefined,
 ): Promise<void> {
@@ -2162,13 +2214,13 @@ async function handleEraseConfirm(
 
   const anchor = anchorFromJson(form.get('anchor'));
   if (anchor === null)
-    return sendErasureEntry(res, businessId, session, 400, { error: ANCHOR_UNREADABLE });
+    return sendErasureEntry(res, db, session, 400, { error: ANCHOR_UNREADABLE });
 
-  const plan = await resolvePlan(anchor, businessId, documentRoot);
+  const plan = await resolvePlan(anchor, db, documentRoot);
   // A refusal first: it is the more useful thing to say, and it is true
   // whether or not the plan also moved.
   if (plan.refusals.length > 0) {
-    return sendErasurePreview(res, businessId, session, anchor, documentRoot, { plan });
+    return sendErasurePreview(res, db, session, anchor, documentRoot, { plan });
   }
 
   // Then the handshake. The owner authorised a set of counts, not an anchor;
@@ -2176,7 +2228,7 @@ async function handleEraseConfirm(
   // destroying a wider set than the preview named (spec §4.4). A missing
   // hash lands here too — nothing was authorised.
   if (form.get('planHash') !== planFingerprint(plan)) {
-    return sendErasurePreview(res, businessId, session, anchor, documentRoot, {
+    return sendErasurePreview(res, db, session, anchor, documentRoot, {
       plan,
       error: PLAN_MOVED,
     });
@@ -2185,7 +2237,7 @@ async function handleEraseConfirm(
   let outcome: ErasureOutcome;
   let auditUnrecorded = false;
   try {
-    outcome = await withBusiness(businessId, (db) => executeErasure(db, plan)); // TENANCY-TODO(task 10)
+    outcome = await executeErasure(db, plan);
   } catch (error) {
     // It happened. The transaction committed and every unlink was attempted;
     // only the record of it is missing, and reporting that as a failure
@@ -2201,8 +2253,8 @@ async function handleEraseConfirm(
       // two reasons (a job woken live, and a document signed since the
       // preview), and the rebuilt plan below already names the specific
       // document or job underneath this sentence.
-      const refreshed = await resolvePlan(anchor, businessId, documentRoot);
-      return sendErasurePreview(res, businessId, session, anchor, documentRoot, {
+      const refreshed = await resolvePlan(anchor, db, documentRoot);
+      return sendErasurePreview(res, db, session, anchor, documentRoot, {
         plan: {
           ...refreshed,
           refusals: [{ kind: error.kind, detail: error.message }, ...refreshed.refusals],
@@ -2238,7 +2290,7 @@ async function handleEraseConfirm(
 async function handleEraseKeep(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   documentRoot: string | undefined,
 ): Promise<void> {
@@ -2250,32 +2302,32 @@ async function handleEraseKeep(
   const kind = keptKindFrom(form.get('kind'));
   const itemId = (form.get('itemId') ?? '').trim();
   if (kind === null || itemId === '')
-    return sendErasureEntry(res, businessId, session, 400, { error: KEEP_UNREADABLE });
+    return sendErasureEntry(res, db, session, 400, { error: KEEP_UNREADABLE });
 
   if (form.get('revoke') === '1') {
-    await withBusiness(businessId, (bdb) => revokeKeep(bdb, kind, itemId)); // TENANCY-TODO(task 10)
+    await revokeKeep(db, kind, itemId);
   } else {
     const note = noteFrom(form);
-    await withBusiness(businessId, (bdb) => keepItem(bdb, { kind, itemId, ...(note === undefined ? {} : { note }) })); // TENANCY-TODO(task 10)
+    await keepItem(db, { kind, itemId, ...(note === undefined ? {} : { note }) });
   }
 
   const anchor = anchorFromJson(form.get('anchor'));
-  if (anchor === null) return sendErasureEntry(res, businessId, session, 200);
-  await sendErasurePreview(res, businessId, session, anchor, documentRoot);
+  if (anchor === null) return sendErasureEntry(res, db, session, 200);
+  await sendErasurePreview(res, db, session, anchor, documentRoot);
 }
 
 
-async function handleCard(res: ServerResponse, businessId: string, session: Session, approvalId: string): Promise<void> {
+async function handleCard(res: ServerResponse, db: BusinessDb, session: Session, approvalId: string): Promise<void> {
   // Scoped by businessId in the same query that loads the row — an approval
   // belonging to another business must not be distinguishable from one that
   // does not exist at all, so both come back 404, never 403.
-  const approval = await withBusiness(businessId, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+  const approval = await getApproval(db, approvalId);
   if (!approval) return sendHtml(res, 404, renderNotFound());
   // `null` (no document behind this approval) is the ordinary case — most
   // approvals never had a document. When one does resolve, the card shows it
   // either way; the sign form is a second, narrower question, answered by the
   // proposal's own intent against `DOCUMENT_DECISION_INTENTS` (I4).
-  const resolved = await documentForApproval(approvalId, { businessId });
+  const resolved = await documentForApproval(db, approvalId);
   // Read at REQUEST time, deliberately — the same reasoning `documentForApproval`
   // already carries a level up. Whether `gov.verify`'s own job has finished by
   // now, or was even opened, is not something this route waits on or cares
@@ -2302,7 +2354,7 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
   if (approval.jobId !== null) {
     try {
       const approvalJobId = approval.jobId;
-      const outcome = await withBusiness(businessId, (bdb) => loadVerificationOutcome(bdb, approvalJobId)); // TENANCY-TODO(task 10)
+      const outcome = await loadVerificationOutcome(db, approvalJobId);
       if (outcome !== null) {
         if (outcome.status === 'judged') {
           verdict = outcome.verdict;
@@ -2326,7 +2378,7 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
       ...(verdict !== null ? { verdict } : {}),
       ...(notJudgedReason !== null ? { notJudged: notJudgedReason } : {}),
       ...(verdictUnreadable ? { verdictUnreadable: true } : {}),
-      ...(await mailReplyOptions(approval.jobId, businessId)),
+      ...(await mailReplyOptions(approval.jobId, db)),
     }),
   );
 }
@@ -2334,22 +2386,22 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
 /** The card options a mailbox reply needs: the marker, and the provider when one is bound. */
 async function mailReplyOptions(
   jobId: string | null,
-  businessId: string,
+  db: BusinessDb,
 ): Promise<{ mailReply?: true; mailProvider?: string }> {
-  if (!(await isMailReplyCard(jobId, businessId))) return {};
-  const mailProvider = await mailboxProviderOf(businessId);
+  if (!(await isMailReplyCard(jobId, db))) return {};
+  const mailProvider = await mailboxProviderOf(db);
   return mailProvider !== null ? { mailReply: true, mailProvider } : { mailReply: true };
 }
 
 /** The provider on the business's `mailbox` binding, or `null` when none is bound. */
-async function mailboxProviderOf(businessId: string): Promise<string | null> {
-  const bindings = await withBusiness(businessId, (db) => loadBindings(db)); // TENANCY-TODO(task 10)
+async function mailboxProviderOf(db: BusinessDb): Promise<string | null> {
+  const bindings = await loadBindings(db);
   return bindings.find((b) => b.system === MAILBOX_SYSTEM)?.provider ?? null;
 }
 
 /** The positive marker the reply layout and the reply edit rule key on. */
-async function isMailReplyCard(jobId: string | null, businessId: string): Promise<boolean> {
-  return jobId !== null && (await withBusiness(businessId, (db) => isMailReplyJob(db, jobId))); // TENANCY-TODO(task 10)
+async function isMailReplyCard(jobId: string | null, db: BusinessDb): Promise<boolean> {
+  return jobId !== null && (await isMailReplyJob(db, jobId));
 }
 
 /** JSON.parse can hand back an object, an array, a string, a number, a boolean, or null — only the first is a tool payload. */
@@ -2478,7 +2530,7 @@ function alreadySignedReason(signature: SignatureRecord | null): string {
 async function handleDecision(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   approvalId: string,
   outcome: 'approved' | 'denied' | 'signed',
@@ -2494,7 +2546,7 @@ async function handleDecision(
     // has to be given up here. The card still needs a live CSRF token and
     // a session, exactly as the plain approve/deny path does; nothing about
     // this error path skips either check.
-    const approval = await withBusiness(businessId, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await getApproval(db, approvalId);
     if (!approval) return sendHtml(res, 404, renderNotFound());
     return sendHtml(
       res,
@@ -2511,7 +2563,7 @@ async function handleDecision(
     return sendHtml(res, 403, renderForbidden());
   }
 
-  const approval = await withBusiness(businessId, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+  const approval = await getApproval(db, approvalId);
   if (!approval) return sendHtml(res, 404, renderNotFound());
 
   const note = noteFrom(form);
@@ -2558,7 +2610,7 @@ async function handleDecision(
       );
     }
 
-    const resolved = await documentForApproval(approvalId, { businessId });
+    const resolved = await documentForApproval(db, approvalId);
     if (resolved === null) {
       // The button that posts here would not have been rendered without a
       // document — a direct POST is a stale page or someone probing.
@@ -2620,9 +2672,9 @@ async function handleDecision(
       );
     }
 
-    const verifyResult = await withBusiness(businessId, (db) => verifyDocumentUnchanged(db, document.documentId, { // TENANCY-TODO(task 10)
+    const verifyResult = await verifyDocumentUnchanged(db, document.documentId, {
       ...(documentRoot !== undefined ? { documentRoot } : {}),
-    }));
+    });
     if (verifyResult.status !== 'unchanged') {
       return sendHtml(
         res,
@@ -2652,8 +2704,8 @@ async function handleDecision(
     // reason in the repo carries attacker-influenced free text.
     let decided: ApprovalRequest;
     try {
-      decided = await withBusiness(businessId, (bdb) => decideAndSign( // TENANCY-TODO(task 10)
-        bdb,
+      decided = await decideAndSign(
+        db,
         {
           approvalId,
           decision: {
@@ -2683,10 +2735,10 @@ async function handleDecision(
             reason: `signature:${document.documentId} by ${session.username} for approval ${approvalId}`,
           },
         }
-      ));
+      );
     } catch (err) {
       if (err instanceof DocumentAlreadySignedError) {
-        const existing = await withBusiness(businessId, (bdb) => loadSignature(bdb, document.documentId)); // TENANCY-TODO(task 10)
+        const existing = await loadSignature(db, document.documentId);
         return sendHtml(
           res,
           400,
@@ -2724,7 +2776,7 @@ async function handleDecision(
     // The job-phase half of `applyDecision`, run after the signature
     // transaction commits: `transition` opens its own transaction and takes
     // `FOR UPDATE` on the job row, so it cannot join the one above.
-    await withBusiness(businessId, (db) => resumeAfterDecision(db, decided, session.username)); // TENANCY-TODO(task 10)
+    await resumeAfterDecision(db, decided, session.username);
     return redirect(res, '/');
   }
 
@@ -2738,8 +2790,8 @@ async function handleDecision(
     approval.inputHash,
   );
 
-  const mailReply = await isMailReplyCard(approval.jobId, businessId);
-  const mailProvider = mailReply ? await mailboxProviderOf(businessId) : null;
+  const mailReply = await isMailReplyCard(approval.jobId, db);
+  const mailProvider = mailReply ? await mailboxProviderOf(db) : null;
   const providerOption = mailProvider !== null ? { mailProvider } : {};
 
   if (!edit.ok) {
@@ -2770,7 +2822,7 @@ async function handleDecision(
       ? mailReplyEditRefusal(
           approval.proposedInput,
           edit.editedInput,
-          mailProvider ?? (await mailboxProviderOf(businessId)),
+          mailProvider ?? (await mailboxProviderOf(db)),
         )
       : null;
   if (editRefusal !== null) {
@@ -2791,22 +2843,22 @@ async function handleDecision(
 
   // `applyDecision` only knows 'approved' | 'denied' — a signature is an
   // extra act performed before this, not a third outcome it records itself.
-  await withBusiness(businessId, (db) => applyDecision(db, approvalId, outcome === 'denied' ? 'denied' : 'approved', { // TENANCY-TODO(task 10)
+  await applyDecision(db, approvalId, outcome === 'denied' ? 'denied' : 'approved', {
       by: session.username,
       channel: 'dashboard',
       ...(note !== undefined ? { note } : {}),
       ...(edit.editedInput !== undefined ? { editedInput: edit.editedInput } : {}),
-    }));
+    });
 
   redirect(res, '/');
 }
 
-async function handleLogout(req: IncomingMessage, res: ServerResponse, businessId: string, session: Session): Promise<void> {
+async function handleLogout(req: IncomingMessage, res: ServerResponse, db: BusinessDb, session: Session): Promise<void> {
   const form = await readFormBody(req);
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
     return sendHtml(res, 403, renderForbidden());
   }
-  await revokeAllSessions(session.username, { businessId });
+  await revokeAllSessions(db, session.username);
   redirect(res, '/login', { 'Set-Cookie': clearedCookie() });
 }
 
@@ -2815,9 +2867,9 @@ async function handleLogout(req: IncomingMessage, res: ServerResponse, businessI
  * owner turns the dial and picks update channels, so a charter this code
  * cannot read (or none at all) must cost him the score, not the page.
  */
-async function readLearning(businessId: string): Promise<LearningSnapshot | null> {
+async function readLearning(db: BusinessDb): Promise<LearningSnapshot | null> {
   try {
-    return await learningSnapshot({ businessId });
+    return await learningSnapshot(db);
   } catch {
     return null;
   }
@@ -2825,18 +2877,18 @@ async function readLearning(businessId: string): Promise<LearningSnapshot | null
 
 async function renderAutonomyScreen(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   status: number,
   error?: string,
   settings?: ActionUpdateSettings,
 ): Promise<void> {
-  const mode = await withBusiness(businessId, (bdb) => loadAutonomyMode(bdb)); // TENANCY-TODO(task 10)
-  const shown = settings ?? (await withBusiness(businessId, (db) => loadActionUpdateSettings(db))); // TENANCY-TODO(task 10)
+  const mode = await loadAutonomyMode(db);
+  const shown = settings ?? (await loadActionUpdateSettings(db));
   sendHtml(
     res,
     status,
-    renderAutonomy(mode, await readLearning(businessId), shown, issueCsrfToken(session.sessionId), error),
+    renderAutonomy(mode, await readLearning(db), shown, issueCsrfToken(session.sessionId), error),
   );
 }
 
@@ -2845,14 +2897,14 @@ async function renderAutonomyScreen(
  * channels below it (shadow mode, spec §5.3, §5.5). GET shows them; the two
  * POSTs change the dial and the channels.
  */
-async function handleAutonomyGet(res: ServerResponse, businessId: string, session: Session): Promise<void> {
-  await renderAutonomyScreen(res, businessId, session, 200);
+async function handleAutonomyGet(res: ServerResponse, db: BusinessDb, session: Session): Promise<void> {
+  await renderAutonomyScreen(res, db, session, 200);
 }
 
 async function handleAutonomyModePost(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
 ): Promise<void> {
   const form = await readFormBody(req);
@@ -2862,10 +2914,10 @@ async function handleAutonomyModePost(
 
   const parsed = AutonomyMode.safeParse(form.get('mode'));
   if (!parsed.success) {
-    return renderAutonomyScreen(res, businessId, session, 400, 'יש לבחור אחת משלוש האפשרויות.');
+    return renderAutonomyScreen(res, db, session, 400, 'יש לבחור אחת משלוש האפשרויות.');
   }
 
-  await withBusiness(businessId, (bdb) => setAutonomyMode(bdb, parsed.data, session.username)); // TENANCY-TODO(task 10)
+  await setAutonomyMode(db, parsed.data, session.username);
   redirect(res, '/autonomy');
 }
 
@@ -2878,7 +2930,7 @@ async function handleAutonomyModePost(
 async function handleAutonomyUpdatesPost(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
 ): Promise<void> {
   const form = await readFormBody(req);
@@ -2892,10 +2944,10 @@ async function handleAutonomyUpdatesPost(
     toScreen: form.get('toScreen') === 'on',
   };
   try {
-    await withBusiness(businessId, (db) => saveActionUpdateSettings(db, settings, { updatedBy: session.username })); // TENANCY-TODO(task 10)
+    await saveActionUpdateSettings(db, settings, { updatedBy: session.username });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return renderAutonomyScreen(res, businessId, session, 400, message, settings);
+    return renderAutonomyScreen(res, db, session, 400, message, settings);
   }
   redirect(res, '/autonomy');
 }
@@ -2908,12 +2960,12 @@ async function handleAutonomyUpdatesPost(
  * has not seen are marked "חדש", and exactly those rows are then marked
  * seen — after the page is rendered, so the mark is what he was shown.
  */
-async function handleAutonomousActionsGet(res: ServerResponse, businessId: string, session: Session): Promise<void> {
-  const actions = await listAutonomousActions({ businessId });
-  const settings = await withBusiness(businessId, (db) => loadActionUpdateSettings(db)); // TENANCY-TODO(task 10)
-  const fresh = settings.toScreen ? await unseenUpdateKeys(actions, { businessId }) : new Set<string>();
+async function handleAutonomousActionsGet(res: ServerResponse, db: BusinessDb, session: Session): Promise<void> {
+  const actions = await listAutonomousActions(db);
+  const settings = await loadActionUpdateSettings(db);
+  const fresh = settings.toScreen ? await unseenUpdateKeys(db, actions) : new Set<string>();
   const html = renderAutonomousActions(actions, issueCsrfToken(session.sessionId), undefined, fresh);
-  await markUpdatesSeen(fresh, { businessId });
+  await markUpdatesSeen(db, fresh);
   sendHtml(res, 200, html);
 }
 
@@ -2935,7 +2987,7 @@ async function handleAutonomousActionsGet(res: ServerResponse, businessId: strin
 async function handleAutonomousActionMark(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: Session,
   jobId: string,
   stepId: string,
@@ -2946,7 +2998,7 @@ async function handleAutonomousActionMark(
   }
 
   const note = (form.get('note') ?? '').trim();
-  const actions = await listAutonomousActions({ businessId });
+  const actions = await listAutonomousActions(db);
   const action = actions.find((candidate) => candidate.jobId === jobId && candidate.stepId === stepId);
 
   if (action === undefined || note === '') {
@@ -2957,10 +3009,10 @@ async function handleAutonomousActionMark(
     return sendHtml(res, 400, renderAutonomousActions(actions, issueCsrfToken(session.sessionId), message));
   }
 
-  await withBusiness(businessId, (bdb) => recordCorrection( // TENANCY-TODO(task 10)
-    bdb,
+  await recordCorrection(
+    db,
     { jobId, stepId, actionClass: action.actionClass, note, by: session.username }
-  ));
+  );
   redirect(res, '/autonomy/actions');
 }
 
@@ -2989,11 +3041,83 @@ const OUTCOME_FOR_ACTION = {
   sign: 'signed',
 } as const;
 
+/** The per-request options `createServer` builds once and every request carries. */
+interface RouteOptions {
+  trustProxy: boolean;
+  documentRoot: string | undefined;
+  oauthOptions: OAuthRouteOptions;
+  setupOptions: SetupOptions;
+  doorOptions: InstructionDoorOptions;
+  meetingOptions: MeetingRouteOptions;
+}
+
+/**
+ * Every request starts here. The login routes need no business; everything
+ * else needs a session, and the session decides the business (spec §5.5):
+ *
+ *   - The cookie names `<businessId>.<token>`. One `withBusiness` is opened
+ *     for that business, and the whole request — session lookup, the
+ *     suspension check, the handler — runs on that one connection. Nothing
+ *     in a handler may run two queries on it at once (`Promise.all`): two
+ *     statements in flight on one client interleave.
+ *   - The session row is looked up inside that business, so a cookie whose
+ *     business part was forged is a miss, sent to the login form.
+ *   - A business the operator suspended is refused before routing, on every
+ *     request of a live session, and nothing is revoked: reactivating it lets
+ *     the same session straight back in.
+ */
+async function handleRequest(req: IncomingMessage, res: ServerResponse, options: RouteOptions): Promise<void> {
+  const method = req.method ?? 'GET';
+  const pathname = new URL(req.url ?? '/', 'http://dashboard.local').pathname;
+
+  if (method === 'GET' && pathname === '/login') return handleLoginGet(res);
+  // Deliberately no CSRF check here — not an oversight. A CSRF token is
+  // bound to a session id, and there is no session yet at this point in the
+  // request. Classic "login CSRF" (a cross-site form submitting attacker-
+  // known credentials so the victim's browser ends up authenticated as the
+  // attacker) has no target here either: every account is created
+  // out-of-band by a local CLI command, with no self-registration — making
+  // either branch of this form succeed already requires possessing an
+  // account's password or an unredeemed recovery code, at which point the
+  // attacker already has direct access and gains nothing by routing it
+  // through the victim's browser.
+  if (method === 'POST' && pathname === '/login') {
+    return handleLoginPost(req, res, options.trustProxy);
+  }
+
+  // Everything past this point requires a session.
+  const cookie = sessionCookieFrom(req);
+  if (cookie === null) return redirect(res, '/login');
+
+  return withBusiness(cookie.businessId, async (db) => {
+    const session = await loadSession(db, cookie);
+    if (!session) return redirect(res, '/login');
+
+    // The business must still be active — read on every request, never
+    // cached in the session, so a suspension takes effect on the next click.
+    const business = await getBusiness(db.businessId);
+    if (business?.status !== 'active') return sendHtml(res, 403, renderSuspended());
+
+    return route(
+      req,
+      res,
+      db,
+      session,
+      options.documentRoot,
+      options.oauthOptions,
+      options.setupOptions,
+      options.doorOptions,
+      options.meetingOptions,
+    );
+  });
+}
+
+/** Routes one authenticated request, on its business's connection. */
 async function route(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
-  trustProxy: boolean,
+  db: BusinessDb,
+  session: Session,
   documentRoot: string | undefined,
   oauthOptions: OAuthRouteOptions,
   setupOptions: SetupOptions = {},
@@ -3004,28 +3128,9 @@ async function route(
   const requestUrl = new URL(req.url ?? '/', 'http://dashboard.local');
   const pathname = requestUrl.pathname;
 
-  if (method === 'GET' && pathname === '/login') return handleLoginGet(res);
-  // Deliberately no CSRF check here — not an oversight. A CSRF token is
-  // bound to a session id, and there is no session yet at this point in the
-  // request. Classic "login CSRF" (a cross-site form submitting attacker-
-  // known credentials so the victim's browser ends up authenticated as the
-  // attacker) has no target here either: this is a single account, created
-  // out-of-band by a local CLI command, with no self-registration — making
-  // either branch of this form succeed already requires possessing that one
-  // account's password or an unredeemed recovery code, at which point the
-  // attacker already has direct access and gains nothing by routing it
-  // through the victim's browser.
-  if (method === 'POST' && pathname === '/login') {
-    return handleLoginPost(req, res, businessId, trustProxy);
-  }
-
-  // Everything past this point requires a session.
-  const session = await loadSession(req, businessId);
-  if (!session) return redirect(res, '/login');
-
   if (method === 'GET' && pathname === '/password') return handlePasswordGet(res, session);
-  if (method === 'POST' && pathname === '/password') return handlePasswordPost(req, res, businessId, session);
-  if (method === 'POST' && pathname === '/logout') return handleLogout(req, res, businessId, session);
+  if (method === 'POST' && pathname === '/password') return handlePasswordPost(req, res, db, session);
+  if (method === 'POST' && pathname === '/logout') return handleLogout(req, res, db, session);
 
   // A session minted from a recovery code cannot reach anything else —
   // checked here, after /password and /logout have already had their turn,
@@ -3037,166 +3142,166 @@ async function route(
   // it (spec §6.1). Absence is read from the pointer column, never by parsing
   // — a charter that exists but does not parse is NOT absent, and is reached
   // through the banner that leads to "edit the rules" instead.
-  if (!pathname.startsWith('/setup') && (await withBusiness(businessId, (bdb) => activeCharterVersion(bdb))) === null) { // TENANCY-TODO(task 10)
+  if (!pathname.startsWith('/setup') && (await activeCharterVersion(db)) === null) {
     return seeOther(res, '/setup');
   }
 
-  if (method === 'GET' && pathname === '/setup') return handleSetupIndex(res, businessId);
-  if (method === 'GET' && pathname === '/setup/edit') return handleSetupEdit(res, businessId, session);
-  if (method === 'GET' && pathname === '/setup/summary') return handleSummaryGet(res, businessId, session);
+  if (method === 'GET' && pathname === '/setup') return handleSetupIndex(res, db);
+  if (method === 'GET' && pathname === '/setup/edit') return handleSetupEdit(res, db, session);
+  if (method === 'GET' && pathname === '/setup/summary') return handleSummaryGet(res, db, session);
   if (method === 'POST' && pathname === '/setup/sign') {
-    return handleSignPost(res, businessId, session, await readFormBody(req), setupOptions);
+    return handleSignPost(res, db, session, await readFormBody(req), setupOptions);
   }
   if (method === 'POST' && pathname === '/setup/rule') {
-    return handleRulePost(res, businessId, session, await readFormBody(req), setupOptions);
+    return handleRulePost(res, db, session, await readFormBody(req), setupOptions);
   }
   const setupStepMatch = SETUP_STEP_PATH.exec(pathname);
   const setupStep = setupStepMatch?.[1] === undefined ? null : parseStep(setupStepMatch[1]);
   if (setupStep !== null && method === 'GET') {
-    return handleSetupStepGet(res, businessId, session, setupStep, requestUrl.searchParams);
+    return handleSetupStepGet(res, db, session, setupStep, requestUrl.searchParams);
   }
   if (setupStep !== null && method === 'POST') {
-    return handleSetupStepPost(res, businessId, session, setupStep, await readFormBody(req));
+    return handleSetupStepPost(res, db, session, setupStep, await readFormBody(req));
   }
   const ruleChoiceMatch = SETUP_RULE_PATH.exec(pathname);
   if (method === 'POST' && ruleChoiceMatch?.[1] !== undefined) {
-    return handleRuleChoice(res, businessId, session, Number(ruleChoiceMatch[1]), await readFormBody(req));
+    return handleRuleChoice(res, db, session, Number(ruleChoiceMatch[1]), await readFormBody(req));
   }
 
   if (method === 'GET' && pathname === '/') {
-    return handlePendingList(res, businessId, session, requestUrl.searchParams.get('mode') === 'failed');
+    return handlePendingList(res, db, session, requestUrl.searchParams.get('mode') === 'failed');
   }
-  if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
-  if (method === 'GET' && pathname === '/memory') return handleMemory(res, businessId, session);
-  if (method === 'GET' && pathname === '/connections') return handleConnections(res, businessId, session);
+  if (method === 'GET' && pathname === '/readings') return handleReadings(res, db, session);
+  if (method === 'GET' && pathname === '/memory') return handleMemory(res, db, session);
+  if (method === 'GET' && pathname === '/connections') return handleConnections(res, db, session);
   // The mailbox screens: list with search, invoices by supplier, one mail, and
   // the business-scoped document download they link to.
   if (method === 'GET' && pathname === '/mail') {
-    return handleMailList(res, businessId, requestUrl, issueCsrfToken(session.sessionId));
+    return handleMailList(res, db, requestUrl, issueCsrfToken(session.sessionId));
   }
   if (method === 'GET' && pathname === '/mail/invoices') {
-    return handleInvoices(res, businessId, requestUrl, issueCsrfToken(session.sessionId));
+    return handleInvoices(res, db, requestUrl, issueCsrfToken(session.sessionId));
   }
   // Before `MAIL_PATH`, which would read "documents" as a mail id.
-  if (method === 'GET' && pathname === '/mail/documents') return handleMailDocuments(res, businessId, requestUrl);
+  if (method === 'GET' && pathname === '/mail/documents') return handleMailDocuments(res, db, requestUrl);
   const mailMatch = MAIL_PATH.exec(pathname);
   if (method === 'GET' && mailMatch?.[1] !== undefined) {
     const mailId = decodePathSegment(mailMatch[1]);
-    return mailId === null ? notFound(res) : handleMailDetail(res, businessId, mailId);
+    return mailId === null ? notFound(res) : handleMailDetail(res, db, mailId);
   }
   const documentFileMatch = DOCUMENT_FILE_PATH.exec(pathname);
   if (method === 'GET' && documentFileMatch?.[1] !== undefined) {
     const documentId = decodePathSegment(documentFileMatch[1]);
-    return documentId === null ? notFound(res) : handleDocumentFile(res, businessId, documentId, documentRoot);
+    return documentId === null ? notFound(res) : handleDocumentFile(res, db, documentId, documentRoot);
   }
   // Connecting the business mailbox: sign the charter amendment FIRST, then
   // run the OAuth ceremony — see `mailbox-connect.ts` for why that order.
   if (method === 'GET' && pathname === '/connections/mailbox') {
-    return handleMailboxStatus(res, businessId, issueCsrfToken(session.sessionId));
+    return handleMailboxStatus(res, db, issueCsrfToken(session.sessionId));
   }
   if (method === 'GET' && pathname === '/connections/mailbox/sign') {
     return handleMailboxSignGet(
       res,
-      businessId,
+      db,
       issueCsrfToken(session.sessionId),
       new URL(req.url ?? '/', 'http://dashboard.local').searchParams,
       oauthOptions.credentialKeyPath,
     );
   }
   if (method === 'POST' && pathname === '/connections/mailbox/sign') {
-    return handleMailboxSignPost(res, businessId, session, await readFormBody(req), oauthOptions.credentialKeyPath);
+    return handleMailboxSignPost(res, db, session, await readFormBody(req), oauthOptions.credentialKeyPath);
   }
   if (method === 'POST' && pathname === '/connections/mailbox/revert') {
-    return handleMailboxRevertPost(res, businessId, session, await readFormBody(req));
+    return handleMailboxRevertPost(res, db, session, await readFormBody(req));
   }
   // Connecting the business calendar: the same sign-then-connect order.
   if (method === 'GET' && pathname === '/connections/calendar') {
-    return handleCalendarStatus(res, businessId, issueCsrfToken(session.sessionId));
+    return handleCalendarStatus(res, db, issueCsrfToken(session.sessionId));
   }
   if (method === 'GET' && pathname === '/connections/calendar/sign') {
-    return handleCalendarSignGet(res, businessId, issueCsrfToken(session.sessionId), requestUrl.searchParams, oauthOptions.credentialKeyPath);
+    return handleCalendarSignGet(res, db, issueCsrfToken(session.sessionId), requestUrl.searchParams, oauthOptions.credentialKeyPath);
   }
   if (method === 'POST' && pathname === '/connections/calendar/sign') {
-    return handleCalendarSignPost(res, businessId, session, await readFormBody(req), oauthOptions.credentialKeyPath);
+    return handleCalendarSignPost(res, db, session, await readFormBody(req), oauthOptions.credentialKeyPath);
   }
   if (method === 'POST' && pathname === '/connections/calendar/revert') {
-    return handleCalendarRevertPost(res, businessId, session, await readFormBody(req));
+    return handleCalendarRevertPost(res, db, session, await readFormBody(req));
   }
   if (method === 'GET' && pathname === '/meetings/settings') {
-    return handleMeetingSettingsGet(res, businessId, session, requestUrl.searchParams, meetingOptions);
+    return handleMeetingSettingsGet(res, db, session, requestUrl.searchParams, meetingOptions);
   }
   if (method === 'POST' && pathname === '/meetings/settings') {
-    return handleMeetingSettingsPost(res, businessId, session, await readFormBody(req), meetingOptions);
+    return handleMeetingSettingsPost(res, db, session, await readFormBody(req), meetingOptions);
   }
-  if (method === 'GET' && pathname === '/meetings') return handleMeetingsGet(res, businessId, session, meetingOptions);
+  if (method === 'GET' && pathname === '/meetings') return handleMeetingsGet(res, db, session, meetingOptions);
   if (method === 'POST' && pathname === '/meetings/new') {
-    return handleMeetingNewPost(res, businessId, session, await readFormBody(req), meetingOptions);
+    return handleMeetingNewPost(res, db, session, await readFormBody(req), meetingOptions);
   }
   const meetingMarkMatch = MEETING_MARK_PATH.exec(pathname);
   if (method === 'POST' && meetingMarkMatch?.[1] !== undefined) {
     const meetingId = decodePathSegment(meetingMarkMatch[1]);
     if (meetingId === null) return notFound(res);
-    return handleMeetingMarkPost(res, businessId, session, meetingId, await readFormBody(req), meetingOptions);
+    return handleMeetingMarkPost(res, db, session, meetingId, await readFormBody(req), meetingOptions);
   }
-  if (method === 'GET' && pathname === '/digest') return handleDigestGet(res, businessId, session);
+  if (method === 'GET' && pathname === '/digest') return handleDigestGet(res, db, session);
   if (method === 'POST' && pathname === '/digest/settings')
-    return handleDigestSettingsPost(req, res, businessId, session);
-  if (method === 'GET' && pathname === '/conversation') return handleConversation(res, businessId, session);
+    return handleDigestSettingsPost(req, res, db, session);
+  if (method === 'GET' && pathname === '/conversation') return handleConversation(res, db, session);
 
-  if (method === 'GET' && pathname === '/autonomy') return handleAutonomyGet(res, businessId, session);
+  if (method === 'GET' && pathname === '/autonomy') return handleAutonomyGet(res, db, session);
   if (method === 'POST' && pathname === '/autonomy/mode')
-    return handleAutonomyModePost(req, res, businessId, session);
+    return handleAutonomyModePost(req, res, db, session);
   if (method === 'POST' && pathname === '/autonomy/updates')
-    return handleAutonomyUpdatesPost(req, res, businessId, session);
+    return handleAutonomyUpdatesPost(req, res, db, session);
   if (method === 'GET' && pathname === '/autonomy/actions')
-    return handleAutonomousActionsGet(res, businessId, session);
+    return handleAutonomousActionsGet(res, db, session);
 
   // The task ledger ("הפנקס"): list + owner actions, settings, critical rules.
-  if (method === 'GET' && pathname === '/ledger') return handleLedgerGet(res, businessId, session, requestUrl);
-  if (method === 'GET' && pathname === '/ledger/settings') return handleLedgerSettingsGet(res, businessId, session);
+  if (method === 'GET' && pathname === '/ledger') return handleLedgerGet(res, db, session, requestUrl);
+  if (method === 'GET' && pathname === '/ledger/settings') return handleLedgerSettingsGet(res, db, session);
   if (method === 'POST' && pathname === '/ledger/settings') {
-    return handleLedgerSettingsPost(res, businessId, session, await readFormBody(req));
+    return handleLedgerSettingsPost(res, db, session, await readFormBody(req));
   }
   if (method === 'POST' && pathname === '/ledger/rules') {
-    return handleLedgerRulePost(res, businessId, session, await readFormBody(req));
+    return handleLedgerRulePost(res, db, session, await readFormBody(req));
   }
   const ledgerRuleDeleteMatch = LEDGER_RULE_DELETE_PATH.exec(pathname);
   if (method === 'POST' && ledgerRuleDeleteMatch?.[1] !== undefined) {
     const ruleId = decodePathSegment(ledgerRuleDeleteMatch[1]);
     if (ruleId === null) return notFound(res);
-    return handleLedgerRuleDelete(res, businessId, session, ruleId, await readFormBody(req));
+    return handleLedgerRuleDelete(res, db, session, ruleId, await readFormBody(req));
   }
   const ledgerActionMatch = LEDGER_ACTION_PATH.exec(pathname);
   if (method === 'POST' && ledgerActionMatch?.[1] !== undefined) {
     const itemId = decodePathSegment(ledgerActionMatch[1]);
     if (itemId === null) return notFound(res);
-    return handleLedgerAction(res, businessId, session, itemId, await readFormBody(req));
+    return handleLedgerAction(res, db, session, itemId, await readFormBody(req));
   }
 
-  if (method === 'GET' && pathname === '/instruct') return handleInstructGet(res, businessId, session);
+  if (method === 'GET' && pathname === '/instruct') return handleInstructGet(res, db, session);
   if (method === 'POST' && pathname === '/instruct')
-    return handleInstructPost(req, res, businessId, session, documentRoot, doorOptions);
+    return handleInstructPost(req, res, db, session, documentRoot, doorOptions);
 
   // Produced documents (document production §4, §8.1, D13): the list, the
   // settings page, one card, its file and preview, and the owner's actions.
   // `/documents/settings` before the card match, which would read it as an id.
-  if (method === 'GET' && pathname === '/documents') return handleDocumentList(res, businessId, session);
-  if (method === 'GET' && pathname === '/documents/settings') return handleDocumentSettingsGet(res, businessId, session);
+  if (method === 'GET' && pathname === '/documents') return handleDocumentList(res, db, session);
+  if (method === 'GET' && pathname === '/documents/settings') return handleDocumentSettingsGet(res, db, session);
   if (method === 'POST' && pathname === '/documents/settings') {
-    return handleDocumentSettingsPost(res, businessId, session, await readFormBody(req));
+    return handleDocumentSettingsPost(res, db, session, await readFormBody(req));
   }
   const documentCardMatch = DOCUMENT_CARD_PATH.exec(pathname);
   if (method === 'GET' && documentCardMatch?.[1] !== undefined) {
     const cardId = decodePathSegment(documentCardMatch[1]);
-    return cardId === null ? notFound(res) : handleDocumentCard(res, businessId, session, cardId, documentRoot);
+    return cardId === null ? notFound(res) : handleDocumentCard(res, db, session, cardId, documentRoot);
   }
   const documentGetMatch = DOCUMENT_CARD_GET_PATH.exec(pathname);
   if (method === 'GET' && documentGetMatch?.[1] !== undefined) {
     const cardId = decodePathSegment(documentGetMatch[1]);
     if (cardId === null) return notFound(res);
     return documentGetMatch[2] === 'download'
-      ? handleDocumentDownload(res, businessId, cardId, documentRoot)
-      : handleDocumentPreview(res, businessId, cardId, documentRoot);
+      ? handleDocumentDownload(res, db, cardId, documentRoot)
+      : handleDocumentPreview(res, db, cardId, documentRoot);
   }
   const documentPostMatch = DOCUMENT_CARD_POST_PATH.exec(pathname);
   if (method === 'POST' && documentPostMatch?.[1] !== undefined) {
@@ -3204,9 +3309,9 @@ async function route(
     if (cardId === null) return notFound(res);
     const form = await readFormBody(req);
     const routeOptions = { ...doorOptions, ...(documentRoot !== undefined ? { documentRoot } : {}) };
-    if (documentPostMatch[2] === 'approve') return handleDocumentApprove(res, businessId, session, cardId, form, routeOptions);
-    if (documentPostMatch[2] === 'fix') return handleDocumentFix(res, businessId, session, cardId, form, routeOptions);
-    return handleDocumentAddress(res, businessId, session, cardId, form, routeOptions);
+    if (documentPostMatch[2] === 'approve') return handleDocumentApprove(res, db, session, cardId, form, routeOptions);
+    if (documentPostMatch[2] === 'fix') return handleDocumentFix(res, db, session, cardId, form, routeOptions);
+    return handleDocumentAddress(res, db, session, cardId, form, routeOptions);
   }
 
   // The OAuth consent ceremony (oauth-routes.ts): the dashboard is the only
@@ -3221,7 +3326,7 @@ async function route(
       if (system === null) return sendHtml(res, 404, renderNotFound());
       return handleOAuthStart(
         res,
-        businessId,
+        db,
         session,
         system,
         oauthOptions,
@@ -3230,7 +3335,7 @@ async function route(
     }
   }
   if (method === 'GET' && pathname === '/oauth/callback') {
-    return handleOAuthCallback(req, res, businessId, session, oauthOptions);
+    return handleOAuthCallback(req, res, db, session, oauthOptions);
   }
   const oauthRevokeMatch = OAUTH_REVOKE_PATH.exec(pathname);
   if (method === 'POST' && oauthRevokeMatch) {
@@ -3238,25 +3343,25 @@ async function route(
     if (raw !== undefined) {
       const system = decodePathSegment(raw);
       if (system === null) return sendHtml(res, 404, renderNotFound());
-      return handleOAuthRevoke(req, res, businessId, session, system, oauthOptions);
+      return handleOAuthRevoke(req, res, db, session, system, oauthOptions);
     }
   }
 
-  if (method === 'GET' && pathname === '/erase') return handleEraseGet(req, res, businessId, session, documentRoot);
-  if (method === 'POST' && pathname === '/erase/preview') return handleErasePreview(req, res, businessId, session, documentRoot);
-  if (method === 'POST' && pathname === '/erase/confirm') return handleEraseConfirm(req, res, businessId, session, documentRoot);
-  if (method === 'POST' && pathname === '/erase/keep') return handleEraseKeep(req, res, businessId, session, documentRoot);
+  if (method === 'GET' && pathname === '/erase') return handleEraseGet(req, res, db, session, documentRoot);
+  if (method === 'POST' && pathname === '/erase/preview') return handleErasePreview(req, res, db, session, documentRoot);
+  if (method === 'POST' && pathname === '/erase/confirm') return handleEraseConfirm(req, res, db, session, documentRoot);
+  if (method === 'POST' && pathname === '/erase/keep') return handleEraseKeep(req, res, db, session, documentRoot);
 
   const instructAnswerMatch = INSTRUCT_ANSWER_PATH.exec(pathname);
   if (method === 'POST' && instructAnswerMatch) {
     const jobId = instructAnswerMatch[1];
-    if (jobId !== undefined) return handleInstructAnswer(req, res, businessId, session, jobId, doorOptions);
+    if (jobId !== undefined) return handleInstructAnswer(req, res, db, session, jobId, doorOptions);
   }
 
   const instructConfirmMatch = INSTRUCT_CONFIRM_PATH.exec(pathname);
   if (method === 'POST' && instructConfirmMatch) {
     const jobId = instructConfirmMatch[1];
-    if (jobId !== undefined) return handleInstructConfirm(req, res, businessId, session, jobId);
+    if (jobId !== undefined) return handleInstructConfirm(req, res, db, session, jobId);
   }
 
   const markMatch = AUTONOMOUS_ACTION_MARK_PATH.exec(pathname);
@@ -3264,14 +3369,14 @@ async function route(
     const jobId = markMatch[1];
     const stepId = markMatch[2];
     if (jobId !== undefined && stepId !== undefined) {
-      return handleAutonomousActionMark(req, res, businessId, session, jobId, stepId);
+      return handleAutonomousActionMark(req, res, db, session, jobId, stepId);
     }
   }
 
   const cardMatch = CARD_PATH.exec(pathname);
   if (method === 'GET' && cardMatch) {
     const id = cardMatch[1];
-    if (id !== undefined) return handleCard(res, businessId, session, id);
+    if (id !== undefined) return handleCard(res, db, session, id);
   }
 
   const decisionMatch = DECISION_PATH.exec(pathname);
@@ -3280,7 +3385,7 @@ async function route(
     const action = decisionMatch[2];
     // The regex only ever captures one of the three keys below.
     if (id !== undefined && (action === 'approve' || action === 'deny' || action === 'sign')) {
-      return handleDecision(req, res, businessId, session, id, OUTCOME_FOR_ACTION[action], documentRoot);
+      return handleDecision(req, res, db, session, id, OUTCOME_FOR_ACTION[action], documentRoot);
     }
   }
 
@@ -3329,7 +3434,6 @@ export function assertBindableHost(host: string, allowNonLoopback: boolean): voi
 }
 
 export function createServer(options: DashboardOptions = {}): Server {
-  const businessId = options.businessId ?? config.businessId;
   // Loopback only, always — see docs/dashboard-deployment.md. This server
   // does not terminate TLS; anything reachable from the internet must arrive
   // through a tunnel or reverse proxy that does, never by binding a public
@@ -3361,7 +3465,14 @@ export function createServer(options: DashboardOptions = {}): Server {
       ...(options.planner !== undefined ? { planner: options.planner } : {}),
       ...(options.uploadMaxBytes !== undefined ? { uploadMaxBytes: options.uploadMaxBytes } : {}),
     };
-    route(req, res, businessId, options.trustProxy ?? false, options.documentRoot, oauthOptions, setupOptions, doorOptions, meetingOptions).catch((err: unknown) => {
+    handleRequest(req, res, {
+      trustProxy: options.trustProxy ?? false,
+      documentRoot: options.documentRoot,
+      oauthOptions,
+      setupOptions,
+      doorOptions,
+      meetingOptions,
+    }).catch((err: unknown) => {
       console.error('dashboard request failed:', err instanceof Error ? err.message : err);
       if (!res.headersSent) {
         sendHtml(res, 500, renderServerError());

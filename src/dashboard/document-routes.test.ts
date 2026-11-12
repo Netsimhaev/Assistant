@@ -24,7 +24,7 @@ import { advanceStage, createProduction, loadProduction, loadVersion, saveVersio
 import type { PlanOutcome, PlanRequest } from '../sdk/planner.js';
 import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
-import { createOwner } from './auth.js';
+import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { createServer, type DashboardOptions } from './server.js';
 
 const B = 'test-business';
@@ -51,8 +51,8 @@ let uploadRoot = '';
 
 beforeEach(async () => {
   await resetDatabase();
-  await createOwner({ username: USERNAME, password: PASSWORD, businessId: B });
-  await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 10)
+  await createTestOwner(B, { username: USERNAME, password: PASSWORD });
+  await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' })));
   uploadRoot = await mkdtemp(join(tmpdir(), 'doc-routes-'));
 });
 afterEach(async () => {
@@ -68,7 +68,7 @@ afterAll(async () => {
 });
 
 async function start(options: Partial<DashboardOptions> = {}): Promise<string> {
-  server = createServer({ businessId: B, port: 0, documentRoot: uploadRoot, ...options });
+  server = createServer({ port: 0, documentRoot: uploadRoot, ...options });
   await once(server, 'listening');
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
@@ -76,7 +76,7 @@ async function start(options: Partial<DashboardOptions> = {}): Promise<string> {
 async function login(baseUrl: string): Promise<string> {
   const res = await fetch(`${baseUrl}/login`, {
     method: 'POST',
-    body: new URLSearchParams({ username: USERNAME, password: PASSWORD }),
+    body: new URLSearchParams({ email: ownerLogin(B, USERNAME), password: PASSWORD }),
     redirect: 'manual',
   });
   const pair = (res.headers.get('set-cookie') ?? '').split(';')[0];
@@ -459,14 +459,14 @@ describe('/documents', () => {
 
   it('another business cannot see or download the card', async () => {
     const a = await card();
-    await createOwner({ username: 'other', password: PASSWORD, businessId: 'other-business' });
-    await withBusiness('other-business', (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 10)
-    server = createServer({ businessId: 'other-business', port: 0 });
+    await createTestOwner('other-business', { username: 'other', password: PASSWORD });
+    await withBusiness('other-business', (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' })));
+    server = createServer({ port: 0 });
     await once(server, 'listening');
     const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     const res = await fetch(`${baseUrl}/login`, {
       method: 'POST',
-      body: new URLSearchParams({ username: 'other', password: PASSWORD }),
+      body: new URLSearchParams({ email: ownerLogin('other-business', 'other'), password: PASSWORD }),
       redirect: 'manual',
     });
     const cookie = (res.headers.get('set-cookie') ?? '').split(';')[0]!;

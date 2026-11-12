@@ -80,8 +80,10 @@ export async function run(argv: string[], io: PromptIo): Promise<number> {
     return 1;
   }
 
-  await setPassword({ username, password, businessId });
-  const codes = await issueRecoveryCodes({ username, businessId });
+  const codes = await withBusiness(businessId, async (db) => {
+    await setPassword(db, { username, password });
+    return issueRecoveryCodes(db, { username });
+  });
 
   io.print(`הסיסמה עבור "${username}" עודכנה. כל ההתחברויות הפעילות בוטלו.`);
   io.print('');

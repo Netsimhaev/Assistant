@@ -20,7 +20,7 @@ import { appendAudit } from '../audit/log.js';
 import { resolveCalendarAccess, type CalendarAccess } from '../calendar/client-for.js';
 import { isCalendarFailure, type CalendarClient, type CalendarInfo } from '../calendar/types.js';
 import { loadActiveCharter } from '../charter/store.js';
-import { getPool, withBusiness, withBusinessTransaction } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { MAX_INSTRUCTION_CHARS } from '../governance/instructions.js';
 import { MasterKeyError, loadMasterKey, verifyKeyState } from '../governance/master-key.js';
 import { storedCredentials } from '../governance/credential-store.js';
@@ -132,13 +132,13 @@ export async function calendarWiring(
   return { runtime: { credentials }, ...(options.calendarClient !== undefined ? { client: options.calendarClient } : {}) };
 }
 
-async function listAccountCalendars(businessId: string, options: MeetingRouteOptions): Promise<Calendars> {
+async function listAccountCalendars(db: BusinessDb, options: MeetingRouteOptions): Promise<Calendars> {
   const credentials = options.calendarCredentials ?? (await realCredentials(options.credentialKeyPath));
   if (credentials === null) return { listed: false, reason: NOT_CONNECTED };
-  const access = await withBusiness(businessId, (db) => resolveCalendarAccess(db, { // TENANCY-TODO(task 10)
+  const access = await resolveCalendarAccess(db, {
     runtime: { credentials },
     ...(options.calendarClient !== undefined ? { client: options.calendarClient } : {}),
-  }));
+  });
   if ('unavailable' in access) {
     return { listed: false, reason: access.unavailable === 'needs_reauth' ? NEEDS_REAUTH : access.unavailable === 'credential_error' ? CREDENTIAL_ERROR : NOT_CONNECTED };
   }
@@ -244,15 +244,15 @@ ${input.saved === true ? '<p role="status"><b>ההגדרות נשמרו.</b></p>
 
 export async function handleMeetingSettingsGet(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: MeetingSession,
   query: URLSearchParams,
   options: MeetingRouteOptions,
 ): Promise<void> {
-  const [settings, calendars] = await Promise.all([
-    withBusiness(businessId, (db) => loadMeetingSettings(db)), // TENANCY-TODO(task 10)
-    listAccountCalendars(businessId, options),
-  ]);
+  // Sequential, never `Promise.all`: both read on this request's one
+  // connection, and two queries in flight on it interleave.
+  const settings = await loadMeetingSettings(db);
+  const calendars = await listAccountCalendars(db, options);
   html(
     res,
     200,
@@ -286,14 +286,14 @@ const LIST_LOST = 'לא הצלחתי לקרוא עכשיו את רשימת הי�
 
 export async function handleMeetingSettingsPost(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: MeetingSession,
   form: URLSearchParams,
   options: MeetingRouteOptions,
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
 
-  const stored = await withBusiness(businessId, (db) => loadMeetingSettings(db)); // TENANCY-TODO(task 10)
+  const stored = await loadMeetingSettings(db);
   const kindRaw = form.get('locationKind');
   const listedInForm = form.get('calendarsListed') === '1';
 
@@ -314,7 +314,7 @@ export async function handleMeetingSettingsPost(
 
   let fetched: Calendars | null = null;
   const refuse = async (message: string): Promise<void> => {
-    const calendars = fetched ?? (await listAccountCalendars(businessId, options));
+    const calendars = fetched ?? (await listAccountCalendars(db, options));
     html(
       res,
       400,
@@ -334,7 +334,7 @@ export async function handleMeetingSettingsPost(
   // Calendar choices are checked against the account's own list whenever the
   // form offered them: a crafted id, or a read-only write calendar, is refused.
   if (listedInForm) {
-    const calendars = await listAccountCalendars(businessId, options);
+    const calendars = await listAccountCalendars(db, options);
     fetched = calendars;
     if (!calendars.listed) return refuse(LIST_LOST);
     const byId = new Map(calendars.calendars.map((c) => [c.calendarId, c] as const));
@@ -351,7 +351,7 @@ export async function handleMeetingSettingsPost(
     }
   }
 
-  const result = await withBusiness(businessId, (db) => saveMeetingSettings(db, submitted)); // TENANCY-TODO(task 10)
+  const result = await saveMeetingSettings(db, submitted);
   if (!result.ok) return refuse(result.reason);
   seeOther(res, '/meetings/settings?saved=1');
 }
@@ -526,9 +526,9 @@ function addDaysIso(date: string, n: number): string {
   return new Date(Date.UTC(y, mo - 1, d + n)).toISOString().slice(0, 10);
 }
 
-async function charterZone(businessId: string): Promise<{ timeZone: string; charterVersion: string }> {
+async function charterZone(db: BusinessDb): Promise<{ timeZone: string; charterVersion: string }> {
   try {
-    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    const active = await loadActiveCharter(db);
     if (active !== null) return { timeZone: active.charter.identity.timezone, charterVersion: active.charter.charterVersion };
   } catch {
     // an unreadable charter costs the zone, not the page
@@ -536,13 +536,14 @@ async function charterZone(businessId: string): Promise<{ timeZone: string; char
   return { timeZone: 'UTC', charterVersion: 'unknown' };
 }
 
-async function loadTomorrow(businessId: string, timeZone: string, options: MeetingRouteOptions): Promise<Tomorrow> {
+async function loadTomorrow(db: BusinessDb, timeZone: string, options: MeetingRouteOptions): Promise<Tomorrow> {
+  const businessId = db.businessId;
   const wiring = await calendarWiring(options);
   if (wiring === undefined) return { ok: false, reason: CALENDAR_NOT_CONNECTED_REPLY };
-  const access = await withBusiness(businessId, (db) => resolveCalendarAccess(db, { // TENANCY-TODO(task 10)
+  const access = await resolveCalendarAccess(db, {
     runtime: wiring.runtime,
     ...(wiring.client !== undefined ? { client: wiring.client } : {}),
-  }));
+  });
   if ('unavailable' in access) {
     return {
       ok: false,
@@ -558,17 +559,17 @@ async function loadTomorrow(businessId: string, timeZone: string, options: Meeti
   const tomorrow = addDaysIso(localParts(new Date(), timeZone).date, 1);
   const dayStart = localToInstant(tomorrow, '00:00', timeZone).getTime();
   const dayEnd = localToInstant(addDaysIso(tomorrow, 1), '00:00', timeZone).getTime();
-  const settings = await withBusiness(businessId, (db) => loadMeetingSettings(db)); // TENANCY-TODO(task 10)
+  const settings = await loadMeetingSettings(db);
   let snapshot;
   try {
-    snapshot = await withBusiness(businessId, (db) => loadCalendarRange(db, { // TENANCY-TODO(task 10)
+    snapshot = await loadCalendarRange(db, {
       access,
       settings,
       timeZone,
       fromIso: new Date(dayStart).toISOString(),
       toIso: new Date(dayEnd).toISOString(),
       signal: AbortSignal.timeout(DAY_READ_TIMEOUT_MS),
-    }));
+    });
   } catch {
     return { ok: false, reason: CALENDAR_READ_FAILED_REPLY };
   }
@@ -584,11 +585,11 @@ async function loadTomorrow(businessId: string, timeZone: string, options: Meeti
     })
     .sort((a, b) => Date.parse(a.start) - Date.parse(b.start) || a.title.localeCompare(b.title));
 
-  const responses = await withBusiness(businessId, (db) => loadMeetingResponses( // TENANCY-TODO(task 10)
+  const responses = await loadMeetingResponses(
     db,
     events.map((e) => e.eventId),
-  ));
-  const { rows: names } = await getPool().query<{ event_id: string; client_name: string }>(
+  );
+  const { rows: names } = await db.query<{ event_id: string; client_name: string }>(
     `SELECT DISTINCT ON (event_id) event_id, client_name FROM meetings
       WHERE business_id = $1 AND event_id = ANY($2::text[]) AND state IN ('proposed','active')
       ORDER BY event_id, updated_at DESC`,
@@ -609,10 +610,11 @@ async function loadTomorrow(businessId: string, timeZone: string, options: Meeti
   };
 }
 
-async function pendingMeetingConfirmations(businessId: string, csrf: string): Promise<string> {
-  const confirmations = await withBusiness(businessId, (db) => dashboardConfirmations(db)); // TENANCY-TODO(task 10)
+async function pendingMeetingConfirmations(db: BusinessDb, csrf: string): Promise<string> {
+  const businessId = db.businessId;
+  const confirmations = await dashboardConfirmations(db);
   if (confirmations.length === 0) return '';
-  const { rows } = await getPool().query<{ job_id: string }>(
+  const { rows } = await db.query<{ job_id: string }>(
     `SELECT DISTINCT job_id FROM meetings WHERE business_id = $1 AND job_id = ANY($2::text[]) AND state = 'proposed'`,
     [businessId, confirmations.map((c) => c.jobId)],
   );
@@ -636,9 +638,10 @@ interface ReplyMeeting {
 }
 
 /** Meetings still waiting on the client, with the mail from the client's address that arrived after the last change. */
-async function loadMailReplies(businessId: string): Promise<ReplyMeeting[]> {
+async function loadMailReplies(db: BusinessDb): Promise<ReplyMeeting[]> {
+  const businessId = db.businessId;
   // `from_address` is the bare address the mailbox stored; compared case-insensitively.
-  const { rows } = await getPool().query<{
+  const { rows } = await db.query<{
     meeting_id: string;
     client_name: string;
     start_at: Date | null;
@@ -772,18 +775,18 @@ ${formSection(o.form, o.csrf)}`;
 async function sendMeetingsPage(
   res: ServerResponse,
   status: number,
-  businessId: string,
+  db: BusinessDb,
   session: MeetingSession,
   options: MeetingRouteOptions,
   extra: { form?: MeetingFormValues; error?: string } = {},
 ): Promise<void> {
   const csrf = issueCsrfToken(session.sessionId);
-  const { timeZone } = await charterZone(businessId);
-  const [confirmations, tomorrow, replies] = await Promise.all([
-    pendingMeetingConfirmations(businessId, csrf),
-    loadTomorrow(businessId, timeZone, options),
-    loadMailReplies(businessId),
-  ]);
+  const { timeZone } = await charterZone(db);
+  // Sequential, never `Promise.all`: all three read on this request's one
+  // connection, and two queries in flight on it interleave.
+  const confirmations = await pendingMeetingConfirmations(db, csrf);
+  const tomorrow = await loadTomorrow(db, timeZone, options);
+  const replies = await loadMailReplies(db);
   html(
     res,
     status,
@@ -803,11 +806,11 @@ async function sendMeetingsPage(
 
 export async function handleMeetingsGet(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: MeetingSession,
   options: MeetingRouteOptions,
 ): Promise<void> {
-  await sendMeetingsPage(res, 200, businessId, session, options);
+  await sendMeetingsPage(res, 200, db, session, options);
 }
 
 /**
@@ -818,14 +821,14 @@ export async function handleMeetingsGet(
  */
 export async function handleMeetingNewPost(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: MeetingSession,
   form: URLSearchParams,
   options: MeetingRouteOptions,
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
   const values = formValuesFrom(form);
-  const refuse = (error: string): Promise<void> => sendMeetingsPage(res, 400, businessId, session, options, { form: values, error });
+  const refuse = (error: string): Promise<void> => sendMeetingsPage(res, 400, db, session, options, { form: values, error });
 
   const built = buildMeeting(values);
   if ('error' in built) return refuse(built.error);
@@ -836,7 +839,7 @@ export async function handleMeetingNewPost(
   const calendar = await calendarWiring(options);
   if (calendar === undefined) return refuse(CALENDAR_NOT_CONNECTED_REPLY);
 
-  const outcome = await withBusiness(businessId, (db) => runInstruction(db, { text: built.text }, { textOrigin: 'typed', channel: 'dashboard', calendar, meetingRequest: built.request })); // TENANCY-TODO(task 10)
+  const outcome = await runInstruction(db, { text: built.text }, { textOrigin: 'typed', channel: 'dashboard', calendar, meetingRequest: built.request });
   if (outcome.status === 'refused') return refuse(outcome.reason);
   // The question is listed at the top of the GET (PRG: a refresh must not book twice).
   if (outcome.status === 'needs_confirmation') return seeOther(res, '/meetings');
@@ -852,19 +855,20 @@ export async function handleMeetingNewPost(
  */
 export async function handleMeetingMarkPost(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: MeetingSession,
   meetingId: string,
   form: URLSearchParams,
   options: MeetingRouteOptions,
 ): Promise<void> {
+  const businessId = db.businessId;
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
   const response = RESPONSE_PAIR.find((r) => r === form.get('response'));
   if (response === undefined) {
-    return sendMeetingsPage(res, 400, businessId, session, options, { error: 'התשובה שנבחרה אינה מוכרת.' });
+    return sendMeetingsPage(res, 400, db, session, options, { error: 'התשובה שנבחרה אינה מוכרת.' });
   }
-  const { charterVersion } = await charterZone(businessId);
-  const marked = await withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 10)
+  const { charterVersion } = await charterZone(db);
+  const marked = await transaction(db, async (tx) => {
     const { rows } = await tx.query<{ meeting_id: string }>(
       `UPDATE meetings SET response = $3, response_at = now(), updated_at = now()
         WHERE business_id = $1 AND meeting_id = $2 AND state = 'active'

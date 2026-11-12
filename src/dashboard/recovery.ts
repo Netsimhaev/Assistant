@@ -1,9 +1,8 @@
 import { randomBytes } from 'node:crypto';
-import { config } from '../config.js';
-import { getPool, withTransaction, withBusinessTransaction, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb, type Queryable } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
-import { hashPassword, verifyPassword, revokeAllSessions, DECOY_HASH, DECOY_SALT } from './auth.js';
+import { hashPassword, verifyPassword, revokeAllSessions, normaliseLogin, DECOY_HASH, DECOY_SALT } from './auth.js';
 import { recordUnknownUserFailure, unknownUserLocked } from './unknown-user-throttle.js';
 
 /** 128 bits of code, encoded as hex — the same size as a session token. */
@@ -57,18 +56,17 @@ function toRecoveryCodeRecord(row: RecoveryCodeRow): RecoveryCodeRecord {
  * holds the hash, never the code, so a leaked backup cannot be read back into
  * working credentials.
  */
-export async function issueRecoveryCodes(input: {
-  username: string;
-  businessId?: string;
-  count?: number;
-}): Promise<string[]> {
-  const businessId = input.businessId ?? config.businessId;
+export async function issueRecoveryCodes(
+  db: BusinessDb,
+  input: { username: string; count?: number },
+): Promise<string[]> {
+  const businessId = db.businessId;
   const count = input.count ?? DEFAULT_CODE_COUNT;
 
   const plainCodes = Array.from({ length: count }, () => randomBytes(CODE_BYTES).toString('hex'));
   const hashed = await Promise.all(plainCodes.map((code) => hashPassword(code)));
 
-  await withTransaction(async (tx) => {
+  await transaction(db, async (tx) => {
     // Re-issuing voids every older code first: two valid sets in circulation
     // means a code the owner believes they burned is still live. The DELETE
     // and the inserts share a transaction so a crash mid-batch cannot leave
@@ -99,29 +97,7 @@ export async function issueRecoveryCodes(input: {
  * recovery_failed_attempts + 1` computed inside a single UPDATE is safe
  * because Postgres holds the row lock for the statement's duration.
  */
-async function recordFailedAttempt(
-  db: Queryable,
-  businessId: string,
-  username: string,
-  userExists: boolean,
-  now: Date,
-): Promise<void> {
-  // No row to hold the counter: this attempt goes to the shared
-  // unknown-username bucket instead. Without it the UPDATE below matched
-  // nothing, the counter never moved, and up to eight scrypt calls per
-  // request were available to anyone who could reach the port.
-  if (!userExists) {
-    await recordUnknownUserFailure({
-      kind: 'recovery',
-      maxFailed: RECOVERY_MAX_FAILED,
-      lockMinutes: RECOVERY_LOCK_MINUTES,
-      businessId,
-      now,
-      db,
-    });
-    return;
-  }
-
+async function recordFailedAttempt(db: BusinessDb, username: string, now: Date): Promise<void> {
   const lockUntilIfThresholdReached = new Date(now.getTime() + RECOVERY_LOCK_MINUTES * 60_000);
   await db.query(
     `UPDATE dashboard_users
@@ -131,7 +107,7 @@ async function recordFailedAttempt(
               ELSE recovery_locked_until
             END
       WHERE business_id = $1 AND username = $2`,
-    [businessId, username, RECOVERY_MAX_FAILED, lockUntilIfThresholdReached],
+    [db.businessId, username, RECOVERY_MAX_FAILED, lockUntilIfThresholdReached],
   );
 }
 
@@ -186,40 +162,27 @@ async function recordFailedAttempt(
  * `sourceAddress` is supplied by the caller because this function has no
  * HTTP context of its own — it is never invented here, only carried through
  * to the audit entry that names where the redemption came from.
+ *
+ * The account is named by its `login` (the email, spec §5.5), inside the
+ * business `resolveLogin` found for it; a success returns the account's
+ * `username`, which the caller mints the session for.
  */
-export async function redeemRecoveryCode(input: {
-  username: string;
-  code: string;
-  businessId?: string;
-  sourceAddress?: string;
-  now?: Date;
-}): Promise<{ ok: true } | { ok: false; code: 'no_match' | 'already_used' }> {
-  const businessId = input.businessId ?? config.businessId;
+export async function redeemRecoveryCode(
+  db: BusinessDb,
+  input: { login: string; code: string; sourceAddress?: string; now?: Date },
+): Promise<{ ok: true; username: string } | { ok: false; code: 'no_match' | 'already_used' }> {
+  const businessId = db.businessId;
   const now = input.now ?? new Date();
-  const db = getPool();
 
-  const { rows: userRows } = await db.query<{ recovery_locked_until: Date | null }>(
-    `SELECT recovery_locked_until FROM dashboard_users WHERE business_id = $1 AND username = $2`,
-    [businessId, input.username],
+  const { rows: userRows } = await db.query<{ username: string; recovery_locked_until: Date | null }>(
+    `SELECT username, recovery_locked_until FROM dashboard_users
+      WHERE business_id = $1 AND lower(login) = $2`,
+    [businessId, normaliseLogin(input.login)],
   );
-  const userExists = userRows.length > 0;
-
-  // A username with no row of its own is throttled against the shared bucket
-  // — checked here, before any hash is computed, exactly as a locked account
-  // is. Refused as `no_match` like every other failure: the interface has no
-  // third case, and telling whoever is submitting codes that they have hit a
-  // limit is a free signal.
-  if (!userExists) {
-    const locked = await unknownUserLocked({
-      kind: 'recovery',
-      maxFailed: RECOVERY_MAX_FAILED,
-      lockMinutes: RECOVERY_LOCK_MINUTES,
-      businessId,
-      now,
-      db,
-    });
-    if (locked) return { ok: false, code: 'no_match' };
-  }
+  const username = userRows[0]?.username;
+  // Normally unreachable — `resolveLogin` found this login in this business a
+  // moment ago — but a row deleted in between is still an unknown login.
+  if (username === undefined) return redeemUnknown(db, input.code, now);
 
   let lockedUntil = userRows[0]?.recovery_locked_until ?? null;
 
@@ -232,7 +195,7 @@ export async function redeemRecoveryCode(input: {
     const cleared = await db.query(
       `UPDATE dashboard_users SET recovery_failed_attempts = 0, recovery_locked_until = NULL
         WHERE business_id = $1 AND username = $2 AND recovery_locked_until <= $3`,
-      [businessId, input.username, now],
+      [businessId, username, now],
     );
     if ((cleared.rowCount ?? 0) > 0) {
       lockedUntil = null;
@@ -247,7 +210,7 @@ export async function redeemRecoveryCode(input: {
     `SELECT code_id, code_hash, code_salt, used_at
        FROM dashboard_recovery_codes
       WHERE business_id = $1 AND username = $2`,
-    [businessId, input.username],
+    [businessId, username],
   );
 
   let matched: RecoveryCodeRecord | null = null;
@@ -255,9 +218,7 @@ export async function redeemRecoveryCode(input: {
     // No codes ever issued for this username: pay the same decoy cost login
     // pays for "no such user", so the timing here matches an account that
     // does have codes to try.
-    for (let i = 0; i < DEFAULT_CODE_COUNT; i += 1) {
-      await verifyPassword(input.code, DECOY_HASH, DECOY_SALT);
-    }
+    await payDecoyCost(input.code);
   } else {
     for (const row of codeRows) {
       const record = toRecoveryCodeRecord(row);
@@ -270,7 +231,7 @@ export async function redeemRecoveryCode(input: {
   }
 
   if (!matched) {
-    await recordFailedAttempt(db, businessId, input.username, userExists, now);
+    await recordFailedAttempt(db, username, now);
     return { ok: false, code: 'no_match' };
   }
 
@@ -279,8 +240,9 @@ export async function redeemRecoveryCode(input: {
   }
 
   const matchedCodeId = matched.codeId;
+  const owner = username;
 
-  return withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 10)
+  return transaction(db, async (tx) => {
     const claim = await tx.query<{ code_id: string }>(
       `UPDATE dashboard_recovery_codes SET used_at = $2
         WHERE code_id = $1 AND used_at IS NULL
@@ -314,7 +276,7 @@ export async function redeemRecoveryCode(input: {
           SET recovery_failed_attempts = 0, recovery_locked_until = NULL,
               failed_attempts = 0, locked_until = NULL
         WHERE business_id = $1 AND username = $2`,
-      [businessId, input.username],
+      [businessId, owner],
     );
 
     // Redeeming a recovery code means the owner believes their session (or
@@ -322,25 +284,63 @@ export async function redeemRecoveryCode(input: {
     // just the one making this request, and in the same transaction as the
     // claim so a crash cannot leave the code spent with a stolen session
     // still valid.
-    await revokeAllSessions(input.username, { businessId, tx });
+    await revokeAllSessions(tx, owner);
 
     await appendAudit(
       tx,
       {
         actor: 'human',
-        onBehalfOf: input.username,
+        onBehalfOf: owner,
         kind: 'incident',
         charterVersion: 'unknown',
         provenance: 'boss',
-        inputHash: canonicalHash({ username: input.username, action: 'redeem_recovery_code' }),
+        inputHash: canonicalHash({ username: owner, action: 'redeem_recovery_code' }),
         reason:
-          `recovery code redeemed for ${input.username} from ` +
+          `recovery code redeemed for ${owner} from ` +
           `${input.sourceAddress ?? 'unknown source'}; all sessions revoked`,
       },
     );
 
-    return { ok: true };
+    return { ok: true, username: owner };
   });
+}
+
+/** The scrypt work an account with a full set of codes would cost. */
+async function payDecoyCost(code: string): Promise<void> {
+  for (let i = 0; i < DEFAULT_CODE_COUNT; i += 1) {
+    await verifyPassword(code, DECOY_HASH, DECOY_SALT);
+  }
+}
+
+/**
+ * A recovery attempt whose address names no account: the dashboard calls this
+ * when `resolveLogin` found nothing, on a connection with no business
+ * (`withNoBusiness`), and `redeemRecoveryCode` calls it when the row vanished.
+ *
+ * Throttled against the shared server-wide bucket — checked before any hash is
+ * computed, exactly as a locked account is. Refused as `no_match` like every
+ * other failure: the interface has no third case, and telling whoever is
+ * submitting codes that they have hit a limit is a free signal. Otherwise it
+ * pays the decoy cost and counts the failure: no row means no counter of its
+ * own, and without the bucket up to eight scrypt calls per request were
+ * available to anyone who could reach the port.
+ */
+export async function redeemUnknown(
+  db: Queryable,
+  code: string,
+  now: Date = new Date(),
+): Promise<{ ok: false; code: 'no_match' }> {
+  const throttle = {
+    kind: 'recovery' as const,
+    maxFailed: RECOVERY_MAX_FAILED,
+    lockMinutes: RECOVERY_LOCK_MINUTES,
+    now,
+    db,
+  };
+  if (await unknownUserLocked(throttle)) return { ok: false, code: 'no_match' };
+  await payDecoyCost(code);
+  await recordUnknownUserFailure(throttle);
+  return { ok: false, code: 'no_match' };
 }
 
 interface CountRow {
@@ -348,12 +348,9 @@ interface CountRow {
 }
 
 /** How many unused codes remain — enough for the dashboard to nag about reissuing before the set runs out. */
-export async function remainingCodes(
-  username: string,
-  options: { businessId?: string } = {},
-): Promise<number> {
-  const businessId = options.businessId ?? config.businessId;
-  const { rows } = await getPool().query<CountRow>(
+export async function remainingCodes(db: BusinessDb, username: string): Promise<number> {
+  const businessId = db.businessId;
+  const { rows } = await db.query<CountRow>(
     `SELECT count(*) AS count FROM dashboard_recovery_codes
       WHERE business_id = $1 AND username = $2 AND used_at IS NULL`,
     [businessId, username],

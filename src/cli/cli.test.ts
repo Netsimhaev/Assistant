@@ -2,7 +2,8 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { login, verifySession } from '../dashboard/auth.js';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { ownerLogin } from '../test/owner.js';
 import { createBusiness } from '../tenancy/businesses.js';
 import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { main as businessMain } from './business.js';
@@ -24,6 +25,8 @@ import { main as setRampMain } from './set-ramp.js';
 const USERNAME = 'owner';
 /** Every business-scoped command in this file runs with this flag. */
 const BIZ = ['--business', TEST_BUSINESS];
+/** `owner:create`'s login address (spec §5.5) — the same one `ownerLogin` derives. */
+const EMAIL = ['--email', ownerLogin(TEST_BUSINESS, USERNAME)];
 const PASSWORD = 'correct horse battery staple';
 
 /**
@@ -72,16 +75,16 @@ describe('owner:create', () => {
 
   it('creates the account via the prompt path', async () => {
     const io = fakeIo([PASSWORD, PASSWORD]);
-    const code = await createOwnerRun([USERNAME, ...BIZ], io);
+    const code = await createOwnerRun([USERNAME, ...BIZ, ...EMAIL], io);
     expect(code).toBe(0);
 
-    const result = await login({ username: USERNAME, password: PASSWORD, businessId: TEST_BUSINESS });
+    const result = await withBusiness(TEST_BUSINESS, (db) => login(db, { login: ownerLogin(TEST_BUSINESS, USERNAME), password: PASSWORD }));
     expect(result.ok).toBe(true);
   });
 
   it('prints exactly eight recovery codes, each a distinct value', async () => {
     const io = fakeIo([PASSWORD, PASSWORD]);
-    const code = await createOwnerRun([USERNAME, ...BIZ], io);
+    const code = await createOwnerRun([USERNAME, ...BIZ, ...EMAIL], io);
     expect(code).toBe(0);
 
     const codeLines = io.prints.filter((line) => /^\s*\d+\.\s/.test(line));
@@ -91,19 +94,19 @@ describe('owner:create', () => {
 
   it('rejects mismatched password confirmation without creating the account', async () => {
     const io = fakeIo(['first password', 'a different password']);
-    const code = await createOwnerRun([USERNAME, ...BIZ], io);
+    const code = await createOwnerRun([USERNAME, ...BIZ, ...EMAIL], io);
     expect(code).toBe(1);
 
-    const result = await login({ username: USERNAME, password: 'first password', businessId: TEST_BUSINESS });
+    const result = await withBusiness(TEST_BUSINESS, (db) => login(db, { login: ownerLogin(TEST_BUSINESS, USERNAME), password: 'first password' }));
     expect(result).toEqual({ ok: false, code: 'bad_credentials' });
   });
 
   it('refuses a second account with a clear message instead of a raw DB error', async () => {
     const first = fakeIo([PASSWORD, PASSWORD]);
-    expect(await createOwnerRun([USERNAME, ...BIZ], first)).toBe(0);
+    expect(await createOwnerRun([USERNAME, ...BIZ, ...EMAIL], first)).toBe(0);
 
     const second = fakeIo(['another password', 'another password']);
-    const code = await createOwnerRun([USERNAME, ...BIZ], second);
+    const code = await createOwnerRun([USERNAME, ...BIZ, '--email', 'another-address@test-business.example'], second);
     expect(code).toBe(1);
     expect(second.errors[0]).toContain('כבר קיים');
   });
@@ -114,7 +117,7 @@ describe('owner:password', () => {
 
   beforeEach(async () => {
     creationIo = fakeIo([PASSWORD, PASSWORD]);
-    await createOwnerRun([USERNAME, ...BIZ], creationIo);
+    await createOwnerRun([USERNAME, ...BIZ, ...EMAIL], creationIo);
   });
 
   it('refuses a password passed as an argument, citing shell history', async () => {
@@ -125,7 +128,7 @@ describe('owner:password', () => {
   });
 
   it('changes the password and revokes every open session', async () => {
-    const session = await login({ username: USERNAME, password: PASSWORD, businessId: TEST_BUSINESS });
+    const session = await withBusiness(TEST_BUSINESS, (db) => login(db, { login: ownerLogin(TEST_BUSINESS, USERNAME), password: PASSWORD }));
     expect(session.ok).toBe(true);
     if (!session.ok) return;
 
@@ -134,12 +137,12 @@ describe('owner:password', () => {
     const code = await ownerPasswordRun([USERNAME, ...BIZ], io);
     expect(code).toBe(0);
 
-    expect(await verifySession(session.sessionId, { businessId: TEST_BUSINESS })).toBeNull();
+    expect(await withBusiness(TEST_BUSINESS, (db) => verifySession(db, session.sessionId))).toBeNull();
 
-    const withOld = await login({ username: USERNAME, password: PASSWORD, businessId: TEST_BUSINESS });
+    const withOld = await withBusiness(TEST_BUSINESS, (db) => login(db, { login: ownerLogin(TEST_BUSINESS, USERNAME), password: PASSWORD }));
     expect(withOld).toEqual({ ok: false, code: 'bad_credentials' });
 
-    const withNew = await login({ username: USERNAME, password: newPassword, businessId: TEST_BUSINESS });
+    const withNew = await withBusiness(TEST_BUSINESS, (db) => login(db, { login: ownerLogin(TEST_BUSINESS, USERNAME), password: newPassword }));
     expect(withNew.ok).toBe(true);
   });
 

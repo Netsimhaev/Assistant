@@ -163,6 +163,33 @@ export async function withBusiness<T>(
 }
 
 /**
+ * Run `fn` on one app-pool connection that carries NO business — for the few
+ * server-wide rows the app role touches before any business is known (the
+ * dashboard's unknown-login throttle, `dashboard_unknown_user_throttle`).
+ *
+ * The connection is explicitly cleared first, so `app_business_id()` raises
+ * on it: a query here that reaches a table with a business policy fails
+ * loudly instead of reading some business's rows. Released under the same
+ * rule as `withBusiness` — anything but idle is destroyed.
+ */
+export async function withNoBusiness<T>(fn: (db: Queryable) => Promise<T>): Promise<T> {
+  const client = await getPool().connect();
+  let destroy = false;
+  try {
+    try {
+      await client.query('RESET app.business_id');
+    } catch (error) {
+      destroy = true;
+      throw error;
+    }
+    return await fn(client);
+  } finally {
+    if (!isIdleOutsideTransaction(client)) destroy = true;
+    client.release(destroy);
+  }
+}
+
+/**
  * Run `fn` in a transaction on `db`. On a db already in a transaction it joins
  * (runs `fn(db)`), so a throw anywhere rolls back the outermost one.
  */

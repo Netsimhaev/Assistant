@@ -12,7 +12,7 @@
  */
 import type { ServerResponse } from 'node:http';
 import { loadActiveCharter } from '../charter/store.js';
-import { getPool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { LedgerFamily, LedgerMode, isLedgerOverdue, type LedgerItem } from '../domain/ledger.js';
 import {
   addCriticalRule,
@@ -64,9 +64,9 @@ const BAD_ACTION = 'הפעולה שנבחרה אינה מוכרת.';
 const EVENTS_SHOWN = 5;
 
 /** The charter's own zone and currency; stated stand-ins (`UTC`, `ILS`) only when no readable charter exists. */
-async function charterContext(businessId: string): Promise<{ timeZone: string; currency: string }> {
+async function charterContext(db: BusinessDb): Promise<{ timeZone: string; currency: string }> {
   try {
-    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    const active = await loadActiveCharter(db);
     if (active !== null) {
       return { timeZone: active.charter.identity.timezone, currency: active.bundle.ceilings.currency };
     }
@@ -114,10 +114,10 @@ function draftOf(body: string): string | null {
  * sent, or the fallback reminder's draft (job fallback: its
  * `nudge_fallback:<job>` row; an open-time fallback: the claimed `nudge` row).
  */
-async function followups(businessId: string, itemIds: string[]): Promise<Map<string, LedgerFollowup>> {
+async function followups(db: BusinessDb, itemIds: string[]): Promise<Map<string, LedgerFollowup>> {
+  const businessId = db.businessId;
   const out = new Map<string, LedgerFollowup>();
   if (itemIds.length === 0) return out;
-  const db = getPool();
   const { rows: flight } = await db.query<{ item_id: string }>(
     `SELECT item_id FROM ledger_items
       WHERE business_id = $1 AND item_id = ANY($2) AND nudge_job_id IS NOT NULL`,
@@ -164,21 +164,22 @@ async function followups(businessId: string, itemIds: string[]): Promise<Map<str
 
 async function renderListPage(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: LedgerSession,
   options: { status: number; filter: LedgerFilter; error?: string; markSeen: boolean },
 ): Promise<void> {
+  const businessId = db.businessId;
   const now = new Date();
-  const { timeZone, currency } = await charterContext(businessId);
-  const all = await withBusiness(businessId, (db) => listLedgerItems(db)); // TENANCY-TODO(task 10)
+  const { timeZone, currency } = await charterContext(db);
+  const all = await listLedgerItems(db);
   const shown = all.filter((i) => matchesFilter(i, options.filter, now, timeZone));
   const follow = await followups(
-    businessId,
+    db,
     shown.filter((i) => i.status === 'open' || i.status === 'stuck').map((i) => i.itemId),
   );
   const rows: LedgerRowView[] = [];
   for (const item of shown) {
-    const events = await withBusiness(businessId, (db) => listLedgerEvents(db, item.itemId)); // TENANCY-TODO(task 10)
+    const events = await listLedgerEvents(db, item.itemId);
     rows.push({ item, events: events.slice(-EVENTS_SHOWN), followup: follow.get(item.itemId) ?? null });
   }
   const body = renderLedger({
@@ -191,7 +192,7 @@ async function renderListPage(
     ...(options.error !== undefined ? { error: options.error } : {}),
   });
   if (options.markSeen) {
-    await getPool().query(
+    await db.query(
       `UPDATE ledger_reminders SET seen_at = now() WHERE business_id = $1 AND seen_at IS NULL`,
       [businessId],
     );
@@ -201,11 +202,11 @@ async function renderListPage(
 
 export async function handleLedgerGet(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: LedgerSession,
   url: URL,
 ): Promise<void> {
-  await renderListPage(res, businessId, session, {
+  await renderListPage(res, db, session, {
     status: 200,
     filter: parseFilter(url.searchParams.get('filter')),
     markSeen: true,
@@ -230,28 +231,28 @@ function isRealDate(value: string): boolean {
 
 export async function handleLedgerAction(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: LedgerSession,
   itemId: string,
   form: URLSearchParams,
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
 
-  const item = await withBusiness(businessId, (db) => loadLedgerItem(db, itemId)); // TENANCY-TODO(task 10)
+  const item = await loadLedgerItem(db, itemId);
   if (item === null) return html(res, 404, renderNotFound());
 
   const refuse = (status: number, error: string): Promise<void> =>
-    renderListPage(res, businessId, session, { status, filter: 'open', error, markSeen: false });
+    renderListPage(res, db, session, { status, filter: 'open', error, markSeen: false });
 
   const action = form.get('action') ?? '';
   if (action === 'critical') {
     if (item.status !== 'open' && item.status !== 'stuck') return refuse(409, NOT_APPLICABLE);
-    await withBusiness(businessId, (db) => updateLedgerItem( // TENANCY-TODO(task 10)
+    await updateLedgerItem(
       db,
       itemId,
       { importance: 'critical', importanceManual: true },
       { kind: 'updated', by: session.username, note: 'importance=critical' },
-    ));
+    );
     return redirect(res, '/ledger');
   }
 
@@ -266,12 +267,12 @@ export async function handleLedgerAction(
     return refuse(400, BAD_ACTION);
   }
 
-  const { timeZone } = await charterContext(businessId);
-  const outcome = await withBusiness(businessId, (db) => applyLedgerCommand(db, itemId, command, { // TENANCY-TODO(task 10)
+  const { timeZone } = await charterContext(db);
+  const outcome = await applyLedgerCommand(db, itemId, command, {
     by: session.username,
     now: new Date(),
     timeZone,
-  }));
+  });
   if (outcome === 'not_applicable') return refuse(409, NOT_APPLICABLE);
   if (outcome === 'lost_race') return refuse(409, LOST_RACE);
   redirect(res, '/ledger');
@@ -297,20 +298,20 @@ function valuesFromSettings(s: LedgerSettings): LedgerSettingsFormValues {
 
 async function renderSettingsPage(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: LedgerSession,
   status: number,
   values?: LedgerSettingsFormValues,
   error?: string,
 ): Promise<void> {
-  const { currency } = await charterContext(businessId);
-  const shown = values ?? valuesFromSettings(await withBusiness(businessId, (db) => loadLedgerSettings(db))); // TENANCY-TODO(task 10)
+  const { currency } = await charterContext(db);
+  const shown = values ?? valuesFromSettings(await loadLedgerSettings(db));
   html(
     res,
     status,
     renderLedgerSettings({
       values: shown,
-      rules: await withBusiness(businessId, (db) => listCriticalRules(db)), // TENANCY-TODO(task 10)
+      rules: await listCriticalRules(db),
       csrf: issueCsrfToken(session.sessionId),
       currency,
       ...(error !== undefined ? { error } : {}),
@@ -320,10 +321,10 @@ async function renderSettingsPage(
 
 export async function handleLedgerSettingsGet(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: LedgerSession,
 ): Promise<void> {
-  await renderSettingsPage(res, businessId, session, 200);
+  await renderSettingsPage(res, db, session, 200);
 }
 
 function wholeNumber(raw: string | null): number {
@@ -333,7 +334,7 @@ function wholeNumber(raw: string | null): number {
 
 export async function handleLedgerSettingsPost(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: LedgerSession,
   form: URLSearchParams,
 ): Promise<void> {
@@ -366,7 +367,7 @@ export async function handleLedgerSettingsPost(
   const parsedModes = {} as Record<LedgerFamily, LedgerMode>;
   for (const family of LedgerFamily.options) {
     const parsed = LedgerMode.safeParse(modes[family]);
-    if (!parsed.success) return renderSettingsPage(res, businessId, session, 400, values, BAD_VALUES);
+    if (!parsed.success) return renderSettingsPage(res, db, session, 400, values, BAD_VALUES);
     parsedModes[family] = parsed.data;
   }
 
@@ -385,9 +386,9 @@ export async function handleLedgerSettingsPost(
     dailyHour: wholeNumber(values.dailyHour),
   };
   try {
-    await withBusiness(businessId, (db) => saveLedgerSettings(db, settings, { updatedBy: session.username })); // TENANCY-TODO(task 10)
+    await saveLedgerSettings(db, settings, { updatedBy: session.username });
   } catch (err) {
-    return renderSettingsPage(res, businessId, session, 400, values, err instanceof Error ? err.message : BAD_VALUES);
+    return renderSettingsPage(res, db, session, 400, values, err instanceof Error ? err.message : BAD_VALUES);
   }
   redirect(res, '/ledger/settings');
 }
@@ -410,13 +411,13 @@ export function parseMajorToMinor(raw: string): { ok: true; minor: number } | { 
 
 export async function handleLedgerRulePost(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: LedgerSession,
   form: URLSearchParams,
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
 
-  const refuse = (message: string): Promise<void> => renderSettingsPage(res, businessId, session, 400, undefined, message);
+  const refuse = (message: string): Promise<void> => renderSettingsPage(res, db, session, 400, undefined, message);
   const kind = form.get('kind');
   let rule: NewCriticalRule;
   if (kind === 'family') {
@@ -433,7 +434,7 @@ export async function handleLedgerRulePost(
     return refuse(BAD_VALUES);
   }
   try {
-    await withBusiness(businessId, (db) => addCriticalRule(db, rule, { by: session.username })); // TENANCY-TODO(task 10)
+    await addCriticalRule(db, rule, { by: session.username });
   } catch (err) {
     return refuse(err instanceof Error ? err.message : BAD_VALUES);
   }
@@ -442,12 +443,12 @@ export async function handleLedgerRulePost(
 
 export async function handleLedgerRuleDelete(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: LedgerSession,
   ruleId: string,
   form: URLSearchParams,
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
-  await withBusiness(businessId, (db) => removeCriticalRule(db, ruleId)); // TENANCY-TODO(task 10)
+  await removeCriticalRule(db, ruleId);
   redirect(res, '/ledger/settings');
 }

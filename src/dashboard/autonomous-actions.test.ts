@@ -96,7 +96,7 @@ function runtimeWith(sent: MailMessage[]): Runtime {
  * one signed charter, exactly as they would on one real install.
  */
 async function installFixture(): Promise<PolicyBundle> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 10)
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
     bdb,
     buildCharter({
       version: '2026-08-15.autonomous-actions',
@@ -104,7 +104,7 @@ async function installFixture(): Promise<PolicyBundle> {
       knownCounterpartyEmailDomain: 'example.com',
     })
   ));
-  await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 10)
+  await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
   await withBusiness(BUSINESS, (db) => upsertBinding(db, {
       system: 'office-mail',
       status: 'live',
@@ -169,7 +169,7 @@ describe('listAutonomousActions', () => {
     expect(result.ran).toEqual([{ jobId, status: 'done', detail: null }]);
     expect(sent).toHaveLength(1);
 
-    const actions = await listAutonomousActions({ businessId: BUSINESS });
+    const actions = await withBusiness(BUSINESS, (db) => listAutonomousActions(db));
     expect(actions).toHaveLength(1);
     expect(actions[0]).toMatchObject({
       jobId,
@@ -224,7 +224,7 @@ describe('listAutonomousActions', () => {
 
     // The owner approves the card — exactly what `applyDecision` runs under
     // the dashboard's `/a/:id/approve` route.
-    const [pending] = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb)); // TENANCY-TODO(task 10)
+    const [pending] = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb));
     if (pending === undefined) throw new Error('expected one pending approval');
     expect(pending.jobId).toBe(cardJobId);
     await withBusiness(BUSINESS, (db) => applyDecision(db, pending.approvalId, 'approved', { by: 'owner@example.com', channel: 'dashboard' }));
@@ -234,7 +234,7 @@ describe('listAutonomousActions', () => {
     expect(secondPass.ran).toEqual([{ jobId: cardJobId, status: 'done', detail: null }]);
     expect(sent).toHaveLength(2);
 
-    const actions = await listAutonomousActions({ businessId: BUSINESS });
+    const actions = await withBusiness(BUSINESS, (db) => listAutonomousActions(db));
     expect(actions.map((a) => a.jobId)).toEqual([autonomousJobId]);
     expect(actions.some((a) => a.jobId === cardJobId)).toBe(false);
   });
@@ -287,10 +287,10 @@ describe('listAutonomousActions', () => {
     expect(firstPass.ran).toEqual([{ jobId, status: 'halted', detail: 'awaiting_approval' }]);
     expect(sent).toHaveLength(1);
 
-    const beforeApproval = await listAutonomousActions({ businessId: BUSINESS });
+    const beforeApproval = await withBusiness(BUSINESS, (db) => listAutonomousActions(db));
     expect(beforeApproval.map((a) => a.stepId)).toEqual(['s1']);
 
-    const [pending] = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb)); // TENANCY-TODO(task 10)
+    const [pending] = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb));
     if (pending === undefined) throw new Error('expected one pending approval for s2');
     await withBusiness(BUSINESS, (db) => applyDecision(db, pending.approvalId, 'approved', { by: 'owner@example.com', channel: 'dashboard' }));
 
@@ -301,7 +301,7 @@ describe('listAutonomousActions', () => {
     expect(sent).toHaveLength(2);
 
     // s1 never touched a card. It must still be here, on its own.
-    const afterApproval = await listAutonomousActions({ businessId: BUSINESS });
+    const afterApproval = await withBusiness(BUSINESS, (db) => listAutonomousActions(db));
     expect(afterApproval.map((a) => a.stepId)).toEqual(['s1']);
   });
 
@@ -313,17 +313,17 @@ describe('listAutonomousActions', () => {
    * or could mark. Only `performed = true` is listed.
    */
   it('lists only steps that performed, leaving out performed = false and performed IS NULL', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION] }))); // TENANCY-TODO(task 10)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION] })));
     const performedJob = await seedCompletedStep(bundle, true);
     await seedCompletedStep(bundle, false);
     await seedCompletedStep(bundle, null);
 
-    const actions = await listAutonomousActions({ businessId: BUSINESS });
+    const actions = await withBusiness(BUSINESS, (db) => listAutonomousActions(db));
     expect(actions.map((a) => a.jobId)).toEqual([performedJob]);
   });
 
   it('marks a step fromInstruction only when ITS business holds a boss_instructions row for the job', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION] }))); // TENANCY-TODO(task 10)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION] })));
     const instructedJob = await seedCompletedStep(bundle, true);
     const plainJob = await seedCompletedStep(bundle, true);
     const foreignInstructionJob = await seedCompletedStep(bundle, true);
@@ -343,7 +343,7 @@ describe('listAutonomousActions', () => {
     );
 
     const byJob = new Map(
-      (await listAutonomousActions({ businessId: BUSINESS })).map((a) => [a.jobId, a.fromInstruction]),
+      (await withBusiness(BUSINESS, (db) => listAutonomousActions(db))).map((a) => [a.jobId, a.fromInstruction]),
     );
     expect(byJob.get(instructedJob)).toBe(true);
     expect(byJob.get(plainJob)).toBe(false);
@@ -351,7 +351,7 @@ describe('listAutonomousActions', () => {
   });
 
   it('returns an empty list for a business with no completed steps', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION] }))); // TENANCY-TODO(task 10)
-    expect(await listAutonomousActions({ businessId: BUSINESS })).toEqual([]);
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION] })));
+    expect(await withBusiness(BUSINESS, (db) => listAutonomousActions(db))).toEqual([]);
   });
 });

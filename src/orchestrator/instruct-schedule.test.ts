@@ -11,7 +11,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import type { CalendarClient, CalendarEvent } from '../calendar/types.js';
 import { installCharter } from '../charter/store.js';
-import { createOwner } from '../dashboard/auth.js';
+import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { issueCsrfToken } from '../dashboard/csrf.js';
 import { createServer } from '../dashboard/server.js';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
@@ -119,9 +119,8 @@ describe('both doors pass the calendar', () => {
 
   it('the dashboard /instruct route answers a schedule question (no planner injected, no job)', async () => {
     await bindCalendar();
-    await createOwner({ username: 'owner', password: 'correct horse battery staple', businessId: BUSINESS });
+    await createTestOwner(BUSINESS, { username: 'owner', password: 'correct horse battery staple' });
     server = createServer({
-      businessId: BUSINESS,
       port: 0,
       calendarCredentials: CREDENTIALS,
       calendarClient: clientWith('לקוח מהדשבורד'),
@@ -130,7 +129,7 @@ describe('both doors pass the calendar', () => {
     const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     const login = await fetch(`${baseUrl}/login`, {
       method: 'POST',
-      body: new URLSearchParams({ username: 'owner', password: 'correct horse battery staple' }),
+      body: new URLSearchParams({ email: ownerLogin(BUSINESS, 'owner'), password: 'correct horse battery staple' }),
       redirect: 'manual',
     });
     const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0] as string;
@@ -148,7 +147,7 @@ describe('both doors pass the calendar', () => {
 
   it('the dashboard answer route answers a schedule question without consuming the parked question', async () => {
     await bindCalendar();
-    await createOwner({ username: 'owner', password: 'correct horse battery staple', businessId: BUSINESS });
+    await createTestOwner(BUSINESS, { username: 'owner', password: 'correct horse battery staple' });
     // A parked question: the planner asks for clarification.
     const parkedOutcome = await withBusiness(TEST_BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לרונית מחר' }, {
         ...SCHEDULE_OPTIONS,
@@ -163,12 +162,12 @@ describe('both doors pass the calendar', () => {
     if (parkedOutcome.status !== 'needs_answer') throw new Error(`expected a parked question, got ${parkedOutcome.status}`);
     const jobsBefore = await count('jobs');
 
-    server = createServer({ businessId: BUSINESS, port: 0, calendarCredentials: CREDENTIALS, calendarClient: clientWith('לקוח מתשובה') });
+    server = createServer({ port: 0, calendarCredentials: CREDENTIALS, calendarClient: clientWith('לקוח מתשובה') });
     await once(server, 'listening');
     const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     const login = await fetch(`${baseUrl}/login`, {
       method: 'POST',
-      body: new URLSearchParams({ username: 'owner', password: 'correct horse battery staple' }),
+      body: new URLSearchParams({ email: ownerLogin(BUSINESS, 'owner'), password: 'correct horse battery staple' }),
       redirect: 'manual',
     });
     const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0] as string;

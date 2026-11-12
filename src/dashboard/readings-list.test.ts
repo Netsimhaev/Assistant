@@ -136,7 +136,7 @@ describe('recentReadings', () => {
 
   it('returns the reading with its proposal stance and reasons', async () => {
     await seed(BUSINESS, 'DOC-1', 'advise_against');
-    const rows = await recentReadings(10, { businessId: BUSINESS });
+    const rows = await withBusiness(BUSINESS, (db) => recentReadings(db, 10));
     expect(rows).toHaveLength(1);
     expect(rows[0]?.stance).toBe('advise_against');
     expect(rows[0]?.headline).toBe('אני נגד חתימה');
@@ -176,7 +176,7 @@ describe('recentReadings', () => {
       },
     });
 
-    const rows = await recentReadings(10, { businessId: BUSINESS });
+    const rows = await withBusiness(BUSINESS, (db) => recentReadings(db, 10));
     const byDocument = new Map(rows.map((r) => [r.documentId, r]));
 
     // Neither has a card — no job, so no approval. What separates them is
@@ -189,7 +189,7 @@ describe('recentReadings', () => {
 
   it('never returns another business\'s reading', async () => {
     await seed(BUSINESS, 'DOC-1', 'advise_against');
-    expect(await recentReadings(10, { businessId: 'other' })).toEqual([]);
+    expect(await withBusiness('other', (db) => recentReadings(db, 10))).toEqual([]);
   });
 
   // C1: `document_readings.content` is NULL exactly when `status =
@@ -202,7 +202,7 @@ describe('recentReadings', () => {
     await seedDocument(BUSINESS, 'DOC-2');
     await seedUnreadableReading(BUSINESS, 'DOC-2', 'RD-DOC-2', 'הקובץ פגום ולא ניתן לפתיחה');
 
-    const rows = await recentReadings(10, { businessId: BUSINESS });
+    const rows = await withBusiness(BUSINESS, (db) => recentReadings(db, 10));
 
     expect(rows).toHaveLength(1);
     expect(rows[0]?.summary).toContain('הקובץ פגום ולא ניתן לפתיחה');
@@ -214,7 +214,7 @@ describe('recentReadings', () => {
   // I2: the approval-link path — the reason this screen exists — was never
   // exercised by a real reading -> proposal -> job -> approval chain.
   it('carries the approval id through a full reading -> proposal -> job -> approval chain', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
 
     await seedDocument(BUSINESS, 'DOC-3');
@@ -229,7 +229,7 @@ describe('recentReadings', () => {
     });
     await seedApproval({ approvalId: 'AP-DOC-3', businessId: BUSINESS, jobId: job.jobId });
 
-    const rows = await recentReadings(10, { businessId: BUSINESS });
+    const rows = await withBusiness(BUSINESS, (db) => recentReadings(db, 10));
 
     expect(rows).toHaveLength(1);
     expect(rows[0]?.approvalId).toBe('AP-DOC-3');
@@ -240,7 +240,7 @@ describe('recentReadings', () => {
   // pick either — `a.approval_id DESC` breaks the tie deterministically, the
   // same way `documentForApproval` already breaks its own proposal tie.
   it('breaks a same-timestamp approval tie deterministically, by approval id', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
 
     await seedDocument(BUSINESS, 'DOC-TIE');
@@ -257,7 +257,7 @@ describe('recentReadings', () => {
     await seedApproval({ approvalId: 'AP-A', businessId: BUSINESS, jobId: job.jobId, createdAt: tiedAt });
     await seedApproval({ approvalId: 'AP-B', businessId: BUSINESS, jobId: job.jobId, createdAt: tiedAt });
 
-    const rows = await recentReadings(10, { businessId: BUSINESS });
+    const rows = await withBusiness(BUSINESS, (db) => recentReadings(db, 10));
     // 'AP-B' > 'AP-A' lexicographically, so `ORDER BY ... a.approval_id DESC`
     // must pick it — and must pick the SAME one on every run.
     expect(rows[0]?.approvalId).toBe('AP-B');
@@ -280,7 +280,7 @@ describe('recentReadings', () => {
       createdAt: new Date(Date.now() + 60_000).toISOString(),
     });
 
-    const rows = await recentReadings(10, { businessId: BUSINESS });
+    const rows = await withBusiness(BUSINESS, (db) => recentReadings(db, 10));
 
     expect(rows).toHaveLength(1);
     expect(rows[0]?.headline).toBe('אני נגד חתימה');
@@ -289,7 +289,7 @@ describe('recentReadings', () => {
 
   // Same concern, for the approval lateral's own `a.business_id = r.business_id`.
   it("is not fooled by a foreign business's later approval on the same job", async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
 
     await seedDocument(BUSINESS, 'DOC-5');
@@ -314,7 +314,7 @@ describe('recentReadings', () => {
       createdAt: new Date(Date.now() + 60_000).toISOString(),
     });
 
-    const rows = await recentReadings(10, { businessId: BUSINESS });
+    const rows = await withBusiness(BUSINESS, (db) => recentReadings(db, 10));
 
     expect(rows).toHaveLength(1);
     expect(rows[0]?.approvalId).toBe('AP-REAL');

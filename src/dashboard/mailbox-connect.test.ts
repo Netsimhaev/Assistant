@@ -36,7 +36,7 @@ import {
 import { loadBindings } from '../orchestrator/bindings.js';
 import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase } from '../test/db.js';
-import { createOwner } from './auth.js';
+import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { issueCsrfToken } from './csrf.js';
 import { createServer } from './server.js';
 import { putPlatformSecret, removePlatformSecret } from '../tenancy/platform-credentials.js';
@@ -75,8 +75,8 @@ beforeEach(async () => {
     // The OAuth client is the server's, not the business's (spec §5.4).
     await putPlatformSecret(ref, value, key, 'test');
   }
-  await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [OFFICE_MAIL] }))); // TENANCY-TODO(task 10)
+  await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [OFFICE_MAIL] })));
 });
 
 afterEach(async () => {
@@ -110,7 +110,6 @@ async function startServer(
   options: { oauthFetch?: typeof fetch; mailboxClientFor?: (p: MailProvider) => MailboxClient } = {},
 ): Promise<string> {
   server = createServer({
-    businessId: BUSINESS,
     port: 0,
     credentialKeyPath: keyPath,
     dashboardBaseUrl: 'http://127.0.0.1:4173',
@@ -124,7 +123,7 @@ async function startServer(
 async function login(baseUrl: string): Promise<string> {
   const res = await fetch(`${baseUrl}/login`, {
     method: 'POST',
-    body: new URLSearchParams({ username: USERNAME, password: PASSWORD }),
+    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
     redirect: 'manual',
   });
   expect(res.status).toBe(302);
@@ -175,10 +174,10 @@ function microsoftFetch(): typeof fetch {
 }
 
 async function installSignedMailbox(provider: MailProvider): Promise<void> {
-  const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+  const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
   if (active === null) throw new Error('no charter');
   const amendment = buildMailboxAmendment(active.charter, new Date(), provider);
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, signCharter(amendment, { signedByPersonId: USERNAME, method: 'dashboard_click' }))); // TENANCY-TODO(task 10)
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, signCharter(amendment, { signedByPersonId: USERNAME, method: 'dashboard_click' })));
 }
 
 describe('GET /connections/mailbox', () => {
@@ -245,7 +244,7 @@ describe('GET /connections/mailbox/sign', () => {
     expect(html).toContain('אלא אם הגדרת ברמת החופש שהעוזרת רשאית לענות לבד');
     expect(html).toContain('תיבת המשרד'); // the connection that is dropped, by its signed label
     expect(html).toContain('Google');
-    expect(html).toContain('יופעל מחדש');
+    expect(html).toContain('בסבב הבא שלו');
     expect(html).toContain('name="csrf"');
     expect(html).toContain('name="provider" value="google"');
   });
@@ -260,7 +259,7 @@ describe('GET /connections/mailbox/sign', () => {
 
 describe('POST /connections/mailbox/sign', () => {
   it('POST /connections/mailbox/sign installs a charter whose active version serves mail.send only via mailbox', async () => {
-    const before = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    const before = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     const baseUrl = await startServer();
     const cookie = await login(baseUrl);
     const res = await signForm(baseUrl, cookie, {
@@ -271,7 +270,7 @@ describe('POST /connections/mailbox/sign', () => {
     expect(res.status).toBe(303);
     expect(res.headers.get('location')).toBe('/connections/mailbox');
 
-    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     expect(active?.charter.supersedes).toBe(before?.charter.charterVersion);
     expect(active?.charter.signature.signedByPersonId).toBe(USERNAME);
     expect(active?.charter.signature.method).toBe('dashboard_click');
@@ -285,13 +284,13 @@ describe('POST /connections/mailbox/sign', () => {
     expect((await withBusiness(BUSINESS, (db) => loadBindings(db))).some((b) => b.system === 'mailbox')).toBe(false);
     expect(await withBusiness(BUSINESS, (db) => getCursor(db))).toBeNull();
 
-    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'charter_change' })); // TENANCY-TODO(task 10)
+    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'charter_change' }));
     expect(audit).toHaveLength(1);
     expect(audit[0]?.charterVersion).toBe(active?.charter.charterVersion);
   });
 
   it('refuses without a valid CSRF token and installs nothing', async () => {
-    const before = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    const before = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     const baseUrl = await startServer();
     const cookie = await login(baseUrl);
     const res = await signForm(baseUrl, cookie, {
@@ -300,21 +299,21 @@ describe('POST /connections/mailbox/sign', () => {
       base: before?.charter.charterVersion ?? '',
     });
     expect(res.status).toBe(403);
-    expect((await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.charterVersion).toBe(before?.charter.charterVersion); // TENANCY-TODO(task 10)
+    expect((await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.charterVersion).toBe(before?.charter.charterVersion);
   });
 
   it('refuses when the active charter changed since the page was shown, and installs nothing', async () => {
-    const before = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    const before = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     const baseUrl = await startServer();
     const cookie = await login(baseUrl);
     const res = await signForm(baseUrl, cookie, { csrf: csrfFor(cookie), provider: 'google', base: 'some-older-version' });
     expect(res.status).toBe(409);
-    expect((await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.charterVersion).toBe(before?.charter.charterVersion); // TENANCY-TODO(task 10)
+    expect((await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.charterVersion).toBe(before?.charter.charterVersion);
   });
 
   it('refuses a second mailbox and installs nothing', async () => {
     await installSignedMailbox('google');
-    const before = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    const before = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     const baseUrl = await startServer();
     const cookie = await login(baseUrl);
     const res = await signForm(baseUrl, cookie, {
@@ -323,7 +322,7 @@ describe('POST /connections/mailbox/sign', () => {
       base: before?.charter.charterVersion ?? '',
     });
     expect(res.status).toBe(409);
-    expect((await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.charterVersion).toBe(before?.charter.charterVersion); // TENANCY-TODO(task 10)
+    expect((await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.charterVersion).toBe(before?.charter.charterVersion);
     const { rows } = await getPool().query('SELECT count(*)::int AS n FROM charter_versions WHERE business_id = $1', [BUSINESS]);
     expect(rows[0]?.['n']).toBe(2);
   });
@@ -428,7 +427,7 @@ async function completeCeremony(baseUrl: string, cookie: string): Promise<Respon
 }
 
 async function activeVersion(): Promise<string | undefined> {
-  return (await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.charterVersion; // TENANCY-TODO(task 10)
+  return (await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.charterVersion;
 }
 
 describe('fix round 1: preflight before signing', () => {
@@ -465,7 +464,7 @@ describe('fix round 1: preflight before signing', () => {
 
 describe('fix round 1: the way back', () => {
   it('revert restores office-mail serving mail.send, as a new signed version with an audit row', async () => {
-    const original = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    const original = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     await installSignedMailbox('microsoft');
     const signedVersion = await activeVersion();
     const baseUrl = await startServer();
@@ -482,7 +481,7 @@ describe('fix round 1: the way back', () => {
     });
     expect(res.status).toBe(303);
 
-    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     expect(active?.charter.charterVersion).not.toBe(signedVersion);
     expect(active?.charter.charterVersion).not.toBe(original?.charter.charterVersion);
     expect(active?.charter.supersedes).toBe(signedVersion);
@@ -490,7 +489,7 @@ describe('fix round 1: the way back', () => {
     expect(active?.charter.connections).toEqual(original?.charter.connections);
     expect(active?.charter.connections.find((c) => c.system === 'office-mail')?.serves).toEqual(['mail.send']);
     expect(active?.charter.data.subprocessorsAllowed).toEqual(original?.charter.data.subprocessorsAllowed);
-    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'charter_change' })); // TENANCY-TODO(task 10)
+    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'charter_change' }));
     expect(audit.map((a) => a.charterVersion)).toContain(active?.charter.charterVersion);
   });
 
@@ -563,7 +562,7 @@ describe('fix round 1: the way back', () => {
  */
 async function raceInstallAgainst(post: () => Promise<Response>): Promise<{ res: Response; other: string }> {
   const otherCharter = buildCharter({ version: 'concurrent-other', connections: [OFFICE_MAIL] });
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, otherCharter, { activate: false })); // TENANCY-TODO(task 10)
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, otherCharter, { activate: false }));
   const client = await getPool().connect();
   try {
     await client.query('BEGIN');
@@ -631,8 +630,8 @@ describe('fix round 1: callback', () => {
 
     // Between start and callback the charter is re-signed for Google.
     const base = buildCharter({ version: 'rebase', connections: [OFFICE_MAIL] });
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, base)); // TENANCY-TODO(task 10)
-    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, base));
+    await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       signCharter(buildMailboxAmendment(base, new Date(), 'google'), { signedByPersonId: USERNAME, method: 'dashboard_click' })
     ));

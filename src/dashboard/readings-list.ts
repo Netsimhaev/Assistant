@@ -10,8 +10,7 @@
  * on the approval card, which carries expiry, decision, signing and audit. A
  * second screen that decided would be a second path to the same table.
  */
-import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 export interface ReadingSummary {
   documentId: string;
@@ -127,12 +126,8 @@ function toSummary(row: ReadingRow): ReadingSummary {
  * result is stored, not discarded. `toSummary` renders `r.reason` for those
  * rows instead of a summary it does not have.
  */
-export async function recentReadings(
-  limit: number,
-  options: { businessId?: string; db?: Queryable } = {},
-): Promise<ReadingSummary[]> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+export async function recentReadings(db: BusinessDb, limit: number): Promise<ReadingSummary[]> {
+  const businessId = db.businessId;
 
   const { rows } = await db.query<ReadingRow>(
     `SELECT d.document_id,

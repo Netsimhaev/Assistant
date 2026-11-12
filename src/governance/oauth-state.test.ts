@@ -24,6 +24,7 @@ describe('oauth-state: the anti-forgery gate for the consent ceremony', () => {
   it('returns the session id and code verifier it was created with', async () => {
     const state = await withBusiness(BUSINESS, (bdb) => createState(bdb, { system: 'office-calendar', sessionId: 'session-abc', codeVerifier: 'verifier-xyz' }));
     expect(await withBusiness(BUSINESS, (bdb) => consumeState(bdb, state))).toEqual({
+      businessId: BUSINESS,
       system: 'office-calendar',
       sessionId: 'session-abc',
       codeVerifier: 'verifier-xyz',

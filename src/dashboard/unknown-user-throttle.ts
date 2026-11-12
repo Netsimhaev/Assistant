@@ -7,8 +7,11 @@
  * unauthenticated caller could spend the server's CPU — up to eight `scrypt`
  * calls per recovery attempt — without limit. See
  * `src/db/migrations/010_unknown_user_throttle.sql` for why the counter lives
- * in one shared row per business rather than one row per submitted name, and
- * for what that choice does and does not leak.
+ * in one shared row rather than one row per submitted name, and for what that
+ * choice does and does not leak. Since migration 066 that row is one for the
+ * whole server, not one per business: a login is an email that has not yet
+ * resolved to any business when it fails, so there is no business to file the
+ * failure under (spec §5.5).
  *
  * The two budgets stay separate here exactly as they are on `dashboard_users`:
  * wrong recovery codes must not spend login's allowance, and vice versa. The
@@ -16,8 +19,7 @@
  * there is one definition of "five attempts, fifteen minutes" and one of "ten
  * attempts, one minute", not two of each drifting apart.
  */
-import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { Queryable } from '../db/pool.js';
 
 /** Which of the two budgets a call is spending. */
 export type ThrottleKind = 'login' | 'recovery';
@@ -36,9 +38,13 @@ export interface ThrottleInput {
   kind: ThrottleKind;
   maxFailed: number;
   lockMinutes: number;
-  businessId?: string;
   now?: Date;
-  db?: Queryable;
+  /**
+   * Any connection — the row has no business and no policy. Before a login
+   * has resolved that is `withNoBusiness`; inside a business's request it is
+   * that request's own connection.
+   */
+  db: Queryable;
 }
 
 /**
@@ -51,15 +57,13 @@ export interface ThrottleInput {
  * after it was set.
  */
 export async function unknownUserLocked(input: ThrottleInput): Promise<boolean> {
-  const businessId = input.businessId ?? config.businessId;
   const now = input.now ?? new Date();
-  const db = input.db ?? getPool();
+  const db = input.db;
   const col = COLUMNS[input.kind];
 
   const { rows } = await db.query<{ locked_until: Date | null }>(
     `SELECT ${col.lockedUntil} AS locked_until
-       FROM dashboard_unknown_user_throttle WHERE business_id = $1`,
-    [businessId],
+       FROM dashboard_unknown_user_throttle`,
   );
   const lockedUntil = rows[0]?.locked_until ?? null;
   if (lockedUntil === null) return false;
@@ -68,8 +72,8 @@ export async function unknownUserLocked(input: ThrottleInput): Promise<boolean> 
     const cleared = await db.query(
       `UPDATE dashboard_unknown_user_throttle
           SET ${col.attempts} = 0, ${col.lockedUntil} = NULL
-        WHERE business_id = $1 AND ${col.lockedUntil} <= $2`,
-      [businessId, now],
+        WHERE ${col.lockedUntil} <= $1`,
+      [now],
     );
     // A no-op means someone else's fresh lock won the race, and that lock
     // stands.
@@ -91,21 +95,20 @@ export async function unknownUserLocked(input: ThrottleInput): Promise<boolean> 
  * first failure create the row, so nothing has to seed it.
  */
 export async function recordUnknownUserFailure(input: ThrottleInput): Promise<void> {
-  const businessId = input.businessId ?? config.businessId;
   const now = input.now ?? new Date();
-  const db = input.db ?? getPool();
+  const db = input.db;
   const col = COLUMNS[input.kind];
   const lockUntilIfThresholdReached = new Date(now.getTime() + input.lockMinutes * 60_000);
 
   await db.query(
-    `INSERT INTO dashboard_unknown_user_throttle (business_id, ${col.attempts}, ${col.lockedUntil})
-     VALUES ($1, 1, CASE WHEN 1 >= $2 THEN $3::timestamptz END)
-     ON CONFLICT (business_id) DO UPDATE
+    `INSERT INTO dashboard_unknown_user_throttle (singleton, ${col.attempts}, ${col.lockedUntil})
+     VALUES (true, 1, CASE WHEN 1 >= $1 THEN $2::timestamptz END)
+     ON CONFLICT (singleton) DO UPDATE
         SET ${col.attempts} = dashboard_unknown_user_throttle.${col.attempts} + 1,
             ${col.lockedUntil} = CASE
-              WHEN dashboard_unknown_user_throttle.${col.attempts} + 1 >= $2 THEN $3::timestamptz
+              WHEN dashboard_unknown_user_throttle.${col.attempts} + 1 >= $1 THEN $2::timestamptz
               ELSE dashboard_unknown_user_throttle.${col.lockedUntil}
             END`,
-    [businessId, input.maxFailed, lockUntilIfThresholdReached],
+    [input.maxFailed, lockUntilIfThresholdReached],
   );
 }

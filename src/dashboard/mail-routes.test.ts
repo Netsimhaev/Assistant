@@ -18,7 +18,7 @@ import { storedMail } from '../test/mailbox.js';
 import { ingestDocument } from '../documents/ingest.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
-import { createOwner } from './auth.js';
+import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { createServer } from './server.js';
 import { DOCUMENT_LIMIT } from './mail-handlers.js';
 
@@ -34,7 +34,7 @@ const PASSWORD = 'correct horse battery staple';
  * own version, so a test that installs `buildCharter()` itself still can.
  */
 async function installGateCharter(businessId: string): Promise<void> {
-  await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 10)
+  await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' })));
 }
 
 let server: Server | null = null;
@@ -43,7 +43,7 @@ let root: string;
 beforeEach(async () => {
   await resetDatabase();
   root = await mkdtemp(join(tmpdir(), 'mail-routes-'));
-  await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+  await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
   await installGateCharter(BUSINESS);
 });
 afterEach(async () => {
@@ -58,7 +58,7 @@ afterAll(async () => {
 });
 
 async function start(): Promise<string> {
-  server = createServer({ businessId: BUSINESS, port: 0, documentRoot: root });
+  server = createServer({ port: 0, documentRoot: root });
   await once(server, 'listening');
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
@@ -66,7 +66,7 @@ async function start(): Promise<string> {
 async function login(baseUrl: string): Promise<string> {
   const res = await fetch(`${baseUrl}/login`, {
     method: 'POST',
-    body: new URLSearchParams({ username: USERNAME, password: PASSWORD }),
+    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
     redirect: 'manual',
   });
   const pair = (res.headers.get('set-cookie') ?? '').split(';')[0];
@@ -376,7 +376,7 @@ describe('fix round 1', () => {
   });
 
   async function auditGap(daysAgo: number): Promise<void> {
-    await withBusiness(BUSINESS, (bdb) => appendAudit( // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => appendAudit(
       bdb,
       {
         jobId: null, actor: 'orchestrator', kind: 'incident', reason: 'mail_cursor_gap', inputHash: 'a'.repeat(64),

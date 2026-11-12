@@ -14,7 +14,7 @@ import type { ServerResponse } from 'node:http';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { getPool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { loadDocument } from '../documents/store.js';
 import { AttachmentDocType } from '../domain/mail-triage.js';
 import { LIKE_ESCAPE, likeLiteral } from '../util/like.js';
@@ -50,9 +50,9 @@ export function notFound(res: ServerResponse): void {
 }
 
 /** The charter's own zone; `UTC` only when no readable charter exists (a stated stand-in, not a silent default). */
-async function charterTimeZone(businessId: string): Promise<string> {
+async function charterTimeZone(db: BusinessDb): Promise<string> {
   try {
-    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    const active = await loadActiveCharter(db);
     return active?.charter.identity.timezone ?? 'UTC';
   } catch {
     return 'UTC';
@@ -101,8 +101,9 @@ const GAP_WINDOW_DAYS = 7;
  * from the durable audit row, not from `mailbox_cursor.last_error`, which the
  * next clean pass overwrites.
  */
-async function recentGapAt(businessId: string): Promise<string | null> {
-  const { rows } = await getPool().query<{ at: Date | null }>(
+async function recentGapAt(db: BusinessDb): Promise<string | null> {
+  const businessId = db.businessId;
+  const { rows } = await db.query<{ at: Date | null }>(
     `SELECT max(at) AS at FROM audit_log
       WHERE business_id = $1 AND reason = 'mail_cursor_gap' AND at > now() - ($2 || ' days')::interval`,
     [businessId, String(GAP_WINDOW_DAYS)],
@@ -115,10 +116,11 @@ async function recentGapAt(businessId: string): Promise<string | null> {
  * could not be decoded (ruling P7), with the reason — shown next to the
  * attachment so the owner knows it was never read.
  */
-async function undecodableDocuments(businessId: string, ids: readonly (string | undefined)[]): Promise<Map<string, string>> {
+async function undecodableDocuments(db: BusinessDb, ids: readonly (string | undefined)[]): Promise<Map<string, string>> {
+  const businessId = db.businessId;
   const wanted = [...new Set(ids.filter((i): i is string => i !== undefined))];
   if (wanted.length === 0) return new Map();
-  const { rows } = await getPool().query<{ document_id: string; reason: string }>(
+  const { rows } = await db.query<{ document_id: string; reason: string }>(
     `SELECT document_id, reason FROM documents
       WHERE business_id = $1 AND document_id = ANY($2::text[]) AND status = 'stored' AND reason IS NOT NULL`,
     [businessId, wanted],
@@ -127,10 +129,11 @@ async function undecodableDocuments(businessId: string, ids: readonly (string | 
 }
 
 /** The subset of `ids` that belong to this business and are in a status that may be served. */
-async function downloadableDocuments(businessId: string, ids: readonly (string | undefined)[]): Promise<Set<string>> {
+async function downloadableDocuments(db: BusinessDb, ids: readonly (string | undefined)[]): Promise<Set<string>> {
+  const businessId = db.businessId;
   const wanted = [...new Set(ids.filter((i): i is string => i !== undefined))];
   if (wanted.length === 0) return new Set();
-  const { rows } = await getPool().query<{ document_id: string }>(
+  const { rows } = await db.query<{ document_id: string }>(
     `SELECT document_id FROM documents
       WHERE business_id = $1 AND document_id = ANY($2::text[]) AND status IN ('extracted', 'stored')`,
     [businessId, wanted],
@@ -138,7 +141,7 @@ async function downloadableDocuments(businessId: string, ids: readonly (string |
   return new Set(rows.map((r) => r.document_id));
 }
 
-export async function handleMailList(res: ServerResponse, businessId: string, url: URL, csrf: string): Promise<void> {
+export async function handleMailList(res: ServerResponse, db: BusinessDb, url: URL, csrf: string): Promise<void> {
   const filters: MailFilters = {
     q: param(url, 'q'),
     from: param(url, 'from'),
@@ -146,10 +149,10 @@ export async function handleMailList(res: ServerResponse, businessId: string, ur
     sender: param(url, 'sender'),
     category: param(url, 'category'),
   };
-  const timeZone = await charterTimeZone(businessId);
+  const timeZone = await charterTimeZone(db);
   const fromIso = dayStartIso(filters.from, timeZone);
   const toIso = dayEndIso(filters.to, timeZone);
-  const rows = await withBusiness(businessId, (db) => searchMail( // TENANCY-TODO(task 10)
+  const rows = await searchMail(
     db,
     {
       ...(filters.q !== '' ? { text: filters.q } : {}),
@@ -159,13 +162,13 @@ export async function handleMailList(res: ServerResponse, businessId: string, ur
       ...(CATEGORIES.includes(filters.category) ? { category: filters.category as MailCategory } : {}),
       limit: MAIL_LIMIT,
     },
-  ));
-  const [mailboxStatus, cursor, gapAt, downloadable] = await Promise.all([
-    mailboxBannerStatus(businessId),
-    withBusiness(businessId, (db) => getCursor(db)), // TENANCY-TODO(task 10)
-    recentGapAt(businessId),
-    downloadableDocuments(businessId, rows.flatMap((m) => m.attachments.map((a) => a.documentId))),
-  ]);
+  );
+  // Sequential, never `Promise.all`: every read runs on this request's one
+  // connection, and two queries in flight on it interleave.
+  const mailboxStatus = await mailboxBannerStatus(db);
+  const cursor = await getCursor(db);
+  const gapAt = await recentGapAt(db);
+  const downloadable = await downloadableDocuments(db, rows.flatMap((m) => m.attachments.map((a) => a.documentId)));
   html(
     res,
     200,
@@ -182,7 +185,7 @@ export async function handleMailList(res: ServerResponse, businessId: string, ur
   );
 }
 
-export async function handleInvoices(res: ServerResponse, businessId: string, url: URL, csrf: string): Promise<void> {
+export async function handleInvoices(res: ServerResponse, db: BusinessDb, url: URL, csrf: string): Promise<void> {
   const filters: InvoiceFilters = {
     supplier: param(url, 'supplier'),
     number: param(url, 'number'),
@@ -190,10 +193,10 @@ export async function handleInvoices(res: ServerResponse, businessId: string, ur
     to: param(url, 'to'),
     file: param(url, 'file'),
   };
-  const timeZone = await charterTimeZone(businessId);
+  const timeZone = await charterTimeZone(db);
   const fromIso = dayStartIso(filters.from, timeZone);
   const toIso = dayEndIso(filters.to, timeZone);
-  const rows = await withBusiness(businessId, (db) => listInvoices( // TENANCY-TODO(task 10)
+  const rows = await listInvoices(
     db,
     {
       ...(filters.supplier !== '' ? { supplier: filters.supplier } : {}),
@@ -202,7 +205,7 @@ export async function handleInvoices(res: ServerResponse, businessId: string, ur
       ...(fromIso !== null ? { fromIso } : {}),
       ...(toIso !== null ? { toIso } : {}),
     },
-  ));
+  );
   html(res, 200, renderInvoices({ groups: groupInvoices(rows), filters, timeZone, csrf }));
 }
 
@@ -210,12 +213,13 @@ export async function handleInvoices(res: ServerResponse, businessId: string, ur
 export const DOCUMENT_LIMIT = 200;
 
 /** Every attachment of every mail of this business, newest mail first, filtered as the owner asked. */
-export async function handleMailDocuments(res: ServerResponse, businessId: string, url: URL): Promise<void> {
+export async function handleMailDocuments(res: ServerResponse, db: BusinessDb, url: URL): Promise<void> {
+  const businessId = db.businessId;
   const requestedType = param(url, 'type');
   // A closed set: anything else means "no filter" and is never echoed back.
   const type = AttachmentDocType.safeParse(requestedType).success ? requestedType : '';
   const filters: DocumentFilters = { type, sender: param(url, 'sender'), from: param(url, 'from'), to: param(url, 'to') };
-  const timeZone = await charterTimeZone(businessId);
+  const timeZone = await charterTimeZone(db);
   const fromIso = dayStartIso(filters.from, timeZone);
   const toIso = dayEndIso(filters.to, timeZone);
   const where = ['m.business_id = $1'];
@@ -236,7 +240,7 @@ export async function handleMailDocuments(res: ServerResponse, businessId: strin
   // One row past the limit, so a cut list is told apart from one that is
   // exactly full — a silent cut reads as "these are all the documents".
   params.push(DOCUMENT_LIMIT + 1);
-  const { rows: fetched } = await getPool().query<{
+  const { rows: fetched } = await db.query<{
     mail_id: string;
     received_at: Date;
     from_name: string | null;
@@ -270,15 +274,15 @@ export async function handleMailDocuments(res: ServerResponse, businessId: strin
     scanned: r.scanned === true,
     documentId: r.document_id,
   }));
-  const downloadable = await downloadableDocuments(businessId, docs.map((d) => d.documentId ?? undefined));
+  const downloadable = await downloadableDocuments(db, docs.map((d) => d.documentId ?? undefined));
   html(res, 200, renderMailDocuments({ rows: docs, filters, downloadable, timeZone, truncated, limit: DOCUMENT_LIMIT }));
 }
 
-export async function handleMailDetail(res: ServerResponse, businessId: string, mailId: string): Promise<void> {
-  const mail = await withBusiness(businessId, (db) => getMail(db, mailId)); // TENANCY-TODO(task 10)
+export async function handleMailDetail(res: ServerResponse, db: BusinessDb, mailId: string): Promise<void> {
+  const businessId = db.businessId;
+  const mail = await getMail(db, mailId);
   if (mail === null) return notFound(res);
-  const timeZone = await charterTimeZone(businessId);
-  const db = getPool();
+  const timeZone = await charterTimeZone(db);
   let cardApprovalId: string | null = null;
   if (mail.replyJobId !== null) {
     const { rows } = await db.query<{ approval_id: string }>(
@@ -304,8 +308,8 @@ export async function handleMailDetail(res: ServerResponse, businessId: string, 
       timeZone,
       cardApprovalId,
       documents: docRows.map((r) => ({ documentId: r.document_id, fileName: r.file_name })),
-      downloadable: await downloadableDocuments(businessId, mail.attachments.map((a) => a.documentId)),
-      undecodable: await undecodableDocuments(businessId, mail.attachments.map((a) => a.documentId)),
+      downloadable: await downloadableDocuments(db, mail.attachments.map((a) => a.documentId)),
+      undecodable: await undecodableDocuments(db, mail.attachments.map((a) => a.documentId)),
     }),
   );
 }
@@ -319,11 +323,11 @@ const SAFE_MEDIA_TYPE = /^[A-Za-z0-9][A-Za-z0-9.+-]*\/[A-Za-z0-9][A-Za-z0-9.+-]*
 
 export async function handleDocumentFile(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   documentId: string,
   documentRoot: string | undefined,
 ): Promise<void> {
-  const doc = await withBusiness(businessId, (db) => loadDocument(db, documentId)); // TENANCY-TODO(task 10)
+  const doc = await loadDocument(db, documentId);
   if (doc === null || (doc.status !== 'extracted' && doc.status !== 'stored')) return notFound(res);
 
   const root = resolve(documentRoot ?? config.documentRoot);

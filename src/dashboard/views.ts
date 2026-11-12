@@ -132,7 +132,7 @@ ${errorBlock}
 <div class="card">
 <h2>סיסמה</h2>
 <form method="post" action="/login">
-  <label>שם משתמש<input type="text" name="username" autocomplete="username" required></label>
+  <label>כתובת מייל<input type="email" name="email" autocomplete="username" required></label>
   <label>סיסמה<input type="password" name="password" autocomplete="current-password" required></label>
   <button type="submit">כניסה</button>
 </form>
@@ -141,7 +141,7 @@ ${errorBlock}
 <h2>קוד שחזור</h2>
 <p class="muted">איבדת את הסיסמה? קוד שחזור חד-פעמי נכנס כאן במקומה, ומחייב קביעת סיסמה חדשה מיד.</p>
 <form method="post" action="/login">
-  <label>שם משתמש<input type="text" name="username" autocomplete="username" required></label>
+  <label>כתובת מייל<input type="email" name="email" autocomplete="username" required></label>
   <label>קוד שחזור<input type="text" name="code" autocomplete="off" required></label>
   <button type="submit">כניסה עם קוד</button>
 </form>
@@ -757,16 +757,17 @@ function connectionRowHtml(row: ConnectionRow, csrf: string): string {
  * `listGrants` takes no decryption key — so there is nothing here for a
  * template literal to leak even by mistake.
  *
- * **The restart notice is not optional, and it is one-directional — say so
- * (final fix wave, item 5).** `buildRuntime`'s own docblock and
- * `docs/live-thread-runbook.md` both say the same thing: the scheduler reads
- * `connection_bindings` once, at process startup, and AUTHORISING a
- * connection here — including a freshly authorised grant this same screen
- * just wrote — has no effect until that process restarts, because the
- * adapter registry itself is only built once. An owner who authorises a
- * connection and then wonders why nothing happened has no way to discover
- * that fact by reading code; it must be on the page. REVOKING is the
- * opposite, and the page must not say the same thing about both:
+ * **The timing notice is not optional, and it is two different facts — say
+ * both (final fix wave, item 5).** Since the per-business runtime (multi-
+ * tenant Task 8) the scheduler builds each business's adapter registry from
+ * the charter and `connection_bindings` on EVERY pass (`businessRuntime`),
+ * so AUTHORISING a connection here — including a freshly authorised grant
+ * this same screen just wrote — takes effect on the scheduler's next pass,
+ * with no restart. (Until then the page said a restart was needed, which was
+ * true while the registry was built once at start-up.) An owner who
+ * authorises a connection and then wonders when it starts working has no way
+ * to discover that by reading code; it must be on the page. REVOKING is
+ * sooner still, and the page must not say the same thing about both:
  * `revoked_at` is checked on every resolve (`oauth-token.ts`'s own docblock,
  * point 2) precisely so a revocation beats an approval the owner gave a
  * moment earlier — the very next call fails, restart or not, exactly as
@@ -815,10 +816,10 @@ export function renderConnections(options: {
 </header>
 <p><a href="/">&rarr; חזרה לרשימה</a></p>
 <p class="muted">
-  תזמון המשימות (ה-scheduler) קורא את רשימת החיבורים פעם אחת בלבד, בעת ההפעלה שלו —
-  ולכן חיבור חדש שאושר כאן ייכנס לתוקף רק אחרי שהתהליך יופעל מחדש.
-  ביטול חיבור הוא ההפך: כל קריאה בודקת אותו מחדש, ולכן ביטול נכנס לתוקף באותו רגע —
-  הקריאה הבאה, גם אם ה-scheduler רץ כבר, כבר נכשלת.
+  תזמון המשימות (ה-scheduler) קורא את רשימת החיבורים מחדש בכל סבב —
+  ולכן חיבור חדש שאושר כאן ייכנס לתוקף בסבב הבא שלו, בלי להפעיל אותו מחדש.
+  ביטול חיבור מהיר עוד יותר: כל קריאה בודקת אותו מחדש, ולכן ביטול נכנס לתוקף באותו רגע —
+  הקריאה הבאה כבר נכשלת.
 </p>
 ${notice}
 ${
@@ -1473,6 +1474,13 @@ export function renderNotFound(): string {
 
 export function renderForbidden(): string {
   return page('אסור', '<h1>403</h1><p>הבקשה נדחתה.</p>');
+}
+
+/** A business the platform operator suspended: refused at login and on every request (spec §5.5). */
+export const SUSPENDED_MESSAGE = 'החשבון מושהה — פנה למנהל המערכת';
+
+export function renderSuspended(): string {
+  return page('החשבון מושהה', `<h1>החשבון מושהה</h1><p class="error">${esc(SUSPENDED_MESSAGE)}</p>`);
 }
 
 export function renderServerError(): string {

@@ -21,8 +21,7 @@
  * collide unless every hop re-asserts `business_id = a.business_id` itself.
  */
 
-import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { IntentName } from '../domain/reading.js';
 import type { DocumentRecord, DocumentSource, DocumentStatus } from '../documents/types.js';
 
@@ -111,11 +110,10 @@ function toDocument(row: DocumentRow): DocumentRecord {
  * the name for the second meaning would be wrong.
  */
 export async function documentForApproval(
+  db: BusinessDb,
   approvalId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<ApprovalDocument | null> {
-  const db = options.db ?? getPool();
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
 
   const { rows } = await db.query<DocumentRow>(
     `SELECT d.document_id, d.business_id, d.source, d.original_name, d.media_type,

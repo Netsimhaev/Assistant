@@ -24,7 +24,7 @@ import { GOOGLE_CLIENT_ID_REF, GOOGLE_CLIENT_SECRET_REF } from '../orchestrator/
 import { loadBindings } from '../orchestrator/bindings.js';
 import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase } from '../test/db.js';
-import { createOwner } from './auth.js';
+import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { createServer } from './server.js';
 import { putPlatformSecret } from '../tenancy/platform-credentials.js';
 
@@ -62,7 +62,7 @@ beforeEach(async () => {
     // The OAuth client is the server's, not the business's (spec §5.4).
     await putPlatformSecret(ref, value, key, 'test');
   }
-  await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+  await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
 });
 
 afterEach(async () => {
@@ -79,7 +79,6 @@ afterAll(async () => {
 
 async function startServer(oauthFetch: typeof fetch): Promise<string> {
   server = createServer({
-    businessId: BUSINESS,
     port: 0,
     credentialKeyPath: keyPath,
     dashboardBaseUrl: 'http://127.0.0.1:4173',
@@ -92,7 +91,7 @@ async function startServer(oauthFetch: typeof fetch): Promise<string> {
 async function login(baseUrl: string): Promise<string> {
   const res = await fetch(`${baseUrl}/login`, {
     method: 'POST',
-    body: new URLSearchParams({ username: USERNAME, password: PASSWORD }),
+    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
     redirect: 'manual',
   });
   expect(res.status).toBe(302);
@@ -104,8 +103,8 @@ async function login(baseUrl: string): Promise<string> {
 /** Installs a base charter, then the calendar amendment signed for `provider`. */
 async function installSignedCalendar(provider: CalendarProvider, version: string): Promise<void> {
   const base = buildCharter({ version, connections: [OFFICE_CALENDAR] });
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, base)); // TENANCY-TODO(task 10)
-  await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 10)
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, base));
+  await withBusiness(BUSINESS, (bdb) => installCharter(
     bdb,
     signCharter(buildCalendarAmendment(base, new Date(), provider), {
       signedByPersonId: USERNAME,

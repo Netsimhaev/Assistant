@@ -35,7 +35,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { appendAudit } from '../audit/log.js';
 import { loadActiveCharter } from '../charter/store.js';
-import { withBusiness, withBusinessTransaction } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { canonicalHash } from '../util/canonical.js';
 import { platformSecrets } from '../tenancy/platform-credentials.js';
 import { MasterKeyError, loadMasterKey, verifyKeyState } from '../governance/master-key.js';
@@ -362,10 +362,11 @@ async function resolveProviderClient(key: Buffer, _businessId: string, provider:
  * for nothing.
  */
 export async function oauthCeremonyPreflight(
-  businessId: string,
+  db: BusinessDb,
   provider: MailProvider,
   credentialKeyPath: string | undefined,
 ): Promise<string | null> {
+  const businessId = db.businessId;
   let key: Buffer;
   try {
     key = await loadKeyForRequest(credentialKeyPath);
@@ -405,12 +406,13 @@ export async function oauthCeremonyPreflight(
  */
 export async function handleOAuthStart(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: OAuthSession,
   system: string,
   options: OAuthRouteOptions,
   query?: URLSearchParams,
 ): Promise<void> {
+  const businessId = db.businessId;
   try {
     assertValidOAuthSystemName(system);
   } catch (error) {
@@ -426,7 +428,7 @@ export async function handleOAuthStart(
 
   let active: Awaited<ReturnType<typeof loadActiveCharter>>;
   try {
-    active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    active = await loadActiveCharter(db);
   } catch {
     // An unreadable charter is refused exactly like no matching connection
     // below -- this ceremony is not the place to diagnose WHY the charter
@@ -511,7 +513,7 @@ export async function handleOAuthStart(
   const clientId = client.clientId;
 
   const codeVerifier = createCodeVerifier();
-  const state = await withBusiness(businessId, (bdb) => createState(bdb, { system, sessionId: session.sessionId, codeVerifier, ...(system === MAILBOX_SYSTEM || system === CALENDAR_SYSTEM ? { provider } : {}) })); // TENANCY-TODO(task 10)
+  const state = await createState(db, { system, sessionId: session.sessionId, codeVerifier, ...(system === MAILBOX_SYSTEM || system === CALENDAR_SYSTEM ? { provider } : {}) });
   const consentUrl = buildConsentUrl({
     provider,
     authorizeUrl: profile.authorizeUrl,
@@ -527,6 +529,9 @@ export async function handleOAuthStart(
 const INVALID_STATE_MESSAGE =
   'הבקשה אינה תקפה — פגה, כבר נוצלה, או לא נפתחה מהסשן הזה. יש להתחיל את תהליך ההרשאה מחדש.';
 
+/** A state minted for another business than the session's (spec §5.5). */
+const OTHER_BUSINESS_STATE_MESSAGE = 'ההרשאה התחילה בחשבון אחר — התחילי מחדש';
+
 /**
  * `GET /oauth/callback` -- Google redirects here with either `error` (the
  * owner declined, or the provider refused) or `code` (success).
@@ -541,19 +546,28 @@ const INVALID_STATE_MESSAGE =
 export async function handleOAuthCallback(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: OAuthSession,
   options: OAuthRouteOptions,
 ): Promise<void> {
+  const businessId = db.businessId;
   const params = new URL(req.url ?? '/oauth/callback', 'http://dashboard.local').searchParams;
   const stateParam = params.get('state');
   if (stateParam === null) {
     return sendHtml(res, 400, page('בקשה לא תקינה', errorBlock('לבקשה חסר פרמטר state.')));
   }
 
-  const consumed = await withBusiness(businessId, (bdb) => consumeState(bdb, stateParam)); // TENANCY-TODO(task 10)
+  const consumed = await consumeState(db, stateParam);
   if (consumed === null || consumed.sessionId !== session.sessionId) {
     return sendHtml(res, 400, page('הבקשה אינה תקפה', errorBlock(INVALID_STATE_MESSAGE)));
+  }
+  // The row's business must be the session's, or a callback opened in one
+  // business's browser would write a grant for another (spec §5.5). Read on
+  // this business's connection, another business's state is already a miss
+  // above (`consumeState`'s WHERE, and RLS) — this is the second, independent
+  // check, on the row itself, and it refuses before anything is exchanged.
+  if (consumed.businessId !== db.businessId) {
+    return sendHtml(res, 400, page('הבקשה אינה תקפה', errorBlock(OTHER_BUSINESS_STATE_MESSAGE)));
   }
 
   // Trusted from here on -- the row this session actually opened, never the
@@ -586,7 +600,7 @@ export async function handleOAuthCallback(
   if (system === MAILBOX_SYSTEM) {
     let mailbox: CharterConnection | undefined;
     try {
-      mailbox = (await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)))?.charter.connections.find((c) => c.system === MAILBOX_SYSTEM); // TENANCY-TODO(task 10)
+      mailbox = (await loadActiveCharter(db))?.charter.connections.find((c) => c.system === MAILBOX_SYSTEM);
     } catch {
       mailbox = undefined;
     }
@@ -609,7 +623,7 @@ export async function handleOAuthCallback(
   if (system === CALENDAR_SYSTEM) {
     let calendar: CharterConnection | undefined;
     try {
-      calendar = (await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)))?.charter.connections.find((c) => c.system === CALENDAR_SYSTEM); // TENANCY-TODO(task 10)
+      calendar = (await loadActiveCharter(db))?.charter.connections.find((c) => c.system === CALENDAR_SYSTEM);
     } catch {
       calendar = undefined;
     }
@@ -738,7 +752,7 @@ export async function handleOAuthCallback(
   // simply restarts the ceremony -- the same trade `decideAndSign` makes for
   // a failed sign-and-approve. The success page below is rendered only after
   // this commits.
-  await withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 10)
+  await transaction(db, async (tx) => {
     await writeGrant(
       tx,
       {
@@ -809,8 +823,8 @@ export async function handleOAuthCallback(
         `<p>ההיקפים שאושרו בפועל: ${
           exchange.grantedScopes.length > 0 ? escapeHtml(exchange.grantedScopes.join(', ')) : 'לא דווח היקף'
         }.</p>` +
-        `<p class="muted">שימו לב: תזמון המשימות (ה-scheduler) קורא את רשימת החיבורים פעם אחת בלבד, בעת ההפעלה שלו. ` +
-        `אם הוא כבר רץ, החיבור החדש ייכנס לתוקף רק אחרי שהוא יופעל מחדש.</p>` +
+        `<p class="muted">שימו לב: תזמון המשימות (ה-scheduler) קורא את רשימת החיבורים מחדש בכל סבב, ` +
+        `ולכן החיבור החדש ייכנס לתוקף כבר בסבב הבא שלו — אין צורך להפעיל אותו מחדש.</p>` +
         (system === MAILBOX_SYSTEM ? `<p><a href="/connections/mailbox">למצב תיבת המייל</a></p>` : '') +
         (system === CALENDAR_SYSTEM ? `<p><a href="/connections/calendar">למצב היומן</a> · <a href="/meetings/settings">להגדרות הפגישות</a></p>` : ''),
     ),
@@ -842,11 +856,12 @@ export async function handleOAuthCallback(
 export async function handleOAuthRevoke(
   req: IncomingMessage,
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: OAuthSession,
   system: string,
   options: OAuthRouteOptions,
 ): Promise<void> {
+  const businessId = db.businessId;
   const form = await readSmallFormBody(req);
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
     return sendHtml(res, 403, page('הבקשה נדחתה', errorBlock('הטופס פג תוקף. רענן/י ונסה/י שוב.')));
@@ -864,14 +879,14 @@ export async function handleOAuthRevoke(
     keyUnavailable = true;
   }
 
-  const grant = key !== null ? await withBusiness(businessId, (db) => readGrantBySystem(db, system, key)) : null; // TENANCY-TODO(task 10)
+  const grant = key !== null ? await readGrantBySystem(db, system, key) : null;
 
   // Local-first, and authoritative: written before any network call to the
   // provider, matching `killswitch.ts`'s `trip()` writing its state before
   // recording it, for the identical reason. `changed` is `revokeGrant`'s own
   // report of whether a live row actually existed to revoke -- used below
   // instead of assuming the call itself proves something was live.
-  const changed = await withBusiness(businessId, (db) => revokeGrant(db, system, session.username)); // TENANCY-TODO(task 10)
+  const changed = await revokeGrant(db, system, session.username);
 
   type ProviderOutcome = 'revoked' | 'failed' | 'no_live_grant' | 'key_unavailable' | 'no_revoke_endpoint';
   let providerOutcome: ProviderOutcome;
@@ -911,8 +926,8 @@ export async function handleOAuthRevoke(
       'could not attempt provider revocation — the master key would not open, so whether access remains at the provider is unknown',
   };
 
-  await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 10)
-    bdb,
+  await appendAudit(
+    db,
     {
       actor: 'human',
       onBehalfOf: session.username,
@@ -922,7 +937,7 @@ export async function handleOAuthRevoke(
       inputHash: canonicalHash({ businessId, system, action: 'revoke' }),
       reason: `oauth revoke for system "${system}" by ${session.username}: ${localNote}; ${providerNote[providerOutcome]}`,
     }
-  ));
+  );
 
   // No `/connections` screen exists yet in this subproject (Task 6 builds
   // it) -- redirecting there is forward-compatible with that screen once it

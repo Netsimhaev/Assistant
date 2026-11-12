@@ -38,7 +38,7 @@ const ACTING_PROPOSAL: Proposal = {
 };
 
 async function install(businessId: string): Promise<PolicyBundle> {
-  return withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+  return withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter()));
 }
 
 /** Real `ActionFacts`, matching the shape `governance/consume.test.ts` builds. */
@@ -157,7 +157,7 @@ async function anApproval(
   bundle: PolicyBundle,
   input: unknown = MAIL_INPUT,
 ): Promise<string> {
-  return withBusiness(businessId, async (bdb) => enqueueApproval( // TENANCY-TODO(task 10)
+  return withBusiness(businessId, async (bdb) => enqueueApproval(
     bdb,
     {
       jobId,
@@ -184,7 +184,7 @@ describe('documentForApproval', () => {
     await aProposal(BUSINESS, readingId, job.jobId);
     const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
 
-    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => documentForApproval(db, approvalId));
 
     expect(result).not.toBeNull();
     expect(result?.document.documentId).toBe(documentId);
@@ -210,7 +210,7 @@ describe('documentForApproval', () => {
       }));
     const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
 
-    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => documentForApproval(db, approvalId));
 
     // The document still resolves — the card should still say what it is
     // about — but there is no intent, so nothing may be signed.
@@ -235,7 +235,7 @@ describe('documentForApproval', () => {
     );
     const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
 
-    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => documentForApproval(db, approvalId));
 
     expect(result?.document).not.toBeUndefined();
     expect(result?.intent).toBeNull();
@@ -246,7 +246,7 @@ describe('documentForApproval', () => {
     const job = await aJob(BUSINESS, bundle, 'משימה בלי הצעה');
     const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
 
-    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => documentForApproval(db, approvalId));
 
     expect(result).toBeNull();
   });
@@ -255,7 +255,7 @@ describe('documentForApproval', () => {
     const bundle = await install(BUSINESS);
     const approvalId = await anApproval(BUSINESS, null, bundle);
 
-    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => documentForApproval(db, approvalId));
 
     expect(result).toBeNull();
   });
@@ -278,7 +278,7 @@ describe('documentForApproval', () => {
     // nothing in the schema itself prevents this).
     const approvalId = await anApproval(OTHER_BUSINESS, job.jobId, otherBundle);
 
-    const result = await documentForApproval(approvalId, { businessId: OTHER_BUSINESS });
+    const result = await withBusiness(OTHER_BUSINESS, (db) => documentForApproval(db, approvalId));
 
     expect(result).toBeNull();
   });
@@ -297,7 +297,7 @@ describe('documentForApproval', () => {
     await aProposal(OTHER_BUSINESS, readingId, job.jobId);
     const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
 
-    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => documentForApproval(db, approvalId));
 
     expect(result).toBeNull();
   });
@@ -319,7 +319,7 @@ describe('documentForApproval', () => {
 
     const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
 
-    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => documentForApproval(db, approvalId));
 
     expect(result?.document.documentId).toBe(newer.documentId);
     expect(result?.document.documentId).not.toBe(older.documentId);
@@ -355,7 +355,7 @@ describe('documentForApproval', () => {
     expect(proposalB.proposalId > proposalA.proposalId).toBe(true);
 
     const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
-    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => documentForApproval(db, approvalId));
 
     expect(result?.document.documentId).toBe(b.documentId);
     expect(result?.document.documentId).not.toBe(a.documentId);
@@ -373,7 +373,7 @@ describe('documentForApproval', () => {
     await aProposal(BUSINESS, readingId, job.jobId);
     const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
 
-    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => documentForApproval(db, approvalId));
 
     expect(result).toBeNull();
   });
@@ -390,7 +390,7 @@ describe('documentForApproval', () => {
     await aProposal(BUSINESS, readingId, job.jobId);
     const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
 
-    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
+    const result = await withBusiness(BUSINESS, (db) => documentForApproval(db, approvalId));
 
     expect(result).toBeNull();
   });

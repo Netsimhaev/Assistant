@@ -29,7 +29,7 @@ import { writeMemory } from '../memory/store.js';
 import { keepItem } from '../governance/kept-items.js';
 import { readForgetCommand } from '../governance/forget-command.js';
 import { buildErasurePlan } from '../governance/erasure-plan.js';
-import { createOwner } from './auth.js';
+import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { createServer } from './server.js';
 import { renderErasure, renderErasureDone, TABLE_LABELS } from './views.js';
 import type { ErasureOutcome } from '../governance/erasure.js';
@@ -46,14 +46,14 @@ const RONIT = 'ronit@beta-log.example';
  * own version, so a test that installs `buildCharter()` itself still can.
  */
 async function installGateCharter(businessId: string): Promise<void> {
-  await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 10)
+  await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' })));
 }
 
 let server: Server | null = null;
 
 beforeEach(async () => {
   await resetDatabase();
-  await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+  await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
   await installGateCharter(BUSINESS);
 });
 
@@ -69,7 +69,7 @@ afterAll(async () => {
 });
 
 async function startServer(): Promise<string> {
-  server = createServer({ businessId: BUSINESS, port: 0 });
+  server = createServer({ port: 0 });
   await once(server, 'listening');
   const address = server.address() as AddressInfo;
   return `http://127.0.0.1:${address.port}`;
@@ -85,7 +85,7 @@ function cookiePair(setCookieHeader: string | null): string {
 async function signIn(baseUrl: string): Promise<string> {
   const res = await fetch(`${baseUrl}/login`, {
     method: 'POST',
-    body: new URLSearchParams({ username: USERNAME, password: PASSWORD }),
+    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
     redirect: 'manual',
   });
   expect(res.status).toBe(302);
@@ -107,7 +107,7 @@ function extractPlanHash(html: string): string {
 
 /** A job whose title names Ronit, plus one memory about her. */
 async function seedRonit(): Promise<{ jobId: string }> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'screen' }))); // TENANCY-TODO(task 10)
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'screen' })));
   const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
@@ -241,7 +241,7 @@ describe('the erasure routes', () => {
    */
   it('renders the erasure screen inline, with the identity in no URL', async () => {
     const baseUrl = await startServer();
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     await seedRonit();
     const cookie = await signIn(baseUrl);
     const csrf = extractCsrf(await (await fetch(`${baseUrl}/instruct`, { headers: { cookie } })).text());
@@ -304,7 +304,7 @@ describe('the erasure routes', () => {
    */
   it('renders the entry form inline for a date-only forget command', async () => {
     const baseUrl = await startServer();
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const cookie = await signIn(baseUrl);
     const csrf = extractCsrf(await (await fetch(`${baseUrl}/instruct`, { headers: { cookie } })).text());
 
@@ -366,7 +366,7 @@ describe('the erasure routes', () => {
   it('shows what is kept on the entry screen, where there is no plan at all', async () => {
     const baseUrl = await startServer();
     const cookie = await signIn(baseUrl);
-    await withBusiness(BUSINESS, (bdb) => keepItem( // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => keepItem(
       bdb,
       { kind: 'memory', itemId: 'MEM-unreachable-by-any-anchor', note: 'הסיכום מהישיבה' }
     ));
@@ -432,7 +432,7 @@ describe('the erasure routes', () => {
   it('returns a kept item to the plan when the keep is revoked', async () => {
     const baseUrl = await startServer();
     const { jobId } = await seedRonit();
-    await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'job', itemId: jobId, note: 'החוזה' })); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'job', itemId: jobId, note: 'החוזה' }));
     const cookie = await signIn(baseUrl);
 
     const kept = await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, {

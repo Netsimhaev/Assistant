@@ -24,7 +24,7 @@ import { upsertBinding } from '../orchestrator/bindings.js';
 import { writeGrant } from '../governance/oauth-grants.js';
 import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase } from '../test/db.js';
-import { createOwner } from './auth.js';
+import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { issueCsrfToken } from './csrf.js';
 import { CALENDAR_AUTHORISATION_TEXT } from './calendar-connect.js';
 import { createServer } from './server.js';
@@ -63,8 +63,8 @@ beforeEach(async () => {
   key = randomBytes(KEY_BYTES);
   await writeFile(keyPath, key, { mode: 0o600 });
   await writeKeyState(key, 'KEY-test');
-  await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [OFFICE_CALENDAR] }))); // TENANCY-TODO(task 10)
+  await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [OFFICE_CALENDAR] })));
 });
 
 afterEach(async () => {
@@ -79,7 +79,7 @@ afterAll(async () => {
 });
 
 async function startServer(): Promise<string> {
-  server = createServer({ businessId: BUSINESS, port: 0, credentialKeyPath: keyPath, dashboardBaseUrl: 'http://127.0.0.1:4173' });
+  server = createServer({ port: 0, credentialKeyPath: keyPath, dashboardBaseUrl: 'http://127.0.0.1:4173' });
   await once(server, 'listening');
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
@@ -87,7 +87,7 @@ async function startServer(): Promise<string> {
 async function login(baseUrl: string): Promise<string> {
   const res = await fetch(`${baseUrl}/login`, {
     method: 'POST',
-    body: new URLSearchParams({ username: USERNAME, password: PASSWORD }),
+    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
     redirect: 'manual',
   });
   const pair = (res.headers.get('set-cookie') ?? '').split(';')[0];
@@ -106,9 +106,9 @@ async function postForm(baseUrl: string, cookie: string, path: string, fields: R
 }
 
 async function installSignedCalendar(provider: 'google' | 'microsoft'): Promise<void> {
-  const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+  const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
   if (active === null) throw new Error('no charter');
-  await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 10)
+  await withBusiness(BUSINESS, (bdb) => installCharter(
     bdb,
     signCharter(buildCalendarAmendment(active.charter, new Date(), provider), { signedByPersonId: USERNAME, method: 'dashboard_click' })
   ));
@@ -157,7 +157,7 @@ describe('POST /connections/calendar/sign', () => {
     await seedProviderApp('google');
     const baseUrl = await startServer();
     const cookie = await login(baseUrl);
-    const before = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    const before = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     const res = await postForm(baseUrl, cookie, '/connections/calendar/sign', {
       csrf: csrfFor(cookie),
       provider: 'google',
@@ -165,20 +165,20 @@ describe('POST /connections/calendar/sign', () => {
     });
     expect(res.status).toBe(303);
     expect(res.headers.get('location')).toBe('/connections/calendar');
-    const after = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    const after = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     expect(after?.charter.connections.map((c) => c.system)).toContain(CALENDAR_SYSTEM);
     expect(after?.charter.connections.map((c) => c.system)).not.toContain('office-calendar');
-    expect((await withBusiness(BUSINESS, (bdb) => queryAudit(bdb))).some((r) => r.kind === 'charter_change')).toBe(true); // TENANCY-TODO(task 10)
+    expect((await withBusiness(BUSINESS, (bdb) => queryAudit(bdb))).some((r) => r.kind === 'charter_change')).toBe(true);
   });
 
   it('refuses a bad CSRF token and a stale base, writing nothing', async () => {
     await seedProviderApp('google');
     const baseUrl = await startServer();
     const cookie = await login(baseUrl);
-    const base = (await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.charterVersion ?? ''; // TENANCY-TODO(task 10)
+    const base = (await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.charterVersion ?? '';
     expect((await postForm(baseUrl, cookie, '/connections/calendar/sign', { csrf: 'nope', provider: 'google', base })).status).toBe(403);
     expect((await postForm(baseUrl, cookie, '/connections/calendar/sign', { csrf: csrfFor(cookie), provider: 'google', base: 'old' })).status).toBe(409);
-    expect((await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.connections.map((c) => c.system)).not.toContain(CALENDAR_SYSTEM); // TENANCY-TODO(task 10)
+    expect((await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.connections.map((c) => c.system)).not.toContain(CALENDAR_SYSTEM);
   });
 });
 
@@ -190,10 +190,10 @@ describe('the way back', () => {
     const cookie = await login(baseUrl);
     const status = await (await fetch(`${baseUrl}/connections/calendar`, { headers: { cookie } })).text();
     expect(status).toContain('בטל את חיבור היומן');
-    const base = (await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.charterVersion ?? ''; // TENANCY-TODO(task 10)
+    const base = (await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.charterVersion ?? '';
     const res = await postForm(baseUrl, cookie, '/connections/calendar/revert', { csrf: csrfFor(cookie), base });
     expect(res.status).toBe(303);
-    const systems = (await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.connections.map((c) => c.system) ?? []; // TENANCY-TODO(task 10)
+    const systems = (await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.connections.map((c) => c.system) ?? [];
     expect(systems).not.toContain(CALENDAR_SYSTEM);
     expect(systems).toContain('office-calendar');
   });
@@ -219,10 +219,10 @@ describe('the way back', () => {
     const status = await (await fetch(`${baseUrl}/connections/calendar`, { headers: { cookie } })).text();
     expect(status).not.toContain('action="/connections/calendar/revert"');
     expect(status).toContain('פעיל');
-    const base = (await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.charterVersion ?? ''; // TENANCY-TODO(task 10)
+    const base = (await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.charterVersion ?? '';
     const res = await postForm(baseUrl, cookie, '/connections/calendar/revert', { csrf: csrfFor(cookie), base });
     expect(res.status).toBe(409);
-    expect((await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.connections.map((c) => c.system)).toContain(CALENDAR_SYSTEM); // TENANCY-TODO(task 10)
+    expect((await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.connections.map((c) => c.system)).toContain(CALENDAR_SYSTEM);
   });
 });
 

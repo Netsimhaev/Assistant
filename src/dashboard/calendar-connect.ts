@@ -46,7 +46,7 @@ import {
 } from './mailbox-connect.js';
 import { oauthCeremonyPreflight } from './oauth-routes.js';
 import { escLabel, escapeHtml as esc } from './views.js';
-import { withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 export type CalendarSession = MailboxSession;
 
@@ -66,9 +66,10 @@ export const CALENDAR_AUTHORISATION_TEXT =
   'לפני שאתה מאשר היא רק שומרת לך מקום ביומן, בלי להזמין אף אחד. ' +
   'היא לעולם לא מוחקת אירוע שלא היא יצרה בלי לשאול אותך, ולעולם לא כותבת ליומן שלא בחרת כיומן הפגישות.';
 
+/** As `RESTART_NOTE` (mailbox-connect.ts): picked up on the next scheduler pass, no restart. */
 export const CALENDAR_RESTART_NOTE =
-  'שימו לב: תזמון המשימות (ה-scheduler) קורא את התקנון ואת רשימת החיבורים פעם אחת בלבד, בעת ההפעלה שלו. ' +
-  'היומן ייכנס לשימוש רק אחרי שהחיבור לספק יושלם והתזמון יופעל מחדש.';
+  'שימו לב: היומן ייכנס לשימוש רק אחרי שהחיבור לספק יושלם. ' +
+  'מאותו רגע תזמון המשימות (ה-scheduler) ישתמש בו כבר בסבב הבא שלו — אין צורך להפעיל אותו מחדש.';
 
 const REVERT_NOTE =
   'אם החיבור אצל הספק לא יצליח, הכפתור „בטל את חיבור היומן” במסך היומן מחזיר את התקנון למצב שלפני החתימה.';
@@ -76,7 +77,7 @@ const REVERT_NOTE =
 const NEEDS_REAUTH_NOTE = 'עד שהיומן יחובר מחדש העוזרת לא תראה את הלו"ז ולא תקבע פגישות.';
 
 const LEGACY_GAP_NOTE =
-  'אם בתקנון כבר יש חיבור יומן לקריאה בלבד, הוא יוחלף בחיבור הזה. עד שהחיבור לספק יושלם והתזמון יופעל מחדש, היומן לא יהיה זמין לעוזרת.';
+  'אם בתקנון כבר יש חיבור יומן לקריאה בלבד, הוא יוחלף בחיבור הזה. עד שהחיבור לספק יושלם, היומן לא יהיה זמין לעוזרת.';
 
 const BAD_PROVIDER = 'יש לבחור ספק יומן: google או microsoft. לא בוצעה כל פעולה.';
 const ALREADY_DECLARED = 'התקנון כבר מגדיר יומן לעסק. אין צורך לחתום שוב — אפשר להמשיך לחיבור במסך היומן.';
@@ -90,8 +91,8 @@ export function parseCalendarProvider(raw: string | null | undefined): CalendarP
 
 type CharterRead = { ok: true; charter: BusinessCharter } | { ok: false; message: string };
 
-async function readCharter(businessId: string): Promise<CharterRead> {
-  const probe = await withBusiness(businessId, (bdb) => probeActiveCharter(bdb)); // TENANCY-TODO(task 10)
+async function readCharter(db: BusinessDb): Promise<CharterRead> {
+  const probe = await probeActiveCharter(db);
   if (!probe.ok) {
     console.error('calendar connect: could not read the active charter:', probe.reason);
     return { ok: false, message: CHARTER_UNREADABLE };
@@ -107,8 +108,11 @@ function calendarOf(charter: BusinessCharter): CharterConnection | undefined {
 type GrantSummary = Awaited<ReturnType<typeof listGrants>>[number];
 
 /** Working = a live binding AND a live grant that does not need reauth. */
-async function calendarIsWorking(businessId: string): Promise<{ working: boolean; grant: GrantSummary | null }> {
-  const [bindings, grants] = await Promise.all([withBusiness(businessId, (db) => loadBindings(db)), withBusiness(businessId, (db) => listGrants(db))]); // TENANCY-TODO(task 10)
+async function calendarIsWorking(db: BusinessDb): Promise<{ working: boolean; grant: GrantSummary | null }> {
+  // One after the other, never `Promise.all`: both run on this request's one
+  // connection, and two queries in flight on it interleave.
+  const bindings = await loadBindings(db);
+  const grants = await listGrants(db);
   const binding = bindings.find((b) => b.system === CALENDAR_SYSTEM) ?? null;
   const grant = grants.find((g) => g.system === CALENDAR_SYSTEM && g.revokedAt === null) ?? null;
   return { working: binding?.status === 'live' && grant !== null && grant.needsReauthAt === null, grant };
@@ -116,8 +120,8 @@ async function calendarIsWorking(businessId: string): Promise<{ working: boolean
 
 // --- GET /connections/calendar ----------------------------------------------
 
-export async function handleCalendarStatus(res: ServerResponse, businessId: string, csrf: string): Promise<void> {
-  const read = await readCharter(businessId);
+export async function handleCalendarStatus(res: ServerResponse, db: BusinessDb, csrf: string): Promise<void> {
+  const read = await readCharter(db);
   if (!read.ok) return sendHtml(res, 200, errorPage('יומן העסק', read.message));
 
   const connection = calendarOf(read.charter);
@@ -148,7 +152,7 @@ export async function handleCalendarStatus(res: ServerResponse, businessId: stri
     );
   }
 
-  const working = await calendarIsWorking(businessId);
+  const working = await calendarIsWorking(db);
   const grant = working.grant;
   const startLink = `<a href="/oauth/${CALENDAR_SYSTEM}/start?provider=${provider}">חיבור היומן אצל ${esc(PROVIDER_NAME[provider])}</a>`;
   let state: string;
@@ -266,17 +270,17 @@ function preflightRefusal(reason: string): string {
 
 export async function handleCalendarSignGet(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   csrf: string,
   query: URLSearchParams,
   credentialKeyPath: string | undefined,
 ): Promise<void> {
   const provider = parseCalendarProvider(query.get('provider'));
   if (provider === null) return sendHtml(res, 400, errorPage('ספק לא תקין', BAD_PROVIDER));
-  const read = await readCharter(businessId);
+  const read = await readCharter(db);
   if (!read.ok) return sendHtml(res, 409, errorPage('לא ניתן לחתום', read.message));
   if (calendarOf(read.charter) !== undefined) return sendHtml(res, 409, errorPage('כבר נחתם', ALREADY_DECLARED));
-  const preflight = await oauthCeremonyPreflight(businessId, provider, credentialKeyPath);
+  const preflight = await oauthCeremonyPreflight(db, provider, credentialKeyPath);
   if (preflight !== null) return sendHtml(res, 409, preflightRefusal(preflight));
   sendHtml(res, 200, renderCalendarSignPage({ charter: read.charter, provider, csrf }));
 }
@@ -286,7 +290,7 @@ export async function handleCalendarSignGet(
 /** CSRF, provider, charter, stale handle, preflight — then the amendment is REBUILT here, never taken from the form. */
 export async function handleCalendarSignPost(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: CalendarSession,
   form: URLSearchParams,
   credentialKeyPath: string | undefined,
@@ -297,17 +301,17 @@ export async function handleCalendarSignPost(
   const provider = parseCalendarProvider(form.get('provider'));
   if (provider === null) return sendHtml(res, 400, errorPage('ספק לא תקין', BAD_PROVIDER));
 
-  const read = await readCharter(businessId);
+  const read = await readCharter(db);
   if (!read.ok) return sendHtml(res, 409, errorPage('לא ניתן לחתום', read.message));
   const active = read.charter;
   if (calendarOf(active) !== undefined) return sendHtml(res, 409, errorPage('כבר נחתם', ALREADY_DECLARED));
   const base = form.get('base');
   if (base !== active.charterVersion) return sendHtml(res, 409, errorPage('התקנון השתנה', STALE_MESSAGE));
-  const preflight = await oauthCeremonyPreflight(businessId, provider, credentialKeyPath);
+  const preflight = await oauthCeremonyPreflight(db, provider, credentialKeyPath);
   if (preflight !== null) return sendHtml(res, 409, preflightRefusal(preflight));
 
   const outcome = await installSigned(
-    businessId,
+    db,
     session.username,
     base,
     buildCalendarAmendment(active, new Date(), provider),
@@ -323,7 +327,7 @@ export async function handleCalendarSignPost(
 const MAX_CHAIN_WALK = 100;
 
 /** The charter version the calendar amendment superseded: walk `supersedes` back while a calendar is still declared. */
-async function versionBeforeCalendar(businessId: string, active: BusinessCharter): Promise<BusinessCharter | null> {
+async function versionBeforeCalendar(db: BusinessDb, active: BusinessCharter): Promise<BusinessCharter | null> {
   let current = active;
   for (let step = 0; step < MAX_CHAIN_WALK; step += 1) {
     if (calendarOf(current) === undefined) return current;
@@ -331,7 +335,7 @@ async function versionBeforeCalendar(businessId: string, active: BusinessCharter
     let previous: BusinessCharter | null;
     try {
       const supersedes = current.supersedes;
-      previous = await withBusiness(businessId, (bdb) => loadCharterVersion(bdb, supersedes)); // TENANCY-TODO(task 10)
+      previous = await loadCharterVersion(db, supersedes);
     } catch (error) {
       console.error('calendar revert: could not read a superseded charter:', error instanceof Error ? error.message : error);
       return null;
@@ -349,20 +353,20 @@ async function versionBeforeCalendar(businessId: string, active: BusinessCharter
  */
 export async function handleCalendarRevertPost(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: CalendarSession,
   form: URLSearchParams,
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
     return sendHtml(res, 403, errorPage('הבקשה נדחתה', CSRF_REFUSAL));
   }
-  const read = await readCharter(businessId);
+  const read = await readCharter(db);
   if (!read.ok) return sendHtml(res, 409, errorPage('לא ניתן לבטל', read.message));
   const active = read.charter;
   if (calendarOf(active) === undefined) {
     return sendHtml(res, 409, errorPage('אין מה לבטל', 'התקנון הפעיל אינו מגדיר יומן. לא בוצעה כל פעולה.'));
   }
-  if ((await calendarIsWorking(businessId)).working) {
+  if ((await calendarIsWorking(db)).working) {
     return sendHtml(
       res,
       409,
@@ -372,7 +376,7 @@ export async function handleCalendarRevertPost(
   const base = form.get('base');
   if (base !== active.charterVersion) return sendHtml(res, 409, errorPage('התקנון השתנה', STALE_MESSAGE));
 
-  const before = await versionBeforeCalendar(businessId, active);
+  const before = await versionBeforeCalendar(db, active);
   if (before === null) {
     return sendHtml(
       res,
@@ -385,7 +389,7 @@ export async function handleCalendarRevertPost(
   }
 
   const outcome = await installSigned(
-    businessId,
+    db,
     session.username,
     base,
     buildCalendarRevert(active, new Date(), before),

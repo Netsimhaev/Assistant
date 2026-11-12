@@ -211,11 +211,11 @@ async function approvedReplyCard(): Promise<void> {
   );
   const input = { to: ['dana@example.com'], subject: 'Re: s', body: 'תודה רבה על הפנייה שלך', ref: sequence };
   const facts = factsFor(input);
-  const approvalId = await withBusiness(BUSINESS, async (bdb) => enqueueApproval( // TENANCY-TODO(task 10)
+  const approvalId = await withBusiness(BUSINESS, async (bdb) => enqueueApproval(
     bdb,
     { facts, risk: await assessRisk(facts, bundle), proposedInput: input, summary: 'שליחת מייל', jobId }
   ));
-  await withBusiness(BUSINESS, (bdb) => decide(bdb, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' })); // TENANCY-TODO(task 10)
+  await withBusiness(BUSINESS, (bdb) => decide(bdb, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
 }
 
 async function autonomyEvent(direction: 'promote' | 'demote', at: Date): Promise<void> {
@@ -227,7 +227,7 @@ async function autonomyEvent(direction: 'promote' | 'demote', at: Date): Promise
 }
 
 async function replyCard(): Promise<ClassCard> {
-  const s = await learningSnapshot({ businessId: BUSINESS });
+  const s = await withBusiness(BUSINESS, (db) => learningSnapshot(db));
   const found = s.cards.find((c) => c.actionClass === 'email.reply');
   if (found === undefined) throw new Error('no email.reply card');
   return found;
@@ -237,24 +237,24 @@ describe('learningSnapshot', () => {
   beforeEach(async () => {
     await resetDatabase();
     sequence = 0;
-    bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
   });
   afterAll(async () => {
     await closePool();
   });
 
   it('has a card for every action class', async () => {
-    const s = await learningSnapshot({ businessId: BUSINESS });
+    const s = await withBusiness(BUSINESS, (db) => learningSnapshot(db));
     expect(s.cards.map((c) => c.actionClass).sort()).toEqual([...ActionClass.options].sort());
     expect(s.overall).toBeNull();
   });
 
   it('a class promoted in its ramp row but clamped by dial off is not acting alone', async () => {
     await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.reply', 'auto_notify'));
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner')); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner'));
     expect((await replyCard()).status).toBe('shadow');
 
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner')); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner'));
     const promotedAt = new Date(Date.now() - 3_600_000);
     await autonomyEvent('promote', promotedAt);
     const acting = await replyCard();
@@ -264,12 +264,12 @@ describe('learningSnapshot', () => {
 
   it('a class learned under ask is ready but waiting for the dial', async () => {
     for (let i = 0; i < 5; i += 1) await approvedReplyCard();
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'owner')); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'owner'));
     const ready = await replyCard();
     expect(ready.agreement).toEqual({ right: 5, counted: 5, topWrongReason: null });
     expect(ready.status).toBe('ready_but_dial_not_learn');
 
-    const s = await learningSnapshot({ businessId: BUSINESS });
+    const s = await withBusiness(BUSINESS, (db) => learningSnapshot(db));
     expect(s.overall).toEqual({ right: 5, counted: 5 });
   });
 
@@ -288,9 +288,9 @@ describe('learningSnapshot', () => {
 
   it('a class the charter holds at approve_required is left out of the overall score', async () => {
     await resetDatabase();
-    bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ autonomyBase: { 'email.reply': 'approve_required' } }))); // TENANCY-TODO(task 10)
+    bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ autonomyBase: { 'email.reply': 'approve_required' } })));
     for (let i = 0; i < 5; i += 1) await approvedReplyCard();
-    const s = await learningSnapshot({ businessId: BUSINESS });
+    const s = await withBusiness(BUSINESS, (db) => learningSnapshot(db));
     expect(s.cards.find((c) => c.actionClass === 'email.reply')?.status).toBe('charter_requires_approval');
     expect(s.overall).toBeNull();
     // Ineligible cards sort last.
@@ -301,6 +301,6 @@ describe('learningSnapshot', () => {
 
   it('throws without an installed charter, rather than claiming what one says', async () => {
     await resetDatabase();
-    await expect(learningSnapshot({ businessId: BUSINESS })).rejects.toThrow(/no active charter/);
+    await expect(withBusiness(BUSINESS, (db) => learningSnapshot(db))).rejects.toThrow(/no active charter/);
   });
 });

@@ -17,7 +17,7 @@ import type { CredentialSource } from '../orchestrator/credentials.js';
 import { loadMeetingSettings, saveMeetingSettings, MEETING_DEFAULTS } from '../meetings/settings.js';
 import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase } from '../test/db.js';
-import { createOwner } from './auth.js';
+import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { issueCsrfToken } from './csrf.js';
 import { createServer } from './server.js';
 
@@ -45,8 +45,8 @@ function clientListing(result: CalendarInfo[] | { failure: 'transient'; status: 
 
 beforeEach(async () => {
   await resetDatabase();
-  await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 10)
+  await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' })));
 });
 afterEach(async () => {
   if (server) {
@@ -64,7 +64,6 @@ async function bindCalendar(): Promise<void> {
 
 async function start(client?: CalendarClient, credentials: CredentialSource = CREDENTIALS): Promise<string> {
   server = createServer({
-    businessId: BUSINESS,
     port: 0,
     ...(client !== undefined ? { calendarClient: client } : {}),
     calendarCredentials: credentials,
@@ -76,7 +75,7 @@ async function start(client?: CalendarClient, credentials: CredentialSource = CR
 async function login(baseUrl: string): Promise<string> {
   const res = await fetch(`${baseUrl}/login`, {
     method: 'POST',
-    body: new URLSearchParams({ username: USERNAME, password: PASSWORD }),
+    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
     redirect: 'manual',
   });
   const pair = (res.headers.get('set-cookie') ?? '').split(';')[0];
@@ -339,7 +338,7 @@ function recordingCalendar(initial: CalendarEvent[] = []) {
 }
 
 async function setupMeetings(): Promise<void> {
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'meetings-screen', connections: [calendarConnection('google')] }))); // TENANCY-TODO(task 10)
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'meetings-screen', connections: [calendarConnection('google')] })));
   await bindCalendar();
   await withBusiness(BUSINESS, (db) => saveMeetingSettings(
     db,

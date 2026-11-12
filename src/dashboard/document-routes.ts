@@ -30,7 +30,7 @@ import { isAbsolute, relative, resolve } from 'node:path';
 import { z } from 'zod';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { getPool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { FORMAT_MEDIA_TYPE, formatAttachmentSize } from '../domain/attachment-ref.js';
 import { DocumentKind } from '../domain/document-spec.js';
 import {
@@ -113,9 +113,9 @@ export const CHARTER_UNREADABLE_HE =
  * be read. Refused, never defaulted: a card whose amounts are shown in a
  * guessed currency is a card whose echo is not what will run.
  */
-async function charterContext(businessId: string): Promise<{ timeZone: string; currency: string } | null> {
+async function charterContext(db: BusinessDb): Promise<{ timeZone: string; currency: string } | null> {
   try {
-    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    const active = await loadActiveCharter(db);
     return active === null
       ? null
       : { timeZone: active.charter.identity.timezone, currency: active.bundle.ceilings.currency };
@@ -146,11 +146,12 @@ interface ListRow {
   stage: string;
 }
 
-export async function handleDocumentList(res: ServerResponse, businessId: string, session: DocumentSession): Promise<void> {
+export async function handleDocumentList(res: ServerResponse, db: BusinessDb, session: DocumentSession): Promise<void> {
+  const businessId = db.businessId;
   // Before anything is read or marked seen.
-  const context = await charterContext(businessId);
+  const context = await charterContext(db);
   if (context === null) return charterUnreadable(res);
-  const { rows } = await getPool().query<ListRow>(
+  const { rows } = await db.query<ListRow>(
     `SELECT c.card_id, c.state, p.kind, v.spec->>'title' AS title, c.created_at, c.seen_at, p.stage
        FROM document_cards c
        JOIN document_versions v ON v.version_id = c.version_id
@@ -179,7 +180,7 @@ export async function handleDocumentList(res: ServerResponse, businessId: string
   }
   // A GET that mutates — see the module docblock.
   if (shown.length > 0) {
-    await getPool().query(
+    await db.query(
       `UPDATE document_cards SET seen_at = now()
         WHERE business_id = $1 AND card_id = ANY($2::text[]) AND seen_at IS NULL`,
       [businessId, shown.map((r) => r.card_id)],
@@ -196,12 +197,12 @@ interface Loaded {
   version: NonNullable<Awaited<ReturnType<typeof loadVersion>>>;
 }
 
-async function loadCard(businessId: string, cardId: string): Promise<Loaded | null> {
-  const card = await withBusiness(businessId, (db) => loadDocumentCard(db, cardId)); // TENANCY-TODO(task 10)
+async function loadCard(db: BusinessDb, cardId: string): Promise<Loaded | null> {
+  const card = await loadDocumentCard(db, cardId);
   if (card === null) return null;
-  const version = await withBusiness(businessId, (db) => loadVersion(db, card.versionId)); // TENANCY-TODO(task 10)
+  const version = await loadVersion(db, card.versionId);
   if (version === null) return null;
-  const production = await withBusiness(businessId, (db) => loadProduction(db, version.productionId)); // TENANCY-TODO(task 10)
+  const production = await loadProduction(db, version.productionId);
   if (production === null) return null;
   return { card, production, version };
 }
@@ -243,10 +244,11 @@ async function containedFile(stored: string, documentRoot: string | undefined): 
   }
 }
 
-async function sourcesOf(businessId: string, production: Production): Promise<SourceView[]> {
+async function sourcesOf(db: BusinessDb, production: Production): Promise<SourceView[]> {
+  const businessId = db.businessId;
   const sources: SourceView[] = [];
   if (production.sourceDocumentIds.length > 0) {
-    const { rows } = await getPool().query<{ document_id: string; original_name: string }>(
+    const { rows } = await db.query<{ document_id: string; original_name: string }>(
       `SELECT document_id, original_name FROM documents
         WHERE business_id = $1 AND document_id = ANY($2::text[])
         ORDER BY array_position($2::text[], document_id)`,
@@ -258,7 +260,7 @@ async function sourcesOf(businessId: string, production: Production): Promise<So
   }
   const memoryIds = production.work.memoryIds ?? [];
   if (memoryIds.length > 0) {
-    const { rows } = await getPool().query<{ subject_key: string; provenance: string }>(
+    const { rows } = await db.query<{ subject_key: string; provenance: string }>(
       `SELECT subject_key, provenance FROM memories
         WHERE business_id = $1 AND memory_id = ANY($2::text[])
         ORDER BY array_position($2::text[], memory_id)`,
@@ -272,17 +274,17 @@ async function sourcesOf(businessId: string, production: Production): Promise<So
 async function renderCard(
   res: ServerResponse,
   status: number,
-  businessId: string,
+  db: BusinessDb,
   session: DocumentSession,
   loaded: Loaded,
   documentRoot: string | undefined,
   error?: string,
 ): Promise<void> {
   const { card, production, version } = loaded;
-  const context = await charterContext(businessId);
+  const context = await charterContext(db);
   if (context === null) return charterUnreadable(res);
   const { currency } = context;
-  const settings = await withBusiness(businessId, (db) => loadDocumentSettings(db)); // TENANCY-TODO(task 10)
+  const settings = await loadDocumentSettings(db);
   const previewPath = previewPathOf(version.check2);
   const hasPreview = previewPath !== null && (await containedFile(previewPath, documentRoot)) !== null;
   const failedChecks = production.stage === 'failed_checks';
@@ -306,7 +308,7 @@ async function renderCard(
       check2: checkView(version.check2),
       findings: failedChecks ? production.findings.map((f) => ({ he: f.he, where: f.where })) : [],
       notes: production.work.notes,
-      sources: await sourcesOf(businessId, production),
+      sources: await sourcesOf(db, production),
       options: card.deliveryPlans.map((option) => ({
         option,
         echo: option.plan.steps.map((step) => renderStepEcho(step, currency)).filter((e) => e !== '').join('\n'),
@@ -324,23 +326,23 @@ async function renderCard(
 
 export async function handleDocumentCard(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: DocumentSession,
   cardId: string,
   documentRoot: string | undefined,
 ): Promise<void> {
-  const loaded = await loadCard(businessId, cardId);
+  const loaded = await loadCard(db, cardId);
   if (loaded === null) return html(res, 404, renderNotFound());
-  return renderCard(res, 200, businessId, session, loaded, documentRoot);
+  return renderCard(res, 200, db, session, loaded, documentRoot);
 }
 
 export async function handleDocumentPreview(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   cardId: string,
   documentRoot: string | undefined,
 ): Promise<void> {
-  const loaded = await loadCard(businessId, cardId);
+  const loaded = await loadCard(db, cardId);
   const stored = loaded === null ? null : previewPathOf(loaded.version.check2);
   const file = stored === null ? null : await containedFile(stored, documentRoot);
   if (file === null) return html(res, 404, renderNotFound());
@@ -370,13 +372,13 @@ export async function handleDocumentPreview(
 
 export async function handleDocumentDownload(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   cardId: string,
   documentRoot: string | undefined,
 ): Promise<void> {
-  const loaded = await loadCard(businessId, cardId);
+  const loaded = await loadCard(db, cardId);
   if (loaded === null) return html(res, 404, renderNotFound());
-  const file = await withBusiness(businessId, (db) => loadVersionFile(db, loaded.version.versionId)); // TENANCY-TODO(task 10)
+  const file = await loadVersionFile(db, loaded.version.versionId);
   if (file === null) return html(res, 404, renderNotFound());
   const read = await readVersionBytes(
     file,
@@ -408,7 +410,7 @@ function renderDownloadRefused(): string {
 
 export async function handleDocumentApprove(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: DocumentSession,
   cardId: string,
   form: URLSearchParams,
@@ -417,18 +419,18 @@ export async function handleDocumentApprove(
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
   // The plan hash and nothing else — see the module docblock.
   const planHash = form.get('planHash') ?? '';
-  const outcome = await withBusiness(businessId, (db) => approveDocumentCard(db, cardId, planHash, 'dashboard')); // TENANCY-TODO(task 10)
+  const outcome = await approveDocumentCard(db, cardId, planHash, 'dashboard');
   if (outcome.status === 'approved') return seeOther(res, `/documents/${encodeURIComponent(cardId)}`);
   if (outcome.status === 'not_found') return html(res, 404, renderNotFound());
-  const loaded = await loadCard(businessId, cardId);
+  const loaded = await loadCard(db, cardId);
   if (loaded === null) return html(res, 404, renderNotFound());
   const error = outcome.status === 'no_base_folder' ? outcome.reason : CARD_STALE_HE;
-  return renderCard(res, 409, businessId, session, loaded, options.documentRoot, error);
+  return renderCard(res, 409, db, session, loaded, options.documentRoot, error);
 }
 
 export async function handleDocumentFix(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: DocumentSession,
   cardId: string,
   form: URLSearchParams,
@@ -436,17 +438,17 @@ export async function handleDocumentFix(
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
   // The dashboard form is the owner's own keystrokes.
-  const outcome = await withBusiness(businessId, (db) => requestFix(db, cardId, form.get('text') ?? '', 'dashboard', 'typed', { // TENANCY-TODO(task 10)
+  const outcome = await requestFix(db, cardId, form.get('text') ?? '', 'dashboard', 'typed', {
     production: options.production ?? productionToolsFromEnv(),
-  }));
+  });
   if (outcome.status === 'opened') return seeOther(res, '/documents');
   if (outcome.status === 'not_found') return html(res, 404, renderNotFound());
-  const loaded = await loadCard(businessId, cardId);
+  const loaded = await loadCard(db, cardId);
   if (loaded === null) return html(res, 404, renderNotFound());
   return renderCard(
     res,
     outcome.status === 'refused' ? 400 : 409,
-    businessId,
+    db,
     session,
     loaded,
     options.documentRoot,
@@ -457,7 +459,7 @@ export async function handleDocumentFix(
 /** C12 — the owner types the address; the server rebuilds the card's options. */
 export async function handleDocumentAddress(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: DocumentSession,
   cardId: string,
   form: URLSearchParams,
@@ -467,15 +469,15 @@ export async function handleDocumentAddress(
   // The dashboard has no notification seams of its own: no re-send happens
   // here, the card's channel states are left as they were, and the WhatsApp
   // delivery stays withdrawn until a card is delivered there again.
-  const outcome = await withBusiness(businessId, (db) => addTypedRecipient(db, cardId, form.get('to') ?? '')); // TENANCY-TODO(task 10)
+  const outcome = await addTypedRecipient(db, cardId, form.get('to') ?? '');
   if (outcome.status === 'added') return seeOther(res, `/documents/${encodeURIComponent(cardId)}`);
   if (outcome.status === 'not_found') return html(res, 404, renderNotFound());
-  const loaded = await loadCard(businessId, cardId);
+  const loaded = await loadCard(db, cardId);
   if (loaded === null) return html(res, 404, renderNotFound());
   return renderCard(
     res,
     outcome.status === 'refused' ? 400 : 409,
-    businessId,
+    db,
     session,
     loaded,
     options.documentRoot,
@@ -485,8 +487,8 @@ export async function handleDocumentAddress(
 
 // ---------------------------------------------------------------- settings
 
-export async function handleDocumentSettingsGet(res: ServerResponse, businessId: string, session: DocumentSession): Promise<void> {
-  const settings = await withBusiness(businessId, (db) => loadDocumentSettings(db)); // TENANCY-TODO(task 10)
+export async function handleDocumentSettingsGet(res: ServerResponse, db: BusinessDb, session: DocumentSession): Promise<void> {
+  const settings = await loadDocumentSettings(db);
   html(res, 200, renderDocumentSettings({ csrf: issueCsrfToken(session.sessionId), ...settings }));
 }
 
@@ -494,7 +496,7 @@ const SETTINGS_REFUSALS: ReadonlySet<string> = new Set(Object.values(DOCUMENT_SE
 
 export async function handleDocumentSettingsPost(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: DocumentSession,
   form: URLSearchParams,
 ): Promise<void> {
@@ -506,7 +508,7 @@ export async function handleDocumentSettingsPost(
     baseFolder: (form.get('baseFolder') ?? '').trim() || null,
   };
   try {
-    await withBusiness(businessId, (db) => saveDocumentSettings(db, chosen)); // TENANCY-TODO(task 10)
+    await saveDocumentSettings(db, chosen);
   } catch (err) {
     const message = err instanceof Error ? err.message : '';
     if (!SETTINGS_REFUSALS.has(message)) throw err;

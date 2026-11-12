@@ -22,7 +22,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { createJob } from '../orchestrator/jobs.js';
 import { writeMemory } from '../memory/store.js';
-import { createOwner } from './auth.js';
+import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { createServer } from './server.js';
 
 const BUSINESS = 'test-business';
@@ -34,7 +34,7 @@ let server: Server | null = null;
 
 beforeEach(async () => {
   await resetDatabase();
-  await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+  await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
 });
 
 afterEach(async () => {
@@ -49,7 +49,7 @@ afterAll(async () => {
 });
 
 async function startServer(): Promise<string> {
-  server = createServer({ businessId: BUSINESS, port: 0 });
+  server = createServer({ port: 0 });
   await once(server, 'listening');
   const address = server.address() as AddressInfo;
   return `http://127.0.0.1:${address.port}`;
@@ -65,7 +65,7 @@ function cookiePair(setCookieHeader: string | null): string {
 async function loginWithPassword(baseUrl: string): Promise<string> {
   const res = await fetch(`${baseUrl}/login`, {
     method: 'POST',
-    body: new URLSearchParams({ username: USERNAME, password: PASSWORD }),
+    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
     redirect: 'manual',
   });
   expect(res.status).toBe(302);
@@ -74,7 +74,7 @@ async function loginWithPassword(baseUrl: string): Promise<string> {
 
 /** A job at a given trust level, so `writeMemory` can stamp its provenance. */
 async function jobWithProvenance(provenance: 'boss' | 'unknown_external'): Promise<{ jobId: string }> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `memory-screen-${provenance}` }))); // TENANCY-TODO(task 10)
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `memory-screen-${provenance}` })));
   const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance,

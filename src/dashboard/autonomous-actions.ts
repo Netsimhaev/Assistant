@@ -43,8 +43,7 @@
  * this screen, and the mark it produces, describe a class the gate never
  * actually acted under.
  */
-import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { Plan } from '../domain/plan.js';
 import type { ActionClass } from '../domain/action.js';
 import { classifyAction, refineActionClass } from '../policy/classify.js';
@@ -107,9 +106,8 @@ interface ActionRow {
  * listed with a fabricated class.
  */
 export async function listAutonomousActions(
+  db: BusinessDb,
   options: {
-    businessId?: string;
-    db?: Queryable;
     /**
      * Only steps completed at or after this moment, bounded in SQL. Shadow
      * mode's dispatcher passes `now - 24h`, so that one stored plan which no
@@ -119,8 +117,7 @@ export async function listAutonomousActions(
     since?: Date;
   } = {},
 ): Promise<AutonomousAction[]> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   const { rows } = await db.query<ActionRow>(
     `SELECT r.job_id, r.step_id, r.external_id, r.completed_at,
@@ -198,16 +195,15 @@ export function stepKey(jobId: string, stepId: string): string {
  * told the owner about it in the first place.
  */
 export async function unseenUpdateKeys(
+  db: BusinessDb,
   actions: readonly AutonomousAction[],
-  options: { businessId: string; db?: Queryable },
 ): Promise<Set<string>> {
   if (actions.length === 0) return new Set();
-  const db = options.db ?? getPool();
   const { rows } = await db.query<{ job_id: string; step_id: string }>(
     `SELECT job_id, step_id FROM action_updates
       WHERE business_id = $1 AND seen_at IS NULL
         AND job_id = ANY($2::text[])`,
-    [options.businessId, [...new Set(actions.map((a) => a.jobId))]],
+    [db.businessId, [...new Set(actions.map((a) => a.jobId))]],
   );
   const shown = new Set(actions.map((a) => stepKey(a.jobId, a.stepId)));
   return new Set(rows.map((r) => stepKey(r.job_id, r.step_id)).filter((key) => shown.has(key)));
@@ -219,11 +215,10 @@ export async function unseenUpdateKeys(
  * it rather than moving it on every reload.
  */
 export async function markUpdatesSeen(
+  db: BusinessDb,
   keys: ReadonlySet<string>,
-  options: { businessId: string; db?: Queryable },
 ): Promise<void> {
   if (keys.size === 0) return;
-  const db = options.db ?? getPool();
   const pairs = [...keys].map((key) => key.split('\u0000'));
   await db.query(
     `UPDATE action_updates u
@@ -231,6 +226,6 @@ export async function markUpdatesSeen(
        FROM unnest($2::text[], $3::text[]) AS shown(job_id, step_id)
       WHERE u.business_id = $1 AND u.seen_at IS NULL
         AND u.job_id = shown.job_id AND u.step_id = shown.step_id`,
-    [options.businessId, pairs.map((p) => p[0]), pairs.map((p) => p[1])],
+    [db.businessId, pairs.map((p) => p[0]), pairs.map((p) => p[1])],
   );
 }

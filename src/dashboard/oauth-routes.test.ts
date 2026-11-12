@@ -30,7 +30,7 @@ import { loadBindings, upsertBinding } from '../orchestrator/bindings.js';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase } from '../test/db.js';
-import { createOwner } from './auth.js';
+import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { issueCsrfToken } from './csrf.js';
 import { createServer } from './server.js';
 import { buildMailboxAmendment } from '../charter/amend-mailbox.js';
@@ -91,7 +91,7 @@ beforeEach(async () => {
   await writeKeyState(key, 'KEY-test');
   await putPlatformSecret(GOOGLE_CLIENT_ID_REF, 'test-client-id', key, 'test');
   await putPlatformSecret(GOOGLE_CLIENT_SECRET_REF, 'test-client-secret', key, 'test');
-  await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+  await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
 });
 
 afterEach(async () => {
@@ -110,7 +110,6 @@ async function startServer(
   options: { oauthFetch?: typeof fetch; mailboxClientFor?: (provider: MailProvider) => MailboxClient } = {},
 ): Promise<string> {
   server = createServer({
-    businessId: BUSINESS,
     port: 0,
     credentialKeyPath: keyPath,
     dashboardBaseUrl: DASHBOARD_BASE_URL,
@@ -139,7 +138,7 @@ function sessionIdFromCookie(cookie: string): string {
 async function loginWithPassword(baseUrl: string): Promise<string> {
   const res = await fetch(`${baseUrl}/login`, {
     method: 'POST',
-    body: new URLSearchParams({ username: USERNAME, password: PASSWORD }),
+    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
     redirect: 'manual',
   });
   expect(res.status).toBe(302);
@@ -192,7 +191,7 @@ async function beginConsent(baseUrl: string, cookie: string, system = SYSTEM): P
 
 describe('GET /oauth/:system/start', () => {
   beforeEach(async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] })));
   });
 
   it('redirects to Google carrying a fresh state and PKCE challenge, and requires a session', async () => {
@@ -266,7 +265,7 @@ describe('GET /oauth/:system/start', () => {
    * the (a) half of the four-part fix: the ceremony itself refuses.
    */
   it('refuses to start the ceremony on a connection that does not serve a calendar tool (item 1a) — no state, no grant, no binding write', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         version: '2026-08-15.2-item1a',
@@ -299,7 +298,7 @@ describe('GET /oauth/:system/start', () => {
    * be "fixed" by refusing everything.
    */
   it('still starts the ceremony on a connection that does serve a calendar tool, under the same charter that refuses mail', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         version: '2026-08-15.2-item1a-positive',
@@ -330,7 +329,7 @@ describe('GET /oauth/:system/start', () => {
     // `calendar.read` for the same (catch-all) target, so this connection
     // alone both satisfies eligibility (channel `api`, serves
     // `calendar.read`) and isolates the SHAPE refusal this test is about.
-    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({
         version: '2026-08-15.2-item1c',
@@ -364,10 +363,10 @@ describe('GET /oauth/:system/start', () => {
 
 describe('GET /oauth/callback', () => {
   beforeEach(async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] })));
   });
 
-  it('writes a grant and the binding provider on a correct state, and shows the restart note', async () => {
+  it('writes a grant and the binding provider on a correct state, and says when the scheduler picks it up', async () => {
     const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
     const cookie = await loginWithPassword(baseUrl);
     const state = await beginConsent(baseUrl, cookie);
@@ -378,10 +377,11 @@ describe('GET /oauth/callback', () => {
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(body).toContain('owner@example.com');
-    // Ruling 2: the success page must say the scheduler only reads bindings
-    // at startup, so a newly authorised connection needs a restart.
+    // Ruling 2: the success page must say when the scheduler picks the new
+    // connection up — since the per-business runtime, its next pass, with no
+    // restart (it used to say a restart was needed).
     expect(body).toMatch(/scheduler|תזמון/);
-    expect(body).toMatch(/הפעל(ה|ה מחדש|ת)|restart/);
+    expect(body).toContain('בסבב הבא שלו');
 
     const grant = await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, SYSTEM, key));
     expect(grant?.provider).toBe('google');
@@ -401,7 +401,7 @@ describe('GET /oauth/callback', () => {
     // operator-provisioned secret ref of the same shape.
     expect(binding?.credentialRef).toBe('OAUTH_OFFICE_CALENDAR');
 
-    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'credential_change' })); // TENANCY-TODO(task 10)
+    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'credential_change' }));
     expect(audit.some((row) => row.reason.includes(SYSTEM))).toBe(true);
     // M11: extend the "no secrets" assertion beyond the two tokens above to
     // the app's own client secret — on the page and in the permanent record.
@@ -575,7 +575,7 @@ describe('GET /oauth/callback', () => {
 
 describe('POST /oauth/:system/revoke', () => {
   beforeEach(async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] })));
   });
 
   async function grantedSystem(baseUrl: string, cookie: string): Promise<void> {
@@ -604,7 +604,7 @@ describe('POST /oauth/:system/revoke', () => {
     // no longer readable through the ordinary path, which is the point.
     expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, SYSTEM, key))).toBeNull();
 
-    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'credential_change' })); // TENANCY-TODO(task 10)
+    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'credential_change' }));
     expect(audit.some((row) => row.reason.includes('revoked'))).toBe(true);
   });
 
@@ -694,7 +694,7 @@ describe('POST /oauth/:system/revoke', () => {
     );
     expect(rows[0]?.revoked_at).not.toBeNull();
 
-    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'credential_change' })); // TENANCY-TODO(task 10)
+    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'credential_change' }));
     const revokeRow = audit.find((row) => row.reason.includes('revoked locally'));
     expect(revokeRow?.reason).toContain('master key');
     expect(revokeRow?.reason).not.toContain('no live grant was found');
@@ -757,7 +757,7 @@ describe('GET /connections', () => {
   });
 
   it('shows a declared connection that was never authorised under its group heading, and never hides an unrecognised one', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION, UNKNOWN_CONNECTION] }))); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION, UNKNOWN_CONNECTION] })));
     const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl);
 
@@ -786,7 +786,7 @@ describe('GET /connections', () => {
    * refuses is a worse experience than no link.
    */
   it('hides the connect link for a connection that does not serve a calendar tool, while showing it for one that does', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(
       bdb,
       buildCharter({ connections: [CALENDAR_CONNECTION, MAIL_ONLY_CONNECTION] })
     ));
@@ -805,7 +805,7 @@ describe('GET /connections', () => {
   });
 
   it("shows an authorised connection's account and granted scopes, offers a revoke control, and never renders the refresh token itself", async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] })));
     const secretToken = 'super-secret-refresh-token-value-should-never-render';
     await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { system: SYSTEM, provider: 'google', credentialRef: 'OFFICE_CALENDAR', account: 'owner@example.com', scopes: ['https://www.googleapis.com/auth/calendar.readonly'], refreshToken: secretToken, grantedBy: USERNAME }, key));
 
@@ -833,7 +833,7 @@ describe('GET /connections', () => {
   });
 
   it('reads a grant needing reauth as "דורש אישור מחדש", and a revoked grant as not yet authorised again', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] })));
     await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { system: SYSTEM, provider: 'google', credentialRef: 'OFFICE_CALENDAR', account: 'owner@example.com', scopes: ['https://www.googleapis.com/auth/calendar.readonly'], refreshToken: 'refresh-token-value', grantedBy: USERNAME }, key));
     await withBusiness(BUSINESS, (bdb) => recordRefresh(bdb, SYSTEM, null, key));
     await withBusiness(BUSINESS, (bdb) => markNeedsReauth(bdb, SYSTEM));
@@ -859,15 +859,17 @@ describe('GET /connections', () => {
   });
 
   it('tells the owner the scheduler only reads connections at process startup', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] })));
     const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl);
     const res = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
     const body = await res.text();
-    // Matches `buildRuntime`'s own docblock and docs/live-thread-runbook.md
-    // word for word on the load-bearing fact: a freshly authorised
-    // connection has no effect until the scheduler process restarts.
-    expect(body).toContain('פעם אחת בלבד, בעת ההפעלה');
+    // The load-bearing fact since the per-business runtime: the scheduler
+    // builds each business's adapters on every pass (`businessRuntime`), so
+    // a freshly authorised connection takes effect on the next pass, with no
+    // restart — the page used to say a restart was needed.
+    expect(body).toContain('מחדש בכל סבב');
+    expect(body).not.toContain('פעם אחת בלבד, בעת ההפעלה');
   });
 
   /**
@@ -881,16 +883,16 @@ describe('GET /connections', () => {
    * under pressure — cutting off access in an emergency — so the page must
    * say both halves, not the false one.
    */
-  it('says authorising needs a restart AND that revoking takes effect immediately, not one sentence covering both', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
+  it('says authorising takes effect next pass AND that revoking takes effect immediately, not one sentence covering both', async () => {
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] })));
     const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl);
     const res = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
     const body = await res.text();
     // The authorising half — unchanged from the test above, restated here so
     // this test alone proves BOTH halves without relying on test order.
-    expect(body).toContain('פעם אחת בלבד, בעת ההפעלה');
-    expect(body).toMatch(/אושר.*יופעל מחדש|restart/);
+    expect(body).toContain('מחדש בכל סבב');
+    expect(body).toMatch(/אושר.*בסבב הבא/);
     // The corrected half: revoking is NOT described the same way.
     expect(body).toMatch(/ביטול.*(מיד|באותו רגע)|revok.*immediat/);
   });
@@ -905,7 +907,7 @@ describe('GET /connections', () => {
    * on `lastError` being non-null.
    */
   it('shows a recorded operational error even though the binding status is still "live", and shows the last successful call', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] })));
     await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: SYSTEM,
         status: 'live',
@@ -987,7 +989,7 @@ describe('mailbox ceremony', () => {
    */
   async function installMailboxCharter(provider: MailProvider): Promise<void> {
     const amendment = buildMailboxAmendment(buildCharter(), new Date(), provider);
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, signCharter(amendment, { signedByPersonId: USERNAME, method: 'dashboard_click' }))); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, signCharter(amendment, { signedByPersonId: USERNAME, method: 'dashboard_click' })));
   }
 
   /** The callback takes the initial cursor; no real provider in tests. */
@@ -995,7 +997,7 @@ describe('mailbox ceremony', () => {
     ({ initialCursor: async () => 'cursor-0' }) as unknown as MailboxClient;
 
   beforeEach(async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     await installMailboxCharter('microsoft');
     await putPlatformSecret('MICROSOFT_OAUTH_CLIENT_ID', 'ms-client-id', key, 'test');
     await putPlatformSecret('MICROSOFT_OAUTH_CLIENT_SECRET', 'ms-client-secret', key, 'test');
@@ -1125,7 +1127,7 @@ describe('mailbox ceremony', () => {
     // The route swallows provider-call errors, so a throwing stub proves
     // nothing: count invocations, and check the audit row names the branch.
     expect(providerCalls).toBe(0);
-    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'credential_change' })); // TENANCY-TODO(task 10)
+    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'credential_change' }));
     const latest = audit[audit.length - 1];
     expect(latest?.reason).toContain('no token revocation endpoint');
   });

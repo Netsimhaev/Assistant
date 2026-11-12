@@ -173,7 +173,8 @@ function knownCard(known: readonly SummaryCounterparty[]): string {
 /**
  * A mailbox this signature adds: the same two statements the connections
  * screen's own mailbox sign page carries (`mailbox-connect.ts`) — what
- * reading and labelling it authorises, and that the scheduler must restart.
+ * reading and labelling it authorises, and when the scheduler picks it up
+ * (its next pass, no restart).
  */
 function mailboxCard(summary: CharterSummary): string {
   if (summary.mailboxAdded === null) return '';

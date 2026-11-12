@@ -13,7 +13,7 @@ import { resetDatabase } from '../test/db.js';
 import { createLedgerItem, listLedgerEvents, loadLedgerItem, type NewLedgerItem } from '../ledger/store.js';
 import { listCriticalRules, loadLedgerSettings } from '../ledger/settings.js';
 import { localParts, localToInstant } from '../util/local-time.js';
-import { createOwner } from './auth.js';
+import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { createServer } from './server.js';
 
 const BUSINESS = 'test-business';
@@ -25,8 +25,8 @@ let server: Server | null = null;
 
 beforeEach(async () => {
   await resetDatabase();
-  await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 10)
+  await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' })));
 });
 afterEach(async () => {
   if (server) {
@@ -39,7 +39,7 @@ afterAll(async () => {
 });
 
 async function start(): Promise<string> {
-  server = createServer({ businessId: BUSINESS, port: 0 });
+  server = createServer({ port: 0 });
   await once(server, 'listening');
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
@@ -47,7 +47,7 @@ async function start(): Promise<string> {
 async function login(baseUrl: string): Promise<string> {
   const res = await fetch(`${baseUrl}/login`, {
     method: 'POST',
-    body: new URLSearchParams({ username: USERNAME, password: PASSWORD }),
+    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
     redirect: 'manual',
   });
   const pair = (res.headers.get('set-cookie') ?? '').split(';')[0];

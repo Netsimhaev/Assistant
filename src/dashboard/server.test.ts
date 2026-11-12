@@ -39,7 +39,8 @@ import {
 } from '../governance/instructions.js';
 import { DIGEST_DEFAULTS, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
 import { loadActionUpdateSettings, saveActionUpdateSettings } from '../governance/action-update-settings.js';
-import { createOwner, login } from './auth.js';
+import { login } from './auth.js';
+import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { issueRecoveryCodes, remainingCodes } from './recovery.js';
 import {
   assertBindableHost,
@@ -70,7 +71,7 @@ afterAll(async () => {
  * own version, so a test that installs `buildCharter()` itself still can.
  */
 async function installGateCharter(businessId: string): Promise<void> {
-  await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 10)
+  await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' })));
 }
 
 let server: Server | null = null;
@@ -82,11 +83,14 @@ afterEach(async () => {
   }
 });
 
+/**
+ * One server for every business: which business a test lands in is decided
+ * by the login address (`ownerLogin`), never by the server.
+ */
 async function startServer(
-  businessId: string,
   options: { trustProxy?: boolean; documentRoot?: string } = {},
 ): Promise<string> {
-  server = createServer({ businessId, port: 0, ...options });
+  server = createServer({ port: 0, ...options });
   await once(server, 'listening');
   const address = server.address() as AddressInfo;
   return `http://127.0.0.1:${address.port}`;
@@ -143,7 +147,7 @@ async function makeApproval(options: {
   summary?: string;
 }): Promise<string> {
   const proposedInput = options.proposedInput ?? { to: 'client@example.com', body: 'שלום' };
-  return withBusiness(options.businessId, (bdb) => enqueueApproval( // TENANCY-TODO(task 10)
+  return withBusiness(options.businessId, (bdb) => enqueueApproval(
     bdb,
     {
       jobId: options.jobId ?? null,
@@ -156,7 +160,7 @@ async function makeApproval(options: {
 }
 
 async function jobAwaitingApproval(businessId: string) {
-  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter()));
   const job = await withBusiness(businessId, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
   for (const to of ['understand', 'plan', 'await_approval'] as const) {
     await withBusiness(businessId, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
@@ -177,7 +181,7 @@ async function seedAutonomousAction(
   businessId: string,
   input: Record<string, unknown> = { to: 'dana@example.com', inReplyTo: 'thread-1', subject: 'תשובה', body: 'גוף' },
 ): Promise<{ jobId: string; stepId: string }> {
-  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter({ version: `autonomy-actions-${ulid()}` }))); // TENANCY-TODO(task 10)
+  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter({ version: `autonomy-actions-${ulid()}` })));
   const job = await withBusiness(businessId, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
   const plan = Plan.parse({
     goal: 'reply to a known customer',
@@ -349,7 +353,7 @@ async function anApprovalForReading(
 async function aConductorRaisedApproval(
   businessId: string,
 ): Promise<{ approvalId: string; jobId: string }> {
-  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter()));
   const documentId = `DOC-${ulid()}`;
   await withBusiness(businessId, (db) => insertOrGetDocument(
     db,
@@ -374,7 +378,7 @@ async function aSignableApproval(
   bytes: Buffer,
   proposal: Proposal = FILING_PROPOSAL,
 ): Promise<{ approvalId: string; jobId: string; documentId: string; sha256: string }> {
-  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter()));
   const { documentId, sha256 } = await aDocument(businessId, docRoot, bytes);
   const readingId = await aReadingOf(documentId, businessId);
   const { approvalId, jobId } = await anApprovalForReading(businessId, bundle, readingId, proposal);
@@ -392,7 +396,7 @@ function cookiePair(setCookieHeader: string | null): string {
 async function loginWithPassword(baseUrl: string, username: string, password: string): Promise<string> {
   const res = await fetch(`${baseUrl}/login`, {
     method: 'POST',
-    body: new URLSearchParams({ username, password }),
+    body: new URLSearchParams({ email: ownerLogin(BUSINESS, username), password }),
     redirect: 'manual',
   });
   expect(res.status).toBe(302);
@@ -429,20 +433,20 @@ function unescapeHtml(s: string): string {
 }
 
 beforeEach(async () => {
-  await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+  await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
   await installGateCharter(BUSINESS);
 });
 
 describe('GET /', () => {
   it('redirects to login without a session', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const res = await fetch(`${baseUrl}/`, { redirect: 'manual' });
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');
   });
 
   it('shows the pending list to a valid session', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     await makeApproval({ businessId: BUSINESS, summary: 'אשר הזמנה מיוחדת ממש כאן' });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -453,9 +457,9 @@ describe('GET /', () => {
   });
 
   it('expires a session past its lifetime', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const farPast = new Date('2000-01-01T00:00:00.000Z');
-    const result = await login({ username: USERNAME, password: PASSWORD, businessId: BUSINESS, now: farPast });
+    const result = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD, now: farPast }));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
@@ -470,7 +474,7 @@ describe('GET /', () => {
 
 describe('GET /conversation', () => {
   it('refuses the conversation screen without a session', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
 
     const res = await fetch(`${baseUrl}/conversation`, { redirect: 'manual' });
     expect(res.status).toBe(302);
@@ -478,7 +482,7 @@ describe('GET /conversation', () => {
   });
 
   it('shows the full record behind a session, oldest first, labelled by sender', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     await withBusiness(BUSINESS, (db) => recordInbound(
@@ -531,7 +535,7 @@ describe('GET /conversation', () => {
   });
 
   it('says there is no conversation yet when nothing has been recorded', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const res = await fetch(`${baseUrl}/conversation`, { headers: { cookie } });
@@ -558,7 +562,7 @@ describe('GET /conversation', () => {
   }
 
   it('shows no truncation note when the history is exactly at the limit', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     await seedMessages(BUSINESS, 200);
 
@@ -572,7 +576,7 @@ describe('GET /conversation', () => {
   });
 
   it('shows the truncation note and drops only the single oldest message past the limit', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     await seedMessages(BUSINESS, 201);
 
@@ -589,7 +593,7 @@ describe('GET /conversation', () => {
 
 describe('GET /readings', () => {
   it('serves the readings screen behind a session', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const res = await fetch(`${baseUrl}/readings`, { headers: { cookie } });
@@ -598,7 +602,7 @@ describe('GET /readings', () => {
   });
 
   it('refuses the readings screen without a session', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
 
     const res = await fetch(`${baseUrl}/readings`, { redirect: 'manual' });
     expect(res.status).toBe(302);
@@ -614,8 +618,8 @@ describe('GET /readings', () => {
   // override character gone — the same guarantee the approval card's own
   // sign form is tested for.
   it('renders the stance label, headline, a reason and a bidi-safe filename from a real reading', async () => {
-    const baseUrl = await startServer(BUSINESS);
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    const baseUrl = await startServer();
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     // `NewProposal.jobId` is required, not nullable — every proposal is made
     // in service of a real job (`proposeForReading` always loads or creates
     // one first). The job never reaches `await_approval`: an `advise_against`
@@ -703,7 +707,7 @@ describe('GET /instruct, POST /instruct', () => {
   // string in the body and the test still passed. `name="text"` is the box
   // itself, and appears on no other page.
   it('serves the instruction box behind a session', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const res = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
@@ -717,7 +721,7 @@ describe('GET /instruct, POST /instruct', () => {
   // silently: without this assertion, removing the link leaves every other
   // test on this file green.
   it('links to the memory screen, the same way it links to erasure', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const res = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
@@ -727,7 +731,7 @@ describe('GET /instruct, POST /instruct', () => {
   });
 
   it('refuses the instruction box without a session', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
 
     const res = await fetch(`${baseUrl}/instruct`, { redirect: 'manual' });
     expect(res.status).toBe(302);
@@ -735,7 +739,7 @@ describe('GET /instruct, POST /instruct', () => {
   });
 
   it('refuses a submitted instruction without a CSRF token', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const res = await fetch(`${baseUrl}/instruct`, {
@@ -768,8 +772,8 @@ describe('GET /instruct, POST /instruct', () => {
   // ever fired. Installing a charter means the length check is what actually
   // has to fire first for this to pass.
   it('shows the refusal when the instruction is too long, and opens no job', async () => {
-    const baseUrl = await startServer(BUSINESS);
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    const baseUrl = await startServer();
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
     const csrf = extractCsrf(await boxPage.text());
@@ -806,8 +810,8 @@ describe('GET /instruct, POST /instruct', () => {
    * the question, on a job parked in `understand`, with no answer yet.
    */
   it('shows a parked question and its answer form on a fresh GET', async () => {
-    const baseUrl = await startServer(BUSINESS);
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    const baseUrl = await startServer();
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -829,8 +833,8 @@ describe('GET /instruct, POST /instruct', () => {
   });
 
   it('does not list a question that has already been answered', async () => {
-    const baseUrl = await startServer(BUSINESS);
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    const baseUrl = await startServer();
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
 
     const answeredJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
@@ -960,7 +964,7 @@ describe('renderInstructionOutcome - the note on a needs_answer outcome', () => 
       },
     } as unknown as ServerResponse;
 
-    await renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome, BUSINESS);
+    await withBusiness(BUSINESS, (db) => renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome, db));
     return body;
   }
 
@@ -1023,7 +1027,7 @@ describe('renderInstruct and renderInstructionOutcome - recordingNote', () => {
       },
     } as unknown as ServerResponse;
 
-    await renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome, BUSINESS);
+    await withBusiness(BUSINESS, (db) => renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome, db));
     return body;
   }
 
@@ -1134,7 +1138,7 @@ describe('POST /instruct/:jobId/answer', () => {
    * N2's phase guard tests) transitions it further after calling this.
    */
   async function anInstructionJob(businessId: string, text: string): Promise<string> {
-    const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter()));
     const job = await withBusiness(businessId, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
     await withBusiness(businessId, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId: job.jobId, text }));
     await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'understand', actor: 'orchestrator', reason: 'test setup' }));
@@ -1142,7 +1146,7 @@ describe('POST /instruct/:jobId/answer', () => {
   }
 
   it('refuses without a CSRF token', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -1158,7 +1162,7 @@ describe('POST /instruct/:jobId/answer', () => {
   });
 
   it('refuses without a session', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
 
     const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
@@ -1174,7 +1178,7 @@ describe('POST /instruct/:jobId/answer', () => {
   // `null` for a job that belongs to another business — a value, not a
   // throw — and the route has to turn that into a clean refusal itself.
   it("refuses to answer another business's job instead of throwing", async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const otherJobId = await anInstructionJob(OTHER_BUSINESS, 'תשלחי לדנה את ההצעה');
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
@@ -1198,7 +1202,7 @@ describe('POST /instruct/:jobId/answer', () => {
   // ask the very same question again — forever. Refused before `claimAnswer`
   // runs at all: the stored answer stays `null`.
   it('refuses a whitespace-only answer without recording it', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
@@ -1225,7 +1229,7 @@ describe('POST /instruct/:jobId/answer', () => {
   // `text` does, so without this a hand-crafted POST could put up to
   // `MAX_BODY_BYTES` of it in the column.
   it('refuses an answer longer than the instruction cap without recording it', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
@@ -1262,7 +1266,7 @@ describe('POST /instruct/:jobId/answer', () => {
   // this exact test pass by coincidence when the join itself was broken —
   // caught only by manually re-verifying the mutation.
   it('joins the original instruction and the answer before re-running the pipeline', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const originalText = 'א'.repeat(3990);
     const jobId = await anInstructionJob(BUSINESS, originalText);
     const answer = 'ב'.repeat(20);
@@ -1309,7 +1313,7 @@ describe('POST /instruct/:jobId/answer', () => {
    * never reaching the planner.
    */
   it('closes the parked job when a re-run refuses, and refuses a second POST instead of 500ing', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const originalText = 'א'.repeat(3990);
     const jobId = await anInstructionJob(BUSINESS, originalText);
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
@@ -1360,7 +1364,7 @@ describe('POST /instruct/:jobId/answer', () => {
   // the parked job to `failed` the same way `handleInstructAnswer` itself
   // would after a successful re-run, then POST again.
   it('refuses a second POST after the parked job has already been closed out', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
     await withBusiness(BUSINESS, (db) => transition(db, jobId, {
       to: 'failed',
@@ -1417,7 +1421,7 @@ describe('POST /instruct/:jobId/answer', () => {
    * happen. It still never touches the network.
    */
   it('turns away an answer while the job is already claimed, and writes nothing', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
@@ -1474,7 +1478,7 @@ describe('POST /instruct/:jobId/answer', () => {
   // `execute → failed` is a legal transition, so without the phase guard this
   // would silently kill a running plan.
   it("refuses to answer a job that isn't parked (e.g. already executing), and leaves it untouched", async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
     for (const to of ['plan', 'execute'] as const) {
       await withBusiness(BUSINESS, (db) => transition(db, jobId, { to, actor: 'orchestrator', reason: 'test setup' }));
@@ -1522,7 +1526,7 @@ describe('POST /instruct/:jobId/answer', () => {
    * `makePlan`'s `refuseUnderTest`.
    */
   it('does not ask the identity question again when answering through the route', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const jobId = await anInstructionJob(BUSINESS, 'תשיבי לרונית');
 
     // Two people one name — the ambiguity the answer below will not settle.
@@ -1570,7 +1574,7 @@ describe('POST /instruct/:jobId/answer', () => {
 
 describe('CSRF', () => {
   it('refuses an approve without a CSRF token', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const approvalId = await makeApproval({ businessId: BUSINESS });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -1582,14 +1586,14 @@ describe('CSRF', () => {
     });
     expect(res.status).toBe(403);
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('pending');
   });
 });
 
 describe('deciding an approval', () => {
   it('approves with a valid token', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const job = await jobAwaitingApproval(BUSINESS);
     const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
@@ -1605,14 +1609,14 @@ describe('deciding an approval', () => {
     });
     expect(decideRes.status).toBe(302);
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('approved');
     const updatedJob = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(updatedJob?.phase).toBe('execute');
   });
 
   it('denies with a valid token', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const job = await jobAwaitingApproval(BUSINESS);
     const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
@@ -1628,7 +1632,7 @@ describe('deciding an approval', () => {
     });
     expect(decideRes.status).toBe(302);
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('denied');
     const updatedJob = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
     expect(updatedJob?.phase).toBe('closed');
@@ -1647,10 +1651,10 @@ describe('the gov.verify verdict on a card', () => {
   // it MANUFACTURED a false one of its own: grouping a phone-shaped token's
   // digits with commas asserts a magnitude the draft never had.
   it('shows the verdict when one exists, with its numbers printed verbatim and a caveat', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const job = await jobAwaitingApproval(BUSINESS);
     const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
-    await withBusiness(BUSINESS, (bdb) => saveVerdict( // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => saveVerdict(
       bdb,
       job.jobId,
       {
@@ -1683,7 +1687,7 @@ describe('the gov.verify verdict on a card', () => {
   });
 
   it('renders exactly as before when no verdict exists', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const job = await jobAwaitingApproval(BUSINESS);
     const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
@@ -1704,10 +1708,10 @@ describe('the gov.verify verdict on a card', () => {
   // fails nothing if this is missing, because the criteria-text path alone
   // already exercises `escLabel`.
   it('escapes the verdict like every other untrusted label on this page', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const job = await jobAwaitingApproval(BUSINESS);
     const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
-    await withBusiness(BUSINESS, (bdb) => saveVerdict( // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => saveVerdict(
       bdb,
       job.jobId,
       {
@@ -1750,10 +1754,10 @@ describe('the gov.verify verdict on a card', () => {
       businessId: string,
       overrides: { fenceForgeryDetected?: boolean } = {},
     ): Promise<{ baseUrl: string; approvalId: string }> {
-      const baseUrl = await startServer(businessId);
+      const baseUrl = await startServer();
       const job = await jobAwaitingApproval(businessId);
       const approvalId = await makeApproval({ businessId, jobId: job.jobId });
-      await withBusiness(businessId, (bdb) => saveVerdict( // TENANCY-TODO(task 10)
+      await withBusiness(businessId, (bdb) => saveVerdict(
         bdb,
         job.jobId,
         {
@@ -1782,7 +1786,7 @@ describe('the gov.verify verdict on a card', () => {
     });
 
     it('absent (a pre-field row) — "not known whether checked", never conflated with false', async () => {
-      const baseUrl = await startServer(BUSINESS);
+      const baseUrl = await startServer();
       const job = await jobAwaitingApproval(BUSINESS);
       const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
       // Bypasses `saveVerdict`'s TS type on purpose — a row written before
@@ -1812,7 +1816,7 @@ describe('the gov.verify verdict on a card', () => {
   // through the same function). A bad row must degrade to a note, never a
   // generic 500 that takes every control on the page down with it.
   it('renders a note instead of a 500 when the verdict row cannot be parsed', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const job = await jobAwaitingApproval(BUSINESS);
     const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
     // `criteria: []` violates `Verdict`'s own `.min(1)` — a row `saveVerdict`
@@ -1841,7 +1845,7 @@ describe('the gov.verify verdict on a card', () => {
   // thing, so each assertion below also checks the OTHER states' text is not
   // what rendered.
   it('says the check is still running when no row exists', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     // A CONDUCTOR-raised card, not a bare job: the note is conditioned on a
     // verification actually being expected for this card, and only the
     // conductor path opens one. See `stillRunningNote` in `views.ts`.
@@ -1866,8 +1870,8 @@ describe('the gov.verify verdict on a card', () => {
    */
   describe('and says nothing at all on a card verification never reaches', () => {
     it('an orphan card — approval_requests.job_id IS NULL, the SDK path', async () => {
-      const baseUrl = await startServer(BUSINESS);
-      await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+      const baseUrl = await startServer();
+      await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
       const approvalId = await makeApproval({ businessId: BUSINESS, jobId: null });
       const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -1879,7 +1883,7 @@ describe('the gov.verify verdict on a card', () => {
     });
 
     it('a gate-raised card with a job the conductor never handled', async () => {
-      const baseUrl = await startServer(BUSINESS);
+      const baseUrl = await startServer();
       // `enqueueApproval` at gate stage 10 on the instruction path: a real job
       // id, and no proposal behind it, because no document was ever read.
       const job = await jobAwaitingApproval(BUSINESS);
@@ -1895,10 +1899,10 @@ describe('the gov.verify verdict on a card', () => {
 
   describe('not judged — attempted and did not finish, one sentence per reason', () => {
     async function cardWithReason(reason: NotJudgedReason): Promise<string> {
-      const baseUrl = await startServer(BUSINESS);
+      const baseUrl = await startServer();
       const job = await jobAwaitingApproval(BUSINESS);
       const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
-      await withBusiness(BUSINESS, (bdb) => saveNotJudged(bdb, job.jobId, reason)); // TENANCY-TODO(task 10)
+      await withBusiness(BUSINESS, (bdb) => saveNotJudged(bdb, job.jobId, reason));
       const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
       return (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
     }
@@ -1950,7 +1954,7 @@ describe('signing an approval', () => {
   });
 
   it('signing an unchanged document records a signature, an audit row, and approves', async () => {
-    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const baseUrl = await startServer({ documentRoot: docRoot });
     const { approvalId, jobId, documentId, sha256 } = await aSignableApproval(
       BUSINESS,
       docRoot,
@@ -1969,10 +1973,10 @@ describe('signing an approval', () => {
     });
     expect(signRes.status).toBe(302);
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('approved');
 
-    const signature = await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId)); // TENANCY-TODO(task 10)
+    const signature = await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId));
     expect(signature).not.toBeNull();
     expect(signature?.signedBy).toBe(USERNAME);
     expect(signature?.approvalId).toBe(approvalId);
@@ -1980,7 +1984,7 @@ describe('signing an approval', () => {
     // just that *some* signature exists.
     expect(signature?.signedSha256).toBe(sha256);
 
-    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'signature' })); // TENANCY-TODO(task 10)
+    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'signature' }));
     expect(audit.length).toBe(1);
     expect(audit[0]?.jobId).toBe(jobId);
     expect(audit[0]?.reason).toContain(`signature:${documentId}`);
@@ -1991,7 +1995,7 @@ describe('signing an approval', () => {
   });
 
   it('refuses to sign an approval already denied in another tab, and writes no signature', async () => {
-    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const baseUrl = await startServer({ documentRoot: docRoot });
     const { approvalId, documentId } = await aSignableApproval(
       BUSINESS,
       docRoot,
@@ -2010,7 +2014,7 @@ describe('signing an approval', () => {
       redirect: 'manual',
     });
     expect(denyRes.status).toBe(302);
-    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('denied'); // TENANCY-TODO(task 10)
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('denied');
 
     // Tab 2, stale: sign the same, now-denied approval. `documentId` matches
     // the real document — this must be refused on the approval's state
@@ -2028,13 +2032,13 @@ describe('signing an approval', () => {
     // button simply gone, no explanation.
     expect(await signRes.text()).toContain('הבקשה כבר הוכרעה');
 
-    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).toBeNull(); // TENANCY-TODO(task 10)
-    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('denied'); // TENANCY-TODO(task 10)
-    expect(await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'signature' }))).toEqual([]); // TENANCY-TODO(task 10)
+    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).toBeNull();
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('denied');
+    expect(await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'signature' }))).toEqual([]);
   });
 
   it('refuses to sign a document that changed on disk, and leaves the approval pending', async () => {
-    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const baseUrl = await startServer({ documentRoot: docRoot });
     const { approvalId, documentId } = await aSignableApproval(
       BUSINESS,
       docRoot,
@@ -2056,18 +2060,18 @@ describe('signing an approval', () => {
     });
     expect(signRes.status).toBe(400);
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('pending');
-    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).toBeNull(); // TENANCY-TODO(task 10)
+    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).toBeNull();
   });
 
   it('refuses to sign when the stored file is unreadable, with text distinct from "missing"', async () => {
-    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const baseUrl = await startServer({ documentRoot: docRoot });
     const bytes = Buffer.from('הסכם שיווק — עוד גרסה', 'utf8');
     // One charter install, reused for both documents below — installCharter
     // writes a fixed, deterministic charter_version id (buildCharter's own),
     // and a second install under the same business would collide on it.
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
 
     const unreadableDoc = await aDocument(BUSINESS, docRoot, bytes);
     const unreadableReading = await aReadingOf(unreadableDoc.documentId, BUSINESS);
@@ -2093,7 +2097,7 @@ describe('signing an approval', () => {
     expect(signRes.status).toBe(400);
     const unreadableBody = await signRes.text();
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, unreadable.approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, unreadable.approvalId));
     expect(approval?.state).toBe('pending');
 
     // Now check the "missing" refusal reads differently, on a fresh document.
@@ -2130,7 +2134,7 @@ describe('signing an approval', () => {
   });
 
   it('refuses to sign an approval that has no document behind it', async () => {
-    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const baseUrl = await startServer({ documentRoot: docRoot });
     const job = await jobAwaitingApproval(BUSINESS);
     const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
@@ -2152,14 +2156,14 @@ describe('signing an approval', () => {
     // got no message instead of a misplaced one.
     expect(await signRes.text()).toContain('לא נמצא מסמך המשויך לבקשה זו');
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('pending');
   });
 
   it('refuses a second signature on the same document, leaving the first intact', async () => {
-    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const baseUrl = await startServer({ documentRoot: docRoot });
     const bytes = Buffer.from('הסכם שיווק — נחתם פעם אחת בלבד', 'utf8');
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const { documentId } = await aDocument(BUSINESS, docRoot, bytes);
     const readingId1 = await aReadingOf(documentId, BUSINESS);
     const first = await anApprovalForReading(BUSINESS, bundle, readingId1);
@@ -2177,7 +2181,7 @@ describe('signing an approval', () => {
       redirect: 'manual',
     });
     expect(firstSignRes.status).toBe(302);
-    const firstSignature = await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId)); // TENANCY-TODO(task 10)
+    const firstSignature = await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId));
     expect(firstSignature).not.toBeNull();
 
     const secondCardRes = await fetch(`${baseUrl}/a/${second.approvalId}`, { headers: { cookie } });
@@ -2195,15 +2199,15 @@ describe('signing an approval', () => {
     expect(secondBody).toContain(USERNAME);
     expect(secondBody).toContain(String(new Date().getUTCFullYear()));
 
-    const secondApproval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, second.approvalId)); // TENANCY-TODO(task 10)
+    const secondApproval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, second.approvalId));
     expect(secondApproval?.state).toBe('pending');
 
-    const stillFirst = await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId)); // TENANCY-TODO(task 10)
+    const stillFirst = await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId));
     expect(stillFirst?.signatureId).toBe(firstSignature?.signatureId);
   });
 
   it('refuses a sign without a CSRF token, exactly as approve does', async () => {
-    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const baseUrl = await startServer({ documentRoot: docRoot });
     const approvalId = await makeApproval({ businessId: BUSINESS });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -2215,12 +2219,12 @@ describe('signing an approval', () => {
     });
     expect(res.status).toBe(403);
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('pending');
   });
 
   it('renders the resolved document id on the sign form', async () => {
-    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const baseUrl = await startServer({ documentRoot: docRoot });
     const { approvalId, documentId } = await aSignableApproval(
       BUSINESS,
       docRoot,
@@ -2239,7 +2243,7 @@ describe('signing an approval', () => {
   // stale, or a request was hand-crafted — must not sign whatever document
   // `documentForApproval` happens to resolve to right now.
   it('refuses to sign when the submitted documentId does not match the resolved document', async () => {
-    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const baseUrl = await startServer({ documentRoot: docRoot });
     const { approvalId, documentId } = await aSignableApproval(
       BUSINESS,
       docRoot,
@@ -2258,8 +2262,8 @@ describe('signing an approval', () => {
     });
     expect(signRes.status).toBe(400);
 
-    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).toBeNull(); // TENANCY-TODO(task 10)
-    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('pending'); // TENANCY-TODO(task 10)
+    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).toBeNull();
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('pending');
   });
 
   // F2: the filename is chosen by whoever sent the document. It is the only
@@ -2268,9 +2272,9 @@ describe('signing an approval', () => {
   // render as something other than what it is. The card must also show
   // something derived from the bytes themselves.
   it('shows a hash prefix beside the name and strips bidi controls from it', async () => {
-    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const baseUrl = await startServer({ documentRoot: docRoot });
     const bytes = Buffer.from('הסכם שיווק — שם עוין', 'utf8');
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     // U+202E RIGHT-TO-LEFT OVERRIDE, then a name that renders reversed.
     const { documentId, sha256 } = await aDocument(
       BUSINESS,
@@ -2299,7 +2303,7 @@ describe('signing an approval', () => {
   // `(business_id, document_id)`, a second signature refused, the row
   // protected by `ON DELETE RESTRICT` since migration 020.
   it('renders no sign form on a card whose proposal is about sending an email', async () => {
-    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const baseUrl = await startServer({ documentRoot: docRoot });
     const { approvalId } = await aSignableApproval(
       BUSINESS,
       docRoot,
@@ -2322,7 +2326,7 @@ describe('signing an approval', () => {
   });
 
   it('renders the sign form on a card whose proposal is a decision about the document', async () => {
-    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const baseUrl = await startServer({ documentRoot: docRoot });
     const { approvalId } = await aSignableApproval(
       BUSINESS,
       docRoot,
@@ -2341,7 +2345,7 @@ describe('signing an approval', () => {
   // hand-written POST reaches `/sign` with no form involved at all, and on
   // the other side of it is a permanent, un-deletable `signatures` row.
   it('refuses a signing POST on a card whose proposal is not a document decision', async () => {
-    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const baseUrl = await startServer({ documentRoot: docRoot });
     const { approvalId, documentId } = await aSignableApproval(
       BUSINESS,
       docRoot,
@@ -2360,15 +2364,15 @@ describe('signing an approval', () => {
     });
     expect(signRes.status).toBe(400);
 
-    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).toBeNull(); // TENANCY-TODO(task 10)
-    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('pending'); // TENANCY-TODO(task 10)
+    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).toBeNull();
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('pending');
   });
 
   // F6, spec §8 and §9: no document behind the approval, no sign control at
   // all. The route refuses such a POST (tested above), but the button must
   // never be on the page to begin with.
   it('renders no sign control on a card with no document behind it', async () => {
-    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const baseUrl = await startServer({ documentRoot: docRoot });
     const job = await jobAwaitingApproval(BUSINESS);
     const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
@@ -2384,7 +2388,7 @@ describe('signing an approval', () => {
 
 describe('tenant isolation', () => {
   it("hides another business's approval", async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const approvalId = await makeApproval({ businessId: OTHER_BUSINESS });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -2393,7 +2397,7 @@ describe('tenant isolation', () => {
   });
 
   it("refuses to decide another business's approval", async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const approvalId = await makeApproval({ businessId: OTHER_BUSINESS });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -2411,7 +2415,7 @@ describe('tenant isolation', () => {
     });
     expect(res.status).toBe(404);
 
-    const approval = await withBusiness(OTHER_BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(OTHER_BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('pending');
   });
 });
@@ -2423,10 +2427,10 @@ describe('session cookie', () => {
   // would silently discard every authorisation code before the ceremony
   // could ever complete in a real browser.
   it('locks the session cookie down', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const res = await fetch(`${baseUrl}/login`, {
       method: 'POST',
-      body: new URLSearchParams({ username: USERNAME, password: PASSWORD }),
+      body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
       redirect: 'manual',
     });
     const setCookie = res.headers.get('set-cookie') ?? '';
@@ -2438,14 +2442,14 @@ describe('session cookie', () => {
 
 describe('recovery-code login', () => {
   it('forces a password change after a recovery-code login', async () => {
-    const baseUrl = await startServer(BUSINESS);
-    const codes = await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
+    const baseUrl = await startServer();
+    const codes = await withBusiness(BUSINESS, (db) => issueRecoveryCodes(db, { username: USERNAME }));
     const code = codes[0];
     expect(code).toBeDefined();
 
     const loginRes = await fetch(`${baseUrl}/login`, {
       method: 'POST',
-      body: new URLSearchParams({ username: USERNAME, code: code! }),
+      body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), code: code! }),
       redirect: 'manual',
     });
     expect(loginRes.status).toBe(302);
@@ -2458,14 +2462,14 @@ describe('recovery-code login', () => {
   });
 
   it('refuses to decide an approval while a password change is pending, even with a valid CSRF token', async () => {
-    const baseUrl = await startServer(BUSINESS);
-    const codes = await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
+    const baseUrl = await startServer();
+    const codes = await withBusiness(BUSINESS, (db) => issueRecoveryCodes(db, { username: USERNAME }));
     const code = codes[0];
     expect(code).toBeDefined();
 
     const loginRes = await fetch(`${baseUrl}/login`, {
       method: 'POST',
-      body: new URLSearchParams({ username: USERNAME, code: code! }),
+      body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), code: code! }),
       redirect: 'manual',
     });
     const cookie = cookiePair(loginRes.headers.get('set-cookie'));
@@ -2487,14 +2491,14 @@ describe('recovery-code login', () => {
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/password');
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('pending');
   });
 
   it('shows how many recovery codes remain', async () => {
-    const baseUrl = await startServer(BUSINESS);
-    await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
-    const expected = await remainingCodes(USERNAME, { businessId: BUSINESS });
+    const baseUrl = await startServer();
+    await withBusiness(BUSINESS, (db) => issueRecoveryCodes(db, { username: USERNAME }));
+    const expected = await withBusiness(BUSINESS, (db) => remainingCodes(db, USERNAME));
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const res = await fetch(`${baseUrl}/`, { headers: { cookie } });
@@ -2534,7 +2538,7 @@ describe('changing the password', () => {
   // nothing but a session. Session theft was therefore permanent takeover:
   // rotate the password and the owner never gets back in.
   it('refuses without the current password', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const csrf = await csrfFor(baseUrl, cookie);
 
@@ -2547,12 +2551,12 @@ describe('changing the password', () => {
     expect(res.status).toBe(403);
 
     // Unchanged: the old password still works, the new one does not.
-    expect((await login({ username: USERNAME, password: PASSWORD, businessId: BUSINESS })).ok).toBe(true);
-    expect((await login({ username: USERNAME, password: NEW_PASSWORD, businessId: BUSINESS })).ok).toBe(false);
+    expect((await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }))).ok).toBe(true);
+    expect((await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: NEW_PASSWORD }))).ok).toBe(false);
   });
 
   it('refuses with the wrong current password', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const csrf = await csrfFor(baseUrl, cookie);
 
@@ -2565,11 +2569,11 @@ describe('changing the password', () => {
       redirect: 'manual',
     });
     expect(res.status).toBe(403);
-    expect((await login({ username: USERNAME, password: PASSWORD, businessId: BUSINESS })).ok).toBe(true);
+    expect((await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }))).ok).toBe(true);
   });
 
   it('accepts with the current password', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const csrf = await csrfFor(baseUrl, cookie);
 
@@ -2582,17 +2586,17 @@ describe('changing the password', () => {
       redirect: 'manual',
     });
     expect(res.status).toBe(302);
-    expect((await login({ username: USERNAME, password: NEW_PASSWORD, businessId: BUSINESS })).ok).toBe(true);
+    expect((await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: NEW_PASSWORD }))).ok).toBe(true);
   });
 
   // The one path where there is no current password to ask for: the owner
   // just proved ownership with a recovery code, which is why they are here.
   it('does not ask for a current password on the forced change after a recovery code', async () => {
-    const baseUrl = await startServer(BUSINESS);
-    const codes = await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
+    const baseUrl = await startServer();
+    const codes = await withBusiness(BUSINESS, (db) => issueRecoveryCodes(db, { username: USERNAME }));
     const loginRes = await fetch(`${baseUrl}/login`, {
       method: 'POST',
-      body: new URLSearchParams({ username: USERNAME, code: codes[0]! }),
+      body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), code: codes[0]! }),
       redirect: 'manual',
     });
     const cookie = cookiePair(loginRes.headers.get('set-cookie'));
@@ -2610,7 +2614,7 @@ describe('changing the password', () => {
       redirect: 'manual',
     });
     expect(res.status).toBe(302);
-    expect((await login({ username: USERNAME, password: NEW_PASSWORD, businessId: BUSINESS })).ok).toBe(true);
+    expect((await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: NEW_PASSWORD }))).ok).toBe(true);
   });
 });
 
@@ -2632,15 +2636,15 @@ describe('the address a recovery redemption is audited from', () => {
     const res = await fetch(`${baseUrl}/login`, {
       method: 'POST',
       headers: { 'x-forwarded-for': forwardedFor },
-      body: new URLSearchParams({ username: USERNAME, code }),
+      body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), code }),
       redirect: 'manual',
     });
     expect(res.status).toBe(302);
   }
 
   it('records the proxy hop as a proxy hop, and never believes a header it was not told to trust', async () => {
-    const baseUrl = await startServer(BUSINESS);
-    const codes = await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
+    const baseUrl = await startServer();
+    const codes = await withBusiness(BUSINESS, (db) => issueRecoveryCodes(db, { username: USERNAME }));
     await redeem(baseUrl, codes[0]!, '203.0.113.9');
 
     const reason = await redemptionAudit(BUSINESS);
@@ -2652,8 +2656,8 @@ describe('the address a recovery redemption is audited from', () => {
   });
 
   it('records the nearest hop of a forwarded-for header when the deployment says to trust one', async () => {
-    const baseUrl = await startServer(BUSINESS, { trustProxy: true });
-    const codes = await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
+    const baseUrl = await startServer({ trustProxy: true });
+    const codes = await withBusiness(BUSINESS, (db) => issueRecoveryCodes(db, { username: USERNAME }));
     // Two entries: the left one is whatever the client sent, the right one
     // is what the trusted proxy appended. The right one is the answer.
     await redeem(baseUrl, codes[0]!, '198.51.100.7, 203.0.113.9');
@@ -2666,7 +2670,7 @@ describe('the address a recovery redemption is audited from', () => {
 
 describe('HTML escaping', () => {
   it('escapes HTML in the proposed input', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const payload = '<script>alert(1)</script>';
     const approvalId = await makeApproval({
       businessId: BUSINESS,
@@ -2684,7 +2688,7 @@ describe('HTML escaping', () => {
     // `<script>` alone proves nothing about the textarea specifically — a
     // textarea's content is RCDATA, and the one sequence that actually ends
     // it early is its own closing tag. This is the payload that matters.
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const payload = '</textarea><script>alert(1)</script>';
     const approvalId = await makeApproval({
       businessId: BUSINESS,
@@ -2705,7 +2709,7 @@ describe('HTML escaping', () => {
     // the text in the form submission, so this reproduces exactly what an
     // owner who opens the card and clicks approve without touching anything
     // actually sends.
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const original = { note: 'שלום <b>עולם</b> & "מרכאות" \'גרש\'' };
     const approvalId = await makeApproval({ businessId: BUSINESS, proposedInput: original });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
@@ -2723,7 +2727,7 @@ describe('HTML escaping', () => {
     });
     expect(decideRes.status).toBe(302);
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('approved');
     expect(approval?.editedInput).toBeNull();
   });
@@ -2731,7 +2735,7 @@ describe('HTML escaping', () => {
 
 describe('editing before approval', () => {
   it('stores the edited payload and yields approved_with_edit when something actually changed', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const job = await jobAwaitingApproval(BUSINESS);
     const original = { to: 'client@example.com', body: 'טקסט מקורי' };
     const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId, proposedInput: original });
@@ -2749,7 +2753,7 @@ describe('editing before approval', () => {
     });
     expect(decideRes.status).toBe(302);
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('approved_with_edit');
     expect(approval?.editedInput).toEqual(edited);
     const updatedJob = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
@@ -2757,7 +2761,7 @@ describe('editing before approval', () => {
   });
 
   it('approves plainly when the resubmitted payload is unchanged, even reformatted', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const original = { to: 'client@example.com', body: 'שלום' };
     const approvalId = await makeApproval({ businessId: BUSINESS, proposedInput: original });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
@@ -2776,13 +2780,13 @@ describe('editing before approval', () => {
     });
     expect(decideRes.status).toBe(302);
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('approved');
     expect(approval?.editedInput).toBeNull();
   });
 
   it('refuses malformed JSON with a readable Hebrew message and leaves the approval pending', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const approvalId = await makeApproval({ businessId: BUSINESS });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -2802,12 +2806,12 @@ describe('editing before approval', () => {
     // in-progress edit on a typo would be its own kind of data loss.
     expect(body).toContain('{not valid json');
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('pending');
   });
 
   it('preserves the typed note on a refusal too, not just the payload', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const approvalId = await makeApproval({ businessId: BUSINESS });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -2833,7 +2837,7 @@ describe('editing before approval', () => {
   ])(
     'refuses a valid-JSON-but-non-object edit (%s), the same as malformed JSON, and never executes it',
     async (_label, raw) => {
-      const baseUrl = await startServer(BUSINESS);
+      const baseUrl = await startServer();
       const job = await jobAwaitingApproval(BUSINESS);
       const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
       const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
@@ -2855,7 +2859,7 @@ describe('editing before approval', () => {
       // handed to the job. `null` in particular used to sail through into
       // `approved_with_edit` and then get silently ignored by the executor,
       // which is the failure mode this test exists to close off.
-      const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+      const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
       expect(approval?.state).toBe('pending');
       expect(approval?.editedInput).toBeNull();
       const jobAfter = await withBusiness(BUSINESS, (db) => loadJob(db, job.jobId));
@@ -2864,7 +2868,7 @@ describe('editing before approval', () => {
   );
 
   it('refuses an oversized edit with a readable message instead of a 500', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const approvalId = await makeApproval({ businessId: BUSINESS });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -2882,12 +2886,12 @@ describe('editing before approval', () => {
     const body = await decideRes.text();
     expect(body).toContain('גדול מדי');
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('pending');
   });
 
   it('refuses an edited approve without a CSRF token', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const approvalId = await makeApproval({ businessId: BUSINESS });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -2899,12 +2903,12 @@ describe('editing before approval', () => {
     });
     expect(res.status).toBe(403);
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('pending');
   });
 
   it('refuses an edited approve without a session', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const approvalId = await makeApproval({ businessId: BUSINESS });
 
     const res = await fetch(`${baseUrl}/a/${approvalId}/approve`, {
@@ -2915,21 +2919,21 @@ describe('editing before approval', () => {
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');
 
-    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('pending');
   });
 });
 
 describe('GET /autonomy — the owner’s dial', () => {
   it('redirects to login without a session', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const res = await fetch(`${baseUrl}/autonomy`, { redirect: 'manual' });
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');
   });
 
   it('shows the current mode and all three positions', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const res = await fetch(`${baseUrl}/autonomy`, { headers: { cookie } });
@@ -2944,7 +2948,7 @@ describe('GET /autonomy — the owner’s dial', () => {
   });
 
   it('changes the mode and writes an audit row', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const getRes = await fetch(`${baseUrl}/autonomy`, { headers: { cookie } });
@@ -2959,11 +2963,11 @@ describe('GET /autonomy — the owner’s dial', () => {
     expect(postRes.status).toBe(302);
     expect(postRes.headers.get('location')).toBe('/autonomy');
 
-    expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('learn'); // TENANCY-TODO(task 10)
+    expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('learn');
   });
 
   it('refuses a mode change without a CSRF token', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const res = await fetch(`${baseUrl}/autonomy/mode`, {
@@ -2973,14 +2977,14 @@ describe('GET /autonomy — the owner’s dial', () => {
       redirect: 'manual',
     });
     expect(res.status).toBe(403);
-    expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off'); // TENANCY-TODO(task 10)
+    expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off');
   });
 });
 
 describe('GET /autonomy — the learning level and the update channels', () => {
   it('shows the learning level in Hebrew, with no raw class id', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
-    const baseUrl = await startServer(BUSINESS);
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const body = await (await fetch(`${baseUrl}/autonomy`, { headers: { cookie } })).text();
@@ -2999,7 +3003,7 @@ describe('GET /autonomy — the learning level and the update channels', () => {
         WHERE business_id = $1`,
       [BUSINESS],
     );
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const res = await fetch(`${baseUrl}/autonomy`, { headers: { cookie } });
@@ -3010,7 +3014,7 @@ describe('GET /autonomy — the learning level and the update channels', () => {
   });
 
   it('shows the three channels with the defaults checked and the WhatsApp note', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const body = await (await fetch(`${baseUrl}/autonomy`, { headers: { cookie } })).text();
@@ -3021,7 +3025,7 @@ describe('GET /autonomy — the learning level and the update channels', () => {
   });
 
   it('saves the chosen channels', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const csrf = extractCsrf(await (await fetch(`${baseUrl}/autonomy`, { headers: { cookie } })).text());
 
@@ -3041,7 +3045,7 @@ describe('GET /autonomy — the learning level and the update channels', () => {
   });
 
   it('refuses all three unchecked, says so in Hebrew, and saves nothing', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const csrf = extractCsrf(await (await fetch(`${baseUrl}/autonomy`, { headers: { cookie } })).text());
 
@@ -3061,7 +3065,7 @@ describe('GET /autonomy — the learning level and the update channels', () => {
   });
 
   it('refuses a channel change without a CSRF token', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const res = await fetch(`${baseUrl}/autonomy/updates`, {
@@ -3097,7 +3101,7 @@ describe('GET /autonomy/actions — "חדש" on the screen channel', () => {
     const { jobId, stepId } = await seedAutonomousAction(BUSINESS);
     await updateRow(BUSINESS, jobId, stepId);
     await updateRow(OTHER_BUSINESS, jobId, stepId);
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const first = await (await fetch(`${baseUrl}/autonomy/actions`, { headers: { cookie } })).text();
@@ -3112,7 +3116,7 @@ describe('GET /autonomy/actions — "חדש" on the screen channel', () => {
 
   it('never marks a step that has no update row', async () => {
     const { jobId } = await seedAutonomousAction(BUSINESS);
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const body = await (await fetch(`${baseUrl}/autonomy/actions`, { headers: { cookie } })).text();
@@ -3124,7 +3128,7 @@ describe('GET /autonomy/actions — "חדש" on the screen channel', () => {
     const { jobId, stepId } = await seedAutonomousAction(BUSINESS);
     await updateRow(BUSINESS, jobId, stepId);
     await withBusiness(BUSINESS, (bdb) => saveActionUpdateSettings(bdb, { toWhatsApp: false, toEmail: true, toScreen: false }, { updatedBy: USERNAME }));
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const body = await (await fetch(`${baseUrl}/autonomy/actions`, { headers: { cookie } })).text();
@@ -3135,7 +3139,7 @@ describe('GET /autonomy/actions — "חדש" on the screen channel', () => {
 
 describe('GET /autonomy/actions — what she did on her own', () => {
   it('redirects to login without a session', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const res = await fetch(`${baseUrl}/autonomy/actions`, { redirect: 'manual' });
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');
@@ -3143,7 +3147,7 @@ describe('GET /autonomy/actions — what she did on her own', () => {
 
   it('lists a step that ran without a card', async () => {
     const { jobId } = await seedAutonomousAction(BUSINESS);
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const res = await fetch(`${baseUrl}/autonomy/actions`, { headers: { cookie } });
@@ -3163,7 +3167,7 @@ describe('GET /autonomy/actions — what she did on her own', () => {
 describe('POST /autonomy/actions/:jobId/:stepId/mark', () => {
   it('redirects to login without a session', async () => {
     const { jobId, stepId } = await seedAutonomousAction(BUSINESS);
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
 
     const res = await fetch(`${baseUrl}/autonomy/actions/${jobId}/${stepId}/mark`, {
       method: 'POST',
@@ -3179,7 +3183,7 @@ describe('POST /autonomy/actions/:jobId/:stepId/mark', () => {
 
   it('refuses a mark without a valid CSRF token', async () => {
     const { jobId, stepId } = await seedAutonomousAction(BUSINESS);
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const res = await fetch(`${baseUrl}/autonomy/actions/${jobId}/${stepId}/mark`, {
@@ -3196,7 +3200,7 @@ describe('POST /autonomy/actions/:jobId/:stepId/mark', () => {
 
   it('records a mark with a valid token, and does not touch the step it marks', async () => {
     const { jobId, stepId } = await seedAutonomousAction(BUSINESS);
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const listRes = await fetch(`${baseUrl}/autonomy/actions`, { headers: { cookie } });
@@ -3239,7 +3243,7 @@ describe('POST /autonomy/actions/:jobId/:stepId/mark', () => {
   });
 
   it('refuses to mark a job/step pair that is not in the autonomous list', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const listRes = await fetch(`${baseUrl}/autonomy/actions`, { headers: { cookie } });
@@ -3263,14 +3267,14 @@ describe('digest screen', () => {
    * preview needs the charter's time zone and money ceiling, same as
    * `runDigests` (`digest-run.ts`). */
   async function digestSession(businessId: string): Promise<{ baseUrl: string; cookie: string }> {
-    const baseUrl = await startServer(businessId);
-    await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    const baseUrl = await startServer();
+    await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter()));
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     return { baseUrl, cookie };
   }
 
   it('requires a session, like the other authenticated screens', async () => {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const res = await fetch(`${baseUrl}/digest`, { redirect: 'manual' });
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');
@@ -3401,7 +3405,7 @@ describe('digest screen', () => {
    */
   it('sends the owner to the setup interview when no charter has been signed yet', async () => {
     await getPool().query('DELETE FROM charter_active WHERE business_id = $1', [BUSINESS]);
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const res = await fetch(`${baseUrl}/digest`, { headers: { cookie }, redirect: 'manual' });
@@ -3418,8 +3422,8 @@ describe('digest screen', () => {
    * 200, still with the history and the form.
    */
   it('renders 200 with a message distinct from "none yet" when the signed charter cannot be read', async () => {
-    const baseUrl = await startServer(BUSINESS);
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
+    const baseUrl = await startServer();
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     await getPool().query(
       `UPDATE charter_versions
           SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb($2::text))
@@ -3572,10 +3576,10 @@ describe('boss-command confirmation on the dashboard', () => {
     businessId: string = BUSINESS,
   ): Promise<string> {
     // One charter per business: installing the same one twice collides.
-    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
+    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb));
     const charterVersion =
       active?.charter.charterVersion ??
-      (await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter()))).charterVersion; // TENANCY-TODO(task 10)
+      (await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter()))).charterVersion;
     const job = await withBusiness(businessId, (db) => createJob(db, { charterVersion, provenance: 'boss' }));
     await withBusiness(businessId, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId: job.jobId, text: 'תשלחי לדנה תזכורת' }));
     await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't' }));
@@ -3601,7 +3605,7 @@ describe('boss-command confirmation on the dashboard', () => {
   }
 
   async function signedIn(): Promise<{ baseUrl: string; cookie: string; csrf: string }> {
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const page = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
     return { baseUrl, cookie, csrf: extractCsrf(await page.text()) };
@@ -3625,12 +3629,12 @@ describe('boss-command confirmation on the dashboard', () => {
         body = typeof chunk === 'string' ? chunk : '';
       },
     } as unknown as ServerResponse;
-    await renderInstructionOutcome(
+    await withBusiness(BUSINESS, (db) => renderInstructionOutcome(
       res,
       { sessionId: 'S1', username: 'owner', mustChangePassword: false },
       outcome,
-      BUSINESS,
-    );
+      db,
+    ));
     return body;
   }
 
@@ -3686,7 +3690,7 @@ describe('boss-command confirmation on the dashboard', () => {
 
   it('refuses without a session', async () => {
     const jobId = await heldCommand([SINGLE]);
-    const baseUrl = await startServer(BUSINESS);
+    const baseUrl = await startServer();
     const res = await confirmPost(baseUrl, '', jobId, { planHash: SINGLE.planHash });
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');

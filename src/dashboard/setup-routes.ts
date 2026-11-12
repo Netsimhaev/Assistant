@@ -48,7 +48,7 @@ import {
 } from './setup-forms.js';
 import { RULE_TEXT_MAX, renderStep, type StepView } from './setup-step-views.js';
 import { STEP_COUNT, UNREADABLE_NOTICE, renderSetupRefusal, renderSummary } from './setup-views.js';
-import { withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 export interface SetupSession {
   sessionId: string;
@@ -99,9 +99,9 @@ function sectionOf(step: number): SectionName {
 }
 
 /** The base charter of the draft, for the two steps that depend on it; unreadable or gone → none. */
-async function baseOf(draft: InterviewDraft | null, businessId: string): Promise<BusinessCharter | null> {
+async function baseOf(draft: InterviewDraft | null, db: BusinessDb): Promise<BusinessCharter | null> {
   if (draft === null) return null;
-  const base = await withBusiness(businessId, (bdb) => previousForDraft(bdb, draft)); // TENANCY-TODO(task 10)
+  const base = await previousForDraft(db, draft);
   return base.ok ? base.previous : null;
 }
 
@@ -111,7 +111,7 @@ function mailboxPinnedBy(previous: BusinessCharter | null): MailProvider | null 
 }
 
 async function stepView(
-  businessId: string,
+  db: BusinessDb,
   session: SetupSession,
   step: number,
   draft: InterviewDraft | null,
@@ -127,23 +127,23 @@ async function stepView(
     ...extra,
   };
   if (step === 5 || step === 6) {
-    const previous = await baseOf(draft, businessId);
+    const previous = await baseOf(draft, db);
     view.pinnedMailbox = mailboxPinnedBy(previous);
     const provider = answers.reading?.mailbox ?? 'none';
     view.connections = buildConnections(provider === 'none' ? null : provider, previous).connections;
   }
   // Step 9 preselects the dial as it is now: on an edit, the live position.
-  if (step === 9) view.currentMode = await withBusiness(businessId, (bdb) => loadAutonomyMode(bdb)); // TENANCY-TODO(task 10)
+  if (step === 9) view.currentMode = await loadAutonomyMode(db);
   return view;
 }
 
 // --- GET /setup --------------------------------------------------------------
 
-export async function handleSetupIndex(res: ServerResponse, businessId: string): Promise<void> {
-  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
+export async function handleSetupIndex(res: ServerResponse, db: BusinessDb): Promise<void> {
+  const draft = await loadDraft(db);
   // A charter is active and no interview is in flight: "edit the rules" is
   // the door that fills the draft from it.
-  if (draft === null && (await withBusiness(businessId, (bdb) => activeCharterVersion(bdb))) !== null) return seeOther(res, '/setup/edit'); // TENANCY-TODO(task 10)
+  if (draft === null && (await activeCharterVersion(db)) !== null) return seeOther(res, '/setup/edit');
   const next = firstUnsavedStep(draft?.answers ?? null);
   seeOther(res, next === null ? '/setup/summary' : `/setup/step/${next}`);
 }
@@ -157,53 +157,53 @@ export async function handleSetupIndex(res: ServerResponse, businessId: string):
  * re-typed. The same rule `handleSetupIndex` applies, at every door that can
  * create a draft.
  */
-async function editMustStartFromPrefill(draft: InterviewDraft | null, businessId: string): Promise<boolean> {
-  return draft === null && (await withBusiness(businessId, (bdb) => activeCharterVersion(bdb))) !== null; // TENANCY-TODO(task 10)
+async function editMustStartFromPrefill(draft: InterviewDraft | null, db: BusinessDb): Promise<boolean> {
+  return draft === null && (await activeCharterVersion(db)) !== null;
 }
 
 export async function handleSetupStepGet(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: SetupSession,
   step: number,
   query: URLSearchParams,
 ): Promise<void> {
-  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
-  if (await editMustStartFromPrefill(draft, businessId)) return seeOther(res, '/setup/edit');
-  const view = await stepView(businessId, session, step, draft, step === 1 && query.get('more') === '1' ? { followUp: true } : {});
+  const draft = await loadDraft(db);
+  if (await editMustStartFromPrefill(draft, db)) return seeOther(res, '/setup/edit');
+  const view = await stepView(db, session, step, draft, step === 1 && query.get('more') === '1' ? { followUp: true } : {});
   sendHtml(res, 200, renderStep(view));
 }
 
 export async function handleSetupStepPost(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: SetupSession,
   step: number,
   form: URLSearchParams,
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return refuseCsrf(res);
   const section = sectionOf(step);
-  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
-  if (await editMustStartFromPrefill(draft, businessId)) return seeOther(res, '/setup/edit');
+  const draft = await loadDraft(db);
+  if (await editMustStartFromPrefill(draft, db)) return seeOther(res, '/setup/edit');
   let candidate = candidateFromForm(section, form, draft?.answers ?? {});
 
   // Step 5: a mailbox the base charter already declares is not the form's to
   // change (spec §6.6) — pinned server-side, whatever was posted.
   if (section === 'reading') {
-    const pinned = mailboxPinnedBy(await baseOf(draft, businessId));
+    const pinned = mailboxPinnedBy(await baseOf(draft, db));
     if (pinned !== null) candidate = { ...(candidate as object), mailbox: pinned };
   }
 
   const issues = validateSection(section, candidate);
   if (issues.length > 0) {
-    const view = await stepView(businessId, session, step, draft, { value: candidate, issues });
+    const view = await stepView(db, session, step, draft, { value: candidate, issues });
     return sendHtml(res, 400, renderStep(view));
   }
 
   // The draft's base is the charter active when the interview started; a
   // draft that starts now starts from whatever is active now.
-  const baseCharterVersion = draft === null ? await withBusiness(businessId, (bdb) => activeCharterVersion(bdb)) : undefined; // TENANCY-TODO(task 10)
-  await withBusiness(businessId, (bdb) => saveSection(bdb, section, candidate, baseCharterVersion === undefined ? {} : { baseCharterVersion })); // TENANCY-TODO(task 10)
+  const baseCharterVersion = draft === null ? await activeCharterVersion(db) : undefined;
+  await saveSection(db, section, candidate, baseCharterVersion === undefined ? {} : { baseCharterVersion });
 
   if (step === 1 && form.get('followed') !== '1' && needsFollowUp(candidate)) {
     return seeOther(res, '/setup/step/1?more=1');
@@ -222,12 +222,12 @@ function extraOf(draft: InterviewDraft | null): { accepted: AcceptedRule[]; pend
 async function renderStep10(
   res: ServerResponse,
   status: number,
-  businessId: string,
+  db: BusinessDb,
   session: SetupSession,
   extra: Partial<StepView>,
 ): Promise<void> {
-  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
-  sendHtml(res, status, renderStep(await stepView(businessId, session, 10, draft, extra)));
+  const draft = await loadDraft(db);
+  sendHtml(res, status, renderStep(await stepView(db, session, 10, draft, extra)));
 }
 
 /**
@@ -239,7 +239,7 @@ async function renderStep10(
  */
 export async function handleRulePost(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: SetupSession,
   form: URLSearchParams,
   options: SetupOptions,
@@ -247,22 +247,22 @@ export async function handleRulePost(
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return refuseCsrf(res);
   const text = (form.get('text') ?? '').trim();
   if (text.length === 0) {
-    return renderStep10(res, 400, businessId, session, { ruleError: 'יש לכתוב משפט לפני שמבקשים הצעה.' });
+    return renderStep10(res, 400, db, session, { ruleError: 'יש לכתוב משפט לפני שמבקשים הצעה.' });
   }
   if (text.length > RULE_TEXT_MAX) {
-    return renderStep10(res, 400, businessId, session, {
+    return renderStep10(res, 400, db, session, {
       ruleText: text,
       ruleError: `המשפט ארוך מדי — עד ${RULE_TEXT_MAX} תווים. אפשר לפצל אותו לכמה משפטים.`,
     });
   }
-  if (await editMustStartFromPrefill(await withBusiness(businessId, (bdb) => loadDraft(bdb)), businessId)) return seeOther(res, '/setup/edit'); // TENANCY-TODO(task 10)
+  if (await editMustStartFromPrefill(await loadDraft(db), db)) return seeOther(res, '/setup/edit');
   const proposer = options.ruleProposer ?? proposeRuleWithModel;
   const proposal = await proposer(text);
-  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
+  const draft = await loadDraft(db);
   const extra = extraOf(draft);
   extra.pending.push(proposal);
-  const baseCharterVersion = draft === null ? await withBusiness(businessId, (bdb) => activeCharterVersion(bdb)) : undefined; // TENANCY-TODO(task 10)
-  await withBusiness(businessId, (bdb) => saveSection(bdb, 'extra', extra, baseCharterVersion === undefined ? {} : { baseCharterVersion })); // TENANCY-TODO(task 10)
+  const baseCharterVersion = draft === null ? await activeCharterVersion(db) : undefined;
+  await saveSection(db, 'extra', extra, baseCharterVersion === undefined ? {} : { baseCharterVersion });
   seeOther(res, '/setup/step/10');
 }
 
@@ -279,7 +279,7 @@ const RULE_CHOICES = new Set(['accept', 'guidance', 'delete', 'fix', 'remove']);
  */
 export async function handleRuleChoice(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: SetupSession,
   index: number,
   form: URLSearchParams,
@@ -287,34 +287,35 @@ export async function handleRuleChoice(
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return refuseCsrf(res);
   const choice = form.get('choice') ?? '';
   if (!RULE_CHOICES.has(choice)) {
-    return renderStep10(res, 400, businessId, session, { ruleError: 'בחירה לא מוכרת. לא בוצעה כל פעולה.' });
+    return renderStep10(res, 400, db, session, { ruleError: 'בחירה לא מוכרת. לא בוצעה כל פעולה.' });
   }
-  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
+  const draft = await loadDraft(db);
   const extra = extraOf(draft);
   const list = choice === 'remove' ? extra.accepted : extra.pending;
   const rule = list[index];
   // The index is only a position; the hash says WHICH rule the owner saw.
   if (rule === undefined || canonicalHash(rule) !== form.get('ruleHash')) {
-    return renderStep10(res, 409, businessId, session, {
+    return renderStep10(res, 409, db, session, {
       ruleError: 'ההצעה הזו כבר השתנתה או לא קיימת — אולי כבר החלטת עליה. לא בוצעה כל פעולה; זו הרשימה כפי שהיא עכשיו.',
     });
   }
   list.splice(index, 1);
   if (choice === 'accept') extra.accepted.push(rule);
   if (choice === 'guidance') extra.accepted.push({ kind: 'guidance', text: rule.text });
-  await withBusiness(businessId, (bdb) => saveSection(bdb, 'extra', extra)); // TENANCY-TODO(task 10)
-  if (choice === 'fix') return renderStep10(res, 200, businessId, session, { ruleText: rule.text });
+  await saveSection(db, 'extra', extra);
+  if (choice === 'fix') return renderStep10(res, 200, db, session, { ruleText: rule.text });
   seeOther(res, '/setup/step/10');
 }
 
 // --- summary and sign --------------------------------------------------------
 
-export async function handleSummaryGet(res: ServerResponse, businessId: string, session: SetupSession): Promise<void> {
-  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
+export async function handleSummaryGet(res: ServerResponse, db: BusinessDb, session: SetupSession): Promise<void> {
+  const businessId = db.businessId;
+  const draft = await loadDraft(db);
   const parsed = InterviewAnswers.safeParse(draft?.answers);
   if (draft === null || !parsed.success) return seeOther(res, '/setup');
   if (parsed.data.extra.pending.length > 0) return seeOther(res, '/setup/step/10');
-  const base = await withBusiness(businessId, (bdb) => previousForDraft(bdb, draft)); // TENANCY-TODO(task 10)
+  const base = await previousForDraft(db, draft);
   if (!base.ok) {
     return sendHtml(
       res,
@@ -326,7 +327,7 @@ export async function handleSummaryGet(res: ServerResponse, businessId: string, 
       ),
     );
   }
-  const frozenAt = await withBusiness(businessId, (bdb) => freezeDraft(bdb, new Date())); // TENANCY-TODO(task 10)
+  const frozenAt = await freezeDraft(db, new Date());
   const unsigned = buildCharterFromInterview(parsed.data, { businessId, frozenAt, previous: base.previous });
   const summary = summarizeCharter(unsigned, { previous: base.previous, documentsWanted: parsed.data.reading.documents });
   sendHtml(
@@ -369,13 +370,13 @@ const REFUSAL: Readonly<Record<'incomplete' | 'not_frozen' | 'hash_mismatch' | '
  */
 export async function handleSignPost(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: SetupSession,
   form: URLSearchParams,
   options: SetupOptions,
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return refuseCsrf(res);
-  const outcome = await withBusiness(businessId, (bdb) => signAndInstallInterview(bdb, { username: session.username, shownHash: form.get('shownHash') ?? '', mailboxPreflight: (provider) => oauthCeremonyPreflight(businessId, provider, options.credentialKeyPath) })); // TENANCY-TODO(task 10)
+  const outcome = await signAndInstallInterview(db, { username: session.username, shownHash: form.get('shownHash') ?? '', mailboxPreflight: (provider) => oauthCeremonyPreflight(db, provider, options.credentialKeyPath) });
   if (outcome.outcome === 'installed') return seeOther(res, outcome.modeApplied ? '/' : '/?mode=failed');
   if (outcome.outcome === 'preflight_failed') {
     return sendHtml(
@@ -400,21 +401,21 @@ export async function handleSignPost(
  *     signature replaces the charter nobody can read;
  *   - none → the first-time interview.
  */
-export async function handleSetupEdit(res: ServerResponse, businessId: string, session: SetupSession): Promise<void> {
-  const probe = await withBusiness(businessId, (bdb) => probeActiveCharter(bdb)); // TENANCY-TODO(task 10)
-  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
+export async function handleSetupEdit(res: ServerResponse, db: BusinessDb, session: SetupSession): Promise<void> {
+  const probe = await probeActiveCharter(db);
+  const draft = await loadDraft(db);
   if (probe.ok) {
     if (probe.active === null) return seeOther(res, '/setup');
     const version = probe.active.charter.charterVersion;
     if (draft === null || draft.baseCharterVersion !== version) {
       const prefill = prefillFromCharter(probe.active.charter);
-      await withBusiness(businessId, (bdb) => replaceDraft(bdb, prefill, version)); // TENANCY-TODO(task 10)
+      await replaceDraft(db, prefill, version);
     }
     return seeOther(res, '/setup/step/1');
   }
   console.error('setup edit: the active charter does not parse:', probe.reason);
-  const version = await withBusiness(businessId, (bdb) => activeCharterVersion(bdb)); // TENANCY-TODO(task 10)
+  const version = await activeCharterVersion(db);
   const current =
-    draft !== null && draft.baseCharterVersion === version ? draft : await withBusiness(businessId, (bdb) => replaceDraft(bdb, {}, version)); // TENANCY-TODO(task 10)
-  sendHtml(res, 200, renderStep(await stepView(businessId, session, 1, current, { notice: UNREADABLE_NOTICE })));
+    draft !== null && draft.baseCharterVersion === version ? draft : await replaceDraft(db, {}, version);
+  sendHtml(res, 200, renderStep(await stepView(db, session, 1, current, { notice: UNREADABLE_NOTICE })));
 }

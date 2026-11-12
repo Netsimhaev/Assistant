@@ -1,7 +1,6 @@
 import { createHash, randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
-import { config } from '../config.js';
-import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { isValidBusinessId, transaction, type BusinessDb, type Queryable } from '../db/pool.js';
 import { recordUnknownUserFailure, unknownUserLocked } from './unknown-user-throttle.js';
 
 const scrypt = promisify(scryptCb) as (
@@ -77,13 +76,55 @@ function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
 
+/**
+ * The login as it is stored and matched: trimmed and lower-cased, the same
+ * normalisation `resolveLogin` (src/tenancy/platform.ts) and the unique index
+ * on `lower(login)` (migration 066) use. One function, so the three cannot
+ * disagree about whether `" Dana@X.example "` is `dana@x.example`.
+ */
+export function normaliseLogin(login: string): string {
+  return login.trim().toLowerCase();
+}
+
+/**
+ * The session cookie's value: `<businessId>.<token>` (spec §5.5).
+ *
+ * The business part tells the server which `withBusiness` to open; the token
+ * is then looked up inside it. A business id cannot contain `.`
+ * (`^[a-z0-9-]{3,63}$`), so the first `.` is always the separator.
+ */
+export function sessionCookieValue(businessId: string, token: string): string {
+  return `${businessId}.${token}`;
+}
+
+/**
+ * The cookie value split back into its business and token, or `null`.
+ *
+ * `null` for a value with no `.` — an old cookie from before migration 066,
+ * which carried the token alone — and for a business part that is not a
+ * valid id. Both are "logged out", never an error page: the caller sends the
+ * owner to the login form (Review Focus 6). A well-formed business part does
+ * not make the cookie trusted; the token must still be found under that
+ * business, and a forged business part is simply a miss.
+ */
+export function parseSessionCookie(value: string): { businessId: string; token: string } | null {
+  const dot = value.indexOf('.');
+  if (dot === -1) return null;
+  const businessId = value.slice(0, dot);
+  const token = value.slice(dot + 1);
+  if (token.length === 0 || !isValidBusinessId(businessId)) return null;
+  return { businessId, token };
+}
+
 interface UserRow {
+  username: string;
   password_hash: string;
   password_salt: string;
   locked_until: Date | null;
 }
 
 interface UserRecord {
+  username: string;
   passwordHash: string;
   passwordSalt: string;
   lockedUntil: Date | null;
@@ -91,6 +132,7 @@ interface UserRecord {
 
 function toUserRecord(row: UserRow): UserRecord {
   return {
+    username: row.username,
     passwordHash: row.password_hash,
     passwordSalt: row.password_salt,
     lockedUntil: row.locked_until,
@@ -104,69 +146,91 @@ interface SessionRow {
   must_change_password: boolean;
 }
 
-export async function createOwner(input: {
-  username: string;
-  password: string;
-  businessId?: string;
-}): Promise<void> {
-  const businessId = input.businessId ?? config.businessId;
+/**
+ * `login` is the email the owner signs in with, unique across the whole
+ * server (migration 066); it is stored normalised. `username` is the
+ * account's name inside its business — sessions, recovery codes and the
+ * audit trail name it.
+ */
+export async function createOwner(
+  db: BusinessDb,
+  input: { username: string; login: string; password: string },
+): Promise<void> {
   const { hash, salt } = await hashPassword(input.password);
-  await getPool().query(
-    `INSERT INTO dashboard_users (business_id, username, password_hash, password_salt)
-     VALUES ($1, $2, $3, $4)`,
-    [businessId, input.username, hash, salt],
+  await db.query(
+    `INSERT INTO dashboard_users (business_id, username, login, password_hash, password_salt)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [db.businessId, input.username, normaliseLogin(input.login), hash, salt],
   );
 }
 
-export async function login(input: {
-  username: string;
-  password: string;
-  businessId?: string;
-  now?: Date;
-}): Promise<{ ok: true; sessionId: string } | { ok: false; code: 'bad_credentials' | 'locked' }> {
-  const businessId = input.businessId ?? config.businessId;
+/**
+ * The password login, inside the business `resolveLogin` already found for
+ * `input.login`. The failure counters and the lock are this business's own
+ * row's (spec §5.5); the session is minted for the row's `username`.
+ */
+/**
+ * A password login whose address names no account: the dashboard calls this
+ * when `resolveLogin` found nothing, on a connection with no business
+ * (`withNoBusiness`), and `login` calls it when the row vanished.
+ *
+ * A login with no row has no counter of its own, so its failures go to the
+ * shared unknown-login bucket (./unknown-user-throttle.js), one for the whole
+ * server. Without it, the UPDATE in `login` matched nothing and this branch
+ * was an unthrottled scrypt call for anyone who could reach the port — one
+ * call rather than recovery's eight, but still unbounded, and still the
+ * owner's only way in.
+ *
+ * A locked bucket returns before the decoy runs. That is the same trade the
+ * per-user lock already makes ('locked' is answered without touching a hash),
+ * and it is what a throttle is: still paying the cost would defeat the point.
+ * Reported as `bad_credentials`, never a distinct code — an unknown login
+ * must not become distinguishable by its reply.
+ */
+export async function loginUnknown(
+  db: Queryable,
+  password: string,
+  now: Date = new Date(),
+): Promise<{ ok: false; code: 'bad_credentials' }> {
+  const throttle = {
+    kind: 'login' as const,
+    maxFailed: MAX_FAILED,
+    lockMinutes: LOCK_MINUTES,
+    now,
+    db,
+  };
+  if (await unknownUserLocked(throttle)) return { ok: false, code: 'bad_credentials' };
+
+  // Pay the same scrypt cost a real user would, so "no such user" and
+  // "wrong password" are not distinguishable by timing.
+  await verifyPassword(password, DECOY_HASH, DECOY_SALT);
+  await recordUnknownUserFailure(throttle);
+  return { ok: false, code: 'bad_credentials' };
+}
+
+export async function login(
+  db: BusinessDb,
+  input: { login: string; password: string; now?: Date },
+): Promise<
+  { ok: true; sessionId: string; username: string } | { ok: false; code: 'bad_credentials' | 'locked' }
+> {
+  const businessId = db.businessId;
   const now = input.now ?? new Date();
-  const db = getPool();
 
   const { rows } = await db.query<UserRow>(
-    `SELECT password_hash, password_salt, locked_until
+    `SELECT username, password_hash, password_salt, locked_until
        FROM dashboard_users
-      WHERE business_id = $1 AND username = $2`,
-    [businessId, input.username],
+      WHERE business_id = $1 AND lower(login) = $2`,
+    [businessId, normaliseLogin(input.login)],
   );
   const row = rows[0];
 
-  if (!row) {
-    // A username with no row has no counter of its own, so its failures go
-    // to the shared unknown-username bucket
-    // (./unknown-user-throttle.js). Without it, the UPDATE further down
-    // matched nothing and this branch was an unthrottled scrypt call for
-    // anyone who could reach the port — one call rather than recovery's
-    // eight, but still unbounded, and still the owner's only way in.
-    //
-    // A locked bucket returns before the decoy runs. That is the same trade
-    // the per-user lock already makes ('locked' is answered without touching
-    // a hash), and it is what a throttle is: still paying the cost would
-    // defeat the point. Reported as `bad_credentials`, never a distinct
-    // code — an unknown username must not become distinguishable by its
-    // reply.
-    const throttle = {
-      kind: 'login' as const,
-      maxFailed: MAX_FAILED,
-      lockMinutes: LOCK_MINUTES,
-      businessId,
-      now,
-    };
-    if (await unknownUserLocked(throttle)) return { ok: false, code: 'bad_credentials' };
-
-    // Pay the same scrypt cost a real user would, so "no such user" and
-    // "wrong password" are not distinguishable by timing.
-    await verifyPassword(input.password, DECOY_HASH, DECOY_SALT);
-    await recordUnknownUserFailure(throttle);
-    return { ok: false, code: 'bad_credentials' };
-  }
+  // Normally unreachable — `resolveLogin` found this login in this business
+  // a moment ago — but a row deleted in between is still an unknown login.
+  if (!row) return loginUnknown(db, input.password, now);
 
   const user = toUserRecord(row);
+  const username = user.username;
 
   // Lazily clear an expired lock on the next attempt rather than running a
   // sweep — there is exactly one account in stage 0, and the next login is
@@ -183,7 +247,7 @@ export async function login(input: {
     const cleared = await db.query(
       `UPDATE dashboard_users SET failed_attempts = 0, locked_until = NULL
         WHERE business_id = $1 AND username = $2 AND locked_until <= $3`,
-      [businessId, input.username, now],
+      [businessId, username, now],
     );
     if ((cleared.rowCount ?? 0) > 0) {
       user.lockedUntil = null;
@@ -230,7 +294,7 @@ export async function login(input: {
                 ELSE locked_until
               END
         WHERE business_id = $1 AND username = $2`,
-      [businessId, input.username, MAX_FAILED, lockUntilIfThresholdReached],
+      [businessId, username, MAX_FAILED, lockUntilIfThresholdReached],
     );
     return { ok: false, code: 'bad_credentials' };
   }
@@ -239,7 +303,7 @@ export async function login(input: {
   const tokenHash = hashToken(token);
   const expiresAt = new Date(now.getTime() + SESSION_HOURS * 3600_000);
 
-  await withTransaction(async (tx) => {
+  await transaction(db, async (tx) => {
     // A successful login resets both counters: the failed-attempt streak
     // and any lock are exactly what a correct password should clear, and
     // leaving either behind would fail the very next legitimate request.
@@ -247,26 +311,33 @@ export async function login(input: {
       `UPDATE dashboard_users
           SET failed_attempts = 0, locked_until = NULL, last_login_at = $3
         WHERE business_id = $1 AND username = $2`,
-      [businessId, input.username, now],
+      [businessId, username, now],
     );
     await tx.query(
       `INSERT INTO dashboard_sessions (session_id, business_id, username, created_at, expires_at)
        VALUES ($1, $2, $3, $4, $5)`,
-      [tokenHash, businessId, input.username, now, expiresAt],
+      [tokenHash, businessId, username, now, expiresAt],
     );
   });
 
-  return { ok: true, sessionId: token };
+  return { ok: true, sessionId: token, username };
 }
 
+/**
+ * Read inside the cookie's business (spec §5.5): `business_id = $2` is the
+ * first layer, and RLS on `dashboard_sessions` the second. A cookie whose
+ * business part was forged is looked up in the wrong business and is simply
+ * not found.
+ */
 async function loadSession(
+  db: BusinessDb,
   sessionId: string,
-  options: { businessId?: string; now?: Date },
+  options: { now?: Date },
 ): Promise<{ username: string; mustChangePassword: boolean } | null> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const now = options.now ?? new Date();
 
-  const { rows } = await getPool().query<SessionRow>(
+  const { rows } = await db.query<SessionRow>(
     `SELECT username, expires_at, revoked_at, must_change_password
        FROM dashboard_sessions
       WHERE session_id = $1 AND business_id = $2`,
@@ -281,10 +352,11 @@ async function loadSession(
 }
 
 export async function verifySession(
+  db: BusinessDb,
   sessionId: string,
-  options: { businessId?: string; now?: Date } = {},
+  options: { now?: Date } = {},
 ): Promise<{ username: string } | null> {
-  const result = await loadSession(sessionId, options);
+  const result = await loadSession(db, sessionId, options);
   return result ? { username: result.username } : null;
 }
 
@@ -298,10 +370,11 @@ export async function verifySession(
  * everywhere except `/password` until it clears.
  */
 export async function verifySessionDetails(
+  db: BusinessDb,
   sessionId: string,
-  options: { businessId?: string; now?: Date } = {},
+  options: { now?: Date } = {},
 ): Promise<{ username: string; mustChangePassword: boolean } | null> {
-  return loadSession(sessionId, options);
+  return loadSession(db, sessionId, options);
 }
 
 /**
@@ -316,15 +389,16 @@ export async function verifySessionDetails(
  * at a login form.
  */
 export async function startSession(
+  db: BusinessDb,
   username: string,
-  options: { businessId?: string; now?: Date; mustChangePassword?: boolean } = {},
+  options: { now?: Date; mustChangePassword?: boolean } = {},
 ): Promise<string> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const now = options.now ?? new Date();
   const token = randomBytes(TOKEN_BYTES).toString('hex');
   const expiresAt = new Date(now.getTime() + SESSION_HOURS * 3600_000);
 
-  await getPool().query(
+  await db.query(
     `INSERT INTO dashboard_sessions
        (session_id, business_id, username, created_at, expires_at, must_change_password)
      VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -334,20 +408,16 @@ export async function startSession(
   return token;
 }
 
-export async function revokeAllSessions(
-  username: string,
-  options: { businessId?: string; tx?: Queryable } = {},
-): Promise<number> {
-  const businessId = options.businessId ?? config.businessId;
-  // Accepts an optional transaction so a caller (recovery-code redemption,
-  // for one) can revoke sessions atomically with whatever else it is doing —
-  // e.g. claiming the code and writing the audit entry — rather than leaving
-  // a window where the code is spent but a stolen session survives it.
-  const db = options.tx ?? getPool();
+export async function revokeAllSessions(db: BusinessDb, username: string): Promise<number> {
+  // Takes the caller's connection, which may be a transaction, so a caller
+  // (recovery-code redemption, for one) can revoke sessions atomically with
+  // whatever else it is doing — e.g. claiming the code and writing the audit
+  // entry — rather than leaving a window where the code is spent but a stolen
+  // session survives it.
   const result = await db.query(
     `UPDATE dashboard_sessions SET revoked_at = now()
       WHERE business_id = $1 AND username = $2 AND revoked_at IS NULL`,
-    [businessId, username],
+    [db.businessId, username],
   );
   return result.rowCount ?? 0;
 }
@@ -369,17 +439,15 @@ export async function revokeAllSessions(
  * a valid session, and letting it spend login's budget would let a stolen
  * session lock the real owner out — the opposite of the point.
  */
-export async function verifyCurrentPassword(input: {
-  username: string;
-  password: string;
-  businessId?: string;
-}): Promise<boolean> {
-  const businessId = input.businessId ?? config.businessId;
-  const { rows } = await getPool().query<UserRow>(
-    `SELECT password_hash, password_salt, locked_until
+export async function verifyCurrentPassword(
+  db: BusinessDb,
+  input: { username: string; password: string },
+): Promise<boolean> {
+  const { rows } = await db.query<UserRow>(
+    `SELECT username, password_hash, password_salt, locked_until
        FROM dashboard_users
       WHERE business_id = $1 AND username = $2`,
-    [businessId, input.username],
+    [db.businessId, input.username],
   );
   const row = rows[0];
   if (!row) {
@@ -389,19 +457,18 @@ export async function verifyCurrentPassword(input: {
   return verifyPassword(input.password, row.password_hash, row.password_salt);
 }
 
-export async function setPassword(input: {
-  username: string;
-  password: string;
-  businessId?: string;
-}): Promise<void> {
-  const businessId = input.businessId ?? config.businessId;
+export async function setPassword(
+  db: BusinessDb,
+  input: { username: string; password: string },
+): Promise<void> {
+  const businessId = db.businessId;
   const { hash, salt } = await hashPassword(input.password);
 
   // Hashing the new password and revoking every open session happen in one
   // transaction: a session opened under the old password must not survive a
   // password change, and a failure partway through must not leave the
   // account with a new password but an old, still-valid session.
-  await withTransaction(async (tx) => {
+  await transaction(db, async (tx) => {
     await tx.query(
       `UPDATE dashboard_users SET password_hash = $3, password_salt = $4
         WHERE business_id = $1 AND username = $2`,

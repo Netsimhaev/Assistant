@@ -152,7 +152,7 @@ export async function dispatchActionUpdates(db: BusinessDb, options: {
   // throws on a stored plan that does not parse, and an unbounded read would
   // let one such row anywhere in history stop every update on every pass.
   const since = new Date(now.getTime() - ACTION_UPDATE_BACKFILL_MS);
-  const due = (await listAutonomousActions({ businessId, db, since }))
+  const due = (await listAutonomousActions(db, { since }))
     .filter((a) => !a.fromInstruction)
     // `listAutonomousActions` is newest first; the owner hears them in the
     // order they happened.

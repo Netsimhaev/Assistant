@@ -43,7 +43,7 @@ import {
 } from '../charter/amend-mailbox.js';
 import { signCharter } from '../charter/sign.js';
 import { installCharter, loadCharterVersion, probeActiveCharter } from '../charter/store.js';
-import { withBusiness, withBusinessTransaction, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb, type Queryable } from '../db/pool.js';
 import type { UnsignedCharter } from '../domain/charter.js';
 import { loadBindings } from '../orchestrator/bindings.js';
 import { oauthCeremonyPreflight } from './oauth-routes.js';
@@ -73,9 +73,15 @@ export const MAILBOX_AUTHORISATION_TEXT =
   'היא לא תמחק, לא תעביר, לא תסמן כנקרא ולא תסמן כספאם. ' +
   'מייל יוצא — כולל תשובות להוראות שלך — יישלח מתיבת העסק במקום משרת השליחה, ורק אחרי אישורך, אלא אם הגדרת ברמת החופש שהעוזרת רשאית לענות לבד.';
 
+/**
+ * What changes when, said on the sign page. Since the runtime is built per
+ * business on every scheduler pass (no longer once at start-up), a signed
+ * and connected mailbox is picked up on the next pass with no restart; the
+ * constant keeps its name so the pages and tests that show it need not move.
+ */
 export const RESTART_NOTE =
-  'שימו לב: תזמון המשימות (ה-scheduler) קורא את התקנון ואת רשימת החיבורים פעם אחת בלבד, בעת ההפעלה שלו. ' +
-  'השליחה תעבור לתיבת העסק רק אחרי שהחיבור לספק יושלם והתזמון יופעל מחדש.';
+  'שימו לב: השליחה תעבור לתיבת העסק רק אחרי שהחיבור לספק יושלם. ' +
+  'מאותו רגע תזמון המשימות (ה-scheduler) ישתמש בה כבר בסבב הבא שלו — אין צורך להפעיל אותו מחדש.';
 
 const REVERT_NOTE =
   'אם החיבור אצל הספק לא יצליח, הכפתור „בטל את חיבור התיבה” במסך תיבת המייל מחזיר את השליחה לשרת השליחה הקודם.';
@@ -83,7 +89,7 @@ const REVERT_NOTE =
 const NEEDS_REAUTH_UNREAD_NOTE = 'מיילים שיגיעו עד שהתיבה תחובר מחדש לא ייקראו.';
 
 const SEND_GAP_NOTE =
-  'מרגע החתימה מייל יוצא לא יישלח עוד דרך שרת השליחה הקודם. עד שהחיבור לספק יושלם והתזמון יופעל מחדש, ' +
+  'מרגע החתימה מייל יוצא לא יישלח עוד דרך שרת השליחה הקודם. עד שהחיבור לספק יושלם, ' +
   'מייל יוצא לא יישלח כלל.';
 
 export function parseMailProvider(raw: string | null | undefined): MailProvider | null {
@@ -137,8 +143,8 @@ const CHARTER_MISSING = 'לא הותקן עדיין תקנון פעיל לעסק
 
 type CharterRead = { ok: true; charter: BusinessCharter } | { ok: false; message: string };
 
-async function readCharter(businessId: string): Promise<CharterRead> {
-  const probe = await withBusiness(businessId, (bdb) => probeActiveCharter(bdb)); // TENANCY-TODO(task 10)
+async function readCharter(db: BusinessDb): Promise<CharterRead> {
+  const probe = await probeActiveCharter(db);
   if (!probe.ok) {
     console.error('mailbox connect: could not read the active charter:', probe.reason);
     return { ok: false, message: CHARTER_UNREADABLE };
@@ -153,8 +159,8 @@ function mailboxOf(charter: BusinessCharter): CharterConnection | undefined {
 
 // --- GET /connections/mailbox ----------------------------------------------
 
-export async function handleMailboxStatus(res: ServerResponse, businessId: string, csrf: string): Promise<void> {
-  const read = await readCharter(businessId);
+export async function handleMailboxStatus(res: ServerResponse, db: BusinessDb, csrf: string): Promise<void> {
+  const read = await readCharter(db);
   if (!read.ok) return sendHtml(res, 200, errorPage('תיבת המייל של העסק', read.message));
 
   const connection = mailboxOf(read.charter);
@@ -188,7 +194,7 @@ export async function handleMailboxStatus(res: ServerResponse, businessId: strin
     );
   }
 
-  const working = await mailboxIsWorking(businessId);
+  const working = await mailboxIsWorking(db);
   const grant = working.grant;
   const startLink = `<a href="/oauth/mailbox/start?provider=${provider}">חיבור התיבה אצל ${esc(PROVIDER_NAME[provider])}</a>`;
   let state: string;
@@ -242,15 +248,18 @@ type GrantSummary = Awaited<ReturnType<typeof listGrants>>[number];
 export type MailboxBannerStatus = 'not_connected' | 'needs_reauth' | 'connected';
 
 /** The one status the mail screens show, derived from the same grant `mailboxIsWorking` reads. */
-export async function mailboxBannerStatus(businessId: string): Promise<MailboxBannerStatus> {
-  const { grant } = await mailboxIsWorking(businessId);
+export async function mailboxBannerStatus(db: BusinessDb): Promise<MailboxBannerStatus> {
+  const { grant } = await mailboxIsWorking(db);
   if (grant === null) return 'not_connected';
   return grant.needsReauthAt !== null ? 'needs_reauth' : 'connected';
 }
 
 /** Working = a live binding AND a live grant that does not need reauth. Anything else is "not working". */
-async function mailboxIsWorking(businessId: string): Promise<{ working: boolean; grant: GrantSummary | null }> {
-  const [bindings, grants] = await Promise.all([withBusiness(businessId, (db) => loadBindings(db)), withBusiness(businessId, (db) => listGrants(db))]); // TENANCY-TODO(task 10)
+async function mailboxIsWorking(db: BusinessDb): Promise<{ working: boolean; grant: GrantSummary | null }> {
+  // One after the other, never `Promise.all`: both run on this request's one
+  // connection, and two queries in flight on it interleave.
+  const bindings = await loadBindings(db);
+  const grants = await listGrants(db);
   const binding = bindings.find((b) => b.system === MAILBOX_SYSTEM) ?? null;
   const grant = grants.find((g) => g.system === MAILBOX_SYSTEM && g.revokedAt === null) ?? null;
   return { working: binding?.status === 'live' && grant !== null && grant.needsReauthAt === null, grant };
@@ -339,7 +348,8 @@ class StaleBaseError extends Error {}
  * page was rendered against. A check outside the transaction leaves a window
  * in which another install lands and this one silently supersedes it.
  */
-async function lockActiveVersion(tx: Queryable, businessId: string, base: string): Promise<void> {
+async function lockActiveVersion(tx: Queryable, db: BusinessDb, base: string): Promise<void> {
+  const businessId = db.businessId;
   const { rows } = await tx.query<{ charter_version: string }>(
     'SELECT charter_version FROM charter_active WHERE business_id = $1 FOR UPDATE',
     [businessId],
@@ -352,16 +362,17 @@ export const STALE_MESSAGE =
 
 /** Sign, install and record one owner-signed charter change, under the locked stale check. */
 export async function installSigned(
-  businessId: string,
+  db: BusinessDb,
   username: string,
   base: string,
   unsigned: UnsignedCharter,
   reason: string,
 ): Promise<'installed' | 'stale'> {
+  const businessId = db.businessId;
   const signed = signCharter(unsigned, { signedByPersonId: username, method: 'dashboard_click' });
   try {
-    await withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 10)
-      await lockActiveVersion(tx, businessId, base);
+    await transaction(db, async (tx) => {
+      await lockActiveVersion(tx, db, base);
       await installCharter(tx, signed);
       await appendAudit(
         tx,
@@ -388,17 +399,17 @@ const BAD_PROVIDER = 'יש לבחור ספק דואר: google או microsoft. ל
 
 export async function handleMailboxSignGet(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   csrf: string,
   query: URLSearchParams,
   credentialKeyPath: string | undefined,
 ): Promise<void> {
   const provider = parseMailProvider(query.get('provider'));
   if (provider === null) return sendHtml(res, 400, errorPage('ספק לא תקין', BAD_PROVIDER));
-  const read = await readCharter(businessId);
+  const read = await readCharter(db);
   if (!read.ok) return sendHtml(res, 409, errorPage('לא ניתן לחתום', read.message));
   if (mailboxOf(read.charter) !== undefined) return sendHtml(res, 409, errorPage('כבר נחתם', ALREADY_DECLARED));
-  const preflight = await oauthCeremonyPreflight(businessId, provider, credentialKeyPath);
+  const preflight = await oauthCeremonyPreflight(db, provider, credentialKeyPath);
   if (preflight !== null) return sendHtml(res, 409, preflightRefusal(preflight));
   sendHtml(res, 200, renderMailboxSignPage({ charter: read.charter, provider, csrf }));
 }
@@ -418,7 +429,7 @@ export async function handleMailboxSignGet(
  */
 export async function handleMailboxSignPost(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: MailboxSession,
   form: URLSearchParams,
   credentialKeyPath: string | undefined,
@@ -429,17 +440,17 @@ export async function handleMailboxSignPost(
   const provider = parseMailProvider(form.get('provider'));
   if (provider === null) return sendHtml(res, 400, errorPage('ספק לא תקין', BAD_PROVIDER));
 
-  const read = await readCharter(businessId);
+  const read = await readCharter(db);
   if (!read.ok) return sendHtml(res, 409, errorPage('לא ניתן לחתום', read.message));
   const active = read.charter;
   if (mailboxOf(active) !== undefined) return sendHtml(res, 409, errorPage('כבר נחתם', ALREADY_DECLARED));
   const base = form.get('base');
   if (base !== active.charterVersion) return sendHtml(res, 409, errorPage('התקנון השתנה', STALE_MESSAGE));
-  const preflight = await oauthCeremonyPreflight(businessId, provider, credentialKeyPath);
+  const preflight = await oauthCeremonyPreflight(db, provider, credentialKeyPath);
   if (preflight !== null) return sendHtml(res, 409, preflightRefusal(preflight));
 
   const outcome = await installSigned(
-    businessId,
+    db,
     session.username,
     base,
     buildMailboxAmendment(active, new Date(), provider),
@@ -459,7 +470,7 @@ const MAX_CHAIN_WALK = 100;
  * `null` when the chain breaks (a missing or unreadable version) before a
  * mailbox-free version is reached.
  */
-async function versionBeforeMailbox(businessId: string, active: BusinessCharter): Promise<BusinessCharter | null> {
+async function versionBeforeMailbox(db: BusinessDb, active: BusinessCharter): Promise<BusinessCharter | null> {
   let current = active;
   for (let step = 0; step < MAX_CHAIN_WALK; step += 1) {
     if (mailboxOf(current) === undefined) return current;
@@ -467,7 +478,7 @@ async function versionBeforeMailbox(businessId: string, active: BusinessCharter)
     let previous: BusinessCharter | null;
     try {
       const supersedes = current.supersedes;
-      previous = await withBusiness(businessId, (bdb) => loadCharterVersion(bdb, supersedes)); // TENANCY-TODO(task 10)
+      previous = await loadCharterVersion(db, supersedes);
     } catch (error) {
       console.error('mailbox revert: could not read a superseded charter:', error instanceof Error ? error.message : error);
       return null;
@@ -487,20 +498,20 @@ async function versionBeforeMailbox(businessId: string, active: BusinessCharter)
  */
 export async function handleMailboxRevertPost(
   res: ServerResponse,
-  businessId: string,
+  db: BusinessDb,
   session: MailboxSession,
   form: URLSearchParams,
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
     return sendHtml(res, 403, errorPage('הבקשה נדחתה', 'הטופס פג תוקף. רענן/י ונסה/י שוב. לא בוצעה כל פעולה.'));
   }
-  const read = await readCharter(businessId);
+  const read = await readCharter(db);
   if (!read.ok) return sendHtml(res, 409, errorPage('לא ניתן לבטל', read.message));
   const active = read.charter;
   if (mailboxOf(active) === undefined) {
     return sendHtml(res, 409, errorPage('אין מה לבטל', 'התקנון הפעיל אינו מגדיר תיבת מייל. לא בוצעה כל פעולה.'));
   }
-  if ((await mailboxIsWorking(businessId)).working) {
+  if ((await mailboxIsWorking(db)).working) {
     return sendHtml(
       res,
       409,
@@ -510,7 +521,7 @@ export async function handleMailboxRevertPost(
   const base = form.get('base');
   if (base !== active.charterVersion) return sendHtml(res, 409, errorPage('התקנון השתנה', STALE_MESSAGE));
 
-  const before = await versionBeforeMailbox(businessId, active);
+  const before = await versionBeforeMailbox(db, active);
   if (before === null) {
     return sendHtml(
       res,
@@ -523,7 +534,7 @@ export async function handleMailboxRevertPost(
   }
 
   const outcome = await installSigned(
-    businessId,
+    db,
     session.username,
     base,
     buildMailboxRevert(active, before, new Date()),

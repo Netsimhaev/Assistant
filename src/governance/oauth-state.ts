@@ -103,6 +103,8 @@ async function pruneStaleStates(db: Queryable): Promise<void> {
 }
 
 export interface ConsumedState {
+  /** The business the row was minted for — the callback checks it against the session's. */
+  businessId: string;
   system: string;
   sessionId: string;
   codeVerifier: string;
@@ -138,17 +140,29 @@ export async function consumeState(
   db: BusinessDb,
   state: string,
 ): Promise<ConsumedState | null> {
-  const { rows } = await db.query<{ system: string; session_id: string; code_verifier: string; provider: string | null }>(
+  const { rows } = await db.query<{
+    business_id: string;
+    system: string;
+    session_id: string;
+    code_verifier: string;
+    provider: string | null;
+  }>(
     `UPDATE oauth_states
         SET consumed_at = now()
       WHERE state = $1
         AND business_id = $2
         AND consumed_at IS NULL
         AND expires_at > now()
-      RETURNING system, session_id, code_verifier, provider`,
+      RETURNING business_id, system, session_id, code_verifier, provider`,
     [state, db.businessId],
   );
   const row = rows[0];
   if (row === undefined) return null;
-  return { system: row.system, sessionId: row.session_id, codeVerifier: row.code_verifier, provider: row.provider };
+  return {
+    businessId: row.business_id,
+    system: row.system,
+    sessionId: row.session_id,
+    codeVerifier: row.code_verifier,
+    provider: row.provider,
+  };
 }
