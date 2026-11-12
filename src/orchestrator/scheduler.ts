@@ -49,7 +49,7 @@ import {
   type ReraiseResult,
 } from '../production/card.js';
 import type { RunDueResult } from './run-due.js';
-import { buildRuntime } from './runtime.js';
+import { buildServerRuntime, businessRuntime } from './runtime.js';
 import { closeVerifiedJobs } from './verify.js';
 import { syncMeetings, type MeetingSyncResult } from '../meetings/sync.js';
 import type { CalendarClient } from '../calendar/types.js';
@@ -804,7 +804,7 @@ export interface SchedulerPassResult {
   /**
    * The document production loop (`src/production/loop.ts`), right after
    * `runDueJobs`. `null` = did not run: the server lacks the production tools
-   * (`runtime.production` absent or unavailable — the same gate `buildRuntime`
+   * (`runtime.production` absent or unavailable — the same gate `buildServerRuntime`
    * warns on), or it threw (`documentProductionsError` then says why). A run
    * with nothing queued is zeros, never `null`.
    */
@@ -835,8 +835,8 @@ export interface SchedulerPassResult {
  * across the wire behind that lock.
  *
  * **Both loops are behind the same switch.** `scan` and `conduct` are both
- * `null`, and neither runs, when `config.documentInbox` (or an explicit
- * `options.inbox`) is absent: an installation that has not configured a
+ * `null`, and neither runs, when the business runtime's `inbox` (or an
+ * explicit `options.inbox`) is absent: an installation that has not configured a
  * watched folder is a switch, not a fault, and the pass must neither throw
  * nor pretend a scan happened. `conductPendingDocuments` used to sit outside
  * this guard, which meant an installation that upgraded with an API key
@@ -871,7 +871,7 @@ export async function schedulerPass(
     now?: Date;
     limit?: number;
     runtime?: Runtime;
-    /** Defaults to `config.documentInbox`. */
+    /** Defaults to `runtime.inbox` — present only when the business turned its inbox on. */
     inbox?: string | null;
     documentRoot?: string;
     readsPerDay?: number;
@@ -948,9 +948,11 @@ export async function schedulerPass(
   }
 
   // Built once per pass and reused everywhere below — `due` and the
-  // conductor loops need it too, and a second `buildRuntime()` call here
-  // would both waste the work and risk two registries disagreeing.
-  const runtime = options.runtime ?? (await buildRuntime());
+  // conductor loops need it too, and a second runtime build here would both
+  // waste the work and risk two registries disagreeing.
+  const runtime =
+    options.runtime ??
+    (await withBusiness(businessId, async (db) => businessRuntime(await buildServerRuntime(), db))); // TENANCY-TODO(task 9)
 
   // The door, right after `resumeDelegatedJobs` and before the conductor
   // loops — see `SchedulerPassResult.whatsappDoor`'s own docblock. Guarded on
@@ -958,9 +960,9 @@ export async function schedulerPass(
   // switch, the same shape `scan`/`conduct` already carry below, not a fault.
   //
   // **The charter is loaded here, once, and the messenger is built from it
-  // here, once — never inside `buildRuntime`.** `principalWhatsAppKey` reads
+  // here, once — never inside the runtime build.** `principalWhatsAppKey` reads
   // the SIGNED charter, which an owner can change by signing an amendment;
-  // building the messenger at process start (inside `buildRuntime`) would pin
+  // building the messenger at process start (inside the runtime build) would pin
   // a recipient for the life of the process, so after the owner changes his
   // number the assistant would keep messaging the old one — which by then may
   // belong to someone who is not the principal at all. `createBossMessenger`
@@ -1104,7 +1106,9 @@ export async function schedulerPass(
   // both would make that separation a matter of what `ConductOptions` happens
   // to declare rather than a statement this function makes.
   const { judge, ...conductOptions } = options;
-  const inbox = options.inbox !== undefined ? options.inbox : config.documentInbox;
+  // The business's runtime carries its inbox only when the business turned it
+  // on (`inbox_enabled`) and the server has a folder — see `Runtime.inbox`.
+  const inbox = options.inbox !== undefined ? options.inbox : (runtime.inbox ?? null);
   let scan: ScanResult | null = null;
   let scanError: string | null = null;
   let conduct: ConductResult | null = null;

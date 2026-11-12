@@ -17,8 +17,11 @@ import {
   GOOGLE_CLIENT_SECRET_REF,
 } from '../src/orchestrator/adapters/google-token-http.js';
 import { listGrants } from '../src/governance/oauth-grants.js';
+import { loadMasterKey } from '../src/governance/master-key.js';
+import { resolvePlatformSecret } from '../src/tenancy/platform-credentials.js';
 import { loadRampLevel } from '../src/orchestrator/ramp.js';
-import { buildRuntime } from '../src/orchestrator/runtime.js';
+import { buildServerRuntime, businessRuntime, NOTIFY_SMTP_PASS_REF } from '../src/orchestrator/runtime.js';
+import { withBusiness } from '../src/db/pool.js';
 
 function line(ok: boolean, label: string, detail: string): void {
   console.log(`${ok ? 'OK  ' : 'MISS'}  ${label.padEnd(26)} ${detail}`);
@@ -81,9 +84,10 @@ line(
 // is. Caught rather than left to reject, because a readiness check whose whole
 // job is printing MISS lines should print one for the key too, not stop with a
 // stack trace before the remaining checks run.
-let runtime: Awaited<ReturnType<typeof buildRuntime>> | null = null;
+let runtime: Awaited<ReturnType<typeof businessRuntime>> | null = null;
 try {
-  runtime = await buildRuntime();
+  const server = await buildServerRuntime();
+  runtime = await withBusiness(businessId, (db) => businessRuntime(server, db));
 } catch (error) {
   line(false, 'credential key', error instanceof Error ? error.message : String(error));
 }
@@ -99,19 +103,26 @@ if (runtime !== null) {
   // with `credential_unavailable` at run time — the one failure this script's
   // own table tells the operator to expect. Both refs are checked: the
   // binding's (whatever `credential_ref` the row carries) and the notifier's
-  // (`NOTIFY_CREDENTIAL_REF`), because they are resolved by different callers
+  // (`NOTIFY_SMTP_PASS`), because they are resolved by different callers
   // and either can be missing on its own.
   const refs = new Set<string>();
   if (mail?.credentialRef) refs.add(mail.credentialRef);
-  const notifyRef = process.env['NOTIFY_CREDENTIAL_REF'];
-  if (notifyRef !== undefined && notifyRef.length > 0) refs.add(notifyRef);
+  refs.add(NOTIFY_SMTP_PASS_REF);
   // The OAuth consent ceremony's own app secret (oauth-routes.ts,
   // oauth-consent.ts) — resolved unconditionally, not only when a Google
   // binding already exists, because the FIRST thing an operator needs to
   // know before clicking "connect" on the dashboard is whether these are
   // provisioned at all.
-  refs.add(GOOGLE_CLIENT_ID_REF);
-  refs.add(GOOGLE_CLIENT_SECRET_REF);
+  // Since multi-tenancy they are the SERVER's secrets, in the platform store
+  // (`platform-credentials.ts`), so they are checked there and not through
+  // the business's credential source.
+  {
+    const key = await loadMasterKey(process.env['CREDENTIAL_KEY_PATH'] ?? '');
+    for (const ref of [GOOGLE_CLIENT_ID_REF, GOOGLE_CLIENT_SECRET_REF]) {
+      const value = await resolvePlatformSecret(ref, key);
+      line(value !== null, `platform secret ${ref}`, value === null ? 'not provisioned' : 'provisioned');
+    }
+  }
   for (const ref of refs) {
     // `resolve` can THROW, not just return `null` — `oauthCredentials.resolve`
     // (`oauth-token.ts`) throws five error classes of its own (a revoked

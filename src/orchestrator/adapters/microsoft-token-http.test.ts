@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { CredentialSource } from '../credentials.js';
-import { createCredentialHandle } from './types.js';
+import type { PlatformSecretSource } from '../../tenancy/platform-credentials.js';
 import {
   MICROSOFT_CLIENT_ID_REF,
   MICROSOFT_CLIENT_SECRET_REF,
@@ -9,11 +8,10 @@ import {
 
 const BUSINESS = 'test-business';
 
-function credentialsFrom(values: Record<string, string>): CredentialSource {
+function credentialsFrom(values: Record<string, string>): PlatformSecretSource {
   return {
-    async resolve(ref: string, _businessId: string) {
-      const value = values[ref];
-      return value === undefined ? null : createCredentialHandle(ref, value);
+    async resolve(ref: string) {
+      return values[ref] ?? null;
     },
   };
 }
@@ -39,7 +37,7 @@ describe('microsoftTokenHttp', () => {
     let calledUrl = '';
     let sentBody = '';
     const http = microsoftTokenHttp({
-      credentials: CONFIGURED,
+      clients: CONFIGURED,
       fetchImpl: (async (url: string | URL, init?: RequestInit) => {
         calledUrl = url.toString();
         sentBody = String(init?.body ?? '');
@@ -60,7 +58,7 @@ describe('microsoftTokenHttp', () => {
 
   it('maps invalid_grant to rejected, without leaking the secret', async () => {
     const http = microsoftTokenHttp({
-      credentials: CONFIGURED,
+      clients: CONFIGURED,
       fetchImpl: (async () => jsonResponse(400, { error: 'invalid_grant' })) as typeof fetch,
     });
     const outcome = await http.exchangeRefresh(input);
@@ -70,21 +68,21 @@ describe('microsoftTokenHttp', () => {
 
   it('maps invalid_client to misconfigured, 5xx to transient, missing refs to misconfigured', async () => {
     const bad = microsoftTokenHttp({
-      credentials: CONFIGURED,
+      clients: CONFIGURED,
       fetchImpl: (async () => jsonResponse(401, { error: 'invalid_client' })) as typeof fetch,
     });
     expect(await bad.exchangeRefresh(input)).toMatchObject({ ok: false, kind: 'misconfigured' });
     const flaky = microsoftTokenHttp({
-      credentials: CONFIGURED,
+      clients: CONFIGURED,
       fetchImpl: (async () => jsonResponse(503, {})) as typeof fetch,
     });
     expect(await flaky.exchangeRefresh(input)).toMatchObject({ ok: false, kind: 'transient' });
-    const missing = microsoftTokenHttp({ credentials: credentialsFrom({}) });
+    const missing = microsoftTokenHttp({ clients: credentialsFrom({}) });
     expect(await missing.exchangeRefresh(input)).toMatchObject({ ok: false, kind: 'misconfigured' });
   });
 
   it('refuses a provider it does not implement', async () => {
-    const http = microsoftTokenHttp({ credentials: CONFIGURED });
+    const http = microsoftTokenHttp({ clients: CONFIGURED });
     expect(await http.exchangeRefresh({ ...input, provider: 'google' })).toMatchObject({
       ok: false,
       kind: 'misconfigured',

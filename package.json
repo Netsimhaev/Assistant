@@ -29,6 +29,8 @@
     "ramp:set": "tsx src/cli/set-ramp.ts",
     "kill": "tsx src/cli/kill.ts",
     "business": "tsx src/cli/business.ts",
+    "business:settings": "tsx src/cli/business-settings.ts",
+    "tenancy:import-env": "tsx src/cli/import-env.ts",
     "secret": "tsx src/cli/secret.ts",
     "secret:key": "tsx src/cli/secret-key.ts",
     "doc:ingest": "tsx src/cli/ingest-doc.ts",

@@ -24,7 +24,6 @@ import { signCharter } from '../charter/sign.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { CharterConnection } from '../domain/connection.js';
-import { putSecret, removeSecret } from '../governance/credential-store.js';
 import { KEY_BYTES, writeKeyState } from '../governance/master-key.js';
 import { markNeedsReauth, readGrantBySystem } from '../governance/oauth-grants.js';
 import { getCursor } from '../mail/inbox-store.js';
@@ -40,6 +39,7 @@ import { resetDatabase } from '../test/db.js';
 import { createOwner } from './auth.js';
 import { issueCsrfToken } from './csrf.js';
 import { createServer } from './server.js';
+import { putPlatformSecret, removePlatformSecret } from '../tenancy/platform-credentials.js';
 
 const BUSINESS = 'test-business';
 const USERNAME = 'owner';
@@ -72,7 +72,8 @@ beforeEach(async () => {
     ['MICROSOFT_OAUTH_CLIENT_ID', 'ms-id'],
     ['MICROSOFT_OAUTH_CLIENT_SECRET', 'ms-secret'],
   ] as const) {
-    await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref, value, updatedBy: 'test' }, key));
+    // The OAuth client is the server's, not the business's (spec §5.4).
+    await putPlatformSecret(ref, value, key);
   }
   await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
   await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [OFFICE_MAIL] }))); // TENANCY-TODO(task 10)
@@ -432,7 +433,7 @@ async function activeVersion(): Promise<string | undefined> {
 
 describe('fix round 1: preflight before signing', () => {
   it('refuses the sign page and the sign POST when the provider client secret is missing, and installs nothing', async () => {
-    await withBusiness(BUSINESS, (bdb) => removeSecret(bdb, 'MICROSOFT_OAUTH_CLIENT_SECRET'));
+    await removePlatformSecret('MICROSOFT_OAUTH_CLIENT_SECRET');
     const before = await activeVersion();
     const baseUrl = await startServer();
     const cookie = await login(baseUrl);

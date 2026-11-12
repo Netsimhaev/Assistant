@@ -6,19 +6,31 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import { closePool, withBusiness } from '../db/pool.js';
+import { closePlatformPool } from '../db/platform-pool.js';
 import type { CharterConnection } from '../domain/connection.js';
 import type { ApprovalRequest } from '../governance/approvals.js';
 import { putSecret } from '../governance/credential-store.js';
 import { KEY_BYTES, MasterKeyError, writeKeyState } from '../governance/master-key.js';
 import type { RiskAssessment } from '../domain/risk.js';
+import { saveRuntimeSettings } from '../tenancy/runtime-settings.js';
+import type { RuntimeSettingsPatch } from '../tenancy/runtime-settings.js';
 import { upsertBinding } from './bindings.js';
 import { DEFAULT_CREDENTIAL_ENV_PREFIX } from './credentials.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { createFakeGateway } from '../whatsapp/fake-gateway.js';
-import { buildRuntime } from './runtime.js';
+import {
+  GREEN_API_INSTANCE_ID_REF,
+  GREEN_API_TOKEN_REF,
+  NOTIFY_SMTP_PASS_REF,
+  buildServerRuntime,
+  businessRuntime,
+} from './runtime.js';
+import type { Runtime, ServerRuntime, ServerRuntimeOverrides } from './runtime.js';
 
+/** The key state is written under the configured business, so tests use it. */
 const BUSINESS = config.businessId;
+const OTHER = 'test-runtime-other';
 
 const CALENDAR_CONNECTION: CharterConnection = {
   system: 'office-calendar',
@@ -29,24 +41,28 @@ const CALENDAR_CONNECTION: CharterConnection = {
   subprocessor: null,
 };
 
-const BASE = {
-  MAIL_SYSTEM: 'office-mail',
-  SMTP_HOST: '127.0.0.1',
-  SMTP_PORT: '1025',
-  SMTP_SECURE: 'false',
-  SMTP_FROM: 'assistant@example.com',
-  SMTP_USER: 'assistant',
-  NOTIFY_CREDENTIAL_REF: 'NOTIFY_MAIL',
-  APPROVAL_NOTIFY_TO: 'boss@example.com',
+/** The server's environment: no business setting lives here any more. */
+const SERVER_ENV = {
   DASHBOARD_BASE_URL: 'http://127.0.0.1:8787',
   ANTHROPIC_API_KEY: 'sk-test-key',
   DOCUMENT_SOFFICE_PATH: '/usr/bin/soffice',
   DOCUMENT_CHROMIUM_PATH: '/usr/bin/chromium',
 };
 
+/** A business whose mail and notify are fully configured (its password stored separately). */
+const SETTINGS: RuntimeSettingsPatch = {
+  mailSystem: 'office-mail',
+  notifySmtpHost: '127.0.0.1',
+  notifySmtpPort: 1025,
+  notifySmtpSecure: false,
+  notifySmtpFrom: 'assistant@example.com',
+  notifySmtpUser: 'assistant',
+  notifyTo: 'boss@example.com',
+};
+
 let DIR: string;
 let KEY: Buffer;
-/** `BASE` plus the key path — what a correctly configured install looks like. */
+/** `SERVER_ENV` plus the key path — what a correctly configured server looks like. */
 let FULL: Record<string, string>;
 
 beforeEach(async () => {
@@ -56,7 +72,7 @@ beforeEach(async () => {
   const keyPath = join(DIR, 'master.key');
   await writeFile(keyPath, KEY, { mode: 0o600 });
   await writeKeyState(KEY, 'key-1');
-  FULL = { ...BASE, CREDENTIAL_KEY_PATH: keyPath };
+  FULL = { ...SERVER_ENV, CREDENTIAL_KEY_PATH: keyPath };
 });
 
 afterEach(async () => {
@@ -64,15 +80,48 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
+  await closePlatformPool();
   await closePool();
 });
+
+async function storeSecret(ref: string, value: string, businessId: string = BUSINESS): Promise<void> {
+  await withBusiness(businessId, (bdb) => putSecret(bdb, { ref, value, updatedBy: 'operator@example.com' }, KEY));
+}
+
+async function saveSettings(patch: RuntimeSettingsPatch, businessId: string = BUSINESS): Promise<void> {
+  await withBusiness(businessId, (db) => saveRuntimeSettings(db, patch));
+}
+
+async function runtimeFor(server: ServerRuntime, businessId: string = BUSINESS): Promise<Runtime> {
+  return withBusiness(businessId, (db) => businessRuntime(server, db));
+}
+
+/**
+ * The common case: a server from `env`, this business's settings saved (and
+ * its notify password stored unless `pass` is null), then its runtime.
+ */
+async function build(
+  options: {
+    env?: Record<string, string | undefined>;
+    settings?: RuntimeSettingsPatch | null;
+    pass?: string | null;
+    overrides?: ServerRuntimeOverrides;
+  } = {},
+): Promise<Runtime> {
+  const server = await buildServerRuntime(options.env ?? FULL, options.overrides ?? {});
+  const settings = options.settings === undefined ? SETTINGS : options.settings;
+  if (settings !== null) await saveSettings(settings);
+  const pass = options.pass === undefined ? 'pw' : options.pass;
+  if (pass !== null) await storeSecret(NOTIFY_SMTP_PASS_REF, pass);
+  return runtimeFor(server);
+}
 
 /**
  * Just enough of a `RiskAssessment`/`ApprovalRequest` for `notify()` to build
  * a message from — the values themselves are inert, only the notifier's
  * *wiring* (which ref, which store, does it reach the transport) is under
  * test here. Deliberately not routed through `enqueueApproval`: this file is
- * not re-testing the approval pipeline, only what `buildRuntime` hands
+ * not re-testing the approval pipeline, only what `businessRuntime` hands
  * `createEmailNotifier`.
  */
 function riskFixture(): RiskAssessment {
@@ -116,61 +165,129 @@ function approvalFixture(): ApprovalRequest {
   };
 }
 
-describe('buildRuntime', () => {
+describe('businessRuntime — settings from the database', () => {
+  it('a business with no settings row has no notify, no WhatsApp, no inbox, and says so in warnings', async () => {
+    const runtime = await build({ env: { ...FULL, DOCUMENT_INBOX: '/srv/inbox' }, settings: null, pass: null });
+    expect(runtime.notify).toBeUndefined();
+    expect(runtime.whatsapp).toBeUndefined();
+    expect(runtime.inbox).toBeUndefined();
+    expect(runtime.registry.get('office-mail')).toBeNull();
+    const warnings = runtime.warnings.join(' | ');
+    expect(warnings).toMatch(/no mail adapter: notify_smtp_host/);
+    expect(warnings).toMatch(/no WhatsApp gateway: whatsapp_enabled is off/);
+    expect(warnings).toMatch(/no document inbox: inbox_enabled is off/);
+  });
+
+  it('settings change takes effect on the next businessRuntime call without restart', async () => {
+    const server = await buildServerRuntime(FULL);
+    await storeSecret(NOTIFY_SMTP_PASS_REF, 'pw');
+
+    const before = await runtimeFor(server);
+    expect(before.notify).toBeUndefined();
+
+    await saveSettings(SETTINGS);
+    // The SAME server object — no process restart, no second key load.
+    const after = await runtimeFor(server);
+    expect(after.notify?.notifier.channel).toBe('email');
+    expect(after.registry.get('office-mail')).not.toBeNull();
+
+    await saveSettings({ notifyTo: null });
+    const cleared = await runtimeFor(server);
+    expect(cleared.notify).toBeUndefined();
+    expect(cleared.warnings.join(' ')).toMatch(/notify_to not set/);
+  });
+
+  it('two businesses get their own notify recipients', async () => {
+    await saveSettings({ ...SETTINGS, notifyTo: 'owner-a@example.com' }, BUSINESS);
+    await saveSettings({ ...SETTINGS, notifyTo: 'owner-b@example.com' }, OTHER);
+    await storeSecret(NOTIFY_SMTP_PASS_REF, 'pass-a', BUSINESS);
+    await storeSecret(NOTIFY_SMTP_PASS_REF, 'pass-b', OTHER);
+
+    const sent: Array<{ to: string; pass?: string }> = [];
+    const capture: ServerRuntimeOverrides['createTransport'] = (opts) => ({
+      sendMail: (mail: { to: string }) => {
+        sent.push({ to: mail.to, pass: opts.auth.pass });
+        return Promise.resolve({ messageId: 'stub-message-id' });
+      },
+    });
+    // One server for both — only the settings rows and the stored passwords differ.
+    const capturing = await buildServerRuntime(FULL, { createTransport: capture });
+
+    const a = await runtimeFor(capturing, BUSINESS);
+    const b = await runtimeFor(capturing, OTHER);
+    expect((await a.notify?.sendAlert?.('נושא', 'גוף'))?.ok).toBe(true);
+    expect((await b.notify?.sendAlert?.('נושא', 'גוף'))?.ok).toBe(true);
+    expect(sent).toEqual([
+      { to: 'owner-a@example.com', pass: 'pass-a' },
+      { to: 'owner-b@example.com', pass: 'pass-b' },
+    ]);
+  });
+
+  it('a credential source that throws fails the build loudly, never reads as "not configured"', async () => {
+    await saveSettings({ whatsappEnabled: true });
+    const server = await buildServerRuntime(FULL);
+    const broken: ServerRuntime = {
+      ...server,
+      credentials: {
+        resolve: async () => {
+          throw new Error('credential store unreachable');
+        },
+      },
+    };
+    await expect(runtimeFor(broken)).rejects.toThrow(/credential store unreachable/);
+  });
+
+  it('builds the inbox only when the business turned it on and the server has a folder', async () => {
+    const on = await build({ env: { ...FULL, DOCUMENT_INBOX: '/srv/inbox' }, settings: { inboxEnabled: true } });
+    expect(on.inbox).toBe('/srv/inbox');
+    expect(on.warnings.join(' ')).not.toMatch(/no document inbox/);
+
+    const noFolder = await build({ settings: { inboxEnabled: true } });
+    expect(noFolder.inbox).toBeUndefined();
+    expect(noFolder.warnings.join(' ')).toMatch(/inbox_enabled is on, but DOCUMENT_INBOX is not set/);
+  });
+});
+
+describe('buildServerRuntime + businessRuntime', () => {
   it('registers a mail adapter under the configured system name', async () => {
-    const runtime = await buildRuntime(FULL);
+    const runtime = await build();
     expect(runtime.registry.get('office-mail')).not.toBeNull();
-    // `FULL` configures mail/notify fully but carries no GREEN_API refs at
-    // all — the one warning this installation is left with is the WhatsApp
-    // switch being off, not a mail-side defect. See the `GREEN_API` test
-    // block below for that switch on its own.
+    // `SETTINGS` configures mail/notify fully but turns neither WhatsApp nor
+    // the inbox on — the two warnings this business is left with are those
+    // switches being off, not a mail-side defect. See the WhatsApp block
+    // below for that switch on its own.
     expect(runtime.warnings).toEqual([
-      "no WhatsApp gateway: GREEN_API_INSTANCE_REF, GREEN_API_TOKEN_REF not set — the owner's WhatsApp channel will not run; messages will neither be received nor sent",
+      "no WhatsApp gateway: whatsapp_enabled is off for this business — the owner's WhatsApp channel will not run; messages will neither be received nor sent",
+      'no document inbox: inbox_enabled is off for this business',
     ]);
   });
 
   it('builds a notifier when a destination and SMTP are both configured', async () => {
-    const runtime = await buildRuntime(FULL);
+    const runtime = await build();
     expect(runtime.notify?.notifier.channel).toBe('email');
     expect(runtime.notify?.dashboardBaseUrl).toBe('http://127.0.0.1:8787');
   });
 
   it('warns loudly rather than silently omitting the mail adapter', async () => {
-    const { SMTP_HOST: _host, ...withoutHost } = FULL;
-    const runtime = await buildRuntime(withoutHost);
+    const runtime = await build({ settings: { ...SETTINGS, notifySmtpHost: null } });
     expect(runtime.registry.get('office-mail')).toBeNull();
-    expect(runtime.warnings.join(' ')).toMatch(/SMTP_HOST/);
+    expect(runtime.warnings.join(' ')).toMatch(/notify_smtp_host/);
   });
 
   it('warns when SMTP is configured but nobody is set to receive notifications', async () => {
-    const { APPROVAL_NOTIFY_TO: _to, ...withoutTo } = FULL;
-    const runtime = await buildRuntime(withoutTo);
+    const runtime = await build({ settings: { ...SETTINGS, notifyTo: null } });
     expect(runtime.notify).toBeUndefined();
-    expect(runtime.warnings.join(' ')).toMatch(/APPROVAL_NOTIFY_TO/);
+    expect(runtime.warnings.join(' ')).toMatch(/notify_to/);
   });
 
-  it('warns and runs without mail when the notify ref is missing, rather than throwing', async () => {
-    const { NOTIFY_CREDENTIAL_REF: _ref, ...withoutRef } = FULL;
+  it('warns and runs without notify when the notify password is not stored, rather than throwing', async () => {
     // The scheduler still has to expire approvals — this was already the
-    // shape for a missing SMTP variable, and an unset ref is the same class.
-    const runtime = await buildRuntime(withoutRef);
+    // shape for a missing SMTP setting, and an unstored password is the same class.
+    const runtime = await build({ pass: null });
     expect(runtime.notify).toBeUndefined();
-    expect(runtime.warnings.join(' ')).toMatch(/NOTIFY_CREDENTIAL_REF/);
+    expect(runtime.warnings.join(' ')).toMatch(/NOTIFY_SMTP_PASS is not stored/);
     // Unrelated to the mail adapter itself, same as the ANTHROPIC_API_KEY case.
     expect(runtime.registry.get('office-mail')).not.toBeNull();
-  });
-
-  it('rejects a notify ref that is not a legal credential ref', async () => {
-    // CREDENTIAL_REF_PATTERN is uppercase, digits and underscore only, and
-    // `key-check` / `key-recovery` are lowercase-with-hyphen precisely so a
-    // real ref can never collide with them. A misconfigured ref must be
-    // refused at startup, not at the first approval. Matched against the
-    // message naming the control, not `toThrow()` bare — an unrelated throw
-    // (a stray typo elsewhere in the same build) would otherwise pass this
-    // just as well.
-    await expect(
-      buildRuntime({ ...FULL, NOTIFY_CREDENTIAL_REF: 'key-check' }),
-    ).rejects.toThrow(/NOTIFY_CREDENTIAL_REF/);
   });
 
   /**
@@ -182,7 +299,9 @@ describe('buildRuntime', () => {
    * and reads source as text instead when the property is "this string must
    * not appear in production code" (`erasure-invariants.test.ts`'s import
    * scan, `conductor-invariants.test.ts`'s call-block scan). Put the literal
-   * back anywhere non-test under `src/` and this goes red.
+   * back anywhere non-test under `src/` and this goes red. The fixed secret
+   * NAME `NOTIFY_SMTP_PASS` (a ref in the business's encrypted store, never an
+   * env var) is the one spelling that is allowed, and only that one.
    */
   it('reads no SMTP_PASS anywhere in production source', async () => {
     const offenders: string[] = [];
@@ -205,7 +324,7 @@ describe('buildRuntime', () => {
         if (!entry.name.endsWith('.ts') || entry.name.endsWith('.test.ts')) continue;
         scanned.push(path);
         const source = await readFile(path, 'utf8');
-        if (source.includes('SMTP_PASS')) offenders.push(path);
+        if (/(?<!NOTIFY_)SMTP_PASS/.test(source)) offenders.push(path);
       }
     };
 
@@ -217,28 +336,33 @@ describe('buildRuntime', () => {
     expect(scanned.length).toBeGreaterThan(100);
     expect(scanned).toContain(join('src', 'orchestrator', 'runtime.ts'));
     expect(offenders).toEqual([]);
+    // And the pattern itself bites on the old spelling while sparing the new.
+    expect(/(?<!NOTIFY_)SMTP_PASS/.test("env['SMTP_PASS']")).toBe(true);
+    expect(/(?<!NOTIFY_)SMTP_PASS/.test("'NOTIFY_SMTP_PASS'")).toBe(false);
   });
 
   /**
-   * The wiring in `buildRuntime` (ref, credential source, business id) is
-   * unmeasured by every test above it: none of them ever calls the notifier
-   * it builds. Driving it end to end is what actually proves three things at
-   * once — the ref resolved is the *configured* one and not some other ref
-   * that happens to also be stored, the source resolving it is the real
-   * encrypted store rather than a stub, and the resolved value actually
-   * reaches the transport's authentication. `overrides.createTransport` is
-   * `buildRuntime`'s own injection seam for exactly this, mirroring
+   * The wiring (ref, credential source, business id) is unmeasured by every
+   * test above it: none of them ever calls the notifier it builds. Driving it
+   * end to end is what actually proves three things at once — the ref
+   * resolved is the fixed `NOTIFY_SMTP_PASS` and not some other ref that
+   * happens to also be stored, the source resolving it is the real encrypted
+   * store rather than a stub, and the resolved value actually reaches the
+   * transport's authentication. `overrides.createTransport` is the server
+   * runtime's own injection seam for exactly this, mirroring
    * `SmtpConfig.createTransport` one layer down.
    */
-  it('notifies using the configured NOTIFY_CREDENTIAL_REF resolved from the real store, not a different stored ref', async () => {
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'NOTIFY_MAIL', value: 'סוד-הנוטיפייר', updatedBy: 'operator@example.com' }, KEY));
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'DECOY_REF', value: 'סוד-אחר-לגמרי', updatedBy: 'operator@example.com' }, KEY));
+  it('notifies using NOTIFY_SMTP_PASS resolved from the real store, not a different stored ref', async () => {
+    await storeSecret('DECOY_REF', 'סוד-אחר-לגמרי');
 
     const captured: Array<{ user?: string; pass?: string }> = [];
-    const runtime = await buildRuntime(FULL, {
-      createTransport: (opts) => {
-        captured.push(opts.auth);
-        return { sendMail: () => Promise.resolve({ messageId: 'stub-message-id' }) };
+    const runtime = await build({
+      pass: 'סוד-הנוטיפייר',
+      overrides: {
+        createTransport: (opts) => {
+          captured.push(opts.auth);
+          return { sendMail: () => Promise.resolve({ messageId: 'stub-message-id' }) };
+        },
       },
     });
 
@@ -264,21 +388,22 @@ describe('buildRuntime', () => {
    * hand-built double. Mirrors the notifier test just above, through the
    * real encrypted store and the real `transport.send` call shape.
    */
-  it('sendAlert resolves NOTIFY_CREDENTIAL_REF through the real store and reaches the transport', async () => {
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'NOTIFY_MAIL', value: 'סוד-התראת-הבריאות', updatedBy: 'operator@example.com' }, KEY));
-
+  it('sendAlert resolves NOTIFY_SMTP_PASS through the real store and reaches the transport', async () => {
     const captured: Array<{ to: string; subject: string; text: string; auth?: { user?: string; pass?: string } }> = [];
-    const runtime = await buildRuntime(FULL, {
-      createTransport: (opts) => ({
-        // The body arrives as a stream (see `send` in `src/mail/transport.ts`);
-        // drained here so the assertion below still reads the text itself.
-        sendMail: async (mail: { to: string; subject: string; text: NodeJS.ReadableStream }) => {
-          let text = '';
-          for await (const chunk of mail.text) text += String(chunk);
-          captured.push({ to: mail.to, subject: mail.subject, text, auth: opts.auth });
-          return { messageId: 'stub-message-id' };
-        },
-      }),
+    const runtime = await build({
+      pass: 'סוד-התראת-הבריאות',
+      overrides: {
+        createTransport: (opts) => ({
+          // The body arrives as a stream (see `send` in `src/mail/transport.ts`);
+          // drained here so the assertion below still reads the text itself.
+          sendMail: async (mail: { to: string; subject: string; text: NodeJS.ReadableStream }) => {
+            let text = '';
+            for await (const chunk of mail.text) text += String(chunk);
+            captured.push({ to: mail.to, subject: mail.subject, text, auth: opts.auth });
+            return { messageId: 'stub-message-id' };
+          },
+        }),
+      },
     });
 
     const notify = runtime.notify;
@@ -292,7 +417,7 @@ describe('buildRuntime', () => {
     expect(captured).toHaveLength(1);
     expect(captured[0]?.subject).toBe('נושא ההתראה');
     expect(captured[0]?.text).toBe('גוף ההתראה');
-    expect(captured[0]?.to).toBe(FULL['APPROVAL_NOTIFY_TO']);
+    expect(captured[0]?.to).toBe(SETTINGS.notifyTo);
     expect(captured[0]?.auth?.pass).toBe('סוד-התראת-הבריאות');
   });
 
@@ -305,15 +430,17 @@ describe('buildRuntime', () => {
    * must carry the new value.
    */
   it('sendAlert resolves a fresh credential on every call, so a rotation takes effect on the next alert', async () => {
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'NOTIFY_MAIL', value: 'סוד-ראשון', updatedBy: 'operator@example.com' }, KEY));
     const captured: Array<{ pass?: string }> = [];
-    const runtime = await buildRuntime(FULL, {
-      createTransport: (opts) => ({
-        sendMail: () => {
-          captured.push({ pass: opts.auth.pass });
-          return Promise.resolve({ messageId: 'stub-message-id' });
-        },
-      }),
+    const runtime = await build({
+      pass: 'סוד-ראשון',
+      overrides: {
+        createTransport: (opts) => ({
+          sendMail: () => {
+            captured.push({ pass: opts.auth.pass });
+            return Promise.resolve({ messageId: 'stub-message-id' });
+          },
+        }),
+      },
     });
     const notify = runtime.notify;
     if (notify?.sendAlert === undefined) throw new Error('unreachable — asserted above');
@@ -322,7 +449,7 @@ describe('buildRuntime', () => {
     expect(first.ok).toBe(true);
     expect(captured[0]?.pass).toBe('סוד-ראשון');
 
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'NOTIFY_MAIL', value: 'סוד-שני', updatedBy: 'operator@example.com' }, KEY));
+    await storeSecret(NOTIFY_SMTP_PASS_REF, 'סוד-שני');
     const second = await notify.sendAlert('נושא', 'גוף');
     expect(second.ok).toBe(true);
     expect(captured[1]?.pass).toBe('סוד-שני');
@@ -330,12 +457,12 @@ describe('buildRuntime', () => {
   });
 
   /**
-   * `SMTP_SECURE=false` is the shipped default and the runbook's value, so the
-   * mandatory-STARTTLS path is the one every installation takes. The switch
-   * that turns it off exists for a local relay that speaks no TLS at all
-   * (`maildev`), and it must be impossible to be in that state quietly — the
-   * whole point of this branch is that one password stops travelling in the
-   * clear.
+   * `notify_smtp_secure = false` is the shipped default and the runbook's
+   * value, so the mandatory-STARTTLS path is the one every business takes.
+   * The switch that turns it off exists for a local relay that speaks no TLS
+   * at all (`maildev`), and it must be impossible to be in that state quietly
+   * — the whole point of this branch is that one password stops travelling
+   * in the clear.
    */
   it('requires STARTTLS by default, and says so loudly when told not to', async () => {
     const seen: Array<Record<string, unknown>> = [];
@@ -344,10 +471,8 @@ describe('buildRuntime', () => {
       return { sendMail: () => Promise.resolve({ messageId: 'stub-message-id' }) };
     };
 
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'NOTIFY_MAIL', value: 'pw', updatedBy: 'test' }, KEY));
-
-    const strict = await buildRuntime(FULL, { createTransport: capture });
-    expect(strict.warnings.join(' ')).not.toMatch(/SMTP_ALLOW_CLEARTEXT/);
+    const strict = await build({ overrides: { createTransport: capture } });
+    expect(strict.warnings.join(' ')).not.toMatch(/allow_cleartext/);
     // Positive half: an option object was actually built, so the assertion
     // about its `requireTLS` is about a real send and not about nothing.
     await strict.notify?.notifier.notify(approvalFixture(), 'http://127.0.0.1:8787/a/AP-test');
@@ -355,111 +480,85 @@ describe('buildRuntime', () => {
     expect(seen[0]?.['requireTLS']).toBe(true);
 
     seen.length = 0;
-    const lax = await buildRuntime({ ...FULL, SMTP_ALLOW_CLEARTEXT: '1' }, { createTransport: capture });
-    expect(lax.warnings.join(' ')).toMatch(/SMTP_ALLOW_CLEARTEXT/);
+    const lax = await build({
+      settings: { ...SETTINGS, notifySmtpAllowCleartext: true },
+      overrides: { createTransport: capture },
+    });
+    expect(lax.warnings.join(' ')).toMatch(/notify_smtp_allow_cleartext/);
     await lax.notify?.notifier.notify(approvalFixture(), 'http://127.0.0.1:8787/a/AP-test');
     expect(seen).toHaveLength(1);
     expect(seen[0]?.['requireTLS']).toBe(false);
-
-    // A value that is not exactly `1` is not the opt-out: same positive-check
-    // discipline as `SMTP_SECURE === 'true'` one field over, so a typo can
-    // only ever leave the stricter setting in place.
-    seen.length = 0;
-    const typo = await buildRuntime({ ...FULL, SMTP_ALLOW_CLEARTEXT: 'true' }, { createTransport: capture });
-    expect(typo.warnings.join(' ')).not.toMatch(/SMTP_ALLOW_CLEARTEXT/);
-    await typo.notify?.notifier.notify(approvalFixture(), 'http://127.0.0.1:8787/a/AP-test');
-    expect(seen[0]?.['requireTLS']).toBe(true);
   });
 
   it('marks document production available when both binary paths are set', async () => {
-    const runtime = await buildRuntime(FULL);
+    const server = await buildServerRuntime(FULL);
+    const runtime = await runtimeFor(server);
     expect(runtime.production).toEqual({
       available: true,
       sofficePath: '/usr/bin/soffice',
       chromiumPath: '/usr/bin/chromium',
     });
-    expect(runtime.warnings.join(' ')).not.toMatch(/DOCUMENT_SOFFICE_PATH|DOCUMENT_CHROMIUM_PATH/);
+    expect(server.warnings.join(' ')).not.toMatch(/DOCUMENT_SOFFICE_PATH|DOCUMENT_CHROMIUM_PATH/);
   });
 
   it('warns, and does not throw, when the LibreOffice or Chromium path is absent', async () => {
     const { DOCUMENT_SOFFICE_PATH: _s, ...withoutSoffice } = FULL;
-    const noSoffice = await buildRuntime(withoutSoffice);
-    expect(noSoffice.production?.available).toBe(false);
+    const noSoffice = await buildServerRuntime(withoutSoffice);
+    expect(noSoffice.production.available).toBe(false);
     expect(noSoffice.warnings.join(' ')).toMatch(/no document production: DOCUMENT_SOFFICE_PATH not set/);
     expect(noSoffice.warnings.join(' ')).not.toMatch(/DOCUMENT_CHROMIUM_PATH/);
 
     // Absent and explicitly empty are both "not set".
     const withoutBoth: Record<string, string> = { ...FULL, DOCUMENT_SOFFICE_PATH: '' };
     delete withoutBoth['DOCUMENT_CHROMIUM_PATH'];
-    const neither = await buildRuntime(withoutBoth);
+    const neither = await buildServerRuntime(withoutBoth);
     expect(neither.production).toEqual({ available: false, sofficePath: null, chromiumPath: null });
     expect(neither.warnings.join(' ')).toMatch(/DOCUMENT_SOFFICE_PATH, DOCUMENT_CHROMIUM_PATH not set/);
-    // Unrelated to mail: the rest of the runtime is still built.
-    expect(neither.registry.get('office-mail')).not.toBeNull();
+    // Unrelated to mail: the business's runtime is still built.
+    await saveSettings(SETTINGS);
+    expect((await runtimeFor(neither)).registry.get('office-mail')).not.toBeNull();
   });
 
   it('warns when ANTHROPIC_API_KEY is absent, so curation-off does not look like nothing-to-remember', async () => {
     const { ANTHROPIC_API_KEY: _key, ...withoutKey } = FULL;
-    const runtime = await buildRuntime(withoutKey);
-    expect(runtime.warnings.join(' ')).toMatch(/ANTHROPIC_API_KEY/);
+    const server = await buildServerRuntime(withoutKey);
+    expect(server.warnings.join(' ')).toMatch(/ANTHROPIC_API_KEY/);
     // Unrelated to the mail adapter — a missing model key must not also
     // suppress the mail warning path or vice versa.
-    expect(runtime.registry.get('office-mail')).not.toBeNull();
+    await saveSettings(SETTINGS);
+    expect((await runtimeFor(server)).registry.get('office-mail')).not.toBeNull();
   });
 
   /**
-   * The switch, and the same pattern as `DOCUMENT_INBOX` and the five SMTP
-   * vars: "no WhatsApp" is a real production state today (there is no
+   * The switch, and the same pattern as the inbox and the SMTP settings: "no
+   * WhatsApp" is a real production state today (there is no
    * `createGreenApiGateway` yet), and it must be REPORTED, not look
-   * identical to "there was nothing to send". `FULL` carries neither
-   * `GREEN_API_INSTANCE_REF` nor `GREEN_API_TOKEN_REF`.
+   * identical to "there was nothing to send".
    */
-  it('builds no WhatsApp gateway and warns, naming both missing GREEN-API refs', async () => {
-    const runtime = await buildRuntime(FULL);
+  it('builds no WhatsApp gateway and warns when the business has not turned it on', async () => {
+    const runtime = await build();
     expect(runtime.whatsapp).toBeUndefined();
-    expect(runtime.warnings.join(' ')).toContain('GREEN_API_INSTANCE_REF');
-    expect(runtime.warnings.join(' ')).toContain('GREEN_API_TOKEN_REF');
+    expect(runtime.warnings.join(' ')).toMatch(/whatsapp_enabled is off/);
   });
 
-  it('warns naming only the one GREEN-API ref that is missing', async () => {
-    const runtime = await buildRuntime({ ...FULL, GREEN_API_INSTANCE_REF: 'GREEN_API_INSTANCE' });
+  it('warns when WhatsApp is on but neither GREEN-API secret is stored', async () => {
+    const runtime = await build({ settings: { ...SETTINGS, whatsappEnabled: true } });
     expect(runtime.whatsapp).toBeUndefined();
-    expect(runtime.warnings.join(' ')).toContain('GREEN_API_TOKEN_REF');
-    expect(runtime.warnings.join(' ')).not.toContain('GREEN_API_INSTANCE_REF not set');
-  });
-
-  it('warns when both GREEN-API refs are set but neither resolves to a stored credential', async () => {
-    const runtime = await buildRuntime({
-      ...FULL,
-      GREEN_API_INSTANCE_REF: 'GREEN_API_INSTANCE',
-      GREEN_API_TOKEN_REF: 'GREEN_API_TOKEN',
-    });
-    expect(runtime.whatsapp).toBeUndefined();
-    expect(runtime.warnings.join(' ')).toMatch(/GREEN_API_INSTANCE_REF.*did not resolve/);
-    expect(runtime.warnings.join(' ')).toMatch(/GREEN_API_TOKEN_REF.*did not resolve/);
-  });
-
-  it('rejects a GREEN-API ref that is not a legal credential ref', async () => {
-    await expect(
-      buildRuntime({ ...FULL, GREEN_API_INSTANCE_REF: 'key-check', GREEN_API_TOKEN_REF: 'GREEN_API_TOKEN' }),
-    ).rejects.toThrow(/GREEN_API_INSTANCE_REF/);
+    expect(runtime.warnings.join(' ')).toMatch(/GREEN_API_INSTANCE_ID.*did not resolve/);
+    expect(runtime.warnings.join(' ')).toMatch(/GREEN_API_TOKEN.*did not resolve/);
   });
 
   /**
-   * Both refs resolve, but no `overrides.whatsappGateway` factory is
+   * Both secrets resolve, but no `overrides.whatsappGateway` factory is
    * supplied — the true production default today, because no
    * `createGreenApiGateway` exists yet (a later task supplies it; see
-   * `buildRuntime`'s own docblock). The credentials resolving is real
+   * `businessRuntime`'s own docblock). The credentials resolving is real
    * progress over the unconfigured case above, and the warning says so.
    */
-  it('warns that no gateway implementation is wired in yet, once both refs resolve', async () => {
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'GREEN_API_INSTANCE', value: 'inst-1', updatedBy: 'operator@example.com' }, KEY));
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'GREEN_API_TOKEN', value: 'tok-1', updatedBy: 'operator@example.com' }, KEY));
-    const runtime = await buildRuntime({
-      ...FULL,
-      GREEN_API_INSTANCE_REF: 'GREEN_API_INSTANCE',
-      GREEN_API_TOKEN_REF: 'GREEN_API_TOKEN',
-    });
+  it('warns that no gateway implementation is wired in yet, once both secrets resolve', async () => {
+    await storeSecret(GREEN_API_INSTANCE_ID_REF, 'inst-1');
+    await storeSecret(GREEN_API_TOKEN_REF, 'tok-1');
+    const runtime = await build({ settings: { ...SETTINGS, whatsappEnabled: true } });
     expect(runtime.whatsapp).toBeUndefined();
     expect(runtime.warnings.join(' ')).toMatch(/no gateway implementation is wired in yet/);
   });
@@ -467,48 +566,42 @@ describe('buildRuntime', () => {
   /**
    * Half-resolved is not configured. A factory IS supplied here (unlike the
    * test above, which has none to call) — so the only thing standing between
-   * this install and a gateway built on an absent token is the `instance ===
+   * this business and a gateway built on an absent token is the `instance ===
    * null || token === null` check, not the absence of a factory. Only the
-   * instance ref is actually stored.
+   * instance secret is actually stored.
    */
-  it('builds no gateway when only one of the two GREEN-API refs resolves, even with a factory supplied', async () => {
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'GREEN_API_INSTANCE', value: 'inst-half', updatedBy: 'operator@example.com' }, KEY));
-    const runtime = await buildRuntime(
-      {
-        ...FULL,
-        GREEN_API_INSTANCE_REF: 'GREEN_API_INSTANCE',
-        GREEN_API_TOKEN_REF: 'GREEN_API_TOKEN', // never stored
-      },
-      { whatsappGateway: () => createFakeGateway() },
-    );
+  it('builds no gateway when only one of the two GREEN-API secrets resolves, even with a factory supplied', async () => {
+    await storeSecret(GREEN_API_INSTANCE_ID_REF, 'inst-half');
+    const runtime = await build({
+      settings: { ...SETTINGS, whatsappEnabled: true },
+      overrides: { whatsappGateway: () => createFakeGateway() },
+    });
     expect(runtime.whatsapp).toBeUndefined();
-    expect(runtime.warnings.join(' ')).toMatch(/GREEN_API_TOKEN_REF.*did not resolve/);
+    expect(runtime.warnings.join(' ')).toMatch(/GREEN_API_TOKEN did not resolve/);
+    expect(runtime.warnings.join(' ')).not.toMatch(/GREEN_API_INSTANCE_ID/);
   });
 
   /**
-   * The positive path: both refs resolve AND a factory is supplied (the seam
-   * a later task's default replaces) — `runtime.whatsapp.gateway` is built
-   * from the resolved credentials, not from anything this function invented.
+   * The positive path: both secrets resolve AND a factory is supplied (the
+   * seam a later task's default replaces) — `runtime.whatsapp.gateway` is
+   * built from the resolved credentials, not from anything this function
+   * invented.
    */
   it('builds a WhatsApp gateway from the resolved credentials when a factory is supplied', async () => {
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'GREEN_API_INSTANCE', value: 'inst-42', updatedBy: 'operator@example.com' }, KEY));
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'GREEN_API_TOKEN', value: 'tok-42', updatedBy: 'operator@example.com' }, KEY));
+    await storeSecret(GREEN_API_INSTANCE_ID_REF, 'inst-42');
+    await storeSecret(GREEN_API_TOKEN_REF, 'tok-42');
     let seenInstance: string | null = null;
     let seenToken: string | null = null;
-    const runtime = await buildRuntime(
-      {
-        ...FULL,
-        GREEN_API_INSTANCE_REF: 'GREEN_API_INSTANCE',
-        GREEN_API_TOKEN_REF: 'GREEN_API_TOKEN',
-      },
-      {
+    const runtime = await build({
+      settings: { ...SETTINGS, whatsappEnabled: true },
+      overrides: {
         whatsappGateway: ({ instance, token }) => {
           seenInstance = instance.value;
           seenToken = token.value;
           return createFakeGateway();
         },
       },
-    );
+    });
     expect(runtime.whatsapp).toBeDefined();
     expect(seenInstance).toBe('inst-42');
     expect(seenToken).toBe('tok-42');
@@ -516,27 +609,27 @@ describe('buildRuntime', () => {
   });
 
   it('always supplies a credential source', async () => {
-    const runtime = await buildRuntime({ CREDENTIAL_KEY_PATH: FULL['CREDENTIAL_KEY_PATH'] as string });
+    const server = await buildServerRuntime({ CREDENTIAL_KEY_PATH: FULL['CREDENTIAL_KEY_PATH'] as string });
+    const runtime = await runtimeFor(server);
     expect(typeof runtime.credentials.resolve).toBe('function');
   });
 
-  it('treats an explicitly-empty MAIL_SYSTEM as unset, not as a literal empty system id', async () => {
-    // `??` alone accepts `''`, and an adapter registered under an empty
-    // system id can never be matched by `resolveChannel` — every mail.send
-    // step would fail silently, with no warning at all, because the earlier
-    // check only looks at the SMTP_* keys. Empty must fall back to the
-    // default, exactly like every other value this function reads.
-    const runtime = await buildRuntime({ ...FULL, MAIL_SYSTEM: '' });
+  it('treats an explicitly-empty mail system as unset, not as a literal empty system id', async () => {
+    // An adapter registered under an empty system id can never be matched by
+    // `resolveChannel` — every mail.send step would fail silently, with no
+    // warning at all. `saveRuntimeSettings` stores empty as NULL, and NULL
+    // falls back to the default.
+    const runtime = await build({ settings: { ...SETTINGS, mailSystem: '' } });
     expect(runtime.registry.get('office-mail')).not.toBeNull();
   });
 
   it('treats an explicitly-empty DASHBOARD_BASE_URL as unset, not as a literal empty link', async () => {
-    const runtime = await buildRuntime({ ...FULL, DASHBOARD_BASE_URL: '' });
+    const runtime = await build({ env: { ...FULL, DASHBOARD_BASE_URL: '' } });
     expect(runtime.notify?.dashboardBaseUrl).toBe('http://127.0.0.1:8787');
   });
 
   it('registers the browser driver as the browser channel default', async () => {
-    const runtime = await buildRuntime(FULL);
+    const runtime = await build();
     // AdapterRegistry.systems() lists system-specific entries under their
     // bare system id and channel defaults prefixed `channel:` (see that
     // method's docblock). Asserting `channel:browser` is present fails if
@@ -551,7 +644,7 @@ describe('buildRuntime', () => {
    * binding's `provider` column alone — never from whether an OAuth grant
    * has actually been stored. A missing authorisation is the adapter's own
    * runtime failure (`credential_unavailable`), not a missing adapter; see
-   * `runtime.ts`'s own docblock on `buildRuntime`.
+   * `businessRuntime`'s own docblock.
    */
   it('registers the provider adapter for a declared system even with no grant stored', async () => {
     await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] })));
@@ -565,7 +658,7 @@ describe('buildRuntime', () => {
         lastError: null,
       }, { by: 'test' }));
 
-    const runtime = await buildRuntime(FULL);
+    const runtime = await build();
     expect(runtime.registry.get('office-calendar')).not.toBeNull();
     // `.resolve(...)`, not only `.get(...)` (fix-round 1, finding M3): this
     // is what actually proves the registered adapter serves the RIGHT
@@ -577,6 +670,24 @@ describe('buildRuntime', () => {
     expect(runtime.registry.resolve('office-calendar', 'api', 'calendar.read')).not.toBeNull();
   });
 
+  it('reads a binding written after the server runtime was built, on the next business build', async () => {
+    // The restart the old single build required: a `provider` set through the
+    // dashboard now takes effect on the business's next pass.
+    const server = await buildServerRuntime(FULL);
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] })));
+    expect((await runtimeFor(server)).registry.get('office-calendar')).toBeNull();
+    await withBusiness(BUSINESS, (db) => upsertBinding(db, {
+        system: 'office-calendar',
+        status: 'live',
+        endpoint: null,
+        credentialRef: 'OFFICE_CALENDAR',
+        provider: 'google',
+        lastOkAt: null,
+        lastError: null,
+      }, { by: 'test' }));
+    expect((await runtimeFor(server)).registry.get('office-calendar')).not.toBeNull();
+  });
+
   /**
    * Fix-round 1, finding I1 — the sharpest finding of the round. Before the
    * fix, registration keyed on `provider === 'google'` and `channel: 'api'`
@@ -585,8 +696,8 @@ describe('buildRuntime', () => {
    * `provider: 'google'` on the `office-mail` binding — the natural thing to
    * do when authorising Gmail through a future consent screen — collided
    * with the mail adapter already registered under that same system name:
-   * `AdapterRegistry`'s constructor throws on the duplicate, so `buildRuntime`
-   * itself threw and the whole scheduler refused to boot. A row a dashboard
+   * `AdapterRegistry`'s constructor throws on the duplicate, so the runtime
+   * build itself threw and the whole scheduler refused to boot. A row a dashboard
    * writes must never be able to stop the process from starting.
    */
   it('does not collide with the mail adapter when its own binding also carries provider: "google"', async () => {
@@ -620,7 +731,7 @@ describe('buildRuntime', () => {
       }, { by: 'test' }));
 
     // Must not throw.
-    const runtime = await buildRuntime(FULL);
+    const runtime = await build();
     // The mail adapter is still the one serving `office-mail`, and it still
     // serves `mail.send` — nothing here silently swapped it out.
     expect(runtime.registry.resolve('office-mail', 'api', 'mail.send')).not.toBeNull();
@@ -661,7 +772,7 @@ describe('buildRuntime', () => {
         lastError: null,
       }, { by: 'test' }));
 
-    const runtime = await buildRuntime(FULL);
+    const runtime = await build();
     expect(runtime.registry.resolve('mailbox', 'api', 'calendar.read')).toBeNull();
     // It gets the mailbox SEND adapter, and only that.
     expect(runtime.registry.resolve('mailbox', 'api', 'mail.send')).not.toBeNull();
@@ -693,7 +804,7 @@ describe('buildRuntime', () => {
         lastError: null,
       }, { by: 'test' }));
 
-    const runtime = await buildRuntime(FULL);
+    const runtime = await build();
     expect(runtime.registry.resolve('mailbox', 'api', 'mail.send')).not.toBeNull();
     expect(runtime.registry.resolve('mailbox', 'api', 'calendar.read')).toBeNull();
     // SMTP adapter still registered for notifications.
@@ -741,7 +852,7 @@ describe('buildRuntime', () => {
 
     // Must not throw: the legacy read-only adapter is NOT registered under
     // the `calendar` name next to the new one.
-    const runtime = await buildRuntime(FULL);
+    const runtime = await build();
     expect(runtime.registry.resolve('calendar', 'api', 'calendar.write')).not.toBeNull();
     expect(runtime.registry.resolve('calendar', 'api', 'calendar.read')).not.toBeNull();
     expect(runtime.registry.resolve('calendar', 'api', 'mail.send')).toBeNull();
@@ -775,7 +886,7 @@ describe('buildRuntime', () => {
         lastOkAt: null,
         lastError: null,
       }, { by: 'test' }));
-    const runtime = await buildRuntime(FULL);
+    const runtime = await build();
     expect(runtime.registry.resolve('calendar', 'api', 'calendar.write')).toBeNull();
     expect(runtime.warnings.some((w) => w.includes('no calendar adapter') && w.includes('signed charter'))).toBe(true);
   });
@@ -805,7 +916,7 @@ describe('buildRuntime', () => {
         lastOkAt: null,
         lastError: null,
       }, { by: 'test' }));
-    const runtime = await buildRuntime(FULL);
+    const runtime = await build();
     expect(runtime.registry.resolve('calendar', 'api', 'calendar.write')).toBeNull();
   });
 
@@ -819,8 +930,8 @@ describe('buildRuntime', () => {
    * connection modelling of Google Workspace the ruling names — so the
    * `serves` check is satisfied and the loop would try to register a second
    * adapter under a system name the mail adapter already claimed, which is
-   * exactly what makes `AdapterRegistry`'s constructor throw. `buildRuntime`
-   * must still not throw: a row a dashboard writes (`provider: 'google'` on
+   * exactly what makes `AdapterRegistry`'s constructor throw. The runtime
+   * build must still not throw: a row a dashboard writes (`provider: 'google'` on
    * an existing binding) must never be able to stop the process from
    * booting, for any charter shape.
    */
@@ -851,7 +962,7 @@ describe('buildRuntime', () => {
       }, { by: 'test' }));
 
     // Must not throw.
-    const runtime = await buildRuntime(FULL);
+    const runtime = await build();
     // The mail adapter still serves `mail.send` under `office-mail` —
     // nothing about the skipped calendar registration touched it.
     expect(runtime.registry.resolve('office-mail', 'api', 'mail.send')).not.toBeNull();
@@ -873,17 +984,19 @@ describe('buildRuntime', () => {
    * both assertions; one that supplied both sources would fail the second.
    */
   it('resolves secrets from the encrypted store, and not from the process environment', async () => {
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'OFFICE_MAIL', value: 'sealed-in-the-database', updatedBy: 'operator@example.com' }, KEY));
+    await storeSecret('OFFICE_MAIL', 'sealed-in-the-database');
 
-    const runtime = await buildRuntime({
-      ...FULL,
-      // Exactly the shape `envCredentials` reads. Stored nowhere else.
-      [`${DEFAULT_CREDENTIAL_ENV_PREFIX}DECOY`]: 'from-the-environment',
+    const runtime = await build({
+      env: {
+        ...FULL,
+        // Exactly the shape `envCredentials` reads. Stored nowhere else.
+        [`${DEFAULT_CREDENTIAL_ENV_PREFIX}DECOY`]: 'from-the-environment',
+      },
     });
 
-    const stored = await runtime.credentials.resolve('OFFICE_MAIL', config.businessId);
+    const stored = await runtime.credentials.resolve('OFFICE_MAIL', BUSINESS);
     expect(stored?.value).toBe('sealed-in-the-database');
-    expect(await runtime.credentials.resolve('DECOY', config.businessId)).toBeNull();
+    expect(await runtime.credentials.resolve('DECOY', BUSINESS)).toBeNull();
   });
 
   /**
@@ -893,8 +1006,8 @@ describe('buildRuntime', () => {
    */
   it('refuses to build at all when no key file is configured', async () => {
     const { CREDENTIAL_KEY_PATH: _path, ...withoutKeyPath } = FULL;
-    await expect(buildRuntime(withoutKeyPath)).rejects.toThrow(MasterKeyError);
-    await expect(buildRuntime({ ...FULL, CREDENTIAL_KEY_PATH: '' })).rejects.toThrow(
+    await expect(buildServerRuntime(withoutKeyPath)).rejects.toThrow(MasterKeyError);
+    await expect(buildServerRuntime({ ...FULL, CREDENTIAL_KEY_PATH: '' })).rejects.toThrow(
       MasterKeyError,
     );
   });
@@ -908,10 +1021,10 @@ describe('buildRuntime', () => {
     await writeFile(wrongPath, randomBytes(KEY_BYTES), { mode: 0o600 });
 
     await expect(
-      buildRuntime({ ...FULL, CREDENTIAL_KEY_PATH: wrongPath }),
+      buildServerRuntime({ ...FULL, CREDENTIAL_KEY_PATH: wrongPath }),
     ).rejects.toThrow(MasterKeyError);
     // …and the right one still builds, so the refusal above is the key and
     // not something that makes every build fail.
-    await expect(buildRuntime(FULL)).resolves.toBeDefined();
+    await expect(buildServerRuntime(FULL)).resolves.toBeDefined();
   });
 });

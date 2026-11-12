@@ -9,12 +9,13 @@
  *   carries a new `refresh_token`, and the old one may stop working. It is
  *   returned as `rotatedRefreshToken` so `oauthCredentials` re-seals it; a
  *   caller that dropped it would lose the grant within days.
- * - The client credentials are resolved from the encrypted store fresh on
- *   every call (never `process.env`), for the business the call names.
+ * - The client credentials are resolved from the encrypted PLATFORM store
+ *   fresh on every call (never `process.env`) -- the client is the app's,
+ *   not any business's.
  * - No token value and no raw response body ever reaches `message`.
  */
 import { z } from 'zod';
-import type { CredentialSource } from '../credentials.js';
+import type { PlatformSecretSource } from '../../tenancy/platform-credentials.js';
 import type { RefreshOutcome, TokenHttp } from '../oauth-token.js';
 
 /** The multi-tenant ("common") v2 token endpoint -- work, school and personal accounts. */
@@ -32,7 +33,13 @@ const MicrosoftTokenSuccessBody = z.object({
 });
 
 export interface MicrosoftTokenHttpOptions {
-  credentials: CredentialSource;
+  /**
+   * The APPLICATION's own OAuth client id/secret — the platform store
+   * (`platform-credentials.ts`), never a business's `credentials`: the client
+   * belongs to the app, and one per business would be one per tenant to keep
+   * in sync.
+   */
+  clients: PlatformSecretSource;
   /** Test seam only. */
   fetchImpl?: typeof fetch;
 }
@@ -51,8 +58,8 @@ export function microsoftTokenHttp(options: MicrosoftTokenHttpOptions): TokenHtt
       }
 
       const [clientId, clientSecret] = await Promise.all([
-        options.credentials.resolve(MICROSOFT_CLIENT_ID_REF, input.businessId),
-        options.credentials.resolve(MICROSOFT_CLIENT_SECRET_REF, input.businessId),
+        options.clients.resolve(MICROSOFT_CLIENT_ID_REF),
+        options.clients.resolve(MICROSOFT_CLIENT_SECRET_REF),
       ]);
       if (clientId === null || clientSecret === null) {
         return {
@@ -60,15 +67,15 @@ export function microsoftTokenHttp(options: MicrosoftTokenHttpOptions): TokenHtt
           kind: 'misconfigured',
           message:
             'תצורת ה-OAuth של Microsoft חסרה — יש להקציב ' +
-            `${MICROSOFT_CLIENT_ID_REF} ו-${MICROSOFT_CLIENT_SECRET_REF} במאגר הסודות`,
+            `${MICROSOFT_CLIENT_ID_REF} ו-${MICROSOFT_CLIENT_SECRET_REF} במאגר הסודות של השרת`,
         };
       }
 
       const body = new URLSearchParams({
         grant_type: 'refresh_token',
         refresh_token: input.refreshToken,
-        client_id: clientId.value,
-        client_secret: clientSecret.value,
+        client_id: clientId,
+        client_secret: clientSecret,
       });
 
       let response: Response;

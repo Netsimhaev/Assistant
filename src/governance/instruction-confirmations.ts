@@ -12,7 +12,7 @@
  *
  * **A question is answerable only while it is fresh — checked in the same
  * UPDATE.** `confirmChoice` requires `presented_at` to be inside the question
- * window (`config.whatsappQuestionWindowMinutes`, the setting `openMailCards`
+ * window (the business's `whatsappQuestionWindowMinutes`, the setting `openMailCards`
  * reads) as a positive condition of that one statement. Expiry by sweep alone
  * would leave the gap between sweeps open, and the gate's 24-hour check
  * measures `decided_at`, so a question presented weeks ago and confirmed now
@@ -52,9 +52,9 @@
  */
 import { z } from 'zod';
 import type { BusinessDb } from '../db/pool.js';
-import { config } from '../config.js';
 import { Plan } from '../domain/plan.js';
 import { planHashOf } from '../orchestrator/plan-store.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 export const ConfirmationOption = z.object({
   label: z.string(),
@@ -208,7 +208,7 @@ export async function confirmChoice(
   decidedBy: string,
   options: { windowMinutes?: number; whatsappInboundAt?: Date } = {},
 ): Promise<boolean> {
-  const windowMinutes = options.windowMinutes ?? config.whatsappQuestionWindowMinutes;
+  const windowMinutes = options.windowMinutes ?? capFor(await loadRuntimeSettings(db), 'whatsappQuestionWindowMinutes');
   if (windowMinutes <= 0) return false;
   const inboundAt = options.whatsappInboundAt;
   if (inboundAt !== undefined && Number.isNaN(inboundAt.getTime())) return false;
@@ -262,7 +262,7 @@ export async function cancelConfirmation(
  * return their job ids — the exact complement of what `confirmChoice` still
  * accepts.
  *
- * The window is `config.whatsappQuestionWindowMinutes` unless overridden, the
+ * The window is the business's `whatsappQuestionWindowMinutes` (`capFor`) unless overridden, the
  * same setting and the same reading as `openMailCards`: `0` (or less) means no
  * question is open, so every pending row of the business expires. Measured on
  * the database clock (`now()`), the clock that wrote `presented_at`.
@@ -271,7 +271,7 @@ export async function expireConfirmations(
   db: BusinessDb,
   options: { windowMinutes?: number } = {},
 ): Promise<string[]> {
-  const windowMinutes = options.windowMinutes ?? config.whatsappQuestionWindowMinutes;
+  const windowMinutes = options.windowMinutes ?? capFor(await loadRuntimeSettings(db), 'whatsappQuestionWindowMinutes');
   const { rows } = await db.query<{ job_id: string }>(
     `UPDATE instruction_confirmations
         SET state = 'expired', decided_at = now()

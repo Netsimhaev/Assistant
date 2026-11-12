@@ -125,7 +125,6 @@
  * stop burning, no due plan runs, nothing closes — for as long as the
  * provider hangs.
  */
-import { config } from '../config.js';
 import type { InstructionRecord } from '../governance/instructions.js';
 import { loadActiveCharter } from '../charter/store.js';
 import type { BusinessCharter } from '../domain/charter.js';
@@ -183,6 +182,7 @@ import {
   type WhatsAppRoute,
 } from './whatsapp-routing.js';
 import type { BusinessDb } from '../db/pool.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 export interface DoorResult {
   /** However many messages `pollOnce` delivered to this pass, redeliveries included. */
@@ -461,7 +461,7 @@ interface ProcessContext {
   /** Called when `applyConfirmation` throws — into `DoorResult.confirmErrored`. */
   reportConfirmError: (jobId: string, error: string) => void;
   /**
-   * Overrides `config.whatsappQuestionWindowMinutes` for one call. Production
+   * Overrides the business's `whatsappQuestionWindowMinutes` for one call. Production
    * leaves it unset — the same escape hatch `pollTimeoutMs` and
    * `transcribeInbound`'s `timeoutMs` already give their own bounds, and for
    * the same reason: a test must be able to prove both sides of a window
@@ -985,7 +985,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     }
 
     const usedToday = await whatsappInstructionsToday(ctx.db);
-    if (usedToday >= config.whatsappInstructionsPerDay) {
+    if (usedToday >= capFor(await loadRuntimeSettings(ctx.db), 'whatsappInstructionsPerDay')) {
       await ctx.messenger.send({
         text: withTranscriptEcho(isAudio, heard, INSTRUCTION_CAP_REACHED),
         jobId: null,
@@ -1268,7 +1268,7 @@ export async function runWhatsAppDoor(db: BusinessDb, options: {
    */
   pollTimeoutMs?: number;
   /**
-   * Overrides `config.whatsappQuestionWindowMinutes` for one call — see
+   * Overrides the business's `whatsappQuestionWindowMinutes` for one call — see
    * `ProcessContext.questionWindowMinutes`. Test seam only; production
    * leaves it unset.
    */

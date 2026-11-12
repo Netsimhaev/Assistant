@@ -18,7 +18,6 @@ import { installCharter } from '../charter/store.js';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { CalendarProvider } from '../calendar/calendar.js';
 import type { CharterConnection } from '../domain/connection.js';
-import { putSecret } from '../governance/credential-store.js';
 import { KEY_BYTES, writeKeyState } from '../governance/master-key.js';
 import { readGrantBySystem } from '../governance/oauth-grants.js';
 import { GOOGLE_CLIENT_ID_REF, GOOGLE_CLIENT_SECRET_REF } from '../orchestrator/adapters/google-token-http.js';
@@ -27,6 +26,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase } from '../test/db.js';
 import { createOwner } from './auth.js';
 import { createServer } from './server.js';
+import { putPlatformSecret } from '../tenancy/platform-credentials.js';
 
 const BUSINESS = 'test-business';
 const USERNAME = 'owner';
@@ -59,7 +59,8 @@ beforeEach(async () => {
     ['MICROSOFT_OAUTH_CLIENT_ID', 'ms-id'],
     ['MICROSOFT_OAUTH_CLIENT_SECRET', 'ms-secret'],
   ] as const) {
-    await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref, value, updatedBy: 'test' }, key));
+    // The OAuth client is the server's, not the business's (spec §5.4).
+    await putPlatformSecret(ref, value, key);
   }
   await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
 });

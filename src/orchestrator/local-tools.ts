@@ -107,6 +107,7 @@ import { authorisedRecipients } from '../governance/typed-recipients.js';
 import { toOneLine } from '../util/bidi.js';
 import type { Runtime } from './runtime.js';
 import { localParts, localToInstant } from '../util/local-time.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 export interface LocalToolContext {
   jobId: string;
@@ -885,7 +886,8 @@ const HANDLERS: Record<string, LocalHandler> = {
     // trade the conductor's own docblock names (M1): it can only under-run
     // the budget, never exceed it.
     const readsSoFar = await readingsToday(ctx.db);
-    if (readsSoFar >= config.documentReadsPerDay) {
+    const readsPerDay = capFor(await loadRuntimeSettings(ctx.db), 'documentReadsPerDay');
+    if (readsSoFar >= readsPerDay) {
       // `DOCUMENT_READS_PER_DAY=0` is a legitimate ceiling (CLAUDE.md: an
       // operator turning document reads off entirely), and `positiveInt`
       // accepts it. At that value `readsSoFar >= 0` is true before anything
@@ -900,8 +902,8 @@ const HANDLERS: Record<string, LocalHandler> = {
       // CLAUDE.md, "בעיות ידועות".
       throw new StepChannelError(
         'document_reads_exhausted',
-        `${readsSoFar}/${config.documentReadsPerDay} document reads already used today`,
-        config.documentReadsPerDay > 0,
+        `${readsSoFar}/${readsPerDay} document reads already used today`,
+        readsPerDay > 0,
       );
     }
     const outcome = await readDocument(

@@ -29,7 +29,7 @@ import {
   MICROSOFT_CLIENT_ID_REF,
   MICROSOFT_CLIENT_SECRET_REF,
 } from '../orchestrator/adapters/microsoft-token-http.js';
-import type { CredentialSource } from '../orchestrator/credentials.js';
+import type { PlatformSecretSource } from '../tenancy/platform-credentials.js';
 import type { MailProvider } from '../mail/mailbox.js';
 import { GOOGLE_TOKEN_URL, MICROSOFT_TOKEN_URL } from './oauth-profiles.js';
 
@@ -119,9 +119,8 @@ export interface ExchangeCodeInput {
   code: string;
   codeVerifier: string;
   redirectUri: string;
-  /** Resolves the APPLICATION's own client id/secret -- never the business's grant. Production: `storedCredentials(key)`. */
-  credentials: CredentialSource;
-  businessId: string;
+  /** Resolves the APPLICATION's own client id/secret -- never the business's grant. Production: `platformSecrets(key)`, the platform store. */
+  clients: PlatformSecretSource;
   /** Defaults to `'google'`. Selects the client refs and, with `tokenUrl`, the endpoint. */
   provider?: MailProvider;
   /** Test seam only. No production caller ever passes it -- the same discipline `googleTokenHttp`'s `fetchImpl` keeps. */
@@ -183,14 +182,14 @@ export async function exchangeCode(input: ExchangeCodeInput): Promise<ExchangeCo
   const secretRef = provider === 'microsoft' ? MICROSOFT_CLIENT_SECRET_REF : GOOGLE_CLIENT_SECRET_REF;
   const tokenUrl = provider === 'microsoft' ? MICROSOFT_TOKEN_URL : GOOGLE_TOKEN_URL;
   const [clientId, clientSecret] = await Promise.all([
-    input.credentials.resolve(idRef, input.businessId),
-    input.credentials.resolve(secretRef, input.businessId),
+    input.clients.resolve(idRef),
+    input.clients.resolve(secretRef),
   ]);
   if (clientId === null || clientSecret === null) {
     return {
       ok: false,
       kind: 'misconfigured',
-      message: `תצורת ה-OAuth של ${names} חסרה — יש להקציב ${idRef} ו-${secretRef} במאגר הסודות`,
+      message: `תצורת ה-OAuth של ${names} חסרה — יש להקציב ${idRef} ו-${secretRef} במאגר הסודות של השרת`,
     };
   }
 
@@ -198,8 +197,8 @@ export async function exchangeCode(input: ExchangeCodeInput): Promise<ExchangeCo
     grant_type: 'authorization_code',
     code: input.code,
     redirect_uri: input.redirectUri,
-    client_id: clientId.value,
-    client_secret: clientSecret.value,
+    client_id: clientId,
+    client_secret: clientSecret,
     code_verifier: input.codeVerifier,
   });
 

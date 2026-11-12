@@ -87,12 +87,13 @@
  * buffer any longer than necessary) happens.
  */
 import type { BusinessDb } from '../db/pool.js';
-import { config } from '../config.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import type { TrustLevel } from '../domain/trust.js';
 import type { NormalizedInboundMessage } from './gateway.js';
 import type { SenderKind } from './store.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
+import type { CapName } from '../tenancy/runtime-settings.js';
 
 export type TranscribeOutcome =
   | { status: 'transcribed'; text: string }
@@ -172,7 +173,7 @@ const DOWNLOAD_TIMEOUT_MS = 60_000;
  * the same fact; the rename closes that gap between the name and the code.
  *
  * **The derivation, spelled out so the next reader can check the
- * arithmetic rather than trust it.** `config.whatsappMaxAudioSeconds`
+ * arithmetic rather than trust it.** `whatsappMaxAudioSeconds`
  * defaults to 180s. A WhatsApp voice note is opus-encoded at roughly
  * 20–32 kbps. At a GENEROUS 128 kbps — four to six times that, to cover
  * audio sent under the `audio` kind that is not a typical voice note —
@@ -236,9 +237,9 @@ function provenanceOf(senderKind: SenderKind): TrustLevel {
  * `provenanceOf`'s own as exactly the kind of two-places-that-must-agree
  * this project has been burned by before.
  */
-const DAILY_CAP: Record<SenderKind, () => number> = {
-  principal: () => config.whatsappTranscribeBossPerDay,
-  other: () => config.whatsappTranscribeOtherPerDay,
+const DAILY_CAP: Record<SenderKind, CapName> = {
+  principal: 'whatsappTranscribeBossPerDay',
+  other: 'whatsappTranscribeOtherPerDay',
 };
 
 /**
@@ -327,12 +328,13 @@ export async function transcribeInbound(
     return { status: 'too_large', bytes: bytes.length };
   }
 
-  const maxSeconds = options.maxSeconds ?? config.whatsappMaxAudioSeconds;
+  const settings = await loadRuntimeSettings(db);
+  const maxSeconds = options.maxSeconds ?? capFor(settings, 'whatsappMaxAudioSeconds');
   if (seconds > maxSeconds) {
     return { status: 'too_long', seconds };
   }
 
-  const perDay = DAILY_CAP[senderKind]();
+  const perDay = capFor(settings, DAILY_CAP[senderKind]);
   const usedToday = await whatsappTranscriptionsToday(db, senderKind);
   if (usedToday >= perDay) {
     return { status: 'capped' };

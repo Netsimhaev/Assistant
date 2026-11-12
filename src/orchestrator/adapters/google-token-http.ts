@@ -6,19 +6,19 @@
  * An earlier version of `oauth-token.ts` shipped a `defaultTokenHttp` that
  * read the OAuth client secret from `process.env` -- in a branch whose
  * entire purpose is getting secrets OUT of the environment. It was removed.
- * **The client credentials are resolved through the existing encrypted
- * store** (`storedCredentials`, `src/governance/credential-store.ts`), the
- * same path every other per-business secret in this project already
- * travels, never through `process.env` -- see `master-key.ts`'s own
- * reasoning for why a secret never lives there, and the removal of the SMTP
- * password's env variable (`runtime.ts`) on the identical argument.
+ * **The client credentials are resolved through an encrypted store** --
+ * since multi-tenancy, the PLATFORM store (`platformSecrets`,
+ * `src/tenancy/platform-credentials.ts`), because the OAuth client belongs
+ * to the application and not to any one business -- never through
+ * `process.env`: see `master-key.ts`'s own reasoning for why a secret never
+ * lives there, and the removal of the SMTP password's env variable
+ * (`runtime.ts`) on the identical argument.
  *
- * `googleTokenHttp` takes the credential SOURCE, not a resolved value, and
+ * `googleTokenHttp` takes the secret SOURCE, not a resolved value, and
  * resolves both refs fresh on EVERY refresh call -- never once at
- * construction. That is what makes a rotated app secret (`secret put
- * GOOGLE_OAUTH_CLIENT_SECRET`, the CLI's only writer) take effect on the
- * very next token refresh with no process restart, the same property
- * `createEmailNotifier` already has for `NOTIFY_CREDENTIAL_REF`.
+ * construction. That is what makes a rotated app secret (`putPlatformSecret`)
+ * take effect on the very next token refresh with no process restart, the
+ * same property `createEmailNotifier` already has for its SMTP password.
  *
  * **Missing configuration is a TERMINAL failure, and it is `'misconfigured'`,
  * never `'rejected'` and never `'transient'`.** A business that never
@@ -61,7 +61,9 @@
  * inside this one implementation, exactly the "which business is this
  * really for" ambiguity `CredentialSource`'s mandatory, undefaulted
  * `businessId` exists to make unreachable (fix-round 1, finding I6). See
- * `TokenHttp`'s own docblock in `oauth-token.ts`.
+ * `TokenHttp`'s own docblock in `oauth-token.ts`. The client refs no longer
+ * read it at all -- they are the server's -- but the grant being refreshed
+ * is still that business's, which is why `input` keeps carrying it.
  *
  * **No token value -- access token, refresh token, or client secret --
  * ever reaches a `RefreshOutcome.message`.** A failure message is built
@@ -73,7 +75,7 @@
  * in `adapters/mail.ts` already applies to an SMTP failure's `message`.
  */
 import { z } from 'zod';
-import type { CredentialSource } from '../credentials.js';
+import type { PlatformSecretSource } from '../../tenancy/platform-credentials.js';
 import type { RefreshOutcome, TokenHttp } from '../oauth-token.js';
 
 /**
@@ -85,10 +87,10 @@ const DEFAULT_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 
 /**
  * The refs the app's own OAuth client id and client secret are stored
- * under, in the SAME encrypted store every other secret in this project
- * uses. Exported so the operator provisioning them with `secret put` (or a
- * test seeding them with `putSecret`) uses the exact spelling this module
- * reads, never a name invented independently.
+ * under, in the PLATFORM store (`platform_credentials`). Exported so the
+ * operator provisioning them (or a test seeding them with
+ * `putPlatformSecret`) uses the exact spelling this module reads, never a
+ * name invented independently.
  */
 export const GOOGLE_CLIENT_ID_REF = 'GOOGLE_OAUTH_CLIENT_ID';
 export const GOOGLE_CLIENT_SECRET_REF = 'GOOGLE_OAUTH_CLIENT_SECRET';
@@ -103,7 +105,13 @@ const GoogleTokenSuccessBody = z.object({
 });
 
 export interface GoogleTokenHttpOptions {
-  credentials: CredentialSource;
+  /**
+   * The APPLICATION's own OAuth client id/secret — the platform store
+   * (`platform-credentials.ts`), never a business's `credentials`: the client
+   * belongs to the app, and one per business would be one per tenant to keep
+   * in sync.
+   */
+  clients: PlatformSecretSource;
   /**
    * Test seam only. Unreachable from env or config -- the same discipline
    * `buildRuntime`'s `overrides.createTransport` already keeps: no
@@ -133,12 +141,12 @@ export function googleTokenHttp(options: GoogleTokenHttpOptions): TokenHttp {
         };
       }
 
-      // Resolved fresh on every call, for the business THIS CALL names --
-      // see module docblock. A throw here (a store failure, not an absent
-      // secret) is left to propagate.
+      // Resolved fresh on every call, from the platform store -- see module
+      // docblock. A throw here (a store failure, not an absent secret) is
+      // left to propagate.
       const [clientId, clientSecret] = await Promise.all([
-        options.credentials.resolve(GOOGLE_CLIENT_ID_REF, input.businessId),
-        options.credentials.resolve(GOOGLE_CLIENT_SECRET_REF, input.businessId),
+        options.clients.resolve(GOOGLE_CLIENT_ID_REF),
+        options.clients.resolve(GOOGLE_CLIENT_SECRET_REF),
       ]);
       if (clientId === null || clientSecret === null) {
         return {
@@ -146,15 +154,15 @@ export function googleTokenHttp(options: GoogleTokenHttpOptions): TokenHttp {
           kind: 'misconfigured',
           message:
             'תצורת ה-OAuth של Google חסרה — יש להקציב ' +
-            `${GOOGLE_CLIENT_ID_REF} ו-${GOOGLE_CLIENT_SECRET_REF} במאגר הסודות`,
+            `${GOOGLE_CLIENT_ID_REF} ו-${GOOGLE_CLIENT_SECRET_REF} במאגר הסודות של השרת`,
         };
       }
 
       const body = new URLSearchParams({
         grant_type: 'refresh_token',
         refresh_token: input.refreshToken,
-        client_id: clientId.value,
-        client_secret: clientSecret.value,
+        client_id: clientId,
+        client_secret: clientSecret,
       });
 
       let response: Response;

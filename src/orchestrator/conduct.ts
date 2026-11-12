@@ -11,7 +11,6 @@
  * keeps for a hostile file. And a job that hit that failure must not be left
  * stranded either — see the `catch` block below, which recovers both.
  */
-import { config } from '../config.js';
 import { loadActiveCharter } from '../charter/store.js';
 import type { BusinessDb } from '../db/pool.js';
 import { renderArtifactFull } from '../documents/brief.js';
@@ -31,9 +30,10 @@ import { proposalToPlan } from './proposal-to-plan.js';
 import { proposeForReading, type ProposeForReadingOptions } from './propose.js';
 import { raiseProposalApproval, type NotifyTarget } from './proposal-approval.js';
 import { withSessionLockOn } from './session-lock.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 export interface ConductOptions {
-  /** Defaults to `config.documentReadsPerDay`. */
+  /** Defaults to the business's `documentReadsPerDay` (`capFor`). */
   readsPerDay?: number;
   /** Most documents to consider in one pass, regardless of the daily ceiling. */
   limit?: number;
@@ -359,7 +359,7 @@ export async function conductPendingDocuments(
   options: ConductOptions = {},
 ): Promise<ConductResult> {
   const businessId = db.businessId;
-  const readsPerDay = options.readsPerDay ?? config.documentReadsPerDay;
+  const readsPerDay = options.readsPerDay ?? capFor(await loadRuntimeSettings(db), 'documentReadsPerDay');
   const limit = options.limit ?? 10;
 
   const result: ConductResult = {

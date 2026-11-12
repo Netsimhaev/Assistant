@@ -5,7 +5,7 @@ import { loadJob, transition } from './jobs.js';
 import { loadPlanBody } from './plan-store.js';
 import { rampLevelForPlan } from './ramp.js';
 import { runPlanForJob, type RunPlanForJobRequest } from './run-plan.js';
-import { buildRuntime } from './runtime.js';
+import { buildServerRuntime, businessRuntime } from './runtime.js';
 import { withSessionLock } from './session-lock.js';
 import type { Runtime } from './runtime.js';
 
@@ -160,7 +160,7 @@ export async function runDueJobs(
 ): Promise<RunDueResult> {
   const businessId = db.businessId;
   const limit = options.limit ?? 20;
-  const runtime = options.runtime ?? (await buildRuntime());
+  const runtime = options.runtime ?? (await businessRuntime(await buildServerRuntime(), db));
 
   const { rows } = await db.query<DueJobRow>(
     `SELECT job_id FROM jobs

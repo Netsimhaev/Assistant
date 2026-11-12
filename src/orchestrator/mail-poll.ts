@@ -136,6 +136,7 @@ import { OAuthGrantRevokedError, OAuthRefreshRejectedError } from './oauth-token
 import type { NotifyTarget } from './proposal-approval.js';
 import { presentMailCard } from './whatsapp-mail-card.js';
 import type { Runtime } from './runtime.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 export interface MailPollResult {
   status: 'ok' | 'needs_reauth' | 'error';
@@ -382,7 +383,7 @@ export async function pollMailbox(db: BusinessDb, options: PollMailboxOptions): 
     result,
   };
 
-  const readsPerDay = options.readsPerDay ?? config.mailReadsPerDay;
+  const readsPerDay = options.readsPerDay ?? capFor(await loadRuntimeSettings(db), 'mailReadsPerDay');
   let remaining = readsPerDay - (await mailReadsToday(db));
   const waiting = await mailAwaitingTriage(db, options.limit ?? DEFAULT_TRIAGE_LIMIT);
   for (const mail of waiting) {
@@ -659,7 +660,7 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
       try {
         const curated = await curateJob(db, job.jobId, {
           scope: 'mail',
-          runsPerDay: config.mailCurationPerDay,
+          runsPerDay: capFor(await loadRuntimeSettings(db), 'mailCurationPerDay'),
           ...(pass.curator !== undefined ? { curator: pass.curator } : {}),
         });
         if (curated.failed) await noteCurationFailure(db, mail, job.jobId);

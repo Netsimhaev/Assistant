@@ -47,6 +47,11 @@ import {
 } from '../governance/credential-store.js';
 import { loadMasterKey } from '../governance/master-key.js';
 import { canonicalHash } from '../util/canonical.js';
+import {
+  putPlatformSecret,
+  removePlatformSecret,
+  resolvePlatformSecret,
+} from '../tenancy/platform-credentials.js';
 import { closeCliPools, runForBusiness } from './business-arg.js';
 import { nodePromptIo } from './node-prompt-io.js';
 
@@ -234,11 +239,74 @@ export async function runSecretCli(db: BusinessDb, argv: string[], deps: SecretC
  * one connection for that business. Returns the exit code so a test can drive
  * it without a process.
  */
+/** The flag that targets the server's own secrets instead of a business's. */
+const PLATFORM_FLAG = '--platform';
+
+/**
+ * `secret --platform put|test|remove <ref> <operator>` — the SERVER's secrets
+ * (`platform_credentials`): the Google and Microsoft OAuth client id/secret,
+ * which belong to the application and to no business (spec §5.4). No
+ * `--business`: there is no business to name. The same stdin-only rule as
+ * `put` above, and the same "no command prints a value" rule as `test`.
+ *
+ * Not audited: `audit_log` is a per-business chain, and a platform secret has
+ * no business whose chain it belongs in. The operator's own shell history is
+ * the record, the same as `secret-key`'s server-wide commands.
+ */
+export async function runPlatformSecretCli(argv: string[], deps: SecretCliDeps): Promise<void> {
+  const { log } = deps;
+  const command = argv[0];
+  const ref = argv[1];
+  const operator = argv[2];
+  const platformUsage =
+    `שימוש:\n` +
+    `  secret --platform put <הפניה> <מפעיל>     — קורא את הסוד מהקלט הסטנדרטי\n` +
+    `  secret --platform test <הפניה> <מפעיל>\n` +
+    `  secret --platform remove <הפניה> <מפעיל>`;
+  if ((command !== 'put' && command !== 'test' && command !== 'remove') || ref === undefined || operator === undefined) {
+    throw new Error(platformUsage);
+  }
+  if (argv.length > 3) {
+    // Same refusal as the business `put`: a fourth element can only be the
+    // secret itself on the command line, and the message never echoes it.
+    throw new Error(
+      'הסוד אינו מתקבל כארגומנט בשורת הפקודה — הוא נקרא מהקלט הסטנדרטי (stdin) בלבד, ' +
+        'ולא נכתב דבר',
+    );
+  }
+  if (command === 'put') {
+    const key = await loadKeyFromEnv();
+    const value = await deps.readSecret();
+    await putPlatformSecret(ref, value, key);
+    log(`הסוד "${ref}" נשמר במאגר השרת.`);
+    return;
+  }
+  if (command === 'remove') {
+    const removed = await removePlatformSecret(ref);
+    log(removed ? `הסוד "${ref}" הוסר ממאגר השרת.` : `לא נמצא סוד בשם "${ref}" במאגר השרת.`);
+    return;
+  }
+  const key = await loadKeyFromEnv();
+  const resolved = (await resolvePlatformSecret(ref, key)) !== null;
+  log(resolved ? `הסוד "${ref}" נפתר בהצלחה.` : `הסוד "${ref}" אינו נפתר.`);
+}
+
 export async function main(
   argv: string[],
   io: { log: (line: string) => void; error: (line: string) => void; readSecret: () => Promise<string> },
 ): Promise<number> {
   try {
+    if (argv.includes(PLATFORM_FLAG)) {
+      if (argv.some((arg) => arg === '--business' || arg.startsWith('--business='))) {
+        io.error('--platform ו---business אינם הולכים יחד — סוד של השרת אינו שייך לאף עסק');
+        return 2;
+      }
+      await runPlatformSecretCli(
+        argv.filter((arg) => arg !== PLATFORM_FLAG),
+        { log: io.log, readSecret: io.readSecret },
+      );
+      return 0;
+    }
     return await runForBusiness(argv, io.error, (db, rest) =>
       runSecretCli(db, rest, { log: io.log, readSecret: io.readSecret }));
   } catch (err) {

@@ -113,6 +113,7 @@ import {
   type Production,
   type ProductionDestination,
 } from './store.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 // ---------------------------------------------------------------- shapes
 
@@ -636,10 +637,10 @@ export type ApproveOutcome =
 export function whatsappAnswerable(
   deliveredAt: Date | null,
   inboundAt: Date | undefined,
-  options: { now?: number; windowMinutes?: number } = {},
+  options: { now?: number; windowMinutes: number },
 ): boolean {
   if (deliveredAt === null || inboundAt === undefined) return false;
-  const windowMinutes = options.windowMinutes ?? config.whatsappQuestionWindowMinutes;
+  const windowMinutes = options.windowMinutes;
   if (windowMinutes <= 0) return false;
   const delivered = deliveredAt.getTime();
   const inbound = inboundAt.getTime();
@@ -698,7 +699,7 @@ export async function approveDocumentCard(
     if (
       actor === 'whatsapp' &&
       !whatsappAnswerable(card.whatsappDeliveredAt, options.whatsappInboundAt, {
-        ...(options.windowMinutes !== undefined ? { windowMinutes: options.windowMinutes } : {}),
+        windowMinutes: options.windowMinutes ?? capFor(await loadRuntimeSettings(tx), 'whatsappQuestionWindowMinutes'),
       })
     ) {
       return { status: 'not_answerable' };
@@ -980,7 +981,7 @@ export async function requestFix(
 
     const active = await loadActiveCharter(tx);
     if (active === null) throw new Error(`requestFix: no active charter for ${businessId}`);
-    const perDay = options.perDay ?? config.documentsPerDay;
+    const perDay = options.perDay ?? capFor(await loadRuntimeSettings(tx), 'documentsPerDay');
     if ((await productionsToday(tx, active.charter.identity.timezone, options.now)) >= perDay) {
       return { status: 'refused', reason: productionCapReason(perDay) };
     }

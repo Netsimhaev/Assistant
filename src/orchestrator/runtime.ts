@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
 import { loadActiveCharter } from '../charter/store.js';
-import { config } from '../config.js';
 import { storedCredentials } from '../governance/credential-store.js';
 import { loadMasterKey, MasterKeyError, verifyKeyState } from '../governance/master-key.js';
 import { createEmailNotifier } from '../governance/notify.js';
@@ -26,7 +25,6 @@ import type { CalendarClient } from '../calendar/types.js';
 import { createCalendarAdapter } from './adapters/calendar.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { loadBindings } from './bindings.js';
-import { CREDENTIAL_REF_PATTERN } from './credentials.js';
 import type { CredentialSource } from './credentials.js';
 import { oauthCredentials } from './oauth-token.js';
 import type { TokenHttp } from './oauth-token.js';
@@ -35,6 +33,10 @@ import type { WhatsAppGateway } from '../whatsapp/gateway.js';
 import { canonicalHash } from '../util/canonical.js';
 import { PRODUCTION_TOOLS_MISSING_REASON } from '../production/render-error.js';
 import { withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
+import { platformSecrets } from '../tenancy/platform-credentials.js';
+import { loadRuntimeSettings } from '../tenancy/runtime-settings.js';
+import type { RuntimeSettings } from '../tenancy/runtime-settings.js';
 
 /** Which vendor's code serves a binding's system. Matches `ConnectionBinding.provider`. */
 const GOOGLE_PROVIDER = 'google';
@@ -109,6 +111,15 @@ export interface Runtime {
    */
   whatsapp?: { gateway: WhatsAppGateway };
   /**
+   * The folder this business's document inbox scans, present only when the
+   * business turned its inbox on (`inbox_enabled`) AND the server has an inbox
+   * folder configured (`DOCUMENT_INBOX`). Absent means the scan and the
+   * conductor do not run for this business this pass — the same "a missing
+   * setting is a switch, not a fault" rule `DOCUMENT_INBOX` stated alone
+   * before settings moved into the database (spec §5.4).
+   */
+  inbox?: string;
+  /**
    * Whether document production can run on this server: both binaries it
    * needs (`DOCUMENT_SOFFICE_PATH` for the LibreOffice page conversion of
    * check 2, `DOCUMENT_CHROMIUM_PATH` for PDF printing and page images) are
@@ -166,23 +177,30 @@ function withAlertDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   });
 }
 
-const SMTP_KEYS = [
-  'SMTP_HOST',
-  'SMTP_PORT',
-  'SMTP_SECURE',
-  'SMTP_FROM',
-  'SMTP_USER',
-] as const;
+/**
+ * The SMTP fields a business must set before its mail adapter and approval
+ * notifier exist, named by their `business_runtime_settings` columns so a
+ * warning points at exactly what `npm run business:settings` writes.
+ */
+const SMTP_FIELDS = [
+  ['notify_smtp_host', 'notifySmtpHost'],
+  ['notify_smtp_port', 'notifySmtpPort'],
+  ['notify_smtp_from', 'notifySmtpFrom'],
+  ['notify_smtp_user', 'notifySmtpUser'],
+] as const satisfies ReadonlyArray<readonly [string, keyof RuntimeSettings]>;
 
 /**
- * The two GREEN-API credential refs — same pattern as `NOTIFY_CREDENTIAL_REF`:
- * the env var names a ref, never a secret itself, and the secret is resolved
- * through `credentials` below. Both must name a ref that actually resolves,
- * or the switch stays off — see `buildRuntime`'s own docblock on why this
- * function resolves credentials only, never the charter.
+ * The fixed secret names a business's runtime resolves, from that business's
+ * own encrypted `credentials`. Fixed rather than named by an env var (the old
+ * `NOTIFY_CREDENTIAL_REF` / `GREEN_API_*_REF`): with many businesses on one
+ * server there is no process-wide setting to name a ref in, and a fixed name
+ * per business is what 500c33b already decided for GREEN-API. Each is a legal
+ * `CREDENTIAL_REF_PATTERN` ref by construction, so no startup check is needed
+ * for a typo that can no longer be made.
  */
-const GREEN_API_INSTANCE_REF_KEY = 'GREEN_API_INSTANCE_REF';
-const GREEN_API_TOKEN_REF_KEY = 'GREEN_API_TOKEN_REF';
+export const NOTIFY_SMTP_PASS_REF = 'NOTIFY_SMTP_PASS';
+export const GREEN_API_INSTANCE_ID_REF = 'GREEN_API_INSTANCE_ID';
+export const GREEN_API_TOKEN_REF = 'GREEN_API_TOKEN';
 
 /**
  * The document card email's idempotency key — content-derived, like
@@ -197,10 +215,46 @@ export function documentCardAlertKey(subject: string, body: string, bytes: Buffe
 }
 
 /**
- * Assemble a production runtime.
+ * The test seams `buildServerRuntime` accepts. No production caller ever
+ * passes any of them — see `buildServerRuntime`'s own docblock.
+ */
+export interface ServerRuntimeOverrides {
+  createTransport?: SmtpConfig['createTransport'];
+  tokenHttp?: TokenHttp;
+  calendarHttp?: CalendarHttp;
+  /** Test seam: the mailbox client a send adapter uses, per provider. */
+  mailboxClient?: (provider: MailProvider) => MailboxClient;
+  /** Test seam: the calendar client the calendar adapter uses, per provider. */
+  calendarClient?: (provider: CalendarProvider) => CalendarClient;
+  /** Test seam only — see `businessRuntime`'s docblock. No default exists yet. */
+  whatsappGateway?: (creds: { instance: CredentialHandle; token: CredentialHandle }) => WhatsAppGateway;
+}
+
+/**
+ * Everything one process needs once, whatever business it is serving: the
+ * master key (as the credential source built from it), the tool paths, the
+ * dashboard link base and the server's own warnings (spec §5.4).
+ *
+ * Nothing here belongs to a business — no charter, no binding, no setting.
+ * Those are read per business, per pass, by `businessRuntime`.
+ */
+export interface ServerRuntime {
+  /** The composed source: the encrypted store, with OAuth grants minted on top. */
+  readonly credentials: CredentialSource;
+  readonly dashboardBaseUrl: string;
+  /** `DOCUMENT_INBOX`, or `null` when the server has no inbox folder at all. */
+  readonly documentInbox: string | null;
+  readonly production: { available: boolean; sofficePath: string | null; chromiumPath: string | null };
+  /** What the SERVER could not assemble. A business's own warnings are on its `Runtime`. */
+  readonly warnings: readonly string[];
+  readonly overrides: Readonly<ServerRuntimeOverrides>;
+}
+
+/**
+ * Assemble the server half of a production runtime, once per process.
  *
  * **Async because the master key is a file, and it is read here** — once, at
- * startup, into process memory. Missing SMTP settings are a warning and the
+ * startup, into process memory. Missing settings are a warning and the
  * scheduler carries on, but a key that will not load is a REFUSAL: an
  * installation running with no secrets produces failures that look like
  * network trouble, one customer at a time, instead of one refusal an operator
@@ -219,86 +273,34 @@ export function documentCardAlertKey(subject: string, body: string, bytes: Buffe
  * without a real Google account behind it — and **no test in this
  * sub-project uses either one yet**. They exist for two NAMED future
  * consumers: Task 5's consent-flow tests (which need to drive a fake token
- * exchange through a `buildRuntime`-assembled runtime end to end, the way
- * this sub-project's own tests drive `createTransport`) and a future
- * live-run script test for the calendar chain, the sibling of
- * `probe-smtp.ts`. Naming the expected consumer here is deliberate: a seam
- * with no reader and no stated owner is exactly the "field nobody reads"
- * class this project has paid for more than once (fix round 2, minor 7) —
- * until one of those two lands, this stays a documented gap, not a claim
- * that something already exercises it. No production caller ever passes
- * any of the three overrides — every real call site calls `buildRuntime()`
- * with zero arguments: `run-scheduler.ts`, `run-due.ts` and `scheduler.ts`
- * in the product, plus the two operator scripts
- * `scripts/live-thread-status.ts` and `scripts/probe-smtp.ts`.
+ * exchange through a runtime assembled here end to end, the way this
+ * sub-project's own tests drive `createTransport`) and a future live-run
+ * script test for the calendar chain, the sibling of `probe-smtp.ts`. Naming
+ * the expected consumer here is deliberate: a seam with no reader and no
+ * stated owner is exactly the "field nobody reads" class this project has
+ * paid for more than once (fix round 2, minor 7) — until one of those two
+ * lands, this stays a documented gap, not a claim that something already
+ * exercises it. No production caller ever passes any of the overrides —
+ * every real call site calls `buildServerRuntime()` with zero arguments.
  *
  * **The credential source is a composition, not a single store.**
  * `oauthCredentials` wraps `storedCredentials(key)` rather than replacing
  * it: a ref that is not a stored OAuth grant — every ref the mail adapter
  * has ever resolved — falls straight through to the same encrypted store as
  * before, unchanged in behaviour. What is added is a ref that names a
- * Google grant: the composed source mints a live access token for it,
- * refreshing through `googleTokenHttp`, which resolves the app's OWN OAuth
- * client id/secret through that identical encrypted store, never through
- * `process.env` (see `google-token-http.ts`'s own docblock — this is the
- * piece Task 3 originally sketched as reading `process.env` and was
- * reverted for that exact reason).
- *
- * **Provider adapters register from the charter and the bindings, not from
- * a grant.** A system whose binding names `provider: 'google'`, and whose
- * charter-declared connection for that same system BOTH uses the `api`
- * channel AND serves `calendar.read`, gets `createGoogleCalendarAdapter`
- * registered under its system name — even when no grant has been stored for
- * it yet. A missing authorisation is a RUNTIME failure the adapter itself
- * reports (`credential_unavailable`, from `oauthCredentials` resolving to
- * `null`), not a missing adapter — the same distinction §6.2 of the design
- * spec draws between a connectivity failure and a policy decision. The
- * `serves` half of that check is load-bearing: see the registration loop's
- * own comment (fix-round 1, finding I1) for the collision it prevents.
- *
- * **This reads the charter and the bindings exactly ONCE, at the moment
- * `buildRuntime` is called — not continuously.** Every real caller
- * (`run-scheduler.ts` chief among them) builds one `Runtime` at process
- * start and reuses it for every scheduler pass thereafter. A `provider`
- * column an owner sets through Task 5's dashboard AFTER the scheduler is
- * already running therefore has NO EFFECT until the process is restarted —
- * this is a known limitation, not an oversight: re-deriving the adapter
- * registry on every pass would mean re-reading the charter and the master
- * key every 30 seconds, and that trade-off belongs to a later task, not this
- * fix round. `docs/live-thread-runbook.md` states the restart requirement
- * for an operator to actually find.
- *
- * **WhatsApp resolves credentials only, never the charter — that is this
- * function's whole business with it.** The two GREEN-API refs
- * (`GREEN_API_INSTANCE_REF`, `GREEN_API_TOKEN_REF`) are resolved through the
- * same `credentials` this function already built; a missing or unresolved
- * ref is a warning naming which one, following the SMTP block's own shape
- * above, never a throw — the scheduler still has approvals to expire. The
- * principal's WhatsApp number lives in the signed CHARTER
- * (`principalWhatsAppKey`), and deliberately plays no part here:
- * `probeActiveCharter` is reserved for exactly two callers (the install path
- * and the readiness report — CLAUDE.md), and a third reader here would void
- * the control beside it. Per-pass charter loading, and the messenger that
- * number builds, is `scheduler.ts`'s job — see `Runtime.whatsapp`'s own
- * docblock for why the messenger is never built here. `overrides.whatsappGateway`
- * is the seam a later task's `createGreenApiGateway` replaces the default
- * (today: none) with; no production caller passes it, same as the other three
- * overrides below.
+ * Google or Microsoft grant: the composed source mints a live access token
+ * for it, refreshing through `googleTokenHttp` / `microsoftTokenHttp`, which
+ * resolve the app's OWN OAuth client id/secret through the encrypted
+ * PLATFORM store (`platform-credentials.ts`) — the client belongs to the
+ * application, not to any business — never through `process.env` (see
+ * `google-token-http.ts`'s own docblock — this is the piece Task 3
+ * originally sketched as reading `process.env` and was reverted for that
+ * exact reason).
  */
-export async function buildRuntime(
+export async function buildServerRuntime(
   env: Record<string, string | undefined> = process.env,
-  overrides: {
-    createTransport?: SmtpConfig['createTransport'];
-    tokenHttp?: TokenHttp;
-    calendarHttp?: CalendarHttp;
-    /** Test seam: the mailbox client a send adapter uses, per provider. */
-    mailboxClient?: (provider: MailProvider) => MailboxClient;
-    /** Test seam: the calendar client the calendar adapter uses, per provider. */
-    calendarClient?: (provider: CalendarProvider) => CalendarClient;
-    /** Test seam only — see this function's docblock. No default exists yet. */
-    whatsappGateway?: (creds: { instance: CredentialHandle; token: CredentialHandle }) => WhatsAppGateway;
-  } = {},
-): Promise<Runtime> {
+  overrides: ServerRuntimeOverrides = {},
+): Promise<ServerRuntime> {
   const warnings: string[] = [];
 
   const keyPath = env['CREDENTIAL_KEY_PATH'];
@@ -322,27 +324,115 @@ export async function buildRuntime(
     http:
       overrides.tokenHttp ??
       providerTokenHttp({
-        google: googleTokenHttp({ credentials: storedCredentials(key) }),
-        microsoft: microsoftTokenHttp({ credentials: storedCredentials(key) }),
+        google: googleTokenHttp({ clients: platformSecrets(key) }),
+        microsoft: microsoftTokenHttp({ clients: platformSecrets(key) }),
       }),
   });
 
-  // A missing ref is a warning below, in the same place APPROVAL_NOTIFY_TO's
-  // absence already is — the notifier simply does not get built. A *present*
-  // ref that cannot be legal is different in kind: it is a typo an operator
-  // made, not a switch they left off, and finding out about it at the first
-  // approval hours later is strictly worse than refusing to start now.
-  const notifyRef = env['NOTIFY_CREDENTIAL_REF'];
-  if (notifyRef !== undefined && notifyRef.length > 0 && !CREDENTIAL_REF_PATTERN.test(notifyRef)) {
-    throw new Error(
-      `NOTIFY_CREDENTIAL_REF אינו ref חוקי (אותיות גדולות, ספרות וקו תחתון בלבד): ${notifyRef}`,
+  // Same switch discipline as the SMTP settings, for the same reason
+  // (spec §4.2): a missing key turns curation off entirely, and a job that
+  // closes without learning anything from it must not look identical to a
+  // job that simply had nothing worth remembering. `curateJob` itself
+  // reports this per-job as `skipped: 'no_key'`; this is the one place that
+  // reports it for the installation as a whole, before any job has run.
+  if ((env['ANTHROPIC_API_KEY'] ?? '').length === 0) {
+    warnings.push(
+      `no curation: ANTHROPIC_API_KEY not set — jobs will close normally, ` +
+        `but the assistant will not learn anything from them`,
     );
   }
 
-  const missing = SMTP_KEYS.filter((key) => {
-    const value = env[key];
-    return value === undefined || value.length === 0;
-  });
+  // Same switch discipline as the SMTP settings: a server without LibreOffice
+  // or Chromium still starts (the scheduler has other work), but the operator
+  // is told, so "no document was produced" does not look like "none was
+  // asked". Presence only; whether the binary actually runs is what
+  // `npm run doc:render-check` checks (docs/11-pre-launch-checks.md).
+  const envValue = (name: string): string | null => {
+    const value = env[name];
+    return value === undefined || value.length === 0 ? null : value;
+  };
+  const production = {
+    sofficePath: envValue('DOCUMENT_SOFFICE_PATH'),
+    chromiumPath: envValue('DOCUMENT_CHROMIUM_PATH'),
+  };
+  const missingProduction = [
+    ...(production.sofficePath === null ? ['DOCUMENT_SOFFICE_PATH'] : []),
+    ...(production.chromiumPath === null ? ['DOCUMENT_CHROMIUM_PATH'] : []),
+  ];
+  if (missingProduction.length > 0) {
+    warnings.push(
+      `no document production: ${missingProduction.join(', ')} not set — every document ` +
+        `production will fail ("${PRODUCTION_TOOLS_MISSING_REASON}")`,
+    );
+  }
+
+  return {
+    credentials,
+    // Empty is treated as unset, the same as every other env value read here.
+    dashboardBaseUrl: envValue('DASHBOARD_BASE_URL') ?? DEFAULT_DASHBOARD_BASE_URL,
+    documentInbox: envValue('DOCUMENT_INBOX'),
+    production: { available: missingProduction.length === 0, ...production },
+    warnings,
+    overrides,
+  };
+}
+
+/**
+ * Assemble one business's runtime from its settings row, its charter, its
+ * bindings and its own credentials (spec §5.4).
+ *
+ * **Rebuilt on every pass, never cached.** A setting the owner changes, a
+ * secret he stores, a `provider` column the dashboard writes — each takes
+ * effect on that business's next pass, with no restart. Before settings
+ * moved into the database the runtime was built once at process start, and
+ * a binding written after it simply had no effect until the scheduler was
+ * restarted; re-reading per pass is what removes that, at the cost of a few
+ * queries per business per pass.
+ *
+ * **No settings row means everything off,** each one reported in `warnings`
+ * rather than looking like "there was nothing to send": no mail adapter and
+ * no notifier (no SMTP), no WhatsApp, no inbox.
+ *
+ * **A credential that THROWS is not "not configured".** `resolve` throws on
+ * a store failure or a malformed business id; that propagates out of here as
+ * a failed build for this business, which the caller reports as such. Only a
+ * clean `null` — nothing stored under that ref — becomes a warning.
+ *
+ * **WhatsApp resolves credentials only, never the charter — that is this
+ * function's whole business with it.** The two GREEN-API secrets
+ * (`GREEN_API_INSTANCE_ID`, `GREEN_API_TOKEN`) are resolved through the
+ * server's credential source, for this business; a missing one is a warning
+ * naming which, never a throw — the scheduler still has approvals to expire.
+ * The principal's WhatsApp number lives in the signed CHARTER
+ * (`principalWhatsAppKey`), and deliberately plays no part here:
+ * `probeActiveCharter` is reserved for exactly two callers (the install path
+ * and the readiness report — CLAUDE.md), and a third reader here would void
+ * the control beside it. Per-pass charter loading, and the messenger that
+ * number builds, is `scheduler.ts`'s job — see `Runtime.whatsapp`'s own
+ * docblock for why the messenger is never built here. `overrides.whatsappGateway`
+ * is the seam a later task's `createGreenApiGateway` replaces the default
+ * (today: none) with; no production caller passes it, same as the other
+ * overrides.
+ *
+ * **Provider adapters register from the charter and the bindings, not from
+ * a grant.** A system whose binding names `provider: 'google'`, and whose
+ * charter-declared connection for that same system BOTH uses the `api`
+ * channel AND serves `calendar.read`, gets `createGoogleCalendarAdapter`
+ * registered under its system name — even when no grant has been stored for
+ * it yet. A missing authorisation is a RUNTIME failure the adapter itself
+ * reports (`credential_unavailable`, from `oauthCredentials` resolving to
+ * `null`), not a missing adapter — the same distinction §6.2 of the design
+ * spec draws between a connectivity failure and a policy decision. The
+ * `serves` half of that check is load-bearing: see the registration loop's
+ * own comment (fix-round 1, finding I1) for the collision it prevents.
+ */
+export async function businessRuntime(server: ServerRuntime, db: BusinessDb): Promise<Runtime> {
+  const warnings: string[] = [];
+  const businessId = db.businessId;
+  const { credentials, overrides } = server;
+  const settings = await loadRuntimeSettings(db);
+
+  const missing = SMTP_FIELDS.filter(([, field]) => settings[field] === null).map(([column]) => column);
 
   const systemAdapters = [];
   let notify: Runtime['notify'];
@@ -353,159 +443,154 @@ export async function buildRuntime(
         `will be refused, and no approval notification can be sent`,
     );
   } else {
-    const port = Number(env['SMTP_PORT']);
-    if (!Number.isInteger(port) || port <= 0) {
-      warnings.push(`no mail adapter: SMTP_PORT is not a positive integer`);
-    } else {
-      // Positive check, the same shape as `SMTP_SECURE` below: a typo must
-      // read as "not set", never as "cleartext is fine". Warned about rather
-      // than merely honoured — an installation sending a stored secret over a
-      // downgradeable channel must say so on every startup, because the
-      // symptom of getting this wrong is silence (see `SmtpConfig.secure`).
-      const allowCleartext = env['SMTP_ALLOW_CLEARTEXT'] === '1';
-      if (allowCleartext) {
-        warnings.push(
-          `SMTP_ALLOW_CLEARTEXT=1: STARTTLS is not required — the mail password ` +
-            `may travel in the clear. Intended for a local test relay only.`,
-        );
-      }
-
-      const transport = createSmtpTransport({
-        host: env['SMTP_HOST'] as string,
-        port,
-        // Positive check. `!== 'false'` would make a typo mean TLS.
-        secure: env['SMTP_SECURE'] === 'true',
-        allowCleartext,
-        from: env['SMTP_FROM'] as string,
-        // No `auth` here any more — see `SmtpConfig.user`'s own docblock.
-        // The password comes from a resolved credential per send, never from
-        // a value this function reads out of `process.env`.
-        user: env['SMTP_USER'] as string,
-        ...(overrides.createTransport !== undefined
-          ? { createTransport: overrides.createTransport }
-          : {}),
-      });
-
-      const mailSystem = env['MAIL_SYSTEM'];
-      systemAdapters.push(
-        createMailAdapter({
-          // `??` alone would accept `MAIL_SYSTEM=''` and register the mail
-          // adapter under an empty system id — one `resolveChannel` can never
-          // match, so every `mail.send` step would fail as if no adapter
-          // existed at all, silently. Empty is treated as unset here, the
-          // same as every other env value this function reads.
-          system: mailSystem === undefined || mailSystem.length === 0 ? DEFAULT_MAIL_SYSTEM : mailSystem,
-          transport,
-        }),
+    // Positive check, the same shape as `notify_smtp_secure` below: anything
+    // but an explicit `true` reads as "not set", never as "cleartext is
+    // fine". Warned about rather than merely honoured — an installation
+    // sending a stored secret over a downgradeable channel must say so on
+    // every pass, because the symptom of getting this wrong is silence (see
+    // `SmtpConfig.secure`).
+    const allowCleartext = settings.notifySmtpAllowCleartext === true;
+    if (allowCleartext) {
+      warnings.push(
+        `notify_smtp_allow_cleartext: STARTTLS is not required — the mail password ` +
+          `may travel in the clear. Intended for a local test relay only.`,
       );
+    }
 
-      const to = env['APPROVAL_NOTIFY_TO'];
-      if (to === undefined || to.length === 0) {
-        warnings.push(
-          `no approval notifier: APPROVAL_NOTIFY_TO not set — approvals will ` +
-            `queue and appear on the dashboard, and nobody will be emailed`,
-        );
-      } else if (notifyRef === undefined || notifyRef.length === 0) {
-        warnings.push(
-          `no approval notifier: NOTIFY_CREDENTIAL_REF not set — approvals will ` +
-            `queue and appear on the dashboard, and nobody will be emailed`,
-        );
-      } else {
-        const dashboardBaseUrl = env['DASHBOARD_BASE_URL'];
-        notify = {
-          notifier: createEmailNotifier({
-            transport,
-            to,
-            credentials,
-            ref: notifyRef,
-            businessId: config.businessId,
-          }),
-          dashboardBaseUrl:
-            dashboardBaseUrl === undefined || dashboardBaseUrl.length === 0
-              ? DEFAULT_DASHBOARD_BASE_URL
-              : dashboardBaseUrl,
-          // §7.4's health email, through the SAME transport/credentials/to
-          // this block just resolved — see `Runtime.notify`'s own docblock
-          // for why this is not a second method on `ApprovalNotifier`.
-          async sendAlert(subject, body) {
-            try {
-              const credential = await withAlertDeadline(
-                credentials.resolve(notifyRef, config.businessId),
-                ALERT_TIMEOUT_MS,
-              );
-              if (credential === null) {
-                return { ok: false, error: `לא נמצא credential עבור ${notifyRef}` };
-              }
-              await withAlertDeadline(
-                transport.send(
-                  { to: [to], subject, body },
-                  {
-                    endpoint: null,
-                    credential,
-                    // Content-derived, not clock-derived (review F3 note):
-                    // `Date.now()` here gave every call its own key, which
-                    // dedupes nothing. The same subject+body hashes the same
-                    // way whether this is a fresh alert or a retry of one
-                    // that failed to send a pass ago — exactly the case
-                    // `checkWhatsAppHealth` produces when it leaves the
-                    // transition unrecorded and tries again next pass.
-                    //
-                    // This function never reads `current.since` itself — it
-                    // only hashes whatever `body` the caller built. The
-                    // caller (`checkWhatsAppHealth`, `scheduler.ts`) is
-                    // therefore the one load-bearing fact for this key: fix
-                    // round A found that its `body` carried `current.state`
-                    // but not `current.since`, so two genuinely distinct
-                    // outages reporting the SAME state word hashed to the
-                    // SAME key, and the mail server dropped the second as a
-                    // duplicate of the first — silence, one layer past every
-                    // test, because a test counting `sendAlert` calls cannot
-                    // see a Message-ID collision. `checkWhatsAppHealth` now
-                    // embeds `since` in `body` for exactly this reason: a
-                    // retry of the SAME outage must still hash identically
-                    // (same `since`, same `state`), while two different
-                    // outages — even under the same state word — must not.
-                    idempotencyKey: `whatsapp-health-alert:${canonicalHash({ subject, body })}`,
-                    signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
-                  },
-                ),
-                ALERT_TIMEOUT_MS,
-              );
-              return { ok: true };
-            } catch (error) {
-              return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    const transport = createSmtpTransport({
+      host: settings.notifySmtpHost as string,
+      port: settings.notifySmtpPort as number,
+      // Positive check. `!== false` would make an unset value mean TLS.
+      secure: settings.notifySmtpSecure === true,
+      allowCleartext,
+      from: settings.notifySmtpFrom as string,
+      // No `auth` here any more — see `SmtpConfig.user`'s own docblock.
+      // The password comes from a resolved credential per send, never from
+      // a value this function reads out of a setting.
+      user: settings.notifySmtpUser as string,
+      ...(overrides.createTransport !== undefined
+        ? { createTransport: overrides.createTransport }
+        : {}),
+    });
+
+    systemAdapters.push(
+      createMailAdapter({
+        // `saveRuntimeSettings` stores an empty value as NULL, so an empty
+        // system id — one `resolveChannel` can never match, failing every
+        // `mail.send` step silently — cannot reach here.
+        system: settings.mailSystem ?? DEFAULT_MAIL_SYSTEM,
+        transport,
+      }),
+    );
+
+    const to = settings.notifyTo;
+    const notifyRef = NOTIFY_SMTP_PASS_REF;
+    // Resolved here once only to know whether to build the notifier at all —
+    // the closures below resolve it again on every send, so a rotated
+    // password takes effect on the next notification. A throw propagates
+    // (see this function's docblock).
+    const stored = to === null ? null : await credentials.resolve(notifyRef, businessId);
+    if (to === null) {
+      warnings.push(
+        `no approval notifier: notify_to not set — approvals will ` +
+          `queue and appear on the dashboard, and nobody will be emailed`,
+      );
+    } else if (stored === null) {
+      warnings.push(
+        `no approval notifier: ${notifyRef} is not stored for this business — approvals will ` +
+          `queue and appear on the dashboard, and nobody will be emailed`,
+      );
+    } else {
+      notify = {
+        notifier: createEmailNotifier({
+          transport,
+          to,
+          credentials,
+          ref: notifyRef,
+          businessId,
+        }),
+        dashboardBaseUrl: server.dashboardBaseUrl,
+        // §7.4's health email, through the SAME transport/credentials/to
+        // this block just resolved — see `Runtime.notify`'s own docblock
+        // for why this is not a second method on `ApprovalNotifier`.
+        async sendAlert(subject, body) {
+          try {
+            const credential = await withAlertDeadline(
+              credentials.resolve(notifyRef, businessId),
+              ALERT_TIMEOUT_MS,
+            );
+            if (credential === null) {
+              return { ok: false, error: `לא נמצא credential עבור ${notifyRef}` };
             }
-          },
-          // The document card's email (document production §10): the same
-          // seam as `sendAlert` above, with the file attached.
-          async sendAlertWithAttachment(subject, body, attachment) {
-            try {
-              const credential = await withAlertDeadline(
-                credentials.resolve(notifyRef, config.businessId),
-                ALERT_TIMEOUT_MS,
-              );
-              if (credential === null) {
-                return { ok: false, error: `לא נמצא credential עבור ${notifyRef}` };
-              }
-              await withAlertDeadline(
-                transport.send(
-                  { to: [to], subject, body, attachments: [attachment] },
-                  {
-                    endpoint: null,
-                    credential,
-                    idempotencyKey: documentCardAlertKey(subject, body, attachment.bytes),
-                    signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
-                  },
-                ),
-                ALERT_TIMEOUT_MS,
-              );
-              return { ok: true };
-            } catch (error) {
-              return { ok: false, error: error instanceof Error ? error.message : String(error) };
+            await withAlertDeadline(
+              transport.send(
+                { to: [to], subject, body },
+                {
+                  endpoint: null,
+                  credential,
+                  // Content-derived, not clock-derived (review F3 note):
+                  // `Date.now()` here gave every call its own key, which
+                  // dedupes nothing. The same subject+body hashes the same
+                  // way whether this is a fresh alert or a retry of one
+                  // that failed to send a pass ago — exactly the case
+                  // `checkWhatsAppHealth` produces when it leaves the
+                  // transition unrecorded and tries again next pass.
+                  //
+                  // This function never reads `current.since` itself — it
+                  // only hashes whatever `body` the caller built. The
+                  // caller (`checkWhatsAppHealth`, `scheduler.ts`) is
+                  // therefore the one load-bearing fact for this key: fix
+                  // round A found that its `body` carried `current.state`
+                  // but not `current.since`, so two genuinely distinct
+                  // outages reporting the SAME state word hashed to the
+                  // SAME key, and the mail server dropped the second as a
+                  // duplicate of the first — silence, one layer past every
+                  // test, because a test counting `sendAlert` calls cannot
+                  // see a Message-ID collision. `checkWhatsAppHealth` now
+                  // embeds `since` in `body` for exactly this reason: a
+                  // retry of the SAME outage must still hash identically
+                  // (same `since`, same `state`), while two different
+                  // outages — even under the same state word — must not.
+                  idempotencyKey: `whatsapp-health-alert:${canonicalHash({ subject, body })}`,
+                  signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
+                },
+              ),
+              ALERT_TIMEOUT_MS,
+            );
+            return { ok: true };
+          } catch (error) {
+            return { ok: false, error: error instanceof Error ? error.message : String(error) };
+          }
+        },
+        // The document card's email (document production §10): the same
+        // seam as `sendAlert` above, with the file attached.
+        async sendAlertWithAttachment(subject, body, attachment) {
+          try {
+            const credential = await withAlertDeadline(
+              credentials.resolve(notifyRef, businessId),
+              ALERT_TIMEOUT_MS,
+            );
+            if (credential === null) {
+              return { ok: false, error: `לא נמצא credential עבור ${notifyRef}` };
             }
-          },
-        };
-      }
+            await withAlertDeadline(
+              transport.send(
+                { to: [to], subject, body, attachments: [attachment] },
+                {
+                  endpoint: null,
+                  credential,
+                  idempotencyKey: documentCardAlertKey(subject, body, attachment.bytes),
+                  signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
+                },
+              ),
+              ALERT_TIMEOUT_MS,
+            );
+            return { ok: true };
+          } catch (error) {
+            return { ok: false, error: error instanceof Error ? error.message : String(error) };
+          }
+        },
+      };
     }
   }
 
@@ -513,43 +598,20 @@ export async function buildRuntime(
   // docblock for why the charter, and the messenger built from it, have no
   // part here.
   let whatsapp: Runtime['whatsapp'];
-  const greenApiInstanceRef = env[GREEN_API_INSTANCE_REF_KEY];
-  const greenApiTokenRef = env[GREEN_API_TOKEN_REF_KEY];
-  const missingGreenApiRefs: string[] = [];
-  if (greenApiInstanceRef === undefined || greenApiInstanceRef.length === 0) {
-    missingGreenApiRefs.push(GREEN_API_INSTANCE_REF_KEY);
-  }
-  if (greenApiTokenRef === undefined || greenApiTokenRef.length === 0) {
-    missingGreenApiRefs.push(GREEN_API_TOKEN_REF_KEY);
-  }
-
-  if (missingGreenApiRefs.length > 0) {
+  if (!settings.whatsappEnabled) {
     warnings.push(
-      `no WhatsApp gateway: ${missingGreenApiRefs.join(', ')} not set — the owner's ` +
+      `no WhatsApp gateway: whatsapp_enabled is off for this business — the owner's ` +
         `WhatsApp channel will not run; messages will neither be received nor sent`,
     );
   } else {
-    // Present means it is a ref — validated before it is resolved, the same
-    // "typo, not a switch left off" distinction NOTIFY_CREDENTIAL_REF already
-    // draws above.
-    for (const [label, ref] of [
-      [GREEN_API_INSTANCE_REF_KEY, greenApiInstanceRef as string],
-      [GREEN_API_TOKEN_REF_KEY, greenApiTokenRef as string],
-    ] as const) {
-      if (!CREDENTIAL_REF_PATTERN.test(ref)) {
-        throw new Error(
-          `${label} אינו ref חוקי (אותיות גדולות, ספרות וקו תחתון בלבד): ${ref}`,
-        );
-      }
-    }
     const [instanceCredential, tokenCredential] = await Promise.all([
-      credentials.resolve(greenApiInstanceRef as string, config.businessId),
-      credentials.resolve(greenApiTokenRef as string, config.businessId),
+      credentials.resolve(GREEN_API_INSTANCE_ID_REF, businessId),
+      credentials.resolve(GREEN_API_TOKEN_REF, businessId),
     ]);
     if (instanceCredential === null || tokenCredential === null) {
       const unresolvedGreenApiRefs: string[] = [];
-      if (instanceCredential === null) unresolvedGreenApiRefs.push(GREEN_API_INSTANCE_REF_KEY);
-      if (tokenCredential === null) unresolvedGreenApiRefs.push(GREEN_API_TOKEN_REF_KEY);
+      if (instanceCredential === null) unresolvedGreenApiRefs.push(GREEN_API_INSTANCE_ID_REF);
+      if (tokenCredential === null) unresolvedGreenApiRefs.push(GREEN_API_TOKEN_REF);
       warnings.push(
         `no WhatsApp gateway: ${unresolvedGreenApiRefs.join(', ')} did not resolve to a ` +
           `stored credential`,
@@ -558,8 +620,8 @@ export async function buildRuntime(
       // No real implementation exists yet — see `Runtime.whatsapp`'s own
       // docblock. Resolving this far and stopping here, rather than skipping
       // straight to this branch, is what makes a genuinely misconfigured
-      // installation (a typo'd ref) distinguishable from one that is simply
-      // waiting on a later task.
+      // business (a secret never stored) distinguishable from one that is
+      // simply waiting on a later task.
       warnings.push(
         `no WhatsApp gateway: GREEN-API credentials resolved, but no gateway ` +
           `implementation is wired in yet`,
@@ -574,41 +636,16 @@ export async function buildRuntime(
     }
   }
 
-  // Same switch discipline as the SMTP set above, for the same reason
-  // (spec §4.2): a missing key turns curation off entirely, and a job that
-  // closes without learning anything from it must not look identical to a
-  // job that simply had nothing worth remembering. `curateJob` itself
-  // reports this per-job as `skipped: 'no_key'`; this is the one place that
-  // reports it for the installation as a whole, before any job has run.
-  if ((env['ANTHROPIC_API_KEY'] ?? '').length === 0) {
-    warnings.push(
-      `no curation: ANTHROPIC_API_KEY not set — jobs will close normally, ` +
-        `but the assistant will not learn anything from them`,
-    );
-  }
-
-  // Same switch discipline as the SMTP set: a server without LibreOffice or
-  // Chromium still starts (the scheduler has other work), but the operator is
-  // told, so "no document was produced" does not look like "none was asked".
-  // Presence only; whether the binary actually runs is what
-  // `npm run doc:render-check` checks (docs/11-pre-launch-checks.md).
-  const productionPath = (key: string): string | null => {
-    const value = env[key];
-    return value === undefined || value.length === 0 ? null : value;
-  };
-  const production = {
-    sofficePath: productionPath('DOCUMENT_SOFFICE_PATH'),
-    chromiumPath: productionPath('DOCUMENT_CHROMIUM_PATH'),
-  };
-  const missingProduction = [
-    ...(production.sofficePath === null ? ['DOCUMENT_SOFFICE_PATH'] : []),
-    ...(production.chromiumPath === null ? ['DOCUMENT_CHROMIUM_PATH'] : []),
-  ];
-  if (missingProduction.length > 0) {
-    warnings.push(
-      `no document production: ${missingProduction.join(', ')} not set — every document ` +
-        `production will fail ("${PRODUCTION_TOOLS_MISSING_REASON}")`,
-    );
+  // The inbox: on only when this business turned it on AND the server has a
+  // folder. Both halves are reported, since "the owner never turned it on"
+  // and "the server has nowhere to watch" are different fixes.
+  let inbox: string | undefined;
+  if (!settings.inboxEnabled) {
+    warnings.push(`no document inbox: inbox_enabled is off for this business`);
+  } else if (server.documentInbox === null) {
+    warnings.push(`no document inbox: inbox_enabled is on, but DOCUMENT_INBOX is not set on this server`);
+  } else {
+    inbox = server.documentInbox;
   }
 
   // Additive, on top of the mail adapter above: every system whose binding
@@ -626,7 +663,7 @@ export async function buildRuntime(
   // thing to do when authorising Gmail through Task 5's consent screen --
   // made `AdapterRegistry`'s constructor throw `adapter for system
   // "office-mail" is already registered`, which is not a failed step but
-  // `buildRuntime` itself throwing: the scheduler, `run-due`,
+  // the runtime build itself throwing: the scheduler, `run-due`,
   // `live-thread-status` and `probe-smtp` all refuse to start, and nothing
   // recovers until someone edits the row by hand. A row a dashboard writes
   // must never be able to stop the process from booting. Requiring BOTH the
@@ -641,22 +678,17 @@ export async function buildRuntime(
   // `status` is not `live` — that status is what `resolveChannel` later
   // reports as `unavailable`, at plan-execution time; it is not a reason for
   // the adapter itself not to exist, the same way the mail adapter above is
-  // registered from env configuration alone with no binding-status check at
+  // registered from SMTP settings alone with no binding-status check at
   // all. A missing authorisation is likewise the adapter's own runtime
   // failure, not a missing adapter — see this function's own docblock. No
   // charter installed, or no matching binding, is simply zero adapters
   // registered here; neither is an error.
   //
-  // **Known limitation, documented rather than fixed here:** the charter and
-  // the bindings are read exactly once, at process start — `run-scheduler.ts`
-  // builds one `Runtime` and passes it into every pass. A `provider` column
-  // written by Task 5's dashboard after this process started therefore has
-  // no effect until the scheduler is RESTARTED; re-deriving the registry on
-  // every pass would mean re-reading the charter and the master key every
-  // 30 seconds, which is an architecture decision for a later task, not a
-  // line in this fix round. See `docs/live-thread-runbook.md`.
-  const charter = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 8)
-  const bindings = await withBusiness(config.businessId, (db) => loadBindings(db)); // TENANCY-TODO(task 8)
+  // The charter and the bindings are read on every pass (this function is
+  // rebuilt per pass — see its docblock), so a `provider` column written by
+  // the dashboard takes effect on that business's next pass, with no restart.
+  const charter = await loadActiveCharter(db);
+  const bindings = await loadBindings(db);
   const connectionBySystem = new Map(
     (charter?.charter.connections ?? []).map((connection) => [connection.system, connection] as const),
   );
@@ -726,8 +758,10 @@ export async function buildRuntime(
       createMailboxSendAdapter({
         system: binding.system,
         provider,
-        replyTargets: (businessId, internetMessageId, providerMessageId) => // TENANCY-TODO(task 8)
-          withBusiness(businessId, (db) => replyTargetFor(db, internetMessageId, providerMessageId)),
+        // Opens its own connection: the adapter runs during a later step,
+        // long after the `db` this runtime was built on may have been released.
+        replyTargets: (callBusinessId, internetMessageId, providerMessageId) =>
+          withBusiness(callBusinessId, (replyDb) => replyTargetFor(replyDb, internetMessageId, providerMessageId)),
         ...(overrides.mailboxClient !== undefined ? { client: overrides.mailboxClient(provider) } : {}),
       }),
     );
@@ -763,7 +797,9 @@ export async function buildRuntime(
         system: binding.system,
         provider,
         timeZone: async () => {
-          const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 8)
+          // Its own connection, for this business: the adapter is called long
+          // after the `db` this runtime was built on may have been released.
+          const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb));
           if (active === null) throw new Error('no active charter: the business time zone is unknown');
           return active.charter.identity.timezone;
         },
@@ -779,11 +815,13 @@ export async function buildRuntime(
     // partition at all. `runtime.test.ts` locks this as a positive control
     // rather than as a claim, because a component nobody uses is exactly the
     // component someone wires by mistake (spec §3.4). The same instance the
-    // notifier above resolves against, not a second one built from the same key.
+    // notifier above resolves against — the server's, not a second one built
+    // from the same key.
     credentials,
     ...(notify !== undefined ? { notify } : {}),
     ...(whatsapp !== undefined ? { whatsapp } : {}),
-    production: { available: missingProduction.length === 0, ...production },
+    ...(inbox !== undefined ? { inbox } : {}),
+    production: server.production,
     warnings,
   };
 }

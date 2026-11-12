@@ -20,7 +20,6 @@
  * that something went wrong rather than reading like a quiet no-op.
  */
 import type { BusinessDb } from '../db/pool.js';
-import { config } from '../config.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import { loadPlanBody } from '../orchestrator/plan-store.js';
@@ -29,6 +28,7 @@ import { buildCurationBrief } from './curation-brief.js';
 import { siftCandidates, type CurationCandidate } from './curation-parse.js';
 import { jobQualifiesForCuration } from './curation-trigger.js';
 import { writeMemory } from './store.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 export interface CurationOutcome {
   ran: boolean;
@@ -42,7 +42,7 @@ export interface CurationOutcome {
 export interface CurateJobOptions {
   /** Injected by tests. Production leaves it unset and gets the billed call. */
   curator?: Curator;
-  /** Defaults to `config.curationRunsPerDay`. Injected by tests, same as `ConductOptions.readsPerDay`. */
+  /** Defaults to the business's `curationRunsPerDay` (`capFor`). Injected by tests, same as `ConductOptions.readsPerDay`. */
   runsPerDay?: number;
   /**
    * `mail` curates a mail's planless triage job from its stored summary, with
@@ -122,7 +122,8 @@ export async function curateJob(
       return { ...idle, skipped: 'no_key' };
     }
     const runsPerDay =
-      options.runsPerDay ?? (scope === 'mail' ? config.mailCurationPerDay : config.curationRunsPerDay);
+      options.runsPerDay ??
+      capFor(await loadRuntimeSettings(db), scope === 'mail' ? 'mailCurationPerDay' : 'curationRunsPerDay');
     if ((await curationRunsToday(db, { scope })) >= runsPerDay) {
       return { ...idle, skipped: 'over_cap' };
     }

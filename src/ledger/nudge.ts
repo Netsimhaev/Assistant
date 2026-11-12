@@ -29,7 +29,6 @@
 import { monotonicFactory } from 'ulid';
 import type { ActiveCharter } from '../charter/store.js';
 import { loadActiveCharter } from '../charter/store.js';
-import { config } from '../config.js';
 import { transaction, type BusinessDb } from '../db/pool.js';
 import type { LedgerFamily, LedgerItem } from '../domain/ledger.js';
 import { Plan } from '../domain/plan.js';
@@ -44,6 +43,7 @@ import { localParts, localToInstant } from '../util/local-time.js';
 import { renderReminder } from './render.js';
 import type { DueSlot } from './schedule.js';
 import { loadLedgerItem, moveLedgerStatus } from './store.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 const ulid = monotonicFactory();
 
@@ -241,7 +241,7 @@ export async function openNudge(
   }
 
   // Daily cap: leave the slot unclaimed; a later pass retries it.
-  if ((await nudgesToday(db, businessId, now, r.timeZone)) >= config.ledgerNudgesPerDay) {
+  if ((await nudgesToday(db, businessId, now, r.timeZone)) >= capFor(await loadRuntimeSettings(db), 'ledgerNudgesPerDay')) {
     return { outcome: 'capped', reminder: null };
   }
 

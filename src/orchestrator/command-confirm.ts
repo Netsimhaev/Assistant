@@ -30,7 +30,6 @@
  * statements (freshness-gated, for the confirm), so a second answer — or two
  * channels answering at once — gets `already_decided` and moves nothing.
  */
-import { config } from '../config.js';
 import { transaction, type BusinessDb } from '../db/pool.js';
 import { CLOSURE_VERB_WORDS } from '../governance/closure-command.js';
 import {
@@ -46,6 +45,7 @@ import { JobPhase } from '../domain/job.js';
 import { stripBidiControls } from '../util/bidi.js';
 import { PhaseMovedError, loadJob, transition } from './jobs.js';
 import { bindPlanToJob, loadStoredPlan } from './plan-store.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 /**
  * Words that confirm (spec §4.3) — only as the whole message, and only the
@@ -252,7 +252,7 @@ export async function openConfirmations(
   o: { channel: 'whatsapp'; inboundAt: Date | null; windowMinutes?: number },
 ): Promise<InstructionConfirmation[]> {
   if (o.inboundAt === null || Number.isNaN(o.inboundAt.getTime())) return [];
-  const windowMinutes = o.windowMinutes ?? config.whatsappQuestionWindowMinutes;
+  const windowMinutes = o.windowMinutes ?? capFor(await loadRuntimeSettings(db), 'whatsappQuestionWindowMinutes');
   if (windowMinutes <= 0) return [];
 
   const { rows } = await db.query<ConfirmationRow>(
@@ -290,7 +290,7 @@ export async function dashboardConfirmations(
   db: BusinessDb,
   o: { windowMinutes?: number } = {},
 ): Promise<InstructionConfirmation[]> {
-  const windowMinutes = o.windowMinutes ?? config.whatsappQuestionWindowMinutes;
+  const windowMinutes = o.windowMinutes ?? capFor(await loadRuntimeSettings(db), 'whatsappQuestionWindowMinutes');
   if (windowMinutes <= 0) return [];
   const { rows } = await db.query<ConfirmationRow>(
     `SELECT c.job_id, c.options, c.presented_text, c.presented_at, c.delivered_at, c.channel, c.state,

@@ -83,7 +83,6 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ulid } from 'ulid';
-import { config } from '../config.js';
 import type { BusinessDb } from '../db/pool.js';
 import { closeCliPools, runForBusiness } from '../cli/business-arg.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
@@ -97,6 +96,7 @@ import { runDueJobs } from '../orchestrator/run-due.js';
 import { resumeDelegatedJobs } from '../orchestrator/resume-delegated.js';
 import { closeVerifiedJobs } from '../orchestrator/verify.js';
 import { verifyDraft, type AwaitingDelegation, type VerifyDraftResult } from './gov-verify.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 /**
  * Applied to every business-wide, oldest-first queue this script drives
@@ -279,10 +279,11 @@ async function main(db: BusinessDb): Promise<void> {
 
   // ------------------------------------------------------------- RUN THE CHILD
   banner('שלב 2: הילד רץ — קריאה חיה אמיתית אל know.reader (doc.fetch)');
-  console.log(`DOCUMENT_READS_PER_DAY = ${config.documentReadsPerDay}`);
+  const readsPerDay = capFor(await loadRuntimeSettings(db), 'documentReadsPerDay');
+  console.log(`DOCUMENT_READS_PER_DAY (לעסק הזה) = ${readsPerDay}`);
   const readsSoFarToday = await readingsToday(db);
   console.log(`קריאות מסמך שנוצלו כבר היום: ${readsSoFarToday}`);
-  if (readsSoFarToday >= config.documentReadsPerDay) {
+  if (readsSoFarToday >= readsPerDay) {
     console.log(
       'התקרה היומית כבר מוצתה — doc.fetch יחזור לא-done, וזה לא באג במנגנון ' +
         'ההאצלה, זו תקרת מדיניות רגילה. ראו CLAUDE.md: DOCUMENT_READS_PER_DAY.',

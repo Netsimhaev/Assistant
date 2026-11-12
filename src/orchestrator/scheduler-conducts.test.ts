@@ -192,10 +192,13 @@ describe('schedulerPass and the conductor', () => {
     // to leave `DOCUMENT_INBOX` unset — the shape the sibling test below
     // already used. The moment anyone actually configured the feature, the
     // earlier version of this test scanned a real folder and went red:
-    // configuring the feature broke the suite.
+    // configuring the feature broke the suite. Since settings moved into the
+    // database (spec §5.4) the inbox comes from the business's runtime, and
+    // `runtimeWith` builds one with none — `config.documentInbox` is set here
+    // too, to prove the ambient server value alone no longer turns it on.
     const mutableConfig = config as { documentInbox: string | null };
     const original = mutableConfig.documentInbox;
-    mutableConfig.documentInbox = null;
+    mutableConfig.documentInbox = await mkdtemp(join(tmpdir(), 'sched-ambient-inbox-'));
     try {
       // Deliberately no `readsPerDay: 0`. The ceiling must not be what stops
       // the conductor here — the switch must. With the ceiling left at its
@@ -211,30 +214,36 @@ describe('schedulerPass and the conductor', () => {
     }
   });
 
+  it("scans the business runtime's inbox when no inbox option is passed", async () => {
+    const runtimeInbox = await mkdtemp(join(tmpdir(), 'sched-runtime-inbox-'));
+    const result = await schedulerPass({
+      businessId: BUSINESS,
+      readsPerDay: 0,
+      runtime: { ...runtimeWith([]), inbox: runtimeInbox },
+    });
+    expect(result.scanError).toBeNull();
+    expect(result.scan).not.toBeNull();
+    // `scanInbox` creates its working subdirectories as its first act.
+    expect((await readdir(runtimeInbox)).length).toBeGreaterThan(0);
+  });
+
   it('an explicit null inbox wins over a configured one', async () => {
     // Proves the ternary is `options.inbox !== undefined ? options.inbox :
-    // config.documentInbox`, not a collapsing `options.inbox ?? ...` — the
-    // latter treats an explicit `null` the same as "not passed" and would
-    // fall through to the configured path here, actually scanning it.
+    // runtime.inbox`, not a collapsing `options.inbox ?? ...` — the latter
+    // treats an explicit `null` the same as "not passed" and would fall
+    // through to the configured path here, actually scanning it.
     const configuredInbox = await mkdtemp(join(tmpdir(), 'sched-configured-inbox-'));
-    const mutableConfig = config as { documentInbox: string | null };
-    const original = mutableConfig.documentInbox;
-    mutableConfig.documentInbox = configuredInbox;
-    try {
-      const result = await schedulerPass({
-        businessId: BUSINESS,
-        inbox: null,
-        readsPerDay: 0,
-        runtime: runtimeWith([]),
-      });
-      expect(result.scan).toBeNull();
-      expect(result.scanError).toBeNull();
-      // `scanInbox` creates its four working subdirectories as its first
-      // act. None here means it was never called against this folder.
-      expect(await readdir(configuredInbox)).toHaveLength(0);
-    } finally {
-      mutableConfig.documentInbox = original;
-    }
+    const result = await schedulerPass({
+      businessId: BUSINESS,
+      inbox: null,
+      readsPerDay: 0,
+      runtime: { ...runtimeWith([]), inbox: configuredInbox },
+    });
+    expect(result.scan).toBeNull();
+    expect(result.scanError).toBeNull();
+    // `scanInbox` creates its four working subdirectories as its first
+    // act. None here means it was never called against this folder.
+    expect(await readdir(configuredInbox)).toHaveLength(0);
   });
 
   it('a document actually read and carded through schedulerPass proves the forwarded reader/proposer reach the conductor', async () => {

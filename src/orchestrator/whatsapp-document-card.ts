@@ -40,7 +40,6 @@
  * The message is claimed (`claimMessage`) before anything is decided, so a
  * redelivered or raced copy cannot approve twice.
  */
-import { config } from '../config.js';
 import type { BusinessDb } from '../db/pool.js';
 import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import type { NormalizedInboundMessage } from '../whatsapp/gateway.js';
@@ -50,6 +49,7 @@ import { approveDocumentCard, loadDocumentCard, requestFix, type DocumentCard } 
 import { loadProduction, loadVersion } from '../production/store.js';
 import type { Runtime } from './runtime.js';
 import { MAIL_CARD_APPROVE_WORDS, isApproveWord } from './whatsapp-mail-card.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 /**
  * Spec §10.11 of the boss command, verbatim: more than one thing is open, and
@@ -108,7 +108,7 @@ export async function openDocumentCards(
   input: { inboundAt: string; now?: number; windowMinutes?: number },
 ): Promise<DocumentCard[]> {
   const businessId = db.businessId;
-  const windowMinutes = input.windowMinutes ?? config.whatsappQuestionWindowMinutes;
+  const windowMinutes = input.windowMinutes ?? capFor(await loadRuntimeSettings(db), 'whatsappQuestionWindowMinutes');
   if (windowMinutes <= 0) return [];
   const inboundMs = Date.parse(input.inboundAt);
   if (Number.isNaN(inboundMs)) return [];

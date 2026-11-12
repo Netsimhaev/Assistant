@@ -54,7 +54,6 @@
  * past its window — none of them is open, and the owner's message goes to
  * the ordinary instruction door. The dashboard is always the other exit.
  */
-import { config } from '../config.js';
 import { transaction, type BusinessDb } from '../db/pool.js';
 import {
   ApprovalNotDecidableError,
@@ -75,6 +74,7 @@ import type { NormalizedInboundMessage } from '../whatsapp/gateway.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { claimMessage, settleMessage } from '../whatsapp/store.js';
 import { resumeAfterDecision } from './resume.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 // --- What the owner reads. Hebrew, every one of them. -----------------------
 
@@ -194,7 +194,7 @@ export async function openMailCards(db: BusinessDb, input: {
   windowMinutes?: number;
 }): Promise<OpenMailCard[]> {
   const businessId = db.businessId;
-  const windowMinutes = input.windowMinutes ?? config.whatsappQuestionWindowMinutes;
+  const windowMinutes = input.windowMinutes ?? capFor(await loadRuntimeSettings(db), 'whatsappQuestionWindowMinutes');
   if (windowMinutes <= 0) return [];
   const nowMs = input.now ?? Date.now();
   const inboundMs = Date.parse(input.inboundAt);

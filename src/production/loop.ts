@@ -60,7 +60,7 @@
  * pages "check 1 flagged" are those its EARLIER failing runs on this
  * production flagged (`slide N` / `page N`) — where the fix landed.
  *
- * **The daily cap** (`config.documentsPerDay`) is checked before every draft
+ * **The daily cap** (the business's `documentsPerDay`, `capFor`) is checked before every draft
  * call is started: at `queued`, and before a fix round. Over it, the
  * production ends `failed` with `productionCapReason` and the drafter never
  * runs. `productionsToday` (`store.ts`) says what is counted.
@@ -140,6 +140,7 @@ import {
 import type { GroundingSources, SpecProblem, SpecProblemCode } from './validate-spec.js';
 import { validateSpec } from './validate-spec.js';
 import type { ProductionStage } from '../domain/document-spec.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 /** Two fix rounds after the first draft (spec §7.3). */
 export const MAX_FIX_ATTEMPTS = 2;
@@ -929,7 +930,7 @@ export async function runDocumentProductions(
     images,
     onFinished: options.onFinished ?? (async () => {}),
     documentRoot: options.documentRoot ?? config.documentRoot,
-    perDay: options.perDay ?? config.documentsPerDay,
+    perDay: options.perDay ?? capFor(await loadRuntimeSettings(db), 'documentsPerDay'),
     deadlines: { ...STAGE_DEADLINES_MS, ...options.deadlines },
     checkpoint: options.checkpoint ?? (() => {}),
     today: () => localParts(now(), active.charter.identity.timezone).date,

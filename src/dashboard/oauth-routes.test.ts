@@ -14,7 +14,6 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { queryAudit } from '../audit/log.js';
 import { installCharter } from '../charter/store.js';
 import type { CharterConnection } from '../domain/connection.js';
-import { putSecret, removeSecret } from '../governance/credential-store.js';
 import { KEY_BYTES, writeKeyState } from '../governance/master-key.js';
 import {
   markNeedsReauth,
@@ -38,6 +37,7 @@ import { buildMailboxAmendment } from '../charter/amend-mailbox.js';
 import { signCharter } from '../charter/sign.js';
 import type { MailProvider } from '../mail/mailbox.js';
 import type { MailboxClient } from '../mail/providers/types.js';
+import { putPlatformSecret, removePlatformSecret } from '../tenancy/platform-credentials.js';
 
 const BUSINESS = 'test-business';
 const USERNAME = 'owner';
@@ -89,8 +89,8 @@ beforeEach(async () => {
   // only, not `input.businessId` — one row here is enough regardless of
   // which business this file's requests are scoped to.
   await writeKeyState(key, 'KEY-test');
-  await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: GOOGLE_CLIENT_ID_REF, value: 'test-client-id', updatedBy: 'test' }, key));
-  await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: GOOGLE_CLIENT_SECRET_REF, value: 'test-client-secret', updatedBy: 'test' }, key));
+  await putPlatformSecret(GOOGLE_CLIENT_ID_REF, 'test-client-id', key);
+  await putPlatformSecret(GOOGLE_CLIENT_SECRET_REF, 'test-client-secret', key);
   await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
 });
 
@@ -226,7 +226,7 @@ describe('GET /oauth/:system/start', () => {
    * any redirect happens.
    */
   it('refuses to start when the client secret is not provisioned, even though the client id is', async () => {
-    await withBusiness(BUSINESS, (bdb) => removeSecret(bdb, GOOGLE_CLIENT_SECRET_REF));
+    await removePlatformSecret(GOOGLE_CLIENT_SECRET_REF);
     const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
     const cookie = await loginWithPassword(baseUrl);
 
@@ -242,7 +242,7 @@ describe('GET /oauth/:system/start', () => {
   });
 
   it('refuses to start when the client id is not provisioned, even though the secret is', async () => {
-    await withBusiness(BUSINESS, (bdb) => removeSecret(bdb, GOOGLE_CLIENT_ID_REF));
+    await removePlatformSecret(GOOGLE_CLIENT_ID_REF);
     const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
     const cookie = await loginWithPassword(baseUrl);
 
@@ -997,8 +997,8 @@ describe('mailbox ceremony', () => {
   beforeEach(async () => {
     await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     await installMailboxCharter('microsoft');
-    await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: 'MICROSOFT_OAUTH_CLIENT_ID', value: 'ms-client-id', updatedBy: 'test' }, key));
-    await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: 'MICROSOFT_OAUTH_CLIENT_SECRET', value: 'ms-client-secret', updatedBy: 'test' }, key));
+    await putPlatformSecret('MICROSOFT_OAUTH_CLIENT_ID', 'ms-client-id', key);
+    await putPlatformSecret('MICROSOFT_OAUTH_CLIENT_SECRET', 'ms-client-secret', key);
   });
 
   function microsoftFetch(): typeof fetch {

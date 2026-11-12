@@ -7,7 +7,10 @@ import { config } from '../config.js';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { writeKeyState } from '../governance/master-key.js';
 import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
-import { runSecretCli, type SecretCliDeps } from './secret.js';
+import { main, runSecretCli, type SecretCliDeps } from './secret.js';
+import { resolveStoredSecret } from '../governance/credential-store.js';
+import { resolvePlatformSecret } from '../tenancy/platform-credentials.js';
+import { closePlatformPool } from '../db/platform-pool.js';
 
 const REF = 'OFFICE_MAIL';
 const SECRET = 'hunter2-the-mailbox-password';
@@ -59,6 +62,7 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
+  await closePlatformPool();
   await closePool();
 });
 
@@ -307,5 +311,46 @@ describe('runSecretCli', () => {
       );
       expect(rows[0]?.n).toBe('1');
     });
+  });
+});
+
+describe('secret --platform', () => {
+  const PLATFORM_REF = 'GOOGLE_OAUTH_CLIENT_SECRET';
+  const PLATFORM_VALUE = 'platform-client-secret-SENTINEL';
+
+  function io(value: string): { log: (l: string) => void; error: (l: string) => void; readSecret: () => Promise<string>; out: string[]; err: string[] } {
+    const out: string[] = [];
+    const err: string[] = [];
+    return { log: (l) => out.push(l), error: (l) => err.push(l), readSecret: reads(value), out, err };
+  }
+
+  it('puts, tests and removes a server secret without a business, never printing the value', async () => {
+    const put = io(PLATFORM_VALUE);
+    expect(await main(['--platform', 'put', PLATFORM_REF, OPERATOR], put)).toBe(0);
+    const { readFile } = await import('node:fs/promises');
+    const key = await readFile(process.env['CREDENTIAL_KEY_PATH'] as string);
+    expect(await resolvePlatformSecret(PLATFORM_REF, key)).toBe(PLATFORM_VALUE);
+    // Stored for the server, not for any business.
+    expect(await withBusiness(BUSINESS, (db) => resolveStoredSecret(db, key, PLATFORM_REF))).toBeNull();
+
+    const test = io('');
+    expect(await main(['--platform', 'test', PLATFORM_REF, OPERATOR], test)).toBe(0);
+    expect(test.out.join('\n')).toMatch(/נפתר בהצלחה/);
+
+    const removed = io('');
+    expect(await main(['--platform', 'remove', PLATFORM_REF, OPERATOR], removed)).toBe(0);
+    expect(await resolvePlatformSecret(PLATFORM_REF, key)).toBeNull();
+
+    for (const run of [put, test, removed]) expect([...run.out, ...run.err].join('\n')).not.toContain(PLATFORM_VALUE);
+  });
+
+  it('refuses --platform together with --business, and a value on the command line', async () => {
+    const both = io(PLATFORM_VALUE);
+    expect(await main(['--platform', '--business', BUSINESS, 'put', PLATFORM_REF, OPERATOR], both)).toBe(2);
+    const argvValue = io(PLATFORM_VALUE);
+    expect(await main(['--platform', 'put', PLATFORM_REF, OPERATOR, PLATFORM_VALUE], argvValue)).toBe(1);
+    expect(argvValue.err.join('\n')).not.toContain(PLATFORM_VALUE);
+    const { rows } = await getPool().query('SELECT 1 FROM platform_credentials');
+    expect(rows).toHaveLength(0);
   });
 });

@@ -37,7 +37,7 @@ import { appendAudit } from '../audit/log.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { withBusiness, withBusinessTransaction } from '../db/pool.js';
 import { canonicalHash } from '../util/canonical.js';
-import { storedCredentials } from '../governance/credential-store.js';
+import { platformSecrets } from '../tenancy/platform-credentials.js';
 import { MasterKeyError, loadMasterKey, verifyKeyState } from '../governance/master-key.js';
 import { readGrantBySystem, revokeGrant, writeGrant } from '../governance/oauth-grants.js';
 import { consumeState, createState } from '../governance/oauth-state.js';
@@ -330,24 +330,25 @@ type ProviderClient =
   | { ok: false; message: string };
 
 /**
- * The provider app's own client id AND secret, both resolved for this
- * business -- the one check `handleOAuthStart` and `oauthCeremonyPreflight`
- * share, so the sign page cannot pass a preflight the ceremony then fails.
+ * The provider app's own client id AND secret, both resolved from the
+ * PLATFORM store -- the client is the application's, not this business's
+ * (spec §5.4) -- the one check `handleOAuthStart` and
+ * `oauthCeremonyPreflight` share, so the sign page cannot pass a preflight
+ * the ceremony then fails. `_businessId` stays in the signature so both
+ * callers keep saying which business is asking.
  */
-async function resolveProviderClient(key: Buffer, businessId: string, provider: MailProvider): Promise<ProviderClient> {
-  const credentials = storedCredentials(key);
+async function resolveProviderClient(key: Buffer, _businessId: string, provider: MailProvider): Promise<ProviderClient> {
+  const clients = platformSecrets(key);
   const idRef = provider === 'microsoft' ? MICROSOFT_CLIENT_ID_REF : GOOGLE_CLIENT_ID_REF;
   const secretRef = provider === 'microsoft' ? MICROSOFT_CLIENT_SECRET_REF : GOOGLE_CLIENT_SECRET_REF;
-  const [clientId, clientSecret] = await Promise.all([
-    credentials.resolve(idRef, businessId),
-    credentials.resolve(secretRef, businessId),
-  ]);
+  const [idValue, clientSecret] = await Promise.all([clients.resolve(idRef), clients.resolve(secretRef)]);
+  const clientId = idValue === null ? null : { value: idValue };
   if (clientId === null || clientSecret === null) {
     return {
       ok: false,
       message:
         `תצורת ה-OAuth של ${provider === 'microsoft' ? 'Microsoft' : 'Google'} חסרה — יש להקציב ${idRef} ו-${secretRef} ` +
-        'במאגר הסודות לפני שאפשר להתחיל.',
+        'במאגר הסודות של השרת לפני שאפשר להתחיל.',
     };
   }
   return { ok: true, clientId };
@@ -647,8 +648,7 @@ export async function handleOAuthCallback(
     codeVerifier: consumed.codeVerifier,
     redirectUri: redirectUriFor(options.dashboardBaseUrl),
     provider,
-    credentials: storedCredentials(key),
-    businessId,
+    clients: platformSecrets(key),
     ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
   });
 

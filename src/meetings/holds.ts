@@ -21,11 +21,11 @@ import { appendAudit } from '../audit/log.js';
 import { HOLD_TITLE_PREFIX } from '../calendar/calendar.js';
 import { resolveCalendarAccess, type CalendarAccess } from '../calendar/client-for.js';
 import { isCalendarFailure, type CalendarClient, type CalendarFailure } from '../calendar/types.js';
-import { config } from '../config.js';
 import type { BusinessDb } from '../db/pool.js';
 import type { Runtime } from '../orchestrator/runtime.js';
 import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import { canonicalHash } from '../util/canonical.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 export { HOLD_TITLE_PREFIX };
 
@@ -259,7 +259,7 @@ export async function sweepHolds(db: BusinessDb, o: {
             )
           )
         )`,
-    [db.businessId, config.whatsappQuestionWindowMinutes + HOLD_GRACE_MINUTES, NO_QUESTION_GRACE_MINUTES],
+    [db.businessId, capFor(await loadRuntimeSettings(db), 'whatsappQuestionWindowMinutes') + HOLD_GRACE_MINUTES, NO_QUESTION_GRACE_MINUTES],
   );
   if (rows.length === 0) return { released: 0, failed: 0 };
 

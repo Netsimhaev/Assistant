@@ -62,7 +62,6 @@
  * `src/governance/closure-command.ts` for the list and for why cancel verbs
  * are excluded from it.
  */
-import { config } from '../config.js';
 import type { BusinessDb } from '../db/pool.js';
 import { isClosureCommand, SUGGESTED_CLOSURE_VERB } from '../governance/closure-command.js';
 import {
@@ -73,6 +72,7 @@ import {
 import { stripBidiControls } from '../util/bidi.js';
 import { claimForReport } from '../whatsapp/store.js';
 import { transition, whatsAppMessageOf } from './jobs.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 /**
  * What this message is. A closed union, so the door's own handling of it is
@@ -152,7 +152,7 @@ export async function answerableWhatsAppQuestions(
   input: { now?: number; windowMinutes?: number } = {},
 ): Promise<InstructionRecord[]> {
   const nowMs = input.now ?? Date.now();
-  const windowMinutes = input.windowMinutes ?? config.whatsappQuestionWindowMinutes;
+  const windowMinutes = input.windowMinutes ?? capFor(await loadRuntimeSettings(db), 'whatsappQuestionWindowMinutes');
   const open = await pendingQuestions(db, { channel: 'whatsapp' });
   return open.filter((record) => withinQuestionWindow(record, nowMs, windowMinutes));
 }
@@ -170,7 +170,7 @@ export async function decideWhatsAppRoute(
   input: { text: string; now?: number; windowMinutes?: number },
 ): Promise<WhatsAppRoute> {
   const nowMs = input.now ?? Date.now();
-  const windowMinutes = input.windowMinutes ?? config.whatsappQuestionWindowMinutes;
+  const windowMinutes = input.windowMinutes ?? capFor(await loadRuntimeSettings(db), 'whatsappQuestionWindowMinutes');
 
   const open = await pendingQuestions(db, { channel: 'whatsapp' });
 

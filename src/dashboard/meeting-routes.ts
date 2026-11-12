@@ -26,6 +26,7 @@ import { MasterKeyError, loadMasterKey, verifyKeyState } from '../governance/mas
 import { storedCredentials } from '../governance/credential-store.js';
 import { googleTokenHttp } from '../orchestrator/adapters/google-token-http.js';
 import { microsoftTokenHttp } from '../orchestrator/adapters/microsoft-token-http.js';
+import { platformSecrets } from '../tenancy/platform-credentials.js';
 import { providerTokenHttp } from '../orchestrator/adapters/provider-token-http.js';
 import type { CredentialSource } from '../orchestrator/credentials.js';
 import { oauthCredentials } from '../orchestrator/oauth-token.js';
@@ -95,7 +96,7 @@ type Calendars =
   | { listed: true; calendars: CalendarInfo[] }
   | { listed: false; reason: string };
 
-/** The real credential source, built from the master key the way `buildRuntime` builds it; `null` when no usable key. */
+/** The real credential source, built from the master key the way `buildServerRuntime` builds it; `null` when no usable key. */
 async function realCredentials(credentialKeyPath: string | undefined): Promise<CredentialSource | null> {
   if (credentialKeyPath === undefined || credentialKeyPath.length === 0) return null;
   try {
@@ -105,8 +106,8 @@ async function realCredentials(credentialKeyPath: string | undefined): Promise<C
       key,
       fallback: storedCredentials(key),
       http: providerTokenHttp({
-        google: googleTokenHttp({ credentials: storedCredentials(key) }),
-        microsoft: microsoftTokenHttp({ credentials: storedCredentials(key) }),
+        google: googleTokenHttp({ clients: platformSecrets(key) }),
+        microsoft: microsoftTokenHttp({ clients: platformSecrets(key) }),
       }),
     });
   } catch (error) {

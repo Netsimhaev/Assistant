@@ -1,21 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import type { CredentialSource } from '../credentials.js';
-import { createCredentialHandle } from './types.js';
+import type { PlatformSecretSource } from '../../tenancy/platform-credentials.js';
 import { GOOGLE_CLIENT_ID_REF, GOOGLE_CLIENT_SECRET_REF, googleTokenHttp } from './google-token-http.js';
 
 const BUSINESS = 'test-business';
 
-/** A `CredentialSource` backed by a plain map — no database, no encryption. */
-function credentialsFrom(values: Record<string, string>): CredentialSource {
+/** A `PlatformSecretSource` backed by a plain map — no database, no encryption. */
+function credentialsFrom(values: Record<string, string>): PlatformSecretSource {
   return {
-    async resolve(ref: string, _businessId: string) {
-      const value = values[ref];
-      return value === undefined ? null : createCredentialHandle(ref, value);
+    async resolve(ref: string) {
+      return values[ref] ?? null;
     },
   };
 }
 
-function configured(): CredentialSource {
+function configured(): PlatformSecretSource {
   return credentialsFrom({
     [GOOGLE_CLIENT_ID_REF]: 'client-id-123',
     [GOOGLE_CLIENT_SECRET_REF]: 'client-secret-SENTINEL',
@@ -29,13 +27,13 @@ function jsonResponse(status: number, body: unknown): Response {
 describe('googleTokenHttp', () => {
   it('refuses a provider it does not implement, without resolving any credential', async () => {
     let resolved = false;
-    const credentials: CredentialSource = {
+    const clients: PlatformSecretSource = {
       async resolve() {
         resolved = true;
         return null;
       },
     };
-    const http = googleTokenHttp({ credentials });
+    const http = googleTokenHttp({ clients });
     const outcome = await http.exchangeRefresh({
       provider: 'microsoft',
       refreshToken: 'rt',
@@ -50,7 +48,7 @@ describe('googleTokenHttp', () => {
   });
 
   it('reports missing app configuration as a TERMINAL failure, and specifically "misconfigured"', async () => {
-    const http = googleTokenHttp({ credentials: credentialsFrom({}) });
+    const http = googleTokenHttp({ clients: credentialsFrom({}) });
     const outcome = await http.exchangeRefresh({
       provider: 'google',
       refreshToken: 'rt',
@@ -73,7 +71,7 @@ describe('googleTokenHttp', () => {
     // mistake, since an operator provisions the id first — is caught too,
     // not just the "nothing at all provisioned" case.
     const http = googleTokenHttp({
-      credentials: credentialsFrom({ [GOOGLE_CLIENT_ID_REF]: 'client-id-123' }),
+      clients: credentialsFrom({ [GOOGLE_CLIENT_ID_REF]: 'client-id-123' }),
     });
     const outcome = await http.exchangeRefresh({
       provider: 'google',
@@ -86,7 +84,7 @@ describe('googleTokenHttp', () => {
 
   it('mints an access token on a successful exchange', async () => {
     const http = googleTokenHttp({
-      credentials: configured(),
+      clients: configured(),
       fetchImpl: async () =>
         jsonResponse(200, { access_token: 'access-1', expires_in: 3600, refresh_token: 'rotated-1' }),
     });
@@ -106,7 +104,7 @@ describe('googleTokenHttp', () => {
 
   it('treats an unrotated refresh token as null, not absent', async () => {
     const http = googleTokenHttp({
-      credentials: configured(),
+      clients: configured(),
       fetchImpl: async () => jsonResponse(200, { access_token: 'access-1', expires_in: 3600 }),
     });
     const outcome = await http.exchangeRefresh({
@@ -120,7 +118,7 @@ describe('googleTokenHttp', () => {
 
   it('treats a 2xx with an unreadable body as transient, not as a refusal', async () => {
     const http = googleTokenHttp({
-      credentials: configured(),
+      clients: configured(),
       fetchImpl: async () => jsonResponse(200, { nonsense: true }),
     });
     const outcome = await http.exchangeRefresh({
@@ -139,7 +137,7 @@ describe('googleTokenHttp', () => {
       [503, 'transient'],
     ] as const) {
       const http = googleTokenHttp({
-        credentials: configured(),
+        clients: configured(),
         fetchImpl: async () => jsonResponse(status, { error: 'invalid_grant' }),
       });
       const outcome = await http.exchangeRefresh({
@@ -171,7 +169,7 @@ describe('googleTokenHttp', () => {
       [400, { error: 'invalid_client' }],
     ] as const) {
       const http = googleTokenHttp({
-        credentials: configured(),
+        clients: configured(),
         fetchImpl: async () => jsonResponse(status, body),
       });
       const outcome = await http.exchangeRefresh({
@@ -186,7 +184,7 @@ describe('googleTokenHttp', () => {
 
   it('treats a network failure as transient', async () => {
     const http = googleTokenHttp({
-      credentials: configured(),
+      clients: configured(),
       fetchImpl: async () => {
         throw new Error('ECONNREFUSED');
       },
@@ -201,12 +199,12 @@ describe('googleTokenHttp', () => {
   });
 
   it('lets a credential-store failure propagate rather than reporting it as a rejection', async () => {
-    const credentials: CredentialSource = {
+    const clients: PlatformSecretSource = {
       async resolve() {
         throw new Error('database blip');
       },
     };
-    const http = googleTokenHttp({ credentials });
+    const http = googleTokenHttp({ clients });
     await expect(
       http.exchangeRefresh({
         provider: 'google',
@@ -219,7 +217,7 @@ describe('googleTokenHttp', () => {
 
   it('never puts the client secret or the refresh token in a failure message', async () => {
     const http = googleTokenHttp({
-      credentials: configured(),
+      clients: configured(),
       fetchImpl: async () => jsonResponse(400, { error: 'invalid_grant', error_description: 'the full request body, echoed back' }),
     });
     const outcome = await http.exchangeRefresh({
@@ -246,7 +244,7 @@ describe('googleTokenHttp', () => {
     let capturedBody: string | undefined;
     let capturedUrl: string | undefined;
     const http = googleTokenHttp({
-      credentials: configured(),
+      clients: configured(),
       fetchImpl: async (input, init) => {
         capturedUrl = String(input);
         capturedBody = typeof init?.body === 'string' ? init.body : undefined;
@@ -265,19 +263,26 @@ describe('googleTokenHttp', () => {
     expect(capturedUrl).not.toContain('client-secret-SENTINEL');
   });
 
-  it('resolves the client id and secret for the business named in the call, not a business baked into construction', async () => {
-    const seenBusinessIds: string[] = [];
-    const credentials: CredentialSource = {
-      async resolve(ref, businessId) {
-        seenBusinessIds.push(businessId);
-        if (ref === GOOGLE_CLIENT_ID_REF) return createCredentialHandle(ref, 'cid');
-        if (ref === GOOGLE_CLIENT_SECRET_REF) return createCredentialHandle(ref, 'csecret');
+  it('resolves the client id and secret from the platform store, whichever business the grant belongs to', async () => {
+    // The OAuth client is the APPLICATION's: the same two refs answer for
+    // every business, and the source is never asked about a business at all.
+    const seen: unknown[][] = [];
+    const clients: PlatformSecretSource = {
+      async resolve(...args: unknown[]) {
+        seen.push(args);
+        const ref = args[0];
+        if (ref === GOOGLE_CLIENT_ID_REF) return 'cid';
+        if (ref === GOOGLE_CLIENT_SECRET_REF) return 'csecret';
         return null;
       },
-    };
+    } as PlatformSecretSource;
+    let capturedBody = '';
     const http = googleTokenHttp({
-      credentials,
-      fetchImpl: async () => jsonResponse(200, { access_token: 'a', expires_in: 10 }),
+      clients,
+      fetchImpl: async (_url, init) => {
+        capturedBody = String(init?.body);
+        return jsonResponse(200, { access_token: 'a', expires_in: 10 });
+      },
     });
     await http.exchangeRefresh({
       provider: 'google',
@@ -285,6 +290,7 @@ describe('googleTokenHttp', () => {
       businessId: 'business-b',
       signal: new AbortController().signal,
     });
-    expect(seenBusinessIds).toEqual(['business-b', 'business-b']);
+    expect(seen).toEqual([[GOOGLE_CLIENT_ID_REF], [GOOGLE_CLIENT_SECRET_REF]]);
+    expect(capturedBody).toContain('client_id=cid');
   });
 });

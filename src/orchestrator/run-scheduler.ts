@@ -11,10 +11,10 @@
  *   npm run scheduler
  */
 import { config } from '../config.js';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { schedulerPass, startScheduler } from './scheduler.js';
 import { logErrored } from './scheduler-log.js';
-import { buildRuntime } from './runtime.js';
+import { buildServerRuntime, businessRuntime } from './runtime.js';
 
 const intervalMs = Number(process.env['SCHEDULER_INTERVAL_MS'] ?? 30_000);
 
@@ -22,7 +22,12 @@ console.log(
   `scheduler starting for ${config.businessId}, every ${Math.round(intervalMs / 1000)}s`,
 );
 
-const runtime = await buildRuntime();
+// The server half once per process; the business half from that business's
+// settings. Built once here until the per-business loop rebuilds it every
+// pass (the next step of the multi-tenant plan).
+const server = await buildServerRuntime();
+for (const warning of server.warnings) console.warn(`warning: ${warning}`);
+const runtime = await withBusiness(config.businessId, (db) => businessRuntime(server, db)); // TENANCY-TODO(task 9)
 for (const warning of runtime.warnings) console.warn(`warning: ${warning}`);
 
 // One pass before the loop, so a misconfiguration surfaces immediately rather

@@ -18,7 +18,6 @@ import { signCharter } from '../charter/sign.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { closePool, withBusiness } from '../db/pool.js';
 import type { CharterConnection } from '../domain/connection.js';
-import { putSecret } from '../governance/credential-store.js';
 import { KEY_BYTES, writeKeyState } from '../governance/master-key.js';
 import { GOOGLE_CLIENT_ID_REF, GOOGLE_CLIENT_SECRET_REF } from '../orchestrator/adapters/google-token-http.js';
 import { upsertBinding } from '../orchestrator/bindings.js';
@@ -29,6 +28,7 @@ import { createOwner } from './auth.js';
 import { issueCsrfToken } from './csrf.js';
 import { CALENDAR_AUTHORISATION_TEXT } from './calendar-connect.js';
 import { createServer } from './server.js';
+import { putPlatformSecret } from '../tenancy/platform-credentials.js';
 
 const BUSINESS = 'test-business';
 const USERNAME = 'owner';
@@ -52,7 +52,8 @@ async function seedProviderApp(provider: 'google' | 'microsoft' | 'both'): Promi
   const refs: [string, string][] = [];
   if (provider !== 'microsoft') refs.push([GOOGLE_CLIENT_ID_REF, 'g-id'], [GOOGLE_CLIENT_SECRET_REF, 'g-secret']);
   if (provider !== 'google') refs.push(['MICROSOFT_OAUTH_CLIENT_ID', 'ms-id'], ['MICROSOFT_OAUTH_CLIENT_SECRET', 'ms-secret']);
-  for (const [ref, value] of refs) await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref, value, updatedBy: 'test' }, key));
+  // The OAuth client is the server's, not the business's (spec §5.4).
+  for (const [ref, value] of refs) await putPlatformSecret(ref, value, key);
 }
 
 beforeEach(async () => {

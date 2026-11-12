@@ -10,7 +10,6 @@
  */
 import { resolveCalendarAccess, type CalendarAccess } from '../calendar/client-for.js';
 import { isCalendarFailure, type CalendarClient, type CalendarEvent } from '../calendar/types.js';
-import { config } from '../config.js';
 import type { BusinessDb } from '../db/pool.js';
 import type { Plan } from '../domain/plan.js';
 import type { ConfirmationOption } from '../governance/instruction-confirmations.js';
@@ -40,6 +39,7 @@ import { isMeetingInstruction, namesMeeting, verifyTypedEmails, type MeetingRequ
 import { loadMeetingSettings, type MeetingSettings } from './settings.js';
 import { loadCalendarRange } from './snapshot.js';
 import { recordProposedMeetings } from './store.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 export const WHATSAPP_MAX_CHARS = 4_000;
 export const CALENDAR_NOT_CONNECTED_REPLY = 'היומן לא מחובר — אפשר לחבר אותו במסך החיבורים.';
@@ -332,7 +332,7 @@ function markersOf(plan: Plan): { sourceJobId: string | null; exclude: Interval[
  * `ok` send) — one the owner never received is not the slot he turned down.
  */
 async function pendingMeetingQuestion(door: DoorContext): Promise<{ jobId: string; plan: Plan } | null> {
-  const windowMinutes = config.whatsappQuestionWindowMinutes;
+  const windowMinutes = capFor(await loadRuntimeSettings(door.db), 'whatsappQuestionWindowMinutes');
   if (windowMinutes <= 0) return null;
   const { rows } = await door.db.query<{ job_id: string }>(
     `SELECT c.job_id

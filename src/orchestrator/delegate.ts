@@ -43,7 +43,6 @@
  * function call can make it disappear.
  */
 import { ulid } from 'ulid';
-import { config } from '../config.js';
 import { AgentId } from '../domain/audit.js';
 import type { AgentEnvelope, ContextRef, EnvelopeConstraints } from '../domain/envelope.js';
 import type { Plan } from '../domain/plan.js';
@@ -75,6 +74,7 @@ import { canonicalHash } from '../util/canonical.js';
 import { createJob, loadJob, transition } from './jobs.js';
 import { bindPlanToJob } from './plan-store.js';
 import type { BusinessDb } from '../db/pool.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 
 /**
  * The ceiling a job with no incoming envelope inherits from — maximally
@@ -460,7 +460,7 @@ export async function requestHelp(db: BusinessDb, input: RequestHelpInput): Prom
   if (hopDenial !== null) return { status: 'refused', ...hopDenial };
 
   const usedToday = await delegationsToday(db);
-  const capDenial = dailyCapGuard(usedToday, config.delegationsPerDay);
+  const capDenial = dailyCapGuard(usedToday, capFor(await loadRuntimeSettings(db), 'delegationsPerDay'));
   if (capDenial !== null) return { status: 'refused', ...capDenial };
 
   const prior = await priorQuadruples(db, correlationId);

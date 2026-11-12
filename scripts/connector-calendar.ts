@@ -14,6 +14,7 @@ import { closePool } from '../src/db/pool.js';
 import { loadBindings } from '../src/orchestrator/bindings.js';
 import { createGoogleCalendarAdapter } from '../src/orchestrator/adapters/google-calendar.js';
 import { googleTokenHttp } from '../src/orchestrator/adapters/google-token-http.js';
+import { platformSecrets } from '../src/tenancy/platform-credentials.js';
 import { oauthCredentials } from '../src/orchestrator/oauth-token.js';
 import { storedCredentials } from '../src/governance/credential-store.js';
 import { loadMasterKey } from '../src/governance/master-key.js';
@@ -55,7 +56,7 @@ try {
       const credentials = oauthCredentials({
         key,
         fallback: storedCredentials(key),
-        http: googleTokenHttp({ credentials: storedCredentials(key) }),
+        http: googleTokenHttp({ clients: platformSecrets(key) }),
       });
 
       // `oauthCredentials.resolve` throws five error classes of its own

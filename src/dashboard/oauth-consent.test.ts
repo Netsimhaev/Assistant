@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createCredentialHandle } from '../orchestrator/adapters/types.js';
-import type { CredentialSource } from '../orchestrator/credentials.js';
+import type { PlatformSecretSource } from '../tenancy/platform-credentials.js';
 import {
   buildConsentUrl,
   codeChallengeFor,
@@ -11,11 +10,10 @@ import {
 
 const REDIRECT_URI = 'http://127.0.0.1:4173/oauth/callback';
 
-function fakeCredentials(values: Record<string, string>): CredentialSource {
+function fakeCredentials(values: Record<string, string>): PlatformSecretSource {
   return {
-    async resolve(ref, _businessId) {
-      const value = values[ref];
-      return value === undefined ? null : createCredentialHandle(ref, value);
+    async resolve(ref) {
+      return values[ref] ?? null;
     },
   };
 }
@@ -107,8 +105,7 @@ describe('exchangeCode', () => {
       code: 'auth-code',
       codeVerifier: 'verifier',
       redirectUri: REDIRECT_URI,
-      credentials: fakeCredentials({}),
-      businessId: 'biz',
+      clients: fakeCredentials({}),
       fetchImpl: async () => {
         throw new Error('must not be called when the app secret is missing');
       },
@@ -124,8 +121,7 @@ describe('exchangeCode', () => {
       code: 'auth-code',
       codeVerifier: 'verifier-value',
       redirectUri: REDIRECT_URI,
-      credentials: CREDENTIALS,
-      businessId: 'biz',
+      clients: CREDENTIALS,
       fetchImpl: async (_url, init) => {
         capturedBody = String(init?.body ?? '');
         return jsonResponse(200, {
@@ -155,8 +151,7 @@ describe('exchangeCode', () => {
       code: 'auth-code',
       codeVerifier: 'verifier',
       redirectUri: REDIRECT_URI,
-      credentials: CREDENTIALS,
-      businessId: 'biz',
+      clients: CREDENTIALS,
       fetchImpl: async () =>
         jsonResponse(200, { access_token: 'access-token-value', refresh_token: 'refresh-token-value' }),
     });
@@ -174,8 +169,7 @@ describe('exchangeCode', () => {
       code: 'auth-code',
       codeVerifier: 'verifier',
       redirectUri: REDIRECT_URI,
-      credentials: CREDENTIALS,
-      businessId: 'biz',
+      clients: CREDENTIALS,
       fetchImpl: async () =>
         jsonResponse(200, { access_token: 'access-token-value', expires_in: 3600 }),
     });
@@ -188,8 +182,7 @@ describe('exchangeCode', () => {
       code: 'auth-code',
       codeVerifier: 'verifier',
       redirectUri: REDIRECT_URI,
-      credentials: CREDENTIALS,
-      businessId: 'biz',
+      clients: CREDENTIALS,
       fetchImpl: async () => jsonResponse(400, { error: 'invalid_grant' }),
     });
     expect(outcome).toEqual(
@@ -203,8 +196,7 @@ describe('exchangeCode', () => {
       code: 'auth-code',
       codeVerifier: 'verifier',
       redirectUri: REDIRECT_URI,
-      credentials: CREDENTIALS,
-      businessId: 'biz',
+      clients: CREDENTIALS,
       fetchImpl: async () => new Response('oops', { status: 503 }),
     });
     expect(outcome).toEqual(expect.objectContaining({ ok: false, kind: 'transient' }));
@@ -215,8 +207,7 @@ describe('exchangeCode', () => {
       code: 'auth-code',
       codeVerifier: 'verifier',
       redirectUri: REDIRECT_URI,
-      credentials: CREDENTIALS,
-      businessId: 'biz',
+      clients: CREDENTIALS,
       fetchImpl: async () => {
         throw new Error('ECONNREFUSED');
       },
@@ -229,8 +220,7 @@ describe('exchangeCode', () => {
       code: 'auth-code',
       codeVerifier: 'verifier',
       redirectUri: REDIRECT_URI,
-      credentials: CREDENTIALS,
-      businessId: 'biz',
+      clients: CREDENTIALS,
       fetchImpl: async () =>
         // A provider that echoes the request body back in an error -- the
         // exact hazard `readErrorCode` exists to refuse.
