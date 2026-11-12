@@ -867,13 +867,14 @@ export interface SchedulerPassResult {
  * they are finer-grained than the tick's lock.
  */
 export async function schedulerPass(
-  db: BusinessDb,
+  businessId: string,
   options: {
     now?: Date;
     limit?: number;
     /**
      * Required: the business's runtime, built by the caller from the server
-     * half (`businessRuntime(server, db)`). There is no default build here —
+     * half (`businessRuntime(server, db)` on a connection the caller releases
+     * before the pass). There is no default build here —
      * a pass that assembled its own would read the master key per business,
      * per pass, and would hide which server half the business ran under.
      */
@@ -930,22 +931,27 @@ export async function schedulerPass(
     production?: Pick<RunProductionsOptions, 'drafter' | 'judge' | 'printer' | 'renderer' | 'onFinished' | 'documentRoot' | 'pdfAssets'>;
   },
 ): Promise<SchedulerPassResult> {
-  // The business comes from `db`, and only from `db`.
-  const businessId = db.businessId;
-  // Every stage below runs on a connection of its own for this business,
-  // never on `db` and never two at once (stages are awaited one by one). Two
-  // reasons. A stage that breaks its connection — an aborted transaction, a
-  // failed session-lock unlock, which `withSessionLockOn` answers by leaving
-  // the session in a `BEGIN` so it is destroyed — must not poison the stages
-  // after it; the conductor (`conductPendingDocuments`) does exactly that on
-  // a failed unlock, so it must never share a connection with anything else.
-  // And it is what each stage already did before the pass took a `db`.
+  // Every stage below — the tick included — runs on a connection of its own
+  // for this business, taken when the stage starts and released when it ends,
+  // never two at once (stages are awaited one by one) and none held across
+  // the pass. Three reasons. A pass that hangs past its deadline then pins
+  // only the connection(s) of the stage it hangs in, never a pass-long one on
+  // top — a few stuck businesses must not drain the pool for every other
+  // business (`tenants.ts`, the bound). A stage that breaks its connection — an
+  // aborted transaction, a failed session-lock unlock, which
+  // `withSessionLockOn` answers by leaving the session in a `BEGIN` so it is
+  // destroyed — must not poison the stages after it; the conductor
+  // (`conductPendingDocuments`) does exactly that on a failed unlock, so it
+  // must never share a connection with anything else. And it is what each
+  // stage already did before the multi-tenant scheduler.
   const stage = <T>(fn: (stageDb: BusinessDb) => Promise<T>): Promise<T> =>
     withBusiness(businessId, fn);
-  const tickResult = await tick(db, {
-    ...(options.now !== undefined ? { now: options.now } : {}),
-    ...(options.limit !== undefined ? { limit: options.limit } : {}),
-  });
+  const tickResult = await stage((tickDb) =>
+    tick(tickDb, {
+      ...(options.now !== undefined ? { now: options.now } : {}),
+      ...(options.limit !== undefined ? { limit: options.limit } : {}),
+    }),
+  );
 
   // First after the tick, and the order matters: a child that closed on the
   // previous pass wakes its parent at the top of this one, so the parent runs

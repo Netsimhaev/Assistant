@@ -584,7 +584,7 @@ describe('the evaluation pass', () => {
       credentials: envCredentials({}, 'TEST_CRED_'),
       warnings: [],
     };
-    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { inbox: null, runtime: inert }));
+    const pass = await schedulerPass(BUSINESS, { inbox: null, runtime: inert });
 
     expect(pass.autonomy.promoted).toContain('email.reply');
     expect(pass.autonomy.errored).toEqual([]);

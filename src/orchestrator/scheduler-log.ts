@@ -333,9 +333,12 @@ export function resetProductionNoticeForTests(): void {
  * never anything a business's pass was holding: a pass that threw is
  * reported by kind, not by its error message.
  */
+export function tenantPassTotal(report: TenantPassReport): number {
+  return report.ran.length + report.failed.length + report.skippedInFlight.length + report.notReached.length;
+}
+
 export function tenantPassLines(report: TenantPassReport): string[] {
-  const total =
-    report.ran.length + report.failed.length + report.skippedInFlight.length + report.notReached.length;
+  const total = tenantPassTotal(report);
   const lines = [
     `${total} businesses, ran ${report.ran.length}, failed ${report.failed.length}, ` +
       `skipped ${report.skippedInFlight.length}` +
@@ -346,8 +349,28 @@ export function tenantPassLines(report: TenantPassReport): string[] {
   return lines;
 }
 
-export function logTenantPass(report: TenantPassReport): void {
-  const [summary, ...rest] = tenantPassLines(report);
-  if (summary !== undefined) console.log(summary);
-  for (const line of rest) console.error(line);
+/**
+ * Whether an interval is worth a summary line: something failed, was
+ * skipped or was not reached, or the number of businesses changed since the
+ * last interval (`previousTotal`, null before the first). A quiet, healthy
+ * interval prints nothing — a line every thirty seconds saying all is well
+ * buries the one that says it is not.
+ */
+export function tenantPassIsNotable(report: TenantPassReport, previousTotal: number | null): boolean {
+  return (
+    report.failed.length > 0 ||
+    report.skippedInFlight.length > 0 ||
+    report.notReached.length > 0 ||
+    tenantPassTotal(report) !== previousTotal
+  );
+}
+
+/** Logs the interval when it is notable; returns the business count for the next call. */
+export function logTenantPass(report: TenantPassReport, previousTotal: number | null): number {
+  if (tenantPassIsNotable(report, previousTotal)) {
+    const [summary, ...rest] = tenantPassLines(report);
+    if (summary !== undefined) console.log(summary);
+    for (const line of rest) console.error(line);
+  }
+  return tenantPassTotal(report);
 }

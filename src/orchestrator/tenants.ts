@@ -4,9 +4,21 @@
  * The list comes from `listActiveBusinesses()` — the declared cross-business
  * read (§5.7) — and nothing else: a business is run only because the registry
  * says it is active, never because some row somewhere carries its id. Each
- * business then runs on its own `withBusiness` connection, with its own
- * runtime (`businessRuntime(server, db)`), inside its own deadline and its own
- * catch. **A stuck business never freezes the others.**
+ * business then runs with its own runtime (`businessRuntime(server, db)`, on a
+ * connection released before the pass starts), inside its own deadline and
+ * its own catch, and every stage of its pass takes a connection of its own
+ * and gives it back when the stage ends (`schedulerPass`).
+ *
+ * **What a stuck business can still cost the others — the bound.** A pass
+ * that hangs past its deadline keeps running, and pins the connection of the
+ * stage it hangs in — one, or two when it hangs inside a per-job stage
+ * (`runDueJobs`, `closeVerifiedJobs`, `resumeDelegatedJobs`,
+ * `reaskFailedCommands` hold their stage connection while each job takes its
+ * own). Nothing is held across the pass. So the others keep running while
+ * the hung passes leave at least two of the pool's connections (max 10) free;
+ * a server with more businesses hung at once than that runs out of
+ * connections for everyone, and the log says so every interval
+ * (`skippedInFlight`, `failed: deadline`). That is the limit, not "never".
  *
  * **Sequential, in `business_id` order.** No concurrency between businesses
  * at this stage: the separation does not need it to be correct, and two
@@ -28,7 +40,7 @@
  */
 import { appendAudit } from '../audit/log.js';
 import { activeCharterVersion } from '../charter/store.js';
-import { withBusiness, type BusinessDb } from '../db/pool.js';
+import { withBusiness } from '../db/pool.js';
 import { withDeadline } from '../governance/notify.js';
 import { listActiveBusinesses } from '../tenancy/platform.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -60,7 +72,7 @@ export interface TenantPassReport {
 }
 
 export type TenantPass = (
-  db: BusinessDb,
+  businessId: string,
   options: { runtime: Runtime; now?: Date },
 ) => Promise<SchedulerPassResult>;
 
@@ -80,10 +92,16 @@ export interface RunAllBusinessesOptions {
   pass?: TenantPass;
 }
 
-/** The registry order, rotated to start at `resumeFrom` (or the first id after it). */
+/**
+ * The registry order, rotated to start at `resumeFrom` — the id itself when it
+ * is still listed, else the first id after it. The list is ordered
+ * `COLLATE "C"` (byte order), which is what JS `>=` on these ASCII ids
+ * compares, so the fallback agrees with the order it is searching.
+ */
 function rotate(ids: string[], resumeFrom: string | null): string[] {
   if (resumeFrom === null) return ids;
-  const start = ids.findIndex((id) => id >= resumeFrom);
+  const exact = ids.indexOf(resumeFrom);
+  const start = exact !== -1 ? exact : ids.findIndex((id) => id >= resumeFrom);
   if (start <= 0) return ids;
   return [...ids.slice(start), ...ids.slice(0, start)];
 }
@@ -106,6 +124,8 @@ async function recordPassFailure(businessId: string, reason: 'threw' | 'deadline
           actor: 'system',
           kind: 'tool_call',
           charterVersion: charterVersion ?? 'n/a',
+          // A system row about the installation, not a trust claim about any
+          // content — the same choice `killswitch.ts` makes for its rows.
           provenance: 'boss',
           inputHash: canonicalHash({ kind: 'scheduler_pass_failed', reason }),
           reason: `scheduler_pass_failed:${reason}`,
@@ -128,11 +148,12 @@ export async function runAllBusinesses(
   const { state } = options;
   const pass: TenantPass = options.pass ?? schedulerPass;
   const budgetMs = options.budgetMs ?? SCHEDULER_INTERVAL_MS;
-  const startedAt = Date.now();
 
   const report: TenantPassReport = { ran: [], skippedInFlight: [], failed: [], notReached: [] };
   const order = rotate(await listActiveBusinesses(), state.resumeFrom);
   state.resumeFrom = null;
+  // The budget is for running businesses, so its clock starts once the list is in.
+  const startedAt = Date.now();
 
   for (const [index, businessId] of order.entries()) {
     // The first business always runs, whatever the budget: a budget smaller
@@ -148,14 +169,16 @@ export async function runAllBusinesses(
     }
 
     state.inFlight.add(businessId);
-    const work: Promise<Outcome> = withBusiness(businessId, async (db) => {
-      const runtime = await businessRuntime(server, db);
-      const result = await pass(db, {
+    const work: Promise<Outcome> = (async (): Promise<Outcome> => {
+      // The runtime's connection is released before the pass starts: nothing
+      // is held across the pass (see the bound in the docblock).
+      const runtime = await withBusiness(businessId, (db) => businessRuntime(server, db));
+      const result = await pass(businessId, {
         runtime,
         ...(options.now !== undefined ? { now: options.now } : {}),
       });
       return { ok: true as const, result, warnings: runtime.warnings };
-    })
+    })()
       .catch((): Outcome => ({ ok: false }))
       .finally(() => {
         // Only here, when the pass has really finished — never on the

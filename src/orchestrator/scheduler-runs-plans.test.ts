@@ -127,7 +127,7 @@ describe('schedulerPass', () => {
     }));
 
     const sent: MailMessage[] = [];
-    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { runtime: runtimeWith(sent), now: NOON }));
+    const pass = await schedulerPass(BUSINESS, { runtime: runtimeWith(sent), now: NOON });
 
     expect(pass.tick.wokenJobs).toContain(job.jobId);
     expect(pass.due.ran.map((r) => r.jobId)).toContain(job.jobId);
@@ -177,7 +177,7 @@ describe('schedulerPass', () => {
     await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
 
     const sent: MailMessage[] = [];
-    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { runtime: runtimeWith(sent), now: NOON }));
+    const pass = await schedulerPass(BUSINESS, { runtime: runtimeWith(sent), now: NOON });
 
     expect(sent).toHaveLength(1);
     expect(pass.verified.closed).toContain(job.jobId);
@@ -244,7 +244,7 @@ describe('schedulerPass', () => {
     await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto_notify'));
 
     const sent: MailMessage[] = [];
-    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, {
+    const pass = await schedulerPass(BUSINESS, {
       runtime: {
         registry: new AdapterRegistry([
           createMailAdapter({
@@ -263,7 +263,7 @@ describe('schedulerPass', () => {
       },
       now: NOON,
       inbox: null,
-    }));
+    });
 
     // The failure really happened in this pass, and nothing was sent.
     expect(sent).toHaveLength(0);
@@ -319,7 +319,7 @@ describe('schedulerPass', () => {
     await withBusiness(BUSINESS, (bdb) => setDigestSettings(bdb, { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: false }, 'owner'));
 
     const sent: MailMessage[] = [];
-    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { runtime: runtimeWith(sent), now: NOON }));
+    const pass = await schedulerPass(BUSINESS, { runtime: runtimeWith(sent), now: NOON });
 
     // The step really ran and queued an approval, and nothing went out.
     expect(pass.due.ran.map((r) => r.jobId)).toContain(job.jobId);

@@ -96,11 +96,11 @@ describe('schedulerPass ledger stages', () => {
       [B, new Date('2026-11-02T09:00:00Z')],
     );
     const emails: { subject: string; body: string }[] = [];
-    const pass = await withBusiness(B, (passDb) => schedulerPass(passDb, {
+    const pass = await schedulerPass(B, {
       runtime: emptyRuntime(emails),
       now: NOW,
       inbox: null,
-    }));
+    });
 
     expect(pass.ledgerEvidenceError).toBeNull();
     expect(pass.ledgerError).toBeNull();
@@ -146,7 +146,7 @@ describe('schedulerPass ledger stages', () => {
     ));
     const gateway = createFakeGateway();
     const runtime = { ...emptyRuntime(), whatsapp: { gateway } } as unknown as Runtime;
-    const pass = await withBusiness(B, (passDb) => schedulerPass(passDb, { runtime, now: NOW, inbox: null }));
+    const pass = await schedulerPass(B, { runtime, now: NOW, inbox: null });
 
     expect(pass.ledgerEvidence?.closed.map((c) => c.itemId)).toEqual([closing.itemId]);
     expect(pass.ledger?.reminded).toBe(1);
@@ -178,14 +178,14 @@ describe('schedulerPass ledger stages', () => {
     await setModes('act');
     const item = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
     await backdate(item.itemId);
-    const pass = await withBusiness(B, (passDb) => schedulerPass(passDb, {
+    const pass = await schedulerPass(B, {
       runtime: emptyRuntime(),
       now: NOW,
       inbox: null,
       ledgerDrafter: async () => {
         throw new Error('drafter exploded');
       },
-    }));
+    });
 
     expect(pass.ledger).not.toBeNull();
     // The throwing drafter was reached and contained inside the stage: the
@@ -200,11 +200,11 @@ describe('schedulerPass ledger stages', () => {
   });
 
   it('is null when no charter is active', async () => {
-    const pass = await withBusiness(B, (passDb) => schedulerPass(passDb, {
+    const pass = await schedulerPass(B, {
       runtime: emptyRuntime(),
       now: NOW,
       inbox: null,
-    }));
+    });
     expect(pass.ledgerEvidence).toBeNull();
     expect(pass.ledger).toBeNull();
     expect(pass.ledgerEvidenceError).toBeNull();
@@ -218,7 +218,7 @@ describe('schedulerPass ledger stages', () => {
     await setModes('remind');
     await testDb().query('ALTER TABLE ledger_items RENAME TO ledger_items_x');
     try {
-      const pass = await withBusiness(B, (passDb) => schedulerPass(passDb, { runtime: emptyRuntime(), now: NOW, inbox: null }));
+      const pass = await schedulerPass(B, { runtime: emptyRuntime(), now: NOW, inbox: null });
       expect(typeof pass.ledgerEvidenceError).toBe('string');
       expect(pass.ledgerEvidenceError?.length).toBeGreaterThan(0);
       expect(typeof pass.ledgerError).toBe('string');

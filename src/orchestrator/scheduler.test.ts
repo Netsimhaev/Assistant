@@ -223,7 +223,7 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
     };
     const handle = startScheduler({
       intervalMs: 50,
-      pass: () => withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { runtime: inert })),
+      pass: () => schedulerPass(BUSINESS, { runtime: inert }),
       onError: (error) => errors.push(error),
     });
 
@@ -381,7 +381,7 @@ describe('a delegation resumes in the same pass it is freed', () => {
     // The critical assertion: ONE schedulerPass both wakes the parent
     // (`resumeDelegatedJobs`) and re-runs its plan (`runDueJobs`) in the SAME
     // pass, and the parent completes rather than being marked `failed`.
-    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime }));
+    const pass = await schedulerPass(BUSINESS, { now: NOON, inbox: null, runtime });
 
     expect(pass.delegated.resumed).toEqual([job.jobId]);
     expect(pass.delegated.errored).toEqual([]);
@@ -414,7 +414,7 @@ describe('the digest field on SchedulerPassResult', () => {
       credentials: envCredentials({}, 'TEST_CRED_'),
       warnings: [],
     };
-    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: inert }));
+    const pass = await schedulerPass(BUSINESS, { now: NOON, inbox: null, runtime: inert });
     expect(pass.digest).toBeNull();
   });
 
@@ -426,7 +426,7 @@ describe('the digest field on SchedulerPassResult', () => {
       credentials: envCredentials({}, 'TEST_CRED_'),
       warnings: [],
     };
-    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: inert }));
+    const pass = await schedulerPass(BUSINESS, { now: NOON, inbox: null, runtime: inert });
     expect(pass.digest).not.toBeNull();
     expect(pass.digest?.produced).toHaveLength(1);
     expect(pass.digest?.produced[0]?.kind).toBe('daily');
@@ -448,7 +448,7 @@ describe('the mail field on SchedulerPassResult', () => {
 
   it('is null, with no error, when no mailbox is connected', async () => {
     await install();
-    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: inert() }));
+    const pass = await schedulerPass(BUSINESS, { now: NOON, inbox: null, runtime: inert() });
     expect(pass.mail).toBeNull();
     expect(pass.mailError).toBeNull();
   });
@@ -462,7 +462,7 @@ describe('the mail field on SchedulerPassResult', () => {
        VALUES ('M-old', $1, 'pm-old', 't', 'a@b.example', 's', $2, 'גוף ישן')`,
       [BUSINESS, old.toISOString()],
     );
-    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, inbox: null, runtime: inert() }));
+    const pass = await schedulerPass(BUSINESS, { now: NOON, inbox: null, runtime: inert() });
     expect(pass.mailRetention).toEqual({ scrubbed: 1 });
     expect(pass.mailRetentionError).toBeNull();
     const { rows } = await getPool().query<{ body_text: string | null }>(
@@ -485,14 +485,14 @@ describe('the mail field on SchedulerPassResult', () => {
     } as unknown as MailboxClient;
     const triage: Triage = async () => ({ status: 'read', triage: QUESTION_TRIAGE });
 
-    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, {
+    const pass = await schedulerPass(BUSINESS, {
       now: MAIL_NOON,
       inbox: null,
       runtime: inert(),
       mailClient: client,
       mailTriage: triage,
       mailDrafter: stubDrafter(),
-    }));
+    });
 
     expect(pass.mailError).toBeNull();
     expect(pass.mail).toMatchObject({ status: 'ok', recorded: 1, triaged: 1, drafts: 1 });
@@ -531,13 +531,13 @@ describe('the document production loop runs in the pass, right after the plans',
   it('does not run (null, not zeros) without production tools, and the request ends failed instead of waiting', async () => {
     const bundle = await install();
     const id = await queuedProduction(bundle);
-    const unavailable = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, {
+    const unavailable = await schedulerPass(BUSINESS, {
       now: NOON,
       runtime: inert({ available: false, sofficePath: null, chromiumPath: null }),
-    }));
+    });
     expect(unavailable.documentProductions).toBeNull();
     expect(unavailable.documentProductionsError).toBeNull();
-    const absent = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, runtime: inert() }));
+    const absent = await schedulerPass(BUSINESS, { now: NOON, runtime: inert() });
     expect(absent.documentProductions).toBeNull();
     const { loadProduction } = await import('../production/store.js');
     const p = await withBusiness(BUSINESS, (db) => loadProduction(db, id));
@@ -586,12 +586,12 @@ describe('the document production loop runs in the pass, right after the plans',
       };
       // Pass 1: draft, build and check 1. Check 2 (the judge, 120s) does not fit
       // the rest of a 120s budget, so it waits for the next pass (loop.ts, Budget).
-      const first = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, runtime: inert(), production }));
+      const first = await schedulerPass(BUSINESS, { now: NOON, runtime: inert(), production });
       expect(first.documentProductionsError).toBeNull();
       expect(first.documentProductions).toMatchObject({ ready: 0, errored: [] });
       const { loadProduction } = await import('../production/store.js');
       expect((await withBusiness(BUSINESS, (db) => loadProduction(db, id)))?.stage).toBe('check2');
-      const result = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { now: NOON, runtime: inert(), production }));
+      const result = await schedulerPass(BUSINESS, { now: NOON, runtime: inert(), production });
       expect(result.documentProductions).toMatchObject({ ready: 1, errored: [] });
       expect((await withBusiness(BUSINESS, (db) => loadProduction(db, id)))?.stage).toBe('ready');
     } finally {

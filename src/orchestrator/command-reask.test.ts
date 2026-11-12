@@ -584,7 +584,7 @@ describe('reaskFailedCommands', () => {
     const { jobId, bundle } = await seedCommand({ channel: 'dashboard' });
     await timeOut(jobId, bundle);
     const sent: MailMessage[] = [];
-    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { runtime: sendingRuntime(sent), now: NOON, inbox: null }));
+    const pass = await schedulerPass(BUSINESS, { runtime: sendingRuntime(sent), now: NOON, inbox: null });
     expect(pass.reaskError).toBeNull();
     expect(pass.reasked.reasked.map((r) => r.oldJobId)).toEqual([jobId]);
     expect(sent).toEqual([]);
@@ -687,7 +687,7 @@ describe('reaskFailedCommands', () => {
     await backdateDecision(jobId);
 
     const sent: MailMessage[] = [];
-    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { runtime: sendingRuntime(sent), now: NOON, inbox: null }));
+    const pass = await schedulerPass(BUSINESS, { runtime: sendingRuntime(sent), now: NOON, inbox: null });
     expect(sent).toEqual([]);
     // Woken, run, refused on the stale "yes", failed — then re-asked.
     expect(await lastReason(jobId)).toContain('draft_only');
@@ -695,7 +695,7 @@ describe('reaskFailedCommands', () => {
     const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, pass.reasked.reasked[0]?.newJobId ?? ''));
     expect(confirmation?.presentedText.includes(REASK_PREFIX)).toBe(false);
 
-    const next = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { runtime: sendingRuntime(sent), now: NOON, inbox: null }));
+    const next = await schedulerPass(BUSINESS, { runtime: sendingRuntime(sent), now: NOON, inbox: null });
     expect(next.reasked.reasked).toEqual([]);
     expect(await reasksOf(jobId)).toHaveLength(1);
   });

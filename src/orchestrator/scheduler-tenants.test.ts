@@ -1,11 +1,11 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { __setAppPoolMaxForTest, closePool, withBusiness } from '../db/pool.js';
 import { closePlatformPool } from '../db/platform-pool.js';
 import { registerBusiness, resetDatabase, testDb } from '../test/db.js';
 import { envCredentials } from './credentials.js';
 import type { ServerRuntime } from './runtime.js';
-import type { SchedulerPassResult } from './scheduler.js';
-import { tenantPassLines } from './scheduler-log.js';
+import { schedulerPass, type SchedulerPassResult } from './scheduler.js';
+import { tenantPassIsNotable, tenantPassLines } from './scheduler-log.js';
 import { runAllBusinesses, type TenantLoopState, type TenantPass } from './tenants.js';
 
 /**
@@ -33,11 +33,11 @@ function freshState(): TenantLoopState {
   return { inFlight: new Set(), resumeFrom: null };
 }
 
-/** A pass seam that records which business it ran on, from the `db` itself. */
+/** A pass seam that records which business it ran on. */
 function recordingPass(seen: string[], behave: (id: string) => Promise<void> = async () => {}): TenantPass {
-  return async (db) => {
-    seen.push(db.businessId);
-    await behave(db.businessId);
+  return async (businessId) => {
+    seen.push(businessId);
+    await behave(businessId);
     return {} as SchedulerPassResult;
   };
 }
@@ -116,6 +116,9 @@ describe('runAllBusinesses', () => {
     const first = await runAllBusinesses(SERVER, { perBusinessDeadlineMs: 100, state, pass });
     expect(first.failed).toEqual([{ businessId: A, reason: 'deadline' }]);
     expect(first.ran).toEqual([B]);
+    // The deadline's own row, in A's chain — not only a thrown pass writes one.
+    expect(await auditReasons(A)).toEqual(['scheduler_pass_failed:deadline']);
+    expect(await auditReasons(B)).toEqual([]);
     // The deadline stopped the waiting, not the work.
     expect(state.inFlight.has(A)).toBe(true);
 
@@ -180,6 +183,93 @@ describe('runAllBusinesses', () => {
     expect(third.notReached).toEqual([]);
     expect(state.resumeFrom).toBeNull();
     expect(seen).toEqual([A, B, C, A, B]);
+  });
+
+  it('a budget of zero still runs the first business, so nothing starves', async () => {
+    await registerBusiness(A);
+    await registerBusiness(B);
+    const state = freshState();
+    const seen: string[] = [];
+    const pass = recordingPass(seen);
+
+    const first = await runAllBusinesses(SERVER, { perBusinessDeadlineMs: 5_000, state, budgetMs: 0, pass });
+    expect(first.ran).toEqual([A]);
+    expect(first.notReached).toEqual([B]);
+
+    const second = await runAllBusinesses(SERVER, { perBusinessDeadlineMs: 5_000, state, budgetMs: 0, pass });
+    expect(second.ran).toEqual([B]);
+    expect(seen).toEqual([A, B]);
+  });
+
+  it('resumes at the remembered business when it is still listed, and after it when it is gone', async () => {
+    await registerBusiness(A);
+    await registerBusiness(C);
+    const seen: string[] = [];
+    // B is no longer listed: the next id after it is C.
+    const gone = await runAllBusinesses(SERVER, {
+      perBusinessDeadlineMs: 5_000,
+      state: { inFlight: new Set(), resumeFrom: B },
+      pass: recordingPass(seen),
+    });
+    expect(gone.ran).toEqual([C, A]);
+  });
+
+  it('several businesses hung past their deadline do not starve another of connections', async () => {
+    // A small pool. Each hung pass here pins one connection, as a pass hung
+    // in a stage does (nothing is held across the pass). The healthy pass
+    // needs two at its peak — a per-job stage (`runDueJobs`) holds its own
+    // connection while each job takes another — so: two hung, two left. Had
+    // the pass held a connection of its own across its stages, as it once
+    // did, the two hung ones would pin four and the healthy one get none.
+    await __setAppPoolMaxForTest(4);
+    const H1 = 'tenant-hung-1';
+    const H2 = 'tenant-hung-2';
+    const OK = 'tenant-ok';
+    await registerBusiness(H1);
+    await registerBusiness(H2);
+    await registerBusiness(OK);
+    const state = freshState();
+    let release!: () => void;
+    const stuck = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // A hung business hangs INSIDE a connection, as a hung stage would; the
+    // healthy one runs the real `schedulerPass`, stage by stage.
+    const pass: TenantPass = (businessId, options) =>
+      businessId === OK
+        ? schedulerPass(businessId, options)
+        : withBusiness(businessId, async () => {
+            await stuck;
+            return {} as SchedulerPassResult;
+          });
+
+    try {
+      const first = await runAllBusinesses(SERVER, { perBusinessDeadlineMs: 300, state, pass });
+      expect(first.failed).toEqual([
+        { businessId: H1, reason: 'deadline' },
+        { businessId: H2, reason: 'deadline' },
+      ]);
+      expect(first.ran).toEqual([OK]);
+
+      // Still hung: skipped, and the healthy business runs again.
+      const second = await runAllBusinesses(SERVER, { perBusinessDeadlineMs: 300, state, pass });
+      expect(second.skippedInFlight).toEqual([H1, H2]);
+      expect(second.ran).toEqual([OK]);
+    } finally {
+      release();
+      await waitFor(() => state.inFlight.size === 0);
+      await __setAppPoolMaxForTest(10);
+    }
+  });
+
+  it('the summary line is printed only when something went wrong or the count changed', () => {
+    const quiet = { ran: [A, B], skippedInFlight: [], failed: [], notReached: [] };
+    expect(tenantPassIsNotable(quiet, null)).toBe(true);
+    expect(tenantPassIsNotable(quiet, 2)).toBe(false);
+    expect(tenantPassIsNotable(quiet, 3)).toBe(true);
+    expect(tenantPassIsNotable({ ...quiet, failed: [{ businessId: A, reason: 'threw' as const }] }, 3)).toBe(true);
+    expect(tenantPassIsNotable({ ...quiet, skippedInFlight: [A] }, 3)).toBe(true);
+    expect(tenantPassIsNotable({ ...quiet, notReached: [B] }, 3)).toBe(true);
   });
 
   it('a failure writes one count-only audit row in that business\'s chain and none in others', async () => {

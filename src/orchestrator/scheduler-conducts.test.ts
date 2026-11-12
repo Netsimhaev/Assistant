@@ -151,14 +151,14 @@ describe('schedulerPass and the conductor', () => {
     const documentRoot = await mkdtemp(join(tmpdir(), 'sched-root-'));
     await writeFile(join(inbox, 'note.txt'), 'שלום', 'utf8');
 
-    const result = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, {
+    const result = await schedulerPass(BUSINESS, {
       inbox,
       documentRoot,
       runtime: runtimeWith([]),
       // No reader injected: the pass must not call a model in this test, so
       // the ceiling is set to zero and only the scan runs.
       readsPerDay: 0,
-    }));
+    });
 
     expect(result.scan?.ingested).toBe(1);
     expect(result.scanError).toBeNull();
@@ -204,7 +204,7 @@ describe('schedulerPass and the conductor', () => {
       // configured default, a regression that moved `conductPendingDocuments`
       // back outside the `inbox !== null` guard would return a real
       // `ConductResult` and fail the last assertion (I1).
-      const result = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, { runtime: runtimeWith([]) }));
+      const result = await schedulerPass(BUSINESS, { runtime: runtimeWith([]) });
       expect(result.scan).toBeNull();
       expect(result.scanError).toBeNull();
       expect(result.conduct).toBeNull();
@@ -215,10 +215,10 @@ describe('schedulerPass and the conductor', () => {
 
   it("scans the business runtime's inbox when no inbox option is passed", async () => {
     const runtimeInbox = await mkdtemp(join(tmpdir(), 'sched-runtime-inbox-'));
-    const result = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, {
+    const result = await schedulerPass(BUSINESS, {
       readsPerDay: 0,
       runtime: { ...runtimeWith([]), inbox: runtimeInbox },
-    }));
+    });
     expect(result.scanError).toBeNull();
     expect(result.scan).not.toBeNull();
     // `scanInbox` creates its working subdirectories as its first act.
@@ -231,11 +231,11 @@ describe('schedulerPass and the conductor', () => {
     // treats an explicit `null` the same as "not passed" and would fall
     // through to the configured path here, actually scanning it.
     const configuredInbox = await mkdtemp(join(tmpdir(), 'sched-configured-inbox-'));
-    const result = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, {
+    const result = await schedulerPass(BUSINESS, {
       inbox: null,
       readsPerDay: 0,
       runtime: { ...runtimeWith([]), inbox: configuredInbox },
-    }));
+    });
     expect(result.scan).toBeNull();
     expect(result.scanError).toBeNull();
     // `scanInbox` creates its four working subdirectories as its first
@@ -278,12 +278,12 @@ describe('schedulerPass and the conductor', () => {
     // inherit whatever `.env` happens to hold.
     const inbox = await mkdtemp(join(tmpdir(), 'sched-conduct-inbox-'));
 
-    const result = await withBusiness(conductBusiness, (passDb) => schedulerPass(passDb, {
+    const result = await schedulerPass(conductBusiness, {
       inbox,
       reader,
       proposer,
       runtime: runtimeWith([]),
-    }));
+    });
 
     expect(reads).toBe(1);
     expect(proposals).toBe(1);
@@ -333,7 +333,7 @@ describe('schedulerPass and the conductor', () => {
     };
 
     const inbox = await mkdtemp(join(tmpdir(), 'sched-notify-inbox-'));
-    const result = await withBusiness(notifyBusiness, (passDb) => schedulerPass(passDb, {
+    const result = await schedulerPass(notifyBusiness, {
       inbox,
       runtime,
       reader: async () => ({
@@ -344,7 +344,7 @@ describe('schedulerPass and the conductor', () => {
         turns: 1,
       }),
       proposer: async () => ({ status: 'proposed' as const, proposal: ACTING, raw: '{}' }),
-    }));
+    });
 
     expect(result.conduct?.carded).toBe(1);
     expect(notified).toHaveLength(1);
@@ -369,7 +369,7 @@ describe('schedulerPass and the conductor', () => {
 
     let reads = 0;
     let proposals = 0;
-    const result = await withBusiness(hostileBusiness, (passDb) => schedulerPass(passDb, {
+    const result = await schedulerPass(hostileBusiness, {
       inbox,
       documentRoot,
       runtime: runtimeWith([]),
@@ -384,7 +384,7 @@ describe('schedulerPass and the conductor', () => {
         proposals += 1;
         throw new Error('the proposer must not be called for a rejected document');
       },
-    }));
+    });
 
     expect(result.scan?.rejected).toBe(1);
     expect(result.scan?.ingested).toBe(0);
@@ -431,11 +431,11 @@ describe('schedulerPass and the conductor', () => {
     const brokenInbox = join(blockerFile, 'inbox');
 
     const sent: MailMessage[] = [];
-    const pass = await withBusiness(BUSINESS, (passDb) => schedulerPass(passDb, {
+    const pass = await schedulerPass(BUSINESS, {
       runtime: runtimeWith(sent),
       inbox: brokenInbox,
       now: NOON,
-    }));
+    });
 
     expect(pass.scan).toBeNull();
     expect(pass.scanError).toBeTruthy();

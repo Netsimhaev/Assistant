@@ -27,7 +27,7 @@ function optional(name: string): string | null {
   return value === undefined || value === '' ? null : value;
 }
 
-function positiveInt(name: string, fallback: number): number {
+export function positiveInt(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
   const parsed = Number(raw);
