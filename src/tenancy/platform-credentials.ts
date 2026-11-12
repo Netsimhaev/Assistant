@@ -78,7 +78,12 @@ interface SealedRow {
  * `ROTATION_LOCK_SCOPE` — the same three rules `putSecret` keeps, for the same reason: a row labelled with
  * one key and sealed with another opens for nobody.
  */
-export async function putPlatformSecret(ref: string, value: string, key: Buffer): Promise<void> {
+export async function putPlatformSecret(
+  ref: string,
+  value: string,
+  key: Buffer,
+  updatedBy: string,
+): Promise<void> {
   assertLegalRef(ref);
   await withPlatform(async (db) => {
     await db.query('BEGIN');
@@ -91,14 +96,15 @@ export async function putPlatformSecret(ref: string, value: string, key: Buffer)
       const keyId = await liveKeyId(db);
       const sealed = encryptSecret(value, key, platformAad(ref));
       await db.query(
-        `INSERT INTO platform_credentials (ref, key_id, nonce, ciphertext)
-         VALUES ($1, $2, $3, $4)
+        `INSERT INTO platform_credentials (ref, key_id, nonce, ciphertext, updated_by)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (ref) DO UPDATE
            SET key_id = EXCLUDED.key_id,
                nonce = EXCLUDED.nonce,
                ciphertext = EXCLUDED.ciphertext,
-               updated_at = now()`,
-        [ref, keyId, sealed.nonce, sealed.ciphertext],
+               updated_at = now(),
+               updated_by = EXCLUDED.updated_by`,
+        [ref, keyId, sealed.nonce, sealed.ciphertext, updatedBy],
       );
       await db.query('COMMIT');
     } catch (error) {
@@ -126,11 +132,44 @@ export async function resolvePlatformSecret(ref: string, key: Buffer): Promise<s
   return decryptSecret({ ciphertext: row.ciphertext, nonce: row.nonce }, key, platformAad(ref));
 }
 
-/** Remove one platform secret; whether a row was actually removed. */
-export async function removePlatformSecret(ref: string): Promise<boolean> {
+/**
+ * Remove one platform secret; whether a row was actually removed.
+ *
+ * Takes the master key and verifies it first, like `putPlatformSecret`: a
+ * removal is as much a change to the server's secrets as a write, and only an
+ * operator holding the installation's key may make one.
+ */
+export async function removePlatformSecret(ref: string, key: Buffer): Promise<boolean> {
   assertLegalRef(ref);
   return withPlatform(async (db) => {
+    await verifyKeyState(key, { db });
     const result = await db.query('DELETE FROM platform_credentials WHERE ref = $1', [ref]);
     return (result.rowCount ?? 0) > 0;
+  });
+}
+
+export interface PlatformSecretSummary {
+  ref: string;
+  updatedAt: Date;
+  updatedBy: string;
+}
+
+interface SummaryRow {
+  ref: string;
+  updated_at: Date;
+  updated_by: string;
+}
+
+function toSummary(row: SummaryRow): PlatformSecretSummary {
+  return { ref: row.ref, updatedAt: row.updated_at, updatedBy: row.updated_by };
+}
+
+/** What the server holds, and nothing about its worth: `ciphertext` is never selected. */
+export async function listPlatformSecrets(): Promise<PlatformSecretSummary[]> {
+  return withPlatform(async (db) => {
+    const { rows } = await db.query<SummaryRow>(
+      'SELECT ref, updated_at, updated_by FROM platform_credentials ORDER BY ref',
+    );
+    return rows.map(toSummary);
   });
 }

@@ -188,6 +188,18 @@ describe('the grant writer stays behind two files', () => {
     const source = await readFile('src/cli/secret-key.ts', 'utf8');
     expect(source).toContain('FROM oauth_grants');
   });
+
+  /**
+   * The third sealed table, the server's own OAuth client secrets
+   * (`platform-credentials.ts`). Same class as the grants: a rotation that
+   * does not name it leaves every Google and Microsoft refresh failing on a
+   * client secret nobody can open any more.
+   */
+  it('key rotation names the platform secrets table', async () => {
+    const source = await readFile('src/cli/secret-key.ts', 'utf8');
+    expect(source).toContain('FROM platform_credentials');
+    expect(source).toContain('UPDATE platform_credentials');
+  });
 });
 
 describe('an OAuth refresh token leaves no trace outside its own ciphertext', () => {

@@ -13,7 +13,8 @@ import { GREEN_API_TOKEN_REF, NOTIFY_SMTP_PASS_REF } from '../orchestrator/runti
 import { putPlatformSecret, resolvePlatformSecret } from '../tenancy/platform-credentials.js';
 import { loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 import { registerBusiness, resetDatabase } from '../test/db.js';
-import { main } from './import-env.js';
+import { IMPORT_OPERATOR, main } from './import-env.js';
+import { testDb } from '../test/db.js';
 
 const BUSINESS = 'test-import-env';
 let DIR: string;
@@ -124,7 +125,7 @@ describe('tenancy:import-env', () => {
   });
 
   it('never overwrites a different platform value, and leaves the business copy', async () => {
-    await putPlatformSecret(GOOGLE_CLIENT_ID_REF, 'already-on-the-server', KEY);
+    await putPlatformSecret(GOOGLE_CLIENT_ID_REF, 'already-on-the-server', KEY, 'test');
     await store(GOOGLE_CLIENT_ID_REF, 'this-business-differs');
     const cli = io();
     expect(await main(['--business', BUSINESS], cli, { CREDENTIAL_KEY_PATH: KEY_PATH })).toBe(0);
@@ -144,5 +145,35 @@ describe('tenancy:import-env', () => {
     expect(noKey.err.join('\n')).toMatch(/CREDENTIAL_KEY_PATH/);
     const noBusiness = io();
     expect(await main([], noBusiness, { CREDENTIAL_KEY_PATH: KEY_PATH })).toBe(2);
+  });
+
+  it('writes a credential_change audit row for every secret it writes or removes, holding no value', async () => {
+    await store('NOTIFY_MAIL', SECRET_VALUES.NOTIFY_MAIL);
+    await store(GOOGLE_CLIENT_ID_REF, SECRET_VALUES[GOOGLE_CLIENT_ID_REF]);
+    const cli = io();
+    expect(
+      await main(['--business', BUSINESS], cli, { CREDENTIAL_KEY_PATH: KEY_PATH, NOTIFY_CREDENTIAL_REF: 'NOTIFY_MAIL' }),
+    ).toBe(0);
+
+    const { rows } = await testDb().query<{ on_behalf_of: string; reason: string; row: string }>(
+      `SELECT on_behalf_of, reason, a::text AS row FROM audit_log a
+        WHERE business_id = $1 AND kind = 'credential_change' ORDER BY seq`,
+      [BUSINESS],
+    );
+    // One put (the copy to the fixed name) and one remove (the OAuth client).
+    expect(rows).toHaveLength(2);
+    expect(rows.every((r) => r.on_behalf_of === IMPORT_OPERATOR)).toBe(true);
+    expect(rows[0]?.reason).toContain(NOTIFY_SMTP_PASS_REF);
+    expect(rows[1]?.reason).toContain(GOOGLE_CLIENT_ID_REF);
+    for (const r of rows) for (const value of Object.values(SECRET_VALUES)) expect(r.row).not.toContain(value);
+  });
+
+  it('refuses a key file that is not the one this installation sealed with, writing nothing', async () => {
+    const wrongPath = join(DIR, 'wrong.key');
+    await writeFile(wrongPath, randomBytes(KEY_BYTES), { mode: 0o600 });
+    const cli = io();
+    expect(await main(['--business', BUSINESS], cli, { CREDENTIAL_KEY_PATH: wrongPath, APPROVAL_NOTIFY_TO: 'x@example.com' })).toBe(1);
+    const settings = await withBusiness(BUSINESS, (db) => loadRuntimeSettings(db));
+    expect(settings.notifyTo).toBeNull();
   });
 });

@@ -34,7 +34,7 @@ import { readFile, stat, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { appendAudit } from '../audit/log.js';
 import { config } from '../config.js';
-import { acquireAdvisoryLock, closePool, withTransaction, withBusiness, withBusinessTransaction, type Queryable, type BusinessDb } from '../db/pool.js';
+import { acquireAdvisoryLock, closePool, withBusiness, withBusinessTransaction, type Queryable, type BusinessDb } from '../db/pool.js';
 import { ROTATION_LOCK_SCOPE } from '../governance/credential-store.js';
 import {
   KEY_BYTES,
@@ -43,6 +43,8 @@ import {
   writeKeyState,
 } from '../governance/master-key.js';
 import { grantAad } from '../governance/oauth-grants.js';
+import { withPlatform } from '../db/platform-pool.js';
+import { platformAad } from '../tenancy/platform-credentials.js';
 import { decryptSecret, encryptSecret } from '../governance/secret-cipher.js';
 import { canonicalHash } from '../util/canonical.js';
 import { nodePromptIo } from './node-prompt-io.js';
@@ -86,6 +88,8 @@ export interface RotationOutcome {
   newKeyId: string;
   secretsReEncrypted: number;
   grantsReEncrypted: number;
+  /** The server's own secrets (`platform_credentials`), re-sealed in the same transaction. */
+  platformSecretsReEncrypted: number;
 }
 
 /**
@@ -120,7 +124,8 @@ export class RotationAuditUnrecordedError extends Error {
   constructor(outcome: RotationOutcome, cause: unknown) {
     super(
       `החלפת המפתח בוצעה במלואה ורשומת הביקורת עליה נכשלה. ההחלפה בתוקף: ` +
-        `${outcome.secretsReEncrypted} סודות ו-${outcome.grantsReEncrypted} הרשאות הוצפנו ` +
+        `${outcome.secretsReEncrypted} סודות, ${outcome.grantsReEncrypted} הרשאות ו-` +
+        `${outcome.platformSecretsReEncrypted} סודות שרת הוצפנו ` +
         `מחדש עבור "${outcome.businessId}", ` +
         `מהמפתח ${outcome.previousKeyId ?? '(לא ידוע)'} אל המפתח ${outcome.newKeyId}, ` +
         `וקובץ המפתח ועותק השחזור כבר נכתבו — אל תריץ rotate שוב. מה שחסר הוא רק ` +
@@ -492,6 +497,26 @@ async function restore(deps: SecretKeyCliDeps, operator: string): Promise<void> 
   deps.log('המפתח שוחזר בהצלחה מעותק השחזור.');
 }
 
+/**
+ * One transaction on the platform pool — `withTransaction`'s shape, on the
+ * login that reaches every business's rows and the server's own table.
+ */
+async function withPlatformTransaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
+  return withPlatform(async (tx) => {
+    await tx.query('BEGIN');
+    try {
+      const result = await fn(tx);
+      await tx.query('COMMIT');
+      return result;
+    } catch (error) {
+      await tx.query('ROLLBACK').catch(() => {
+        // A broken connection; the original error is the one worth reporting.
+      });
+      throw error;
+    }
+  });
+}
+
 interface CredentialRow {
   business_id: string;
   ref: string;
@@ -502,6 +527,12 @@ interface CredentialRow {
 interface GrantRow {
   business_id: string;
   system: string;
+  ciphertext: Buffer;
+  nonce: Buffer;
+}
+
+interface PlatformSecretRow {
+  ref: string;
   ciphertext: Buffer;
   nonce: Buffer;
 }
@@ -531,6 +562,14 @@ interface GrantRow {
  * system)` instead of `(business_id, ref)`, and aborts the whole rotation
  * the same way on a row that fails to decrypt — no row changes if any one
  * of them can't be opened with the key on file today.
+ *
+ * **`platform_credentials` — the server's own OAuth client secrets — is the
+ * third table, in the same transaction.** Missing it would orphan exactly the
+ * secrets every Google and Microsoft refresh needs, the same silent class as
+ * the grants above. The whole transaction runs on the PLATFORM pool: that
+ * table has no business, and the platform login is the one that reaches every
+ * business's rows once row level security is on, so all three loops share one
+ * connection and one all-or-nothing commit.
  */
 async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   const businessId = deps.businessId ?? config.businessId; // TENANCY-TODO(task 12)
@@ -556,7 +595,7 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   const passphrase = await readNewPassphrase(deps);
   const recovery = await sealRecoveryCopy(newKey, passphrase, businessId);
 
-  const { rotated, grantsRotated, previousKeyId } = await withTransaction(async (tx: Queryable) => {
+  const { rotated, grantsRotated, platformRotated, previousKeyId } = await withPlatformTransaction(async (tx: Queryable) => {
     await acquireAdvisoryLock(tx, ROTATION_LOCK_SCOPE);
 
     // Read BEFORE `writeKeyState` overwrites it. The id of the key being
@@ -620,8 +659,33 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
       );
     }
 
+    // The third loop: the server's own secrets. Same shape, same refusal.
+    const { rows: platformRows } = await tx.query<PlatformSecretRow>(
+      'SELECT ref, ciphertext, nonce FROM platform_credentials FOR UPDATE',
+    );
+
+    for (const row of platformRows) {
+      const plain = decryptSecret({ ciphertext: row.ciphertext, nonce: row.nonce }, oldKey, platformAad(row.ref));
+      if (plain === null) {
+        throw new Error(
+          `החלפת המפתח בוטלה: סוד השרת ${row.ref} אינו נפתח במפתח הנוכחי — שום שורה לא שונתה.`,
+        );
+      }
+      const sealed = encryptSecret(plain, newKey, platformAad(row.ref));
+      await tx.query(
+        `UPDATE platform_credentials SET ciphertext = $1, nonce = $2, key_id = $3, updated_at = now()
+           WHERE ref = $4`,
+        [sealed.ciphertext, sealed.nonce, newKeyId, row.ref],
+      );
+    }
+
     await writeKeyState(newKey, newKeyId, { businessId, db: tx });
-    return { rotated: rows.length, grantsRotated: grantRows.length, previousKeyId: previous };
+    return {
+      rotated: rows.length,
+      grantsRotated: grantRows.length,
+      platformRotated: platformRows.length,
+      previousKeyId: previous,
+    };
   });
 
   // The database is committed and atomic by this point: every row now opens
@@ -666,7 +730,7 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
       action: 'rotate',
       reason:
         `המפתח הוחלף (${newKeyId}) עבור ${businessId} על ידי ${operator} — ` +
-        `${rotated} סודות ו-${grantsRotated} הרשאות הוצפנו מחדש`,
+        `${rotated} סודות, ${grantsRotated} הרשאות ו-${platformRotated} סודות שרת הוצפנו מחדש`,
     });
   } catch (error) {
     throw new RotationAuditUnrecordedError(
@@ -676,13 +740,15 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
         newKeyId,
         secretsReEncrypted: rotated,
         grantsReEncrypted: grantsRotated,
+        platformSecretsReEncrypted: platformRotated,
       },
       error,
     );
   }
 
   deps.log(
-    `המפתח הוחלף בהצלחה. ${rotated} סודות ו-${grantsRotated} הרשאות הוצפנו מחדש תחת המפתח החדש.`,
+    `המפתח הוחלף בהצלחה. ${rotated} סודות, ${grantsRotated} הרשאות ו-${platformRotated} סודות שרת ` +
+      'הוצפנו מחדש תחת המפתח החדש.',
   );
 }
 

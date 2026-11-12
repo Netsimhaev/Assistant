@@ -53,7 +53,7 @@ async function seedProviderApp(provider: 'google' | 'microsoft' | 'both'): Promi
   if (provider !== 'microsoft') refs.push([GOOGLE_CLIENT_ID_REF, 'g-id'], [GOOGLE_CLIENT_SECRET_REF, 'g-secret']);
   if (provider !== 'google') refs.push(['MICROSOFT_OAUTH_CLIENT_ID', 'ms-id'], ['MICROSOFT_OAUTH_CLIENT_SECRET', 'ms-secret']);
   // The OAuth client is the server's, not the business's (spec §5.4).
-  for (const [ref, value] of refs) await putPlatformSecret(ref, value, key);
+  for (const [ref, value] of refs) await putPlatformSecret(ref, value, key, 'test');
 }
 
 beforeEach(async () => {

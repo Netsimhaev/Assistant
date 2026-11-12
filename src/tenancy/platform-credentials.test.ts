@@ -30,15 +30,15 @@ afterAll(async () => {
 
 describe('platform credentials', () => {
   it('stores and resolves a platform secret, and a rewrite replaces it', async () => {
-    await putPlatformSecret(REF, 'first', KEY);
+    await putPlatformSecret(REF, 'first', KEY, 'test');
     expect(await resolvePlatformSecret(REF, KEY)).toBe('first');
-    await putPlatformSecret(REF, 'second', KEY);
+    await putPlatformSecret(REF, 'second', KEY, 'test');
     expect(await platformSecrets(KEY).resolve(REF)).toBe('second');
     expect(await resolvePlatformSecret('MISSING_REF', KEY)).toBeNull();
   });
 
   it('never stores the value in a readable column', async () => {
-    await putPlatformSecret(REF, 'plain-sentinel-value', KEY);
+    await putPlatformSecret(REF, 'plain-sentinel-value', KEY, 'test');
     const { rows } = await testDb().query<{ ciphertext: Buffer; key_id: string }>(
       'SELECT ciphertext, key_id FROM platform_credentials',
     );
@@ -47,12 +47,12 @@ describe('platform credentials', () => {
   });
 
   it('refuses a ref outside the legal shape', async () => {
-    await expect(putPlatformSecret('grant:mailbox', 'x', KEY)).rejects.toThrow(PlatformCredentialError);
+    await expect(putPlatformSecret('grant:mailbox', 'x', KEY, 'test')).rejects.toThrow(PlatformCredentialError);
     expect(await resolvePlatformSecret('key-check', KEY)).toBeNull();
   });
 
   it('platform secret does not open as a business secret and vice versa', async () => {
-    await putPlatformSecret(REF, 'platform-value', KEY);
+    await putPlatformSecret(REF, 'platform-value', KEY, 'test');
     await withBusiness(BUSINESS, (db) => putSecret(db, { ref: REF, value: 'business-value', updatedBy: 'test' }, KEY));
 
     // Positive half first: each store opens its own row under the same ref.
@@ -86,14 +86,14 @@ describe('platform credentials', () => {
   });
 
   it('a wrong key opens nothing', async () => {
-    await putPlatformSecret(REF, 'v', KEY);
+    await putPlatformSecret(REF, 'v', KEY, 'test');
     expect(await resolvePlatformSecret(REF, randomBytes(KEY_BYTES))).toBeNull();
   });
 
   it('removes a secret and reports whether one was there', async () => {
-    await putPlatformSecret(REF, 'v', KEY);
-    expect(await removePlatformSecret(REF)).toBe(true);
-    expect(await removePlatformSecret(REF)).toBe(false);
+    await putPlatformSecret(REF, 'v', KEY, 'test');
+    expect(await removePlatformSecret(REF, KEY)).toBe(true);
+    expect(await removePlatformSecret(REF, KEY)).toBe(false);
     expect(await resolvePlatformSecret(REF, KEY)).toBeNull();
   });
 });

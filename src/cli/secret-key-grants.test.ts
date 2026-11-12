@@ -25,7 +25,9 @@ import {
 } from '../governance/oauth-grants.js';
 import type { WriteGrantInput } from '../governance/oauth-grants.js';
 import { decryptSecret, encryptSecret } from '../governance/secret-cipher.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
+import { platformAad, putPlatformSecret, resolvePlatformSecret } from '../tenancy/platform-credentials.js';
+import { closePlatformPool } from '../db/platform-pool.js';
 import { runSecretKeyCli } from './secret-key.js';
 import type { SecretKeyCliDeps } from './secret-key.js';
 
@@ -71,6 +73,7 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
+  await closePlatformPool();
   await closePool();
 });
 
@@ -201,5 +204,43 @@ describe('rotate re-encrypts oauth_grants', () => {
     expect((await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, GRANT.system, OLD_KEY)))?.refreshToken).toBe(
       GRANT.refreshToken,
     );
+  });
+});
+
+describe('rotate re-encrypts platform_credentials', () => {
+  it('re-seals the server secrets too, so resolvePlatformSecret answers under the new key', async () => {
+    const OLD_KEY = randomBytes(KEY_BYTES);
+    await writeFile(KEY_PATH, OLD_KEY, { mode: 0o600 });
+    await writeKeyState(OLD_KEY, 'KEY-old', { businessId: BUSINESS });
+    await putPlatformSecret('GOOGLE_OAUTH_CLIENT_SECRET', 'platform-client-secret', OLD_KEY, OPERATOR);
+
+    await runRotate();
+
+    const newKey = await loadMasterKey(KEY_PATH);
+    expect(newKey.equals(OLD_KEY)).toBe(false);
+    expect(await resolvePlatformSecret('GOOGLE_OAUTH_CLIENT_SECRET', newKey)).toBe('platform-client-secret');
+    expect(await resolvePlatformSecret('GOOGLE_OAUTH_CLIENT_SECRET', OLD_KEY)).toBeNull();
+  });
+
+  it('aborts the whole rotation, leaving every table untouched, when a platform secret fails to open', async () => {
+    const OLD_KEY = randomBytes(KEY_BYTES);
+    await writeFile(KEY_PATH, OLD_KEY, { mode: 0o600 });
+    await writeKeyState(OLD_KEY, 'KEY-old', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, OLD_KEY));
+    await putPlatformSecret('GOOGLE_OAUTH_CLIENT_ID', 'good-client-id', OLD_KEY, OPERATOR);
+    // A platform row sealed under a key this installation never held.
+    const corrupted = encryptSecret('unreadable', randomBytes(KEY_BYTES), platformAad('MICROSOFT_OAUTH_CLIENT_ID'));
+    await testDb().query(
+      `INSERT INTO platform_credentials (ref, key_id, nonce, ciphertext, updated_by)
+       VALUES ('MICROSOFT_OAUTH_CLIENT_ID', 'KEY-old', $1, $2, 'test')`,
+      [corrupted.nonce, corrupted.ciphertext],
+    );
+
+    await expect(runRotate()).rejects.toThrow(/MICROSOFT_OAUTH_CLIENT_ID/);
+
+    // Nothing moved: the key file, the business secret and the good platform row all still open under the old key.
+    expect((await loadMasterKey(KEY_PATH)).equals(OLD_KEY)).toBe(true);
+    expect((await storedCredentials(OLD_KEY).resolve('ONE', BUSINESS))?.value).toBe('first-secret');
+    expect(await resolvePlatformSecret('GOOGLE_OAUTH_CLIENT_ID', OLD_KEY)).toBe('good-client-id');
   });
 });

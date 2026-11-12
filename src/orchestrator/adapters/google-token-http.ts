@@ -27,7 +27,7 @@
  * `'rejected'`: `oauthCredentials` treats `'rejected'` as the PROVIDER
  * having looked at the refresh token and refused it — that branch writes an
  * audit row naming the provider and flags the grant for re-consent. An
- * install that simply never ran `secret put GOOGLE_OAUTH_CLIENT_SECRET`
+ * install that simply never ran `secret --platform put GOOGLE_OAUTH_CLIENT_SECRET`
  * never reached Google at all; reporting `'rejected'` for it wrote a false
  * audit row ("Google rejected your refresh") and flagged a grant that
  * re-consenting cannot fix, because the problem was never on Google's side.

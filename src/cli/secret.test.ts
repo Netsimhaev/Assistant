@@ -353,4 +353,37 @@ describe('secret --platform', () => {
     const { rows } = await getPool().query('SELECT 1 FROM platform_credentials');
     expect(rows).toHaveLength(0);
   });
+
+  it('records the operator on the row, lists ref/updated_at/updated_by only, and leaves one stderr trace per action', async () => {
+    const put = io(PLATFORM_VALUE);
+    expect(await main(['--platform', 'put', PLATFORM_REF, OPERATOR], put)).toBe(0);
+    expect(put.err).toEqual([`secret --platform put ${PLATFORM_REF} — מפעיל: ${OPERATOR}`]);
+
+    const { rows } = await getPool().query<{ updated_by: string }>('SELECT updated_by FROM platform_credentials');
+    expect(rows[0]?.updated_by).toBe(OPERATOR);
+
+    const list = io('');
+    expect(await main(['--platform', 'list', OPERATOR], list)).toBe(0);
+    expect(list.out).toHaveLength(1);
+    expect(list.out[0]).toMatch(new RegExp(`^${PLATFORM_REF}\tעודכן=.+\tעל ידי=${OPERATOR}$`));
+    expect(list.err).toEqual([`secret --platform list — מפעיל: ${OPERATOR}`]);
+    expect([...list.out, ...list.err].join('\n')).not.toContain(PLATFORM_VALUE);
+  });
+
+  it('remove requires the verified master key', async () => {
+    const put = io(PLATFORM_VALUE);
+    expect(await main(['--platform', 'put', PLATFORM_REF, OPERATOR], put)).toBe(0);
+    const wrongPath = join(DIR, 'wrong.key');
+    await writeFile(wrongPath, randomBytes(32), { mode: 0o600 });
+    const original = process.env['CREDENTIAL_KEY_PATH'];
+    process.env['CREDENTIAL_KEY_PATH'] = wrongPath;
+    try {
+      const removed = io('');
+      expect(await main(['--platform', 'remove', PLATFORM_REF, OPERATOR], removed)).toBe(1);
+    } finally {
+      process.env['CREDENTIAL_KEY_PATH'] = original;
+    }
+    const { rows } = await getPool().query('SELECT 1 FROM platform_credentials');
+    expect(rows).toHaveLength(1);
+  });
 });

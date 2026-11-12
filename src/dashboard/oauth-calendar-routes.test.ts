@@ -60,7 +60,7 @@ beforeEach(async () => {
     ['MICROSOFT_OAUTH_CLIENT_SECRET', 'ms-secret'],
   ] as const) {
     // The OAuth client is the server's, not the business's (spec §5.4).
-    await putPlatformSecret(ref, value, key);
+    await putPlatformSecret(ref, value, key, 'test');
   }
   await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
 });

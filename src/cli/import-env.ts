@@ -24,7 +24,7 @@
  */
 import type { BusinessDb } from '../db/pool.js';
 import { putSecret, removeSecret, resolveStoredSecret } from '../governance/credential-store.js';
-import { loadMasterKey } from '../governance/master-key.js';
+import { loadMasterKey, verifyKeyState } from '../governance/master-key.js';
 import { GOOGLE_CLIENT_ID_REF, GOOGLE_CLIENT_SECRET_REF } from '../orchestrator/adapters/google-token-http.js';
 import {
   MICROSOFT_CLIENT_ID_REF,
@@ -36,6 +36,7 @@ import { putPlatformSecret, resolvePlatformSecret } from '../tenancy/platform-cr
 import { CAP_COLUMNS, CAP_NAMES, saveRuntimeSettings } from '../tenancy/runtime-settings.js';
 import type { CapName, RuntimeSettingsPatch } from '../tenancy/runtime-settings.js';
 import { closeCliPools, runForBusiness } from './business-arg.js';
+import { auditAction } from './secret.js';
 
 export const OAUTH_CLIENT_REFS = [
   GOOGLE_CLIENT_ID_REF,
@@ -50,6 +51,12 @@ const RENAMED_SECRETS = [
   ['GREEN_API_INSTANCE_REF', GREEN_API_INSTANCE_ID_REF],
   ['GREEN_API_TOKEN_REF', GREEN_API_TOKEN_REF],
 ] as const;
+
+/**
+ * Who the audit rows name. This command takes no operator argument (the
+ * brief's shape is `--business` alone), so it names itself.
+ */
+export const IMPORT_OPERATOR = 'tenancy:import-env';
 
 /** A cap's environment variable: its column, upper-cased. */
 function capEnvName(name: CapName): string {
@@ -152,7 +159,14 @@ export async function importEnv(db: BusinessDb, env: Env, key: Buffer): Promise<
       report.missing.push(`${oldRef} (${envName})`);
       continue;
     }
-    await putSecret(db, { ref: fixedRef, value: stored.value, updatedBy: 'tenancy:import-env' }, key);
+    await putSecret(db, { ref: fixedRef, value: stored.value, updatedBy: IMPORT_OPERATOR }, key);
+    // The same `credential_change` row `secret put` writes — names only.
+    await auditAction(db, {
+      ref: fixedRef,
+      operator: IMPORT_OPERATOR,
+      action: 'put',
+      reason: `סוד "${fixedRef}" נכתב עבור ${db.businessId} (הועתק מ-"${oldRef}") על ידי ${IMPORT_OPERATOR}`,
+    });
     report.copiedSecrets.push(`${oldRef} → ${fixedRef}`);
   }
 
@@ -169,8 +183,16 @@ export async function importEnv(db: BusinessDb, env: Env, key: Buffer): Promise<
       report.conflicts.push(ref);
       continue;
     }
-    if (existing === null) await putPlatformSecret(ref, stored.value, key);
+    if (existing === null) await putPlatformSecret(ref, stored.value, key, IMPORT_OPERATOR);
     await removeSecret(db, ref);
+    // The same row `secret remove` writes: the business's store lost a
+    // secret, and its own audit chain says so — names only, never the value.
+    await auditAction(db, {
+      ref,
+      operator: IMPORT_OPERATOR,
+      action: 'remove',
+      reason: `סוד "${ref}" הוסר עבור ${db.businessId} והועבר למאגר השרת על ידי ${IMPORT_OPERATOR}`,
+    });
     report.movedToPlatform.push(ref);
   }
   return report;
@@ -203,6 +225,9 @@ export async function main(
         throw new Error('CREDENTIAL_KEY_PATH אינו מוגדר — אין מפתח לפתוח בו את הסודות');
       }
       const key = await loadMasterKey(path);
+      // A key file that is not the one this installation sealed with would
+      // write rows that open for nobody — refused before anything is touched.
+      await verifyKeyState(key);
       const report = await importEnv(db, env, key);
       for (const line of renderImportReport(db.businessId, report)) io.log(line);
     });

@@ -73,7 +73,7 @@ beforeEach(async () => {
     ['MICROSOFT_OAUTH_CLIENT_SECRET', 'ms-secret'],
   ] as const) {
     // The OAuth client is the server's, not the business's (spec §5.4).
-    await putPlatformSecret(ref, value, key);
+    await putPlatformSecret(ref, value, key, 'test');
   }
   await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
   await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [OFFICE_MAIL] }))); // TENANCY-TODO(task 10)
@@ -433,7 +433,7 @@ async function activeVersion(): Promise<string | undefined> {
 
 describe('fix round 1: preflight before signing', () => {
   it('refuses the sign page and the sign POST when the provider client secret is missing, and installs nothing', async () => {
-    await removePlatformSecret('MICROSOFT_OAUTH_CLIENT_SECRET');
+    await removePlatformSecret('MICROSOFT_OAUTH_CLIENT_SECRET', key);
     const before = await activeVersion();
     const baseUrl = await startServer();
     const cookie = await login(baseUrl);
