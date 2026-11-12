@@ -29,7 +29,7 @@ import { runNudgeDrafter, type NudgeDrafter, type NudgeDraftRequest } from '../s
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { fakeMailboxClient, installMailboxCharter, mailboxRuntime } from '../test/mailbox.js';
-import { observeNudges, openNudge } from './nudge.js';
+import { observeNudges, openNudge, SEND_FAILED_REASON } from './nudge.js';
 import { runLedgerPass } from './pass.js';
 import { LEDGER_DEFAULTS, saveLedgerSettings } from './settings.js';
 import { createLedgerItem, listLedgerEvents, loadLedgerItem, moveLedgerStatus, type NewLedgerItem } from './store.js';
@@ -239,6 +239,36 @@ describe('act mode: the nudge goes through the gate', () => {
     const third = await withBusiness(B, (db) => runLedgerPass(db, { now: later, drafter: stubDrafter().fn, sendAlert: recordingAlert(sent2) }));
     expect(third.nudgeFallbacks).toBe(0);
     expect(sent2.filter((s) => s.body.includes('הכנתי טיוטה'))).toHaveLength(0);
+  });
+
+  /**
+   * The first wall (ruling R9): the fallback reads the job's last step reason
+   * filtered by the business. A later `job_steps` row carrying the same job id
+   * under ANOTHER business — whose reason would read as a plain send failure —
+   * must not decide what this owner is told.
+   */
+  it('R9: the fallback reason ignores a later job_steps row of another business for the same job id', async () => {
+    await actMode();
+    const item = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
+    await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, drafter: stubDrafter().fn, sendAlert: recordingAlert([]) }));
+    const jobId = await nudgeJobId(item.itemId);
+    const { client } = fakeMailboxClient();
+    await withBusiness(B, (db) => runDueJobs(db, { runtime: mailboxRuntime(client), now: NOW }));
+    expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
+
+    await getPool().query(
+      `INSERT INTO job_steps (job_id, business_id, from_phase, to_phase, actor, reason, at)
+       VALUES ($1, 'other-business', 'execute', 'failed', 'orchestrator', 'channel_unavailable: foreign', now() + interval '1 hour')`,
+      [jobId],
+    );
+
+    const sent: Sent[] = [];
+    const later = new Date(NOW.getTime() + 5 * 60 * 1000);
+    const result = await withBusiness(B, (db) => runLedgerPass(db, { now: later, drafter: stubDrafter().fn, sendAlert: recordingAlert(sent) }));
+    expect(result.nudgeFallbacks).toBe(1);
+    const owner = sent.find((s) => s.body.includes('הכנתי טיוטה'));
+    expect(owner?.body).toContain('העוזרת לא מורשית לשלוח את זה עדיין');
+    expect(owner?.body).not.toContain(SEND_FAILED_REASON);
   });
 
   it('a failed draft falls back to the owner and opens no job', async () => {

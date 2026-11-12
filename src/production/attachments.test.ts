@@ -6,7 +6,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { DocxSpec } from '../domain/document-spec.js';
-import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
+import { resetDatabase } from '../test/db.js';
 import {
   canonicalAttachmentName,
   resolveAttachments,
@@ -52,7 +52,7 @@ async function produced(
   await mkdir(join(config.documentRoot, DIR), { recursive: true });
   await writeFile(join(config.documentRoot, storedPath), bytes);
   const size = opts.recordSize ?? bytes.length;
-  const versionId = await withBusiness(TEST_BUSINESS, (db) => saveVersion(db, {
+  const versionId = await withBusiness(opts.businessId ?? B, (db) => saveVersion(db, {
     productionId,
     versionNo: 1,
     spec,

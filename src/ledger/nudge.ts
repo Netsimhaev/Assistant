@@ -509,8 +509,8 @@ export async function observeNudges(db: BusinessDb, o: { now?: Date } = {}): Pro
     if (observedPhase !== 'failed' && observedPhase !== 'halted') continue;
 
     const last = await db.query<{ reason: string }>(
-      `SELECT reason FROM job_steps WHERE job_id = $1 ORDER BY at DESC, id DESC LIMIT 1`,
-      [row.job_id],
+      `SELECT reason FROM job_steps WHERE job_id = $1 AND business_id = $2 ORDER BY at DESC, id DESC LIMIT 1`,
+      [row.job_id, db.businessId],
     );
     const code = leadingCode(last.rows[0]?.reason ?? '');
     const reason = code !== null && isGateDenialCode(code) ? GATE_REFUSED_REASON : SEND_FAILED_REASON;

@@ -10,7 +10,10 @@ import {
   latestVersion,
   loadProduction,
   productionsToday,
+  releaseLease,
   saveVersion,
+  saveVersionCheck,
+  saveWork,
   type CreateProductionInput,
 } from './store.js';
 
@@ -153,5 +156,51 @@ describe('production store', () => {
     expect(rows[0]!.findings).toEqual(f);
     expect(rows[0]!.work).toEqual(EMPTY_WORK);
     expect((await withBusiness(B, (db) => loadProduction(db, id)))?.findings).toEqual(f);
+  });
+});
+
+/**
+ * The first wall (ruling R9): every statement that names a production or a
+ * version by id also filters by the calling business, so business B's
+ * connection cannot touch business A's row even when it holds the id.
+ */
+describe('production store — another business cannot touch a row by id', () => {
+  const OTHER = 'other-business';
+
+  it('releaseLease under another business leaves the lease in place', async () => {
+    await withBusiness(B, (db) => createProduction(db, input()));
+    const claimed = await withBusiness(B, (db) => claimProduction(db, 'a', 60_000));
+    if (claimed === null) throw new Error('expected a claim');
+    await withBusiness(OTHER, (db) => releaseLease(db, claimed.productionId, 'a'));
+    expect((await withBusiness(B, (db) => loadProduction(db, claimed.productionId)))?.leasedBy).toBe('a');
+    // Control: the owning business does release it.
+    await withBusiness(B, (db) => releaseLease(db, claimed.productionId, 'a'));
+    expect((await withBusiness(B, (db) => loadProduction(db, claimed.productionId)))?.leasedBy).toBeNull();
+  });
+
+  it('advanceStage and saveWork under another business move nothing', async () => {
+    const id = await withBusiness(B, (db) => createProduction(db, input()));
+    expect(await withBusiness(OTHER, (db) => advanceStage(db, id, 'queued', 'drafting', {}))).toBe(false);
+    expect(await withBusiness(OTHER, (db) => saveWork(db, id, 'queued', { ...EMPTY_WORK, drafted: true }))).toBe(false);
+    const p = await withBusiness(B, (db) => loadProduction(db, id));
+    expect(p?.stage).toBe('queued');
+    expect(p?.work).toEqual(EMPTY_WORK);
+    // Control.
+    expect(await withBusiness(B, (db) => advanceStage(db, id, 'queued', 'drafting', {}))).toBe(true);
+  });
+
+  it('saveVersion under another business writes no version; latestVersion and saveVersionCheck do not reach one', async () => {
+    const id = await withBusiness(B, (db) => createProduction(db, input()));
+    const row = { productionId: id, versionNo: 1, spec, storedPath: 'p', sha256: 'a'.repeat(64), sizeBytes: 1 };
+    await withBusiness(OTHER, (db) => saveVersion(db, row));
+    expect(await withBusiness(B, (db) => latestVersion(db, id))).toBeNull();
+
+    const versionId = await withBusiness(B, (db) => saveVersion(db, row));
+    expect(await withBusiness(OTHER, (db) => latestVersion(db, id))).toBeNull();
+    await withBusiness(OTHER, (db) => saveVersionCheck(db, versionId, 'check1', { ok: true }));
+    expect((await withBusiness(B, (db) => latestVersion(db, id)))?.check1).toBeNull();
+    // Control.
+    await withBusiness(B, (db) => saveVersionCheck(db, versionId, 'check1', { ok: true }));
+    expect((await withBusiness(B, (db) => latestVersion(db, id)))?.check1).toEqual({ ok: true });
   });
 });

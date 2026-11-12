@@ -10,7 +10,7 @@ import { documentKindLabel } from '../domain/labels.js';
 import { saveDocumentSettings } from '../governance/document-settings.js';
 import { runLocalTool } from '../orchestrator/local-tools.js';
 import { StepChannelError } from '../orchestrator/step-error.js';
-import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
+import { resetDatabase } from '../test/db.js';
 import { resolveSaveTarget, saveVersionToFolder, SAVE_FAILURE_HE } from './save.js';
 import { createProduction, saveVersion } from './store.js';
 
@@ -248,7 +248,7 @@ describe('doc.save handler', () => {
     const storedPath = `${DIR}/${productionId}.xlsx`;
     await mkdir(join(config.documentRoot, DIR), { recursive: true });
     await writeFile(join(config.documentRoot, storedPath), bytes);
-    return withBusiness(TEST_BUSINESS, (db) => saveVersion(db, { productionId, versionNo: 1, spec, storedPath, sha256: sha(bytes), sizeBytes: bytes.length }));
+    return withBusiness(businessId, (db) => saveVersion(db, { productionId, versionNo: 1, spec, storedPath, sha256: sha(bytes), sizeBytes: bytes.length }));
   }
 
   async function deliveryCard(versionId: string, businessId = B): Promise<void> {
@@ -260,10 +260,7 @@ describe('doc.save handler', () => {
   }
 
   async function withBase(): Promise<void> {
-    await saveDocumentSettings(
-      { toWhatsApp: false, toEmail: true, toScreen: true, baseFolder: base },
-      { businessId: B },
-    );
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: true, toScreen: true, baseFolder: base }));
   }
 
   function save(input: Record<string, unknown>) {

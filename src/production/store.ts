@@ -327,8 +327,8 @@ export async function claimUnfinished(
 export async function releaseLease(db: BusinessDb, productionId: string, holder: string): Promise<void> {
   await db.query(
     `UPDATE document_productions SET lease_until = NULL, leased_by = NULL
-      WHERE production_id = $1 AND leased_by = $2`,
-    [productionId, holder],
+      WHERE production_id = $1 AND leased_by = $2 AND business_id = $3`,
+    [productionId, holder, db.businessId],
   );
 }
 
@@ -356,7 +356,7 @@ export async function advanceStage(
             work = COALESCE($5::jsonb, work),
             findings = COALESCE($6::jsonb, findings),
             updated_at = now()
-      WHERE production_id = $1 AND stage = $2`,
+      WHERE production_id = $1 AND stage = $2 AND business_id = $7`,
     [
       productionId,
       ProductionStage.parse(from),
@@ -364,6 +364,7 @@ export async function advanceStage(
       patch.attempt ?? null,
       patch.work === undefined ? null : JSON.stringify(ProductionWork.parse(patch.work)),
       patch.findings === undefined ? null : JSON.stringify(z.array(ProductionFinding).parse(patch.findings)),
+      db.businessId,
     ],
   );
   return (rowCount ?? 0) > 0;
@@ -451,11 +452,11 @@ export async function saveVersion(db: BusinessDb, input: SaveVersionInput): Prom
     `WITH ins AS (
        INSERT INTO document_versions (version_id, production_id, business_id, version_no, spec, stored_path, sha256, size_bytes)
        SELECT $1, $2, p.business_id, $3, $4, $5, $6, $7
-         FROM document_productions p WHERE p.production_id = $2
+         FROM document_productions p WHERE p.production_id = $2 AND p.business_id = $8
        ON CONFLICT (production_id, version_no) DO NOTHING
        RETURNING version_id)
      UPDATE document_versions SET superseded_at = now()
-      WHERE production_id = $2 AND version_no < $3 AND superseded_at IS NULL`,
+      WHERE production_id = $2 AND version_no < $3 AND superseded_at IS NULL AND business_id = $8`,
     [
       versionId,
       input.productionId,
@@ -464,6 +465,7 @@ export async function saveVersion(db: BusinessDb, input: SaveVersionInput): Prom
       input.storedPath,
       input.sha256,
       input.sizeBytes,
+      db.businessId,
     ],
   );
   return versionId;
@@ -471,8 +473,8 @@ export async function saveVersion(db: BusinessDb, input: SaveVersionInput): Prom
 
 export async function latestVersion(db: BusinessDb, productionId: string): Promise<DocumentVersion | null> {
   const { rows } = await db.query<VersionRow>(
-    `SELECT * FROM document_versions WHERE production_id = $1 ORDER BY version_no DESC LIMIT 1`,
-    [productionId],
+    `SELECT * FROM document_versions WHERE production_id = $1 AND business_id = $2 ORDER BY version_no DESC LIMIT 1`,
+    [productionId, db.businessId],
   );
   const row = rows[0];
   return row === undefined ? null : toVersion(row);
@@ -484,10 +486,10 @@ export async function saveVersionCheck(
   check: 'check1' | 'check2',
   result: unknown,
 ): Promise<void> {
-  await db.query(`UPDATE document_versions SET ${check === 'check1' ? 'check1' : 'check2'} = $2 WHERE version_id = $1`, [
-    versionId,
-    JSON.stringify(result),
-  ]);
+  await db.query(
+    `UPDATE document_versions SET ${check === 'check1' ? 'check1' : 'check2'} = $2 WHERE version_id = $1 AND business_id = $3`,
+    [versionId, JSON.stringify(result), db.businessId],
+  );
 }
 
 /**
