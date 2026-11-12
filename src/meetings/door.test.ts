@@ -723,7 +723,10 @@ describe('runMeetingOperation — fix round 1', () => {
 
   it('a no_slot answered with "תזיזי את X" becomes a reshuffle confirmation', async () => {
     const day = workDay();
-    const next = workDay(4);
+    // The work day after `day`, never `day` itself: `workDay(4)` was the same
+    // date as `workDay()` whenever today was a Wednesday (both skip to Sunday),
+    // and a move onto the full day found no slot.
+    const next = workDayAfter(day);
     const cal = fakeCalendar([
       event({ eventId: 'ronit', title: 'רונית לוי', start: at(day, '09:00'), end: at(day, '17:30') }),
     ]);

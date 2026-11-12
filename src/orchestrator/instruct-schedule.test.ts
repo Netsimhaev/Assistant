@@ -7,7 +7,7 @@ import { readFileSync } from 'node:fs';
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
-import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import type { CalendarClient, CalendarEvent } from '../calendar/types.js';
 import { installCharter } from '../charter/store.js';
@@ -71,17 +71,26 @@ afterAll(async () => {
 
 describe('runInstruction: schedule answers', () => {
   it('answers a schedule question without creating a job or instruction row', async () => {
-    await bindCalendar();
-    const jobsBefore = await count('jobs');
-    const instructionsBefore = await count('boss_instructions');
-    const outcome = await withBusiness(TEST_BUSINESS, (db) => runInstruction(db, { text: 'מה יש לי מחר?' }, { ...SCHEDULE_OPTIONS, calendar: { runtime: { credentials: CREDENTIALS }, client: clientWith('דני כהן') } }));
-    expect(outcome.status).toBe('answered');
-    if (outcome.status !== 'answered') return;
-    expect(outcome.text).toContain('*10:00–11:00 · דני כהן*');
-    expect(outcome.text).toContain('📍 הרצל 5');
-    expect(outcome.text).toContain('פנוי:');
-    expect(await count('jobs')).toBe(jobsBefore);
-    expect(await count('boss_instructions')).toBe(instructionsBefore);
+    // Pinned to a Tuesday morning: "tomorrow" on the real clock is a Friday or a
+    // Saturday two days a week, which have no working hours and so no free line.
+    // Only `Date` is faked — the pool's timers keep running.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-10T06:00:00Z'));
+    try {
+      await bindCalendar();
+      const jobsBefore = await count('jobs');
+      const instructionsBefore = await count('boss_instructions');
+      const outcome = await withBusiness(TEST_BUSINESS, (db) => runInstruction(db, { text: 'מה יש לי מחר?' }, { ...SCHEDULE_OPTIONS, calendar: { runtime: { credentials: CREDENTIALS }, client: clientWith('דני כהן') } }));
+      expect(outcome.status).toBe('answered');
+      if (outcome.status !== 'answered') return;
+      expect(outcome.text).toContain('*10:00–11:00 · דני כהן*');
+      expect(outcome.text).toContain('📍 הרצל 5');
+      expect(outcome.text).toContain('פנוי:');
+      expect(await count('jobs')).toBe(jobsBefore);
+      expect(await count('boss_instructions')).toBe(instructionsBefore);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('asks for the range when the question has none, still without a job', async () => {
