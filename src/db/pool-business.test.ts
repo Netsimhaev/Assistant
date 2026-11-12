@@ -9,7 +9,7 @@ import {
 } from './pool.js';
 import { closePlatformPool, withPlatform } from './platform-pool.js';
 import { ensureSchema, testDb } from '../test/db.js';
-import { ensureRoles } from './roles.js';
+import { PLATFORM_GROUP_ROLE, ensureRoles } from './roles.js';
 import { config } from '../config.js';
 
 function testLogins(): NonNullable<typeof config.testLogins> {
@@ -283,6 +283,24 @@ describe('ensureRoles', () => {
       );
       await admin.query(`DROP ROLE IF EXISTS ${probe}`);
       admin.release();
+    }
+  });
+
+  it("refuses an app login that is a member of the platform login's group (migration 068)", async () => {
+    const admin = await testDb().connect();
+    try {
+      await admin.query(`GRANT ${PLATFORM_GROUP_ROLE} TO ${testLogins().app.user}`);
+      await expect(ensureRoles(admin, testLogins())).rejects.toThrow(/member of assistant_platform_group/);
+    } finally {
+      await admin.query(`REVOKE ${PLATFORM_GROUP_ROLE} FROM ${testLogins().app.user}`);
+      admin.release();
+    }
+    // And with the membership gone, the same logins are accepted again.
+    const again = await testDb().connect();
+    try {
+      await ensureRoles(again, testLogins());
+    } finally {
+      again.release();
     }
   });
 });

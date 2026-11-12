@@ -21,6 +21,8 @@
  * Everything asserted runs on the APP login (`withBusiness` /
  * `withNoBusiness`), which is NOBYPASSRLS and owns nothing.
  */
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { withBusiness, withNoBusiness, type Queryable } from '../db/pool.js';
@@ -58,9 +60,30 @@ async function businessTables(db: Queryable): Promise<string[]> {
 }
 
 /**
+ * The inverse: every base table in `public` that has NO `business_id` and is
+ * not excluded by name. Business data without the column the policy reads is
+ * data the wall cannot see, so it fails here by name.
+ */
+async function tablesNeitherBusinessNorExcluded(db: Queryable): Promise<string[]> {
+  const { rows } = await db.query<{ table_name: string }>(
+    `SELECT t.table_name
+       FROM information_schema.tables t
+      WHERE t.table_schema = 'public'
+        AND t.table_type = 'BASE TABLE'
+        AND NOT EXISTS (
+          SELECT 1 FROM information_schema.columns c
+           WHERE c.table_schema = t.table_schema AND c.table_name = t.table_name
+             AND c.column_name = 'business_id')
+      ORDER BY 1`,
+  );
+  return rows.map((r) => r.table_name).filter((t) => !EXCLUDED.has(t));
+}
+
+/**
  * The tables among `tables` whose wall is not closed, each with what is
  * missing: RLS not enabled, not FORCEd (the owner would bypass it), or no
- * `tenant_isolation` policy that reads `app_business_id()` both ways.
+ * `tenant_isolation` policy that reads `app_business_id()` both ways, or
+ * any other policy beside it.
  */
 async function wallProblems(db: Queryable, tables: readonly string[]): Promise<string[]> {
   const problems: string[] = [];
@@ -78,15 +101,29 @@ async function wallProblems(db: Queryable, tables: readonly string[]): Promise<s
     }
     if (!rel.enabled) problems.push(`${table}: row level security not enabled`);
     if (!rel.forced) problems.push(`${table}: row level security not forced`);
-    const { rows: policies } = await db.query<{ cmd: string; qual: string | null; with_check: string | null }>(
-      `SELECT cmd, qual, with_check FROM pg_policies
-        WHERE schemaname = 'public' AND tablename = $1 AND policyname = $2`,
-      [table, POLICY_NAME],
+    // Every policy on the table, not only ours: policies of the same kind
+    // are OR-ed, so a second PERMISSIVE policy (`USING (true)`, say) would
+    // open the table whatever `tenant_isolation` says.
+    const { rows: policies } = await db.query<{
+      name: string;
+      permissive: string;
+      cmd: string;
+      qual: string | null;
+      with_check: string | null;
+    }>(
+      `SELECT policyname AS name, permissive, cmd, qual, with_check FROM pg_policies
+        WHERE schemaname = 'public' AND tablename = $1
+        ORDER BY policyname`,
+      [table],
     );
-    const policy = policies[0];
+    const others = policies.filter((p) => p.name !== POLICY_NAME).map((p) => p.name);
+    if (others.length > 0) problems.push(`${table}: other policies beside ${POLICY_NAME}: ${others.join(', ')}`);
+    const policy = policies.find((p) => p.name === POLICY_NAME);
     const expected = '(business_id = app_business_id())';
     if (policy === undefined) {
       problems.push(`${table}: no ${POLICY_NAME} policy`);
+    } else if (policy.permissive !== 'PERMISSIVE') {
+      problems.push(`${table}: ${POLICY_NAME} policy is not PERMISSIVE`);
     } else if (policy.cmd !== 'ALL' || policy.qual !== expected || policy.with_check !== expected) {
       problems.push(`${table}: ${POLICY_NAME} policy is not business_id = app_business_id() for ALL`);
     }
@@ -356,6 +393,50 @@ describe('row level security on every business table (spec §5.6)', () => {
     }
   });
 
+  it('a second permissive policy beside tenant_isolation fails by name', async () => {
+    const probe = 'rls_probe_extra_policy';
+    await testDb().query(`DROP TABLE IF EXISTS ${probe}`);
+    await testDb().query(`CREATE TABLE ${probe} (business_id TEXT NOT NULL)`);
+    try {
+      await testDb().query(`ALTER TABLE ${probe} ENABLE ROW LEVEL SECURITY`);
+      await testDb().query(`ALTER TABLE ${probe} FORCE ROW LEVEL SECURITY`);
+      await testDb().query(
+        `CREATE POLICY ${POLICY_NAME} ON ${probe}
+           USING (business_id = app_business_id()) WITH CHECK (business_id = app_business_id())`,
+      );
+      expect(await wallProblems(testDb(), [probe])).toEqual([]);
+      await testDb().query(`CREATE POLICY wide_open ON ${probe} USING (true)`);
+      expect(await wallProblems(testDb(), [probe])).toEqual([
+        `${probe}: other policies beside ${POLICY_NAME}: wide_open`,
+      ]);
+      // And a RESTRICTIVE tenant_isolation is not the policy the wall is made of.
+      await testDb().query(`DROP POLICY wide_open ON ${probe}`);
+      await testDb().query(`DROP POLICY ${POLICY_NAME} ON ${probe}`);
+      await testDb().query(
+        `CREATE POLICY ${POLICY_NAME} ON ${probe} AS RESTRICTIVE
+           USING (business_id = app_business_id()) WITH CHECK (business_id = app_business_id())`,
+      );
+      expect(await wallProblems(testDb(), [probe])).toEqual([`${probe}: ${POLICY_NAME} policy is not PERMISSIVE`]);
+    } finally {
+      await testDb().query(`DROP TABLE IF EXISTS ${probe}`);
+    }
+  });
+
+  it('every public table either has business_id or is excluded by name', async () => {
+    expect(await tablesNeitherBusinessNorExcluded(testDb())).toEqual([]);
+  });
+
+  it('a new table with neither business_id nor an exclusion fails by name', async () => {
+    const probe = 'rls_probe_no_business_id';
+    await testDb().query(`DROP TABLE IF EXISTS ${probe}`);
+    await testDb().query(`CREATE TABLE ${probe} (note TEXT)`);
+    try {
+      expect(await tablesNeitherBusinessNorExcluded(testDb())).toEqual([probe]);
+    } finally {
+      await testDb().query(`DROP TABLE IF EXISTS ${probe}`);
+    }
+  });
+
   describe('a row of business A, seen from business B', () => {
     beforeAll(async () => {
       const { failed } = await seedEveryTable(tables, BIZ_A);
@@ -443,6 +524,27 @@ describe('row level security on every business table (spec §5.6)', () => {
       });
     });
 
+    it('business A writes its own rows and cannot move one to business B', async () => {
+      // One representative table: kept_items, with no foreign key to satisfy.
+      await withBusiness(BIZ_A, async (db) => {
+        const inserted = await db.query(
+          `INSERT INTO kept_items (business_id, item_kind, item_id) VALUES ($1, 'job', 'rls-own-row')`,
+          [BIZ_A],
+        );
+        expect(inserted.rowCount).toBe(1);
+        const updated = await db.query(`UPDATE kept_items SET note = 'mine' WHERE item_id = 'rls-own-row'`);
+        expect(updated.rowCount).toBe(1);
+        await expect(
+          db.query(`UPDATE kept_items SET business_id = $1 WHERE item_id = 'rls-own-row'`, [BIZ_B]),
+        ).rejects.toThrow('new row violates row-level security policy for table "kept_items"');
+      });
+      const { rows } = await testDb().query<{ business_id: string; note: string | null }>(
+        `SELECT business_id, note FROM kept_items WHERE item_id = 'rls-own-row'`,
+      );
+      expect(rows).toEqual([{ business_id: BIZ_A, note: 'mine' }]);
+      await testDb().query(`DELETE FROM kept_items WHERE item_id = 'rls-own-row'`);
+    });
+
     it('(5) a connection whose business was set and then RESET throws, never reads empty', async () => {
       await withBusiness(BIZ_A, async (db) => {
         await db.query('RESET app.business_id');
@@ -487,7 +589,10 @@ describe('row level security on every business table (spec §5.6)', () => {
 });
 
 describe('the excluded tables: only what the app path provably uses', () => {
-  it('withNoBusiness can use the unknown-user throttle, and only it', async () => {
+  // `withNoBusiness` reaches two server tables and no business table: the
+  // throttle (read, clear, upsert) and `server_key_state` (read only: the key
+  // id and the key check's ciphertext, never a secret).
+  it('withNoBusiness can use the unknown-user throttle and read server_key_state', async () => {
     await withNoBusiness(async (db) => {
       await db.query('BEGIN');
       try {
@@ -497,6 +602,7 @@ describe('the excluded tables: only what the app path provably uses', () => {
         );
         await db.query('SELECT failed_attempts FROM dashboard_unknown_user_throttle');
         await db.query('UPDATE dashboard_unknown_user_throttle SET failed_attempts = 0');
+        await db.query('SELECT key_id, check_nonce, check_value FROM server_key_state');
       } finally {
         await db.query('ROLLBACK');
       }
@@ -561,5 +667,56 @@ describe('the excluded tables: only what the app path provably uses', () => {
     );
     expect(rows.length).toBeGreaterThan(0);
     expect(rows.filter((r) => !r.ok)).toEqual([]);
+  });
+});
+
+/**
+ * Migration 068's last block adds an EXISTING platform login to
+ * `assistant_platform_group`, so a server keeps working between the migrate
+ * and the next `db:roles`. It finds the login as "a BYPASSRLS login in
+ * `assistant_app`". The block is read from the shipped file and run again, so
+ * the test exercises the SQL that actually ships, not a copy.
+ */
+describe('migration 068 adds only the BYPASSRLS logins of assistant_app to the platform group', () => {
+  const MIGRATION = fileURLToPath(new URL('../db/migrations/068_rls.sql', import.meta.url));
+
+  function enrolBlock(): string {
+    const sql = readFileSync(MIGRATION, 'utf8');
+    const start = sql.lastIndexOf('\nDO $$');
+    const block = sql.slice(start).trim();
+    // Proof the slice is the block meant, not some other DO block.
+    expect(block).toContain('GRANT assistant_platform_group TO %I');
+    expect(block).toContain('m.rolbypassrls');
+    return block;
+  }
+
+  it('picks (c) and leaves (a) and (b) alone', async () => {
+    const probes = {
+      a: 'rls_probe_login_app_nobypass',
+      b: 'rls_probe_login_bypass_outside',
+      c: 'rls_probe_login_bypass_in_app',
+    };
+    const db = testDb();
+    try {
+      for (const role of Object.values(probes)) await db.query(`DROP ROLE IF EXISTS ${role}`);
+      await db.query(`CREATE ROLE ${probes.a} LOGIN NOBYPASSRLS IN ROLE assistant_app`);
+      await db.query(`CREATE ROLE ${probes.b} LOGIN BYPASSRLS`);
+      await db.query(`CREATE ROLE ${probes.c} LOGIN BYPASSRLS IN ROLE assistant_app`);
+
+      await db.query(enrolBlock());
+
+      const { rows } = await db.query<{ role: string; member: boolean }>(
+        `SELECT r AS role, pg_has_role(r, 'assistant_platform_group', 'MEMBER') AS member
+           FROM unnest($1::text[]) AS r ORDER BY r`,
+        [Object.values(probes)],
+      );
+      expect(Object.fromEntries(rows.map((row) => [row.role, row.member]))).toEqual({
+        [probes.a]: false,
+        [probes.b]: false,
+        [probes.c]: true,
+      });
+    } finally {
+      for (const role of Object.values(probes)) await db.query(`DROP ROLE IF EXISTS ${role}`);
+    }
   });
 });

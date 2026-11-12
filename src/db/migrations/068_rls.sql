@@ -61,7 +61,12 @@ $$;
 --                            key id when it seals a row (`verifyKeyState`,
 --                            `liveKeyId`: putSecret, writeGrant, recordRefresh,
 --                            the dashboard's key check). Only the key CLI
---                            writes it, on the platform pool.
+--                            writes it, on the platform pool. A grant is per
+--                            role, not per connection, so a `withNoBusiness`
+--                            connection can read this row too — the throttle
+--                            is not the only table it reaches. What it reads
+--                            is the key id and the key check's ciphertext,
+--                            never a secret.
 --   dashboard_unknown_user_throttle — SELECT, INSERT, UPDATE. The one
 --                            server-wide row `withNoBusiness` reads, clears
 --                            and upserts before a login has resolved
