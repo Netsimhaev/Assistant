@@ -195,7 +195,7 @@ describe('schedulerPass and the conductor', () => {
 
   it('runs neither loop, and does not fail, when no inbox is configured', async () => {
     // Makes its own precondition true rather than relying on `.env` happening
-    // to leave `DOCUMENT_INBOX` unset — the shape the sibling test below
+    // to leave `DOCUMENT_INBOX_ROOT` unset — the shape the sibling test below
     // already used. The moment anyone actually configured the feature, the
     // earlier version of this test scanned a real folder and went red:
     // configuring the feature broke the suite. Since settings moved into the

@@ -21,7 +21,16 @@
  *     value that already exists and differs is never overwritten.
  *
  * It prints what it moved and what was missing — names only, never a value.
+ *
+ * The inbox switch keeps reading the OLD name, `DOCUMENT_INBOX`, because that
+ * is what an install from before §5.8 has. But the folder it named is no
+ * longer scanned: a business's inbox is now `<DOCUMENT_INBOX_ROOT>/<businessId>`.
+ * So when the switch is turned on, the command says where the files belong,
+ * creates that folder when `DOCUMENT_INBOX_ROOT` is set, and says how when it
+ * is not.
  */
+import { mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { BusinessDb } from '../db/pool.js';
 import { putSecret, removeSecret, resolveStoredSecret } from '../governance/credential-store.js';
 import { loadMasterKey, verifyKeyState } from '../governance/master-key.js';
@@ -96,7 +105,8 @@ export function settingsFromEnv(env: Env): RuntimeSettingsPatch {
   if (mailSystem !== null) patch.mailSystem = mailSystem;
 
   // The two env switches: the inbox was on when a folder was set, WhatsApp
-  // when both GREEN-API refs were.
+  // when both GREEN-API refs were. The old inbox NAME, deliberately — see the
+  // module docblock for where its files go now.
   if (present(env, 'DOCUMENT_INBOX') !== null) patch.inboxEnabled = true;
   if (present(env, 'GREEN_API_INSTANCE_REF') !== null && present(env, 'GREEN_API_TOKEN_REF') !== null) {
     patch.whatsappEnabled = true;
@@ -119,6 +129,38 @@ export interface ImportEnvReport {
   movedToPlatform: string[];
   missing: string[];
   conflicts: string[];
+  /** Where the inbox files now belong, when the import turned the inbox on. Hebrew, for the operator. */
+  inboxNotes: string[];
+}
+
+/**
+ * The inbox moved from one folder (`DOCUMENT_INBOX`) to this business's
+ * folder under the server root. Created here when the root is known — a
+ * scan of a missing folder would only make it later, and the operator
+ * needs to know where to move the old files now.
+ */
+async function inboxFolderNotes(env: Env, businessId: string): Promise<string[]> {
+  const oldFolder = present(env, 'DOCUMENT_INBOX');
+  const moveLine = oldFolder === null ? [] : [`  יש להעביר את הקבצים שממתינים ב-${oldFolder} לתיקייה הזו.`];
+  const root = present(env, 'DOCUMENT_INBOX_ROOT');
+  if (root === null) {
+    return [
+      `תיבת הקליטה הופעלה, והקבצים שייכים עכשיו ל-<DOCUMENT_INBOX_ROOT>/${businessId}.`,
+      `  DOCUMENT_INBOX_ROOT אינו מוגדר: יש להגדיר אותו וליצור בתוכו את התיקייה ${businessId}.`,
+      ...moveLine,
+    ];
+  }
+  const folder = join(root, businessId);
+  try {
+    await mkdir(folder, { recursive: true });
+  } catch (err) {
+    return [
+      `תיבת הקליטה הופעלה, והקבצים שייכים עכשיו ל-${folder}.`,
+      `  התיקייה לא נוצרה (${err instanceof Error ? err.message : String(err)}) — יש ליצור אותה ידנית.`,
+      ...moveLine,
+    ];
+  }
+  return [`תיבת הקליטה הופעלה, והקבצים שייכים עכשיו ל-${folder} (התיקייה קיימת).`, ...moveLine];
 }
 
 /**
@@ -126,10 +168,18 @@ export interface ImportEnvReport {
  * prints them. No value of any secret leaves this function.
  */
 export async function importEnv(db: BusinessDb, env: Env, key: Buffer): Promise<ImportEnvReport> {
-  const report: ImportEnvReport = { settings: [], copiedSecrets: [], movedToPlatform: [], missing: [], conflicts: [] };
+  const report: ImportEnvReport = {
+    settings: [],
+    copiedSecrets: [],
+    movedToPlatform: [],
+    missing: [],
+    conflicts: [],
+    inboxNotes: [],
+  };
 
   const patch = settingsFromEnv(env);
   await saveRuntimeSettings(db, patch);
+  if (patch.inboxEnabled === true) report.inboxNotes = await inboxFolderNotes(env, db.businessId);
   for (const field of Object.keys(patch)) {
     if (field === 'caps') {
       for (const name of Object.keys(patch.caps ?? {}) as CapName[]) report.settings.push(CAP_COLUMNS[name]);
@@ -209,6 +259,7 @@ export function renderImportReport(businessId: string, report: ImportEnvReport):
     ...(report.conflicts.length > 0
       ? [`  התנגשות — במאגר השרת כבר יש ערך אחר, ולא נדרס (העותק של העסק נשאר): ${list(report.conflicts)}`]
       : []),
+    ...report.inboxNotes.map((line) => `  ${line}`),
   ];
 }
 

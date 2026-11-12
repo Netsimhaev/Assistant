@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -122,6 +122,38 @@ describe('tenancy:import-env', () => {
     expect(printed).toContain(`NOTIFY_MAIL → ${NOTIFY_SMTP_PASS_REF}`);
     // Never a value.
     for (const value of Object.values(SECRET_VALUES)) expect(printed).not.toContain(value);
+  });
+
+  it("turning the inbox on says the files now belong in <DOCUMENT_INBOX_ROOT>/<businessId>, and creates it", async () => {
+    const root = await mkdtemp(join(tmpdir(), 'import-inbox-root-'));
+    try {
+      const cli = io();
+      expect(
+        await main(['--business', BUSINESS], cli, {
+          CREDENTIAL_KEY_PATH: KEY_PATH,
+          DOCUMENT_INBOX: '/srv/old-inbox',
+          DOCUMENT_INBOX_ROOT: root,
+        }),
+      ).toBe(0);
+      const folder = join(root, BUSINESS);
+      expect((await stat(folder)).isDirectory()).toBe(true);
+      const printed = cli.out.join('\n');
+      expect(printed).toContain(folder);
+      expect(printed).toContain('/srv/old-inbox');
+
+      // Without the root: nothing is created, and the operator is told how.
+      const unset = io();
+      expect(await main(['--business', BUSINESS], unset, { CREDENTIAL_KEY_PATH: KEY_PATH, DOCUMENT_INBOX: '/srv/old-inbox' })).toBe(0);
+      expect(unset.out.join('\n')).toContain(`<DOCUMENT_INBOX_ROOT>/${BUSINESS}`);
+      expect(unset.out.join('\n')).toMatch(/DOCUMENT_INBOX_ROOT אינו מוגדר/);
+
+      // No inbox in the env: no inbox lines at all.
+      const none = io();
+      expect(await main(['--business', BUSINESS], none, { CREDENTIAL_KEY_PATH: KEY_PATH })).toBe(0);
+      expect(none.out.join('\n')).not.toMatch(/תיבת הקליטה/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it('never overwrites a different platform value, and leaves the business copy', async () => {

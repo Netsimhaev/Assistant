@@ -58,6 +58,7 @@ export const DOCUMENT_SETTINGS_HE = Object.freeze({
   notWritable: 'אין הרשאת כתיבה לתיקיית הבסיס',
   outsideBusiness: 'התיקייה חייבת להיות בתוך התיקייה של העסק בשרת',
   noServerRoot: 'לא הוגדרה בשרת תיקייה לשמירת מסמכים — אי אפשר להגדיר תיקיית בסיס',
+  businessFolderMissing: 'התיקייה של העסק בשרת עדיין לא קיימת — פנה למנהל המערכת',
 });
 
 /**
@@ -147,7 +148,18 @@ async function checkedBaseFolder(
   } catch {
     throw new Error(DOCUMENT_SETTINGS_HE.notWritable);
   }
-  if (businessSaveRoot(businessId) === null) throw new Error(DOCUMENT_SETTINGS_HE.noServerRoot);
+  const saveRoot = businessSaveRoot(businessId);
+  if (saveRoot === null) throw new Error(DOCUMENT_SETTINGS_HE.noServerRoot);
+  // A business created before `createBusiness` made this folder, or one whose
+  // folder was removed: "outside" would send the owner looking for the wrong
+  // fix — the operator has to create it.
+  try {
+    if (!(await stat(saveRoot)).isDirectory()) throw new Error(DOCUMENT_SETTINGS_HE.businessFolderMissing);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') throw new Error(DOCUMENT_SETTINGS_HE.businessFolderMissing);
+    throw err;
+  }
   if (!(await isInsideBusinessSaveRoot(folder, businessId))) throw new Error(DOCUMENT_SETTINGS_HE.outsideBusiness);
   return realpath(folder);
 }

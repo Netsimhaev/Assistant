@@ -1,4 +1,6 @@
+import { rm, stat } from 'node:fs/promises';
 import { withBusiness } from '../db/pool.js';
+import { businessSaveRoot } from './paths.js';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePlatformPool } from '../db/platform-pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
@@ -30,6 +32,21 @@ describe('businesses registry', () => {
       await expect(createBusiness(bad, 'שם')).rejects.toBeInstanceOf(TenancyError);
     }
     expect(await countBusinesses()).toBe(0);
+  });
+
+  it("refuses the reserved id 'produced' — it is a folder of the server, not a business", async () => {
+    const err = await createBusiness('produced', 'שם').then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(BusinessIdError);
+    expect((err as Error).message).toMatch(/שמור לשימוש המערכת/);
+    expect(await countBusinesses()).toBe(0);
+  });
+
+  it("creates the business's save folder on the server", async () => {
+    const folder = businessSaveRoot('gamma-shop');
+    if (folder === null) throw new Error('DOCUMENT_SAVE_ROOT is set for tests (vitest.config.ts)');
+    await rm(folder, { recursive: true, force: true });
+    await createBusiness('gamma-shop', 'ג');
+    expect((await stat(folder)).isDirectory()).toBe(true);
   });
 
   it('refuses an empty name', async () => {

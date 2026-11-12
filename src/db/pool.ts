@@ -100,8 +100,21 @@ export interface BusinessDb extends Queryable {
 /** Global Constraints: `^[a-z0-9-]{3,63}$`, and a key that is safe as an object key. */
 const BUSINESS_ID_SHAPE = /^[a-z0-9-]{3,63}$/;
 
+/**
+ * Ids no business may take: every fixed top-level name the code places
+ * directly under `DOCUMENT_ROOT`, `DOCUMENT_INBOX_ROOT` or `DOCUMENT_SAVE_ROOT`
+ * (spec §5.8). A business folder is `<root>/<businessId>`, so a business
+ * named after one of these would own a server folder that holds OTHER
+ * businesses' files — `produced` is the parent of every business's produced
+ * documents (`produced/<businessId>/...`, `production/loop.ts`), and its
+ * reader would be scoped to all of them. `src/tenancy/paths.test.ts` scans the
+ * source for literal first segments under those roots and fails on one that
+ * is not listed here.
+ */
+export const RESERVED_BUSINESS_IDS: ReadonlySet<string> = new Set(['produced']);
+
 export function isValidBusinessId(id: string): boolean {
-  return BUSINESS_ID_SHAPE.test(id) && SafeLookupKey.safeParse(id).success;
+  return BUSINESS_ID_SHAPE.test(id) && SafeLookupKey.safeParse(id).success && !RESERVED_BUSINESS_IDS.has(id);
 }
 
 function assertBusinessId(id: string): void {

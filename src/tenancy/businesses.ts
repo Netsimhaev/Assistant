@@ -1,5 +1,7 @@
+import { mkdir } from 'node:fs/promises';
 import { withPlatform } from '../db/platform-pool.js';
-import { isValidBusinessId } from '../db/pool.js';
+import { isValidBusinessId, RESERVED_BUSINESS_IDS } from '../db/pool.js';
+import { businessSaveRoot } from './paths.js';
 
 /** A refusal meant for the platform operator; the message is Hebrew. */
 export class TenancyError extends Error {
@@ -44,6 +46,11 @@ function toBusiness(row: BusinessRow): Business {
 }
 
 export async function createBusiness(id: string, displayName: string): Promise<void> {
+  // Before the shape message: a reserved id has the right shape, and telling
+  // the operator it is malformed would send her looking for the wrong fix.
+  if (RESERVED_BUSINESS_IDS.has(id)) {
+    throw new BusinessIdError(`המזהה "${id}" שמור לשימוש המערכת — בחרי מזהה אחר לעסק`);
+  }
   if (!isValidBusinessId(id)) {
     throw new BusinessIdError(malformedIdMessage(id));
   }
@@ -59,6 +66,20 @@ export async function createBusiness(id: string, displayName: string): Promise<v
     );
     if (rowCount === 0) throw new TenancyError(`העסק ${id} כבר קיים`);
   });
+  // The business's save folder on the server (spec §5.8). `saveDocumentSettings`
+  // accepts a base folder only inside it, so a business without it could
+  // never save. After the row, so a refused duplicate creates nothing new.
+  const saveRoot = businessSaveRoot(id);
+  if (saveRoot !== null) {
+    try {
+      await mkdir(saveRoot, { recursive: true });
+    } catch (err) {
+      throw new TenancyError(
+        `העסק ${id} נוצר, אבל תיקיית השמירה שלו בשרת (${saveRoot}) לא נוצרה: ` +
+          `${err instanceof Error ? err.message : String(err)} — יש ליצור אותה ידנית`,
+      );
+    }
+  }
 }
 
 export async function setBusinessStatus(id: string, status: BusinessStatus): Promise<void> {

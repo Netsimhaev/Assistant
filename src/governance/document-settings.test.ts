@@ -135,6 +135,16 @@ describe('document settings', () => {
     }
   });
 
+  it("says the business's server folder is missing, rather than 'outside', when it does not exist", async () => {
+    // A business with no save folder yet; any folder at all is then refused
+    // with the operator-facing message, never as "outside the business".
+    const NEW = 'business-without-save-folder';
+    await expect(
+      withBusiness(NEW, (bdb) => saveDocumentSettings(bdb, { ...channels, baseFolder: scratch })),
+    ).rejects.toThrow(DOCUMENT_SETTINGS_HE.businessFolderMissing);
+    expect(DOCUMENT_SETTINGS_HE.businessFolderMissing).toBe('התיקייה של העסק בשרת עדיין לא קיימת — פנה למנהל המערכת');
+  });
+
   it('a null or blank base folder clears it', async () => {
     await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { ...channels, baseFolder: scratch }));
     await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { ...channels, baseFolder: '  ' }));
