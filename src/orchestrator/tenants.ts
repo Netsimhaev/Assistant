@@ -15,7 +15,7 @@
  * (`runDueJobs`, `closeVerifiedJobs`, `resumeDelegatedJobs`,
  * `reaskFailedCommands` hold their stage connection while each job takes its
  * own). Nothing is held across the pass. So the others keep running while
- * the hung passes leave at least two of the pool's connections (max 10) free;
+ * the hung passes leave at least two of the pool's connections (`DATABASE_POOL_MAX`, default 20) free;
  * a server with more businesses hung at once than that runs out of
  * connections for everyone, and the log says so every interval
  * (`skippedInFlight`, `failed: deadline`). That is the limit, not "never".
