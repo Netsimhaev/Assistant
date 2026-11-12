@@ -3067,8 +3067,10 @@ interface RouteOptions {
  *   - The cookie names `<businessId>.<token>`. One `withBusiness` is opened
  *     for that business, and the whole request — session lookup, the
  *     suspension check, the handler — runs on that one connection. Nothing
- *     in a handler may run two queries on it at once (`Promise.all`): two
- *     statements in flight on one client interleave.
+ *     in a handler may run work on it in parallel (`Promise.all`): pg queues
+ *     statements on one client, but two parallel paths that each open a
+ *     transaction would interleave — one path's BEGIN/COMMIT capturing the
+ *     other's statements.
  *   - The session row is looked up inside that business, so a cookie whose
  *     business part was forged is a miss, sent to the login form.
  *   - A business the operator suspended is refused before routing, on every

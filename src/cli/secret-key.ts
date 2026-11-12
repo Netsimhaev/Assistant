@@ -781,9 +781,10 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
       auditKeyAction(tx, {
         operator,
         action: 'rotate',
-        reason:
-          `מפתח השרת הוחלף (${newKeyId}) על ידי ${operator} — ` +
-          `${rotated} סודות, ${grantsRotated} הרשאות ו-${platformRotated} סודות שרת הוצפנו מחדש`,
+        // No counts: this row is written into EVERY business's chain, and the
+        // counts are server-wide (other businesses' secrets). They stay on
+        // stderr/the log line and in the error outcome (ruling R18).
+        reason: `מפתח השרת הוחלף (${newKeyId}) על ידי ${operator}`,
       }),
     );
   } catch (error) {

@@ -20,7 +20,10 @@
  * (a session is not tied to the login string).
  */
 import { DatabaseError } from 'pg';
+import { appendAudit } from '../audit/log.js';
+import { transaction } from '../db/pool.js';
 import { EMAIL_SHAPE } from '../governance/typed-recipients.js';
+import { canonicalHash } from '../util/canonical.js';
 import { normaliseLogin } from '../tenancy/login.js';
 import { resolveLogin } from '../tenancy/platform.js';
 import { closeCliPools, runForBusiness } from './business-arg.js';
@@ -102,10 +105,28 @@ export async function main(
     }
 
     try {
-      await db.query(
-        'UPDATE dashboard_users SET login = $3 WHERE business_id = $1 AND username = $2',
-        [db.businessId, username.value, login],
-      );
+      // The change and its audit row are one transaction. The row names the
+      // business and the account only — never the address, which is the
+      // login and personal data.
+      await transaction(db, async (tx) => {
+        await tx.query(
+          'UPDATE dashboard_users SET login = $3 WHERE business_id = $1 AND username = $2',
+          [tx.businessId, username.value, login],
+        );
+        await appendAudit(tx, {
+          actor: 'human',
+          onBehalfOf: 'operator',
+          kind: 'credential_change',
+          charterVersion: 'n/a',
+          provenance: 'boss',
+          inputHash: canonicalHash({
+            action: 'owner_email',
+            businessId: tx.businessId,
+            username: username.value,
+          }),
+          reason: `כתובת הכניסה של החשבון ${username.value} בעסק ${tx.businessId} הוחלפה`,
+        });
+      });
     } catch (err) {
       if (err instanceof DatabaseError && err.code === UNIQUE_VIOLATION && err.constraint === LOGIN_UNIQUE_INDEX) {
         io.error(LOGIN_TAKEN_MESSAGE);

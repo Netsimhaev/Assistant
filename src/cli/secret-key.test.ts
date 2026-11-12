@@ -280,6 +280,17 @@ describe('a key that exists is a key that was recorded', () => {
       { business_id: TEST_BUSINESS, n: '2' },
       { business_id: OTHER, n: '2' },
     ]);
+
+    // R18: the row sits in every business's chain, so it carries no server-wide
+    // counts — only the key id and the operator.
+    const { rows: reasons } = await testDb().query<{ reason: string }>(
+      `SELECT reason FROM audit_log WHERE kind = 'credential_change' AND reason LIKE '%הוחלף%'`,
+    );
+    expect(reasons.length).toBe(2);
+    for (const { reason } of reasons) {
+      expect(reason).toMatch(/^מפתח השרת הוחלף \([^)]+\) על ידי \S+$/);
+      expect(reason).not.toMatch(/סודות|הרשאות/);
+    }
   });
 
   it('with no business registered writes no row, and the stderr line is the trace', async () => {

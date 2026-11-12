@@ -43,19 +43,20 @@ export async function openOnWhatsApp(db: BusinessDb, input: {
 }): Promise<OpenOnWhatsApp> {
   const windowOverride = input.windowMinutes !== undefined ? { windowMinutes: input.windowMinutes } : {};
   const inbound = new Date(input.inboundAt);
-  const [confirmations, mailCards, questions, documentCards] = await Promise.all([
-    openConfirmations(db, {
-      channel: 'whatsapp',
-      inboundAt: Number.isNaN(inbound.getTime()) ? null : inbound,
-      ...windowOverride,
-    }),
-    openMailCards(db, {
-      excludeMessageId: input.excludeMessageId,
-      inboundAt: input.inboundAt,
-      ...windowOverride,
-    }),
-    answerableWhatsAppQuestions(db, { ...windowOverride }),
-    openDocumentCards(db, { inboundAt: input.inboundAt, ...windowOverride }),
-  ]);
+  // Sequential, never `Promise.all`: all four read on the one `BusinessDb`, and
+  // a shared connection must not carry interleaved work (a reader that opens
+  // its own transaction would capture the others' statements).
+  const confirmations = await openConfirmations(db, {
+    channel: 'whatsapp',
+    inboundAt: Number.isNaN(inbound.getTime()) ? null : inbound,
+    ...windowOverride,
+  });
+  const mailCards = await openMailCards(db, {
+    excludeMessageId: input.excludeMessageId,
+    inboundAt: input.inboundAt,
+    ...windowOverride,
+  });
+  const questions = await answerableWhatsAppQuestions(db, { ...windowOverride });
+  const documentCards = await openDocumentCards(db, { inboundAt: input.inboundAt, ...windowOverride });
   return { confirmations, mailCards, questions, documentCards };
 }

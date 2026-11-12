@@ -12,9 +12,23 @@ CREATE TABLE businesses (
     suspended_at TIMESTAMPTZ
 );
 
--- Backfill from every place an install already holds a business. Ids that
--- do not fit the format (never expected in production) are skipped rather
--- than failing the migration.
+-- Backfill from every place an install already holds a business. An id that
+-- does not fit the format would be left out of the registry while its rows
+-- stay behind row level security with no business to own them, so it refuses
+-- the migration, naming the id, rather than being skipped (final review).
+DO $$
+DECLARE bad TEXT;
+BEGIN
+  SELECT string_agg(DISTINCT b, ', ') INTO bad
+    FROM (SELECT business_id AS b FROM charter_versions
+          UNION SELECT business_id FROM jobs
+          UNION SELECT business_id FROM dashboard_users) found
+   WHERE b !~ '^[a-z0-9-]{3,63}$';
+  IF bad IS NOT NULL THEN
+    RAISE EXCEPTION 'migration 063: business id(s) not matching ^[a-z0-9-]{3,63}$: %', bad;
+  END IF;
+END $$;
+
 INSERT INTO businesses (business_id, display_name)
 SELECT b, b
   FROM (SELECT business_id AS b FROM charter_versions

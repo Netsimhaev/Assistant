@@ -208,6 +208,20 @@ describe('owner:email', () => {
     expect(withOld.ok).toBe(false);
   });
 
+  it('writes one credential_change audit row that names no address', async () => {
+    const io = out();
+    expect(await ownerEmailMain([...BIZ, '--username', USERNAME, '--email', NEW_EMAIL], io)).toBe(0);
+    const { rows } = await testDb().query<{ reason: string; input_hash: string }>(
+      `SELECT reason, input_hash FROM audit_log
+        WHERE business_id = $1 AND kind = 'credential_change' AND reason LIKE '%הוחלפה%'`,
+      [TEST_BUSINESS],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.reason).toContain(USERNAME);
+    expect(rows[0]?.reason).not.toContain('new-address');
+    expect(rows[0]?.reason).not.toContain('@');
+  });
+
   it('refuses an address another business already holds, in any case, and changes nothing', async () => {
     await createBusiness('other-business', 'עסק אחר');
     await createOwnerRun(
