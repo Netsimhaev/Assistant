@@ -149,10 +149,7 @@ describe('dispatchActionUpdates', () => {
 
   it('records skipped_not_connected for a chosen channel with no seam, and NULL for an unchosen one', async () => {
     await seedStep();
-    await saveActionUpdateSettings(
-      { toWhatsApp: true, toEmail: false, toScreen: false },
-      { businessId: BUSINESS, updatedBy: 'owner' },
-    );
+    await withBusiness(BUSINESS, (bdb) => saveActionUpdateSettings(bdb, { toWhatsApp: true, toEmail: false, toScreen: false }, { updatedBy: 'owner' }));
 
     const result = await withBusiness(BUSINESS, (db) => dispatchActionUpdates(db, { now: NOW }));
     expect(result).toEqual({ written: 1, emailFailed: 0, whatsappFailed: 0, skippedNotConnected: 1 });
@@ -163,10 +160,7 @@ describe('dispatchActionUpdates', () => {
 
   it('sends through the messenger with the step job id when WhatsApp is chosen', async () => {
     const jobId = await seedStep();
-    await saveActionUpdateSettings(
-      { toWhatsApp: true, toEmail: false, toScreen: false },
-      { businessId: BUSINESS, updatedBy: 'owner' },
-    );
+    await withBusiness(BUSINESS, (bdb) => saveActionUpdateSettings(bdb, { toWhatsApp: true, toEmail: false, toScreen: false }, { updatedBy: 'owner' }));
     const messages: { text: string; jobId: string | null }[] = [];
     const messenger: BossMessenger = {
       channel: 'whatsapp',
@@ -280,10 +274,7 @@ describe('dispatchActionUpdates — distinct outbound bytes and a bounded read',
         [BUSINESS, job.jobId, binding.planHash, stepId],
       );
     }
-    await saveActionUpdateSettings(
-      { toWhatsApp: true, toEmail: false, toScreen: false },
-      { businessId: BUSINESS, updatedBy: 'owner' },
-    );
+    await withBusiness(BUSINESS, (bdb) => saveActionUpdateSettings(bdb, { toWhatsApp: true, toEmail: false, toScreen: false }, { updatedBy: 'owner' }));
     const messages: { text: string; jobId: string | null }[] = [];
     const messenger: BossMessenger = {
       channel: 'whatsapp',

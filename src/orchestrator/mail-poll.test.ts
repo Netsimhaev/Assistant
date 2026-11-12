@@ -564,20 +564,8 @@ describe('pollMailbox', () => {
     const { documentRoot } = await setup();
     const key = randomBytes(32);
     await writeKeyState(key, 'KEY-test');
-    await writeGrant(
-      {
-        businessId: BUSINESS,
-        system: 'mailbox',
-        provider: 'google',
-        credentialRef: 'OAUTH_MAILBOX',
-        account: 'owner@business.example',
-        scopes: ['https://www.googleapis.com/auth/gmail.modify'],
-        refreshToken: 'refresh-token-value',
-        grantedBy: 'owner',
-      },
-      key,
-    );
-    await revokeGrant('mailbox', BUSINESS, 'owner');
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { system: 'mailbox', provider: 'google', credentialRef: 'OAUTH_MAILBOX', account: 'owner@business.example', scopes: ['https://www.googleapis.com/auth/gmail.modify'], refreshToken: 'refresh-token-value', grantedBy: 'owner' }, key));
+    await withBusiness(BUSINESS, (bdb) => revokeGrant(bdb, 'mailbox', 'owner'));
     const neverCalled: TokenHttp = {
       exchangeRefresh: async () => {
         throw new Error('the token endpoint must not be reached for a revoked grant');
@@ -785,8 +773,8 @@ describe('pollMailbox', () => {
     // And a contact erasure by the sender's ADDRESS — which the subject never
     // contains — leaves no copy of the subject anywhere outside the three
     // tables an erasure deliberately keeps.
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: 'dana@client.example' }, { businessId: BUSINESS, documentRoot });
-    await executeErasure(plan, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: 'dana@client.example' }, { documentRoot }));
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
     const { rows: columns } = await getPool().query<{ table_name: string; column_name: string }>(
       `SELECT c.table_name, c.column_name
          FROM information_schema.columns c

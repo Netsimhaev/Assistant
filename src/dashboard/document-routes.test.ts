@@ -228,7 +228,7 @@ describe('upload on /instruct', () => {
     expect(seen[0]?.attachedDocuments).toEqual([{ documentId: doc.document_id, name }]);
 
     const job = await getPool().query<{ job_id: string }>('SELECT job_id FROM boss_instructions WHERE business_id = $1', [B]);
-    expect(await attachedDocumentsForJob(job.rows[0]!.job_id, { businessId: B })).toEqual([doc.document_id]);
+    expect(await withBusiness(B, (bdb) => attachedDocumentsForJob(bdb, job.rows[0]!.job_id))).toEqual([doc.document_id]);
   });
 
   it('a rejected ingest shows its Hebrew reason and the instruction is not run', async () => {
@@ -483,7 +483,7 @@ describe('/documents/settings', () => {
     const res = await post(baseUrl, cookie, '/documents/settings', { csrf, baseFolder: '' });
     expect(res.status).toBe(400);
     expect(await res.text()).toContain(DOCUMENT_SETTINGS_HE.noChannel);
-    expect(await loadDocumentSettings({ businessId: B })).toMatchObject({ toEmail: true, toScreen: true });
+    expect(await withBusiness(B, (bdb) => loadDocumentSettings(bdb))).toMatchObject({ toEmail: true, toScreen: true });
   });
 
   it('saves channels and a base folder', async () => {
@@ -492,7 +492,7 @@ describe('/documents/settings', () => {
     const csrf = await csrfOf(baseUrl, cookie, '/documents/settings');
     const res = await post(baseUrl, cookie, '/documents/settings', { csrf, toScreen: 'on', baseFolder: uploadRoot });
     expect(res.status).toBe(303);
-    const saved = await loadDocumentSettings({ businessId: B });
+    const saved = await withBusiness(B, (bdb) => loadDocumentSettings(bdb));
     expect(saved).toMatchObject({ toWhatsApp: false, toEmail: false, toScreen: true });
     expect(saved.baseFolder).not.toBe(null);
   });

@@ -130,7 +130,7 @@ describe('the WhatsApp time gate inside approveDocumentCard', () => {
     await resetDatabase();
     await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({ version: 'v-gate' })));
     // A save option needs somewhere to save to (M4); the gate under test is time.
-    await saveDocumentSettings({ ...DOCUMENT_SETTINGS_DEFAULTS, baseFolder: tmpdir() }, { businessId: B });
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { ...DOCUMENT_SETTINGS_DEFAULTS, baseFolder: tmpdir() }));
   });
   afterAll(async () => {
     await rm(join(config.documentRoot, DIR), { recursive: true, force: true });

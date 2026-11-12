@@ -17,8 +17,7 @@
  * answer would launder the recorded half into typed bytes one hop later.
  */
 import { ulid } from 'ulid';
-import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { InstructionTextOrigin } from './typed-recipients.js';
 
 /** Enforced here and by a CHECK constraint, so neither path can drift alone. */
@@ -86,6 +85,7 @@ const COLUMNS =
   'instruction_id, business_id, job_id, text, text_origin, question, answer, created_at::text AS created_at';
 
 export async function saveInstruction(
+  db: BusinessDb,
   input: {
     jobId: string;
     text: string;
@@ -96,10 +96,8 @@ export async function saveInstruction(
      */
     attachedDocumentIds?: readonly string[];
   },
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<InstructionRecord> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   // Checked here as well as in the CHECK constraint. The constraint is the
   // one that cannot be bypassed; this one gives a message in the owner's
@@ -142,12 +140,11 @@ export async function saveInstruction(
  * that was never written.
  */
 export async function recordQuestion(
+  db: BusinessDb,
   instructionId: string,
   question: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   await db.query(
     `UPDATE boss_instructions SET question = $3
@@ -180,10 +177,10 @@ export async function recordQuestion(
  * new table, no new column, no second "what is open" to drift from this one.
  */
 export async function pendingQuestions(
-  options: { businessId?: string; db?: Queryable; channel?: 'whatsapp' } = {},
+  db: BusinessDb,
+  options: { channel?: 'whatsapp' } = {},
 ): Promise<InstructionRecord[]> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   // Positive narrowing: the clause is added only when the caller asks for
   // the WhatsApp channel, and the unnarrowed form is byte-identical to what
   // the dashboard's `GET /instruct` has always run.
@@ -231,12 +228,11 @@ export async function pendingQuestions(
  * been two rules for one fact.
  */
 export async function claimAnswer(
+  db: BusinessDb,
   instructionId: string,
   answer: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<boolean> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   const { rowCount } = await db.query(
     `UPDATE boss_instructions SET answer = $3
@@ -252,11 +248,10 @@ export async function claimAnswer(
  * `doc.produce` reads to tell the owner's own sources from everything else.
  */
 export async function attachedDocumentsForJob(
+  db: BusinessDb,
   jobId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<string[]> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<{ attached_document_ids: string[] }>(
     'SELECT attached_document_ids FROM boss_instructions WHERE job_id = $1 AND business_id = $2',
     [jobId, businessId],
@@ -265,11 +260,10 @@ export async function attachedDocumentsForJob(
 }
 
 export async function loadInstructionForJob(
+  db: BusinessDb,
   jobId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<InstructionRecord | null> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   const { rows } = await db.query<InstructionRow>(
     `SELECT ${COLUMNS} FROM boss_instructions

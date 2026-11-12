@@ -104,7 +104,7 @@ async function ownerJob(
   const active = await charter();
   const job = await withBusiness(B, (db) => createJob(db, { charterVersion: active.charterVersion, provenance: options.provenance ?? 'boss' }));
   if (options.instruction !== false) {
-    await saveInstruction({ jobId: job.jobId, text, textOrigin: options.textOrigin ?? 'typed' }, { businessId: B });
+    await withBusiness(B, (bdb) => saveInstruction(bdb, { jobId: job.jobId, text, textOrigin: options.textOrigin ?? 'typed' }));
   }
   for (const to of ['understand', 'plan', 'execute'] as const) {
     await withBusiness(B, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
@@ -333,8 +333,8 @@ describe('approveDocumentCard', () => {
     const job = await withBusiness(B, (db) => loadJob(db, outcome.jobId));
     expect(job?.provenance).toBe('boss');
     expect(job?.phase).toBe('execute');
-    expect((await loadInstructionForJob(outcome.jobId, { businessId: B }))?.text).toContain('stranger@nowhere.example');
-    const confirmation = await loadConfirmation(outcome.jobId, { businessId: B });
+    expect((await withBusiness(B, (bdb) => loadInstructionForJob(bdb, outcome.jobId)))?.text).toContain('stranger@nowhere.example');
+    const confirmation = await withBusiness(B, (bdb) => loadConfirmation(bdb, outcome.jobId));
     expect(confirmation?.state).toBe('confirmed');
     expect(confirmation?.chosenPlanHash).toBe(shown.planHash);
     expect((await withBusiness(B, (db) => loadStoredPlan(db, outcome.jobId)))?.planHash).toBe(shown.planHash);
@@ -407,7 +407,7 @@ describe('approveDocumentCard', () => {
     expect(await deliveryJobs()).toBe(0);
     expect((await withBusiness(B, (db) => loadDocumentCard(db, card.cardId)))?.state).toBe('open');
     // Control: the shown plan's hash does approve (a save: it needs a base folder).
-    await saveDocumentSettings({ toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }, { businessId: B });
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }));
     const ok = await withBusiness(B, (db) => approveDocumentCard(db, card.cardId, card.deliveryPlans[1]!.planHash, 'dashboard'));
     expect(ok.status).toBe('approved');
     expect((await withBusiness(B, (db) => loadDocumentCard(db, card.cardId)))?.state).toBe('saved');
@@ -456,7 +456,7 @@ describe('approveDocumentCard', () => {
     expect(await deliveryJobs()).toBe(0);
 
     // Save is allowed (once there is a base folder to save into).
-    await saveDocumentSettings({ toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }, { businessId: B });
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }));
     const saved = await withBusiness(B, (db) => approveDocumentCard(db, card.cardId, card.deliveryPlans[0]!.planHash, 'dashboard'));
     expect(saved).toMatchObject({ status: 'approved', option: 'save' });
     expect((await withBusiness(B, (db) => loadDocumentCard(db, card.cardId)))?.state).toBe('saved');
@@ -474,7 +474,7 @@ describe('requestFix', () => {
     const production = await withBusiness(B, (db) => loadProduction(db, fix.productionId));
     expect(production?.textOrigin).toBe('transcribed');
     expect(production?.instructionText).toBe('תכיני הצעת מחיר ותשלחי ל-stranger@nowhere.example\n\nתיקון: הוסיפי את המחיר');
-    expect((await loadInstructionForJob(fix.jobId, { businessId: B }))?.textOrigin).toBe('transcribed');
+    expect((await withBusiness(B, (bdb) => loadInstructionForJob(bdb, fix.jobId)))?.textOrigin).toBe('transcribed');
     // Recipients re-checked on the joined, now-transcribed text: the address
     // only the recording carries is no longer authorised.
     expect(production?.destination).toEqual({ mode: 'send', to: [] });
@@ -519,7 +519,7 @@ describe('requestFix', () => {
 describe('createDocumentCard and its notices', () => {
   it('sends the file on the chosen channels once; a repeat call is a no-op', async () => {
     const { versionId, bytes } = await readyProduction();
-    await saveDocumentSettings({ toWhatsApp: true, toEmail: true, toScreen: false, baseFolder: null }, { businessId: B });
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: true, toEmail: true, toScreen: false, baseFolder: null }));
     const emails: { subject: string; body: string; bytes: Buffer }[] = [];
     const messenger = createFakeMessenger();
     const seams = {
@@ -551,7 +551,7 @@ describe('createDocumentCard and its notices', () => {
       `UPDATE document_productions SET work = jsonb_set(work, '{notes}', $2::jsonb) WHERE production_id = $1`,
       [productionId, JSON.stringify(['א'.repeat(4_500)])],
     );
-    await saveDocumentSettings({ toWhatsApp: true, toEmail: false, toScreen: true, baseFolder: null }, { businessId: B });
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: true, toEmail: false, toScreen: true, baseFolder: null }));
     const messenger = createFakeMessenger();
     await withBusiness(B, (db) => createDocumentCard(db, versionId, { messenger }));
     expect(messenger.sentFiles).toHaveLength(1);
@@ -563,7 +563,7 @@ describe('createDocumentCard and its notices', () => {
 
   it('a chosen channel with no seam is skipped_not_connected; an unchosen one stays NULL', async () => {
     const { versionId } = await readyProduction();
-    await saveDocumentSettings({ toWhatsApp: true, toEmail: false, toScreen: true, baseFolder: null }, { businessId: B });
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: true, toEmail: false, toScreen: true, baseFolder: null }));
     await withBusiness(B, (db) => createDocumentCard(db, versionId));
     expect(await withBusiness(B, (db) => loadCardForVersion(db, versionId))).toMatchObject({ whatsappState: 'skipped_not_connected', emailState: null });
   });
@@ -632,7 +632,7 @@ describe('exclusions', () => {
     const { cardId, jobId } = await failedDelivery(false);
     expect((await withBusiness(B, (db) => reaskFailedCommands(db))).reasked).toEqual([]);
 
-    await saveDocumentSettings({ toWhatsApp: true, toEmail: false, toScreen: true, baseFolder: null }, { businessId: B });
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: true, toEmail: false, toScreen: true, baseFolder: null }));
     const messenger = createFakeMessenger();
     const first = await withBusiness(B, (db) => reraiseFailedDeliveries(db, { messenger }));
     expect(first.reraised).toEqual([{ cardId, jobId, mayHaveSent: false }]);
@@ -675,16 +675,13 @@ describe('exclusions', () => {
     });
     await withBusiness(B, (db) => bindPlanToJob(db, job.jobId, plan));
     const hash = planHashOf(plan);
-    await createConfirmation(
-      {
+    await withBusiness(B, (bdb) => createConfirmation(bdb, {
         jobId: job.jobId,
         options: [{ label: 'x', planHash: hash, plan, contactSource: null }],
         presentedText: 'x',
         channel: 'dashboard',
-      },
-      { businessId: B },
-    );
-    expect(await confirmChoice(job.jobId, hash, 'p', { businessId: B })).toBe(true);
+      }));
+    expect(await withBusiness(B, (bdb) => confirmChoice(bdb, job.jobId, hash, 'p'))).toBe(true);
     await getPool().query(
       `INSERT INTO confirmed_step_claims (business_id, job_id, step_id, plan_hash) VALUES ($1, $2, 's1', $3)`,
       [B, job.jobId, hash],
@@ -725,7 +722,7 @@ describe('exclusions', () => {
 
   it('after an unknown step row the returned card also says the mail may already have gone', async () => {
     const { cardId } = await failedDelivery(true);
-    await saveDocumentSettings({ toWhatsApp: true, toEmail: false, toScreen: true, baseFolder: null }, { businessId: B });
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: true, toEmail: false, toScreen: true, baseFolder: null }));
     const messenger = createFakeMessenger();
     const result = await withBusiness(B, (db) => reraiseFailedDeliveries(db, { messenger }));
     expect(result.reraised).toEqual([expect.objectContaining({ cardId, mayHaveSent: true })]);
@@ -759,7 +756,7 @@ describe('card notices are each unique, and save needs a base folder', () => {
   it('I2: two re-raises of the same card carry different notice ids, so their email idempotency keys differ', async () => {
     const { versionId } = await readyProduction();
     const card = await cardFor(versionId);
-    await saveDocumentSettings({ toWhatsApp: false, toEmail: true, toScreen: true, baseFolder: null }, { businessId: B });
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: true, toScreen: true, baseFolder: null }));
     const emails: { subject: string; body: string; bytes: Buffer }[] = [];
     const seams = {
       sendAlertWithAttachment: async (subject: string, body: string, file: { bytes: Buffer }) => {
@@ -794,7 +791,7 @@ describe('card notices are each unique, and save needs a base folder', () => {
     expect((await withBusiness(B, (db) => loadDocumentCard(db, card.cardId)))?.state).toBe('open');
 
     // Control: the same option with a base folder set is approved.
-    await saveDocumentSettings({ toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }, { businessId: B });
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }));
     const approved = await withBusiness(B, (db) => approveDocumentCard(db, card.cardId, save.planHash, 'dashboard'));
     expect(approved).toMatchObject({ status: 'approved', option: 'save' });
   });
@@ -802,7 +799,7 @@ describe('card notices are each unique, and save needs a base folder', () => {
   it('M4: a returned save card says the SAVE did not complete, not the send', async () => {
     const { versionId } = await readyProduction({ destination: { mode: 'save', folder: null } });
     const card = await cardFor(versionId);
-    await saveDocumentSettings({ toWhatsApp: true, toEmail: false, toScreen: true, baseFolder: tmpdir() }, { businessId: B });
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: true, toEmail: false, toScreen: true, baseFolder: tmpdir() }));
     await approveAndFail(card.cardId, 'save');
     const messenger = createFakeMessenger();
     expect((await withBusiness(B, (db) => reraiseFailedDeliveries(db, { messenger }))).reraised).toHaveLength(1);
@@ -822,7 +819,7 @@ describe('card notices are each unique, and save needs a base folder', () => {
 
   it('M5: a new card with an unreadable charter is created, sends nothing in a guessed currency, and records the notice as failed', async () => {
     const { versionId } = await readyProduction();
-    await saveDocumentSettings({ toWhatsApp: true, toEmail: true, toScreen: true, baseFolder: null }, { businessId: B });
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: true, toEmail: true, toScreen: true, baseFolder: null }));
     await breakCharter();
     let emailed = 0;
     const messenger = createFakeMessenger();
@@ -840,7 +837,7 @@ describe('card notices are each unique, and save needs a base folder', () => {
   it('M5: a re-raise with an unreadable charter records the notice as failed and an error, without throwing', async () => {
     const { versionId } = await readyProduction();
     const card = await cardFor(versionId);
-    await saveDocumentSettings({ toWhatsApp: false, toEmail: true, toScreen: true, baseFolder: null }, { businessId: B });
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: true, toScreen: true, baseFolder: null }));
     await approveAndFail(card.cardId, 'send');
     await breakCharter();
     let emailed = 0;

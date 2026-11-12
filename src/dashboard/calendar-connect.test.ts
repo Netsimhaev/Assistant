@@ -52,7 +52,7 @@ async function seedProviderApp(provider: 'google' | 'microsoft' | 'both'): Promi
   const refs: [string, string][] = [];
   if (provider !== 'microsoft') refs.push([GOOGLE_CLIENT_ID_REF, 'g-id'], [GOOGLE_CLIENT_SECRET_REF, 'g-secret']);
   if (provider !== 'google') refs.push(['MICROSOFT_OAUTH_CLIENT_ID', 'ms-id'], ['MICROSOFT_OAUTH_CLIENT_SECRET', 'ms-secret']);
-  for (const [ref, value] of refs) await putSecret({ businessId: BUSINESS, ref, value, updatedBy: 'test' }, key);
+  for (const [ref, value] of refs) await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref, value, updatedBy: 'test' }, key));
 }
 
 beforeEach(async () => {
@@ -114,19 +114,7 @@ async function installSignedCalendar(provider: 'google' | 'microsoft'): Promise<
 }
 
 async function connectLive(): Promise<void> {
-  await writeGrant(
-    {
-      businessId: BUSINESS,
-      system: CALENDAR_SYSTEM,
-      provider: 'google',
-      credentialRef: 'OAUTH_CALENDAR',
-      account: 'owner@business.example',
-      scopes: ['https://www.googleapis.com/auth/calendar'],
-      refreshToken: 'refresh',
-      grantedBy: USERNAME,
-    },
-    key,
-  );
+  await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { system: CALENDAR_SYSTEM, provider: 'google', credentialRef: 'OAUTH_CALENDAR', account: 'owner@business.example', scopes: ['https://www.googleapis.com/auth/calendar'], refreshToken: 'refresh', grantedBy: USERNAME }, key));
   await withBusiness(BUSINESS, (db) => upsertBinding(db, { system: CALENDAR_SYSTEM, status: 'live', endpoint: null, credentialRef: 'OAUTH_CALENDAR', provider: 'google', lastOkAt: null, lastError: null }, { by: 'test' }));
 }
 

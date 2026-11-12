@@ -22,7 +22,7 @@ const RONIT = 'ronit@beta-log.example';
 
 /** A job with a fresh charter, nothing else attached. */
 async function bareJob(title: string): Promise<string> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `er-${title}` }))); // TENANCY-TODO(task 6)
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `er-${title}` })));
   const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
@@ -82,10 +82,7 @@ describe('buildErasurePlan', () => {
         [BUSINESS, jobId, RONIT],
       );
 
-      const plan = await buildErasurePlan(
-        { kind: 'contact', identifier: RONIT },
-        { businessId: BUSINESS },
-      );
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
       expect(plan.jobIds).toContain(jobId);
     });
@@ -98,10 +95,7 @@ describe('buildErasurePlan', () => {
         [BUSINESS, jobId, JSON.stringify({ goal: 'send', steps: [{ input: { to: [RONIT] } }] })],
       );
 
-      const plan = await buildErasurePlan(
-        { kind: 'contact', identifier: RONIT },
-        { businessId: BUSINESS },
-      );
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
       expect(plan.jobIds).toContain(jobId);
     });
@@ -114,10 +108,7 @@ describe('buildErasurePlan', () => {
         [`INS-${ulid()}`, BUSINESS, jobId, `תשלחי תזכורת ל-${RONIT}`],
       );
 
-      const plan = await buildErasurePlan(
-        { kind: 'contact', identifier: RONIT },
-        { businessId: BUSINESS },
-      );
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
       expect(plan.jobIds).toContain(jobId);
     });
@@ -144,10 +135,7 @@ describe('buildErasurePlan', () => {
         ],
       );
 
-      const plan = await buildErasurePlan(
-        { kind: 'contact', identifier: RONIT },
-        { businessId: BUSINESS },
-      );
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
       expect(plan.jobIds).toContain(jobId);
     });
@@ -168,10 +156,7 @@ describe('buildErasurePlan', () => {
         [BUSINESS, `ENV-${ulid()}`, JSON.stringify({ lookFor: RONIT }), `idem-${ulid()}`, jobId],
       );
 
-      const plan = await buildErasurePlan(
-        { kind: 'contact', identifier: RONIT },
-        { businessId: BUSINESS },
-      );
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
       expect(plan.jobIds).toContain(jobId);
     });
@@ -208,7 +193,7 @@ describe('buildErasurePlan', () => {
         [BUSINESS, `ENV-${ulid()}`, JSON.stringify({ lookFor: identifier }), `idem-${ulid()}`, jobId],
       );
 
-      const plan = await buildErasurePlan({ kind: 'contact', identifier }, { businessId: BUSINESS });
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier }));
 
       expect(plan.jobIds).toContain(jobId);
     });
@@ -242,10 +227,7 @@ describe('buildErasurePlan', () => {
         ],
       );
 
-      const plan = await buildErasurePlan(
-        { kind: 'contact', identifier: RONIT },
-        { businessId: BUSINESS },
-      );
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
       expect(plan.jobIds).toContain(jobId);
     });
@@ -278,7 +260,7 @@ describe('buildErasurePlan', () => {
         ],
       );
 
-      const plan = await buildErasurePlan({ kind: 'contact', identifier }, { businessId: BUSINESS });
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier }));
 
       expect(plan.jobIds).toContain(jobId);
     });
@@ -286,10 +268,7 @@ describe('buildErasurePlan', () => {
     it('via jobs.title', async () => {
       const jobId = await bareJob(`פנייה בנוגע ל-${RONIT}`);
 
-      const plan = await buildErasurePlan(
-        { kind: 'contact', identifier: RONIT },
-        { businessId: BUSINESS },
-      );
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
       expect(plan.jobIds).toContain(jobId);
     });
@@ -307,7 +286,7 @@ describe('buildErasurePlan', () => {
    * to anything else that would have carried it in by accident.
    */
   it('finds a digest whose body mentions the contact, and counts it for deletion', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'digest-found' }))); // TENANCY-TODO(task 6)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'digest-found' })));
     const digestId = `DG-${ulid()}`;
     await getPool().query(
       `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
@@ -325,10 +304,7 @@ describe('buildErasurePlan', () => {
       [`DG-${ulid()}`, BUSINESS, 'תדריך יומי · הכל תקין, אין חריגות'],
     );
 
-    const plan = await buildErasurePlan(
-      { kind: 'contact', identifier: RONIT },
-      { businessId: BUSINESS },
-    );
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect(plan.digestIds).toEqual([digestId]);
     const digestItem = plan.items.find((i) => i.table === 'digests' && i.action === 'delete');
@@ -343,7 +319,7 @@ describe('buildErasurePlan', () => {
    * authorization — nothing but the digest's own `body` names the contact.
    */
   it('discovers a digest by its body alone, with no job or document linking to it', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'digest-discovery' }))); // TENANCY-TODO(task 6)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'digest-discovery' })));
     const digestId = `DG-${ulid()}`;
     await getPool().query(
       `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
@@ -359,10 +335,7 @@ describe('buildErasurePlan', () => {
       [`DG-${ulid()}`, BUSINESS, 'תדריך שבועי · מסמך מ-avi@gamma-lift.example נדחה'],
     );
 
-    const plan = await buildErasurePlan(
-      { kind: 'contact', identifier: RONIT },
-      { businessId: BUSINESS },
-    );
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect(plan.jobIds).toEqual([]);
     expect(plan.documentIds).toEqual([]);
@@ -382,7 +355,7 @@ describe('buildErasurePlan', () => {
    * second before `fromIso` — the edge a `>` vs `>=` mistake would flip.
    */
   it('discovers a digest by a window anchor on its created_at, with a decoy just outside the range', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'digest-window' }))); // TENANCY-TODO(task 6)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'digest-window' })));
     const insideId = `DG-${ulid()}`;
     const outsideId = `DG-${ulid()}`;
     await getPool().query(
@@ -399,10 +372,7 @@ describe('buildErasurePlan', () => {
       [outsideId, BUSINESS, '2026-03-10T11:59:59Z'],
     );
 
-    const plan = await buildErasurePlan(
-      { kind: 'window', fromIso: '2026-03-10T12:00:00Z', toIso: '2026-03-11T12:00:00Z' },
-      { businessId: BUSINESS },
-    );
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'window', fromIso: '2026-03-10T12:00:00Z', toIso: '2026-03-11T12:00:00Z' }));
 
     expect(plan.digestIds).toEqual([insideId]);
     const digestItem = plan.items.find((i) => i.table === 'digests' && i.action === 'delete');
@@ -430,7 +400,7 @@ describe('buildErasurePlan', () => {
       [JSON.stringify({ counterparties: { known: [], doNotContact: [{ label: name, phone: '+972541234567' }] } })],
     );
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: name }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: name }));
 
     expect(plan.draftIds).toEqual(['DR-ronit']);
     expect(plan.items.find((i) => i.table === 'charter_interview_drafts')).toEqual({
@@ -449,12 +419,9 @@ describe('buildErasurePlan', () => {
       `INSERT INTO charter_interview_drafts (draft_id, business_id, answers) VALUES ('DR-any', $1, '{}')`,
       [BUSINESS],
     );
-    const window = await buildErasurePlan(
-      { kind: 'window', fromIso: '2000-01-01T00:00:00Z', toIso: '2100-01-01T00:00:00Z' },
-      { businessId: BUSINESS },
-    );
+    const window = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'window', fromIso: '2000-01-01T00:00:00Z', toIso: '2100-01-01T00:00:00Z' }));
     expect(window.draftIds).toEqual([]);
-    const document = await buildErasurePlan({ kind: 'document', documentId: 'DOC-none' }, { businessId: BUSINESS });
+    const document = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'document', documentId: 'DOC-none' }));
     expect(document.draftIds).toEqual([]);
   });
 
@@ -479,10 +446,7 @@ describe('buildErasurePlan', () => {
       [BUSINESS, jobId],
     );
 
-    const plan = await buildErasurePlan(
-      { kind: 'contact', identifier: RONIT },
-      { businessId: BUSINESS },
-    );
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     // Keyed by table AND action, not table alone: `jobs` now reports both a
     // `scrub` (title/pointer cleared, unconditionally) and a `fail` (a
@@ -524,10 +488,7 @@ describe('buildErasurePlan', () => {
       { jobId: theirs, kind: 'entity', subjectKey: 'avi@gamma-lift.example', body: {} },
     ));
 
-    const plan = await buildErasurePlan(
-      { kind: 'contact', identifier: RONIT },
-      { businessId: BUSINESS },
-    );
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect(plan.jobIds).toContain(mine);
     expect(plan.jobIds).not.toContain(theirs);
@@ -560,7 +521,7 @@ describe('buildErasurePlan', () => {
         [BUSINESS, jobId, JSON.stringify({ goal: 'send', steps: [{ input: { body: `לכבוד ${QUOTED}\nשלום` } }] })],
       );
 
-      const plan = await buildErasurePlan({ kind: 'contact', identifier: QUOTED }, { businessId: BUSINESS });
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: QUOTED }));
 
       expect(plan.jobIds).toContain(jobId);
     });
@@ -581,7 +542,7 @@ describe('buildErasurePlan', () => {
         ],
       );
 
-      const plan = await buildErasurePlan({ kind: 'contact', identifier: QUOTED }, { businessId: BUSINESS });
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: QUOTED }));
 
       expect(plan.jobIds).toContain(jobId);
     });
@@ -600,7 +561,7 @@ describe('buildErasurePlan', () => {
         ],
       );
 
-      const plan = await buildErasurePlan({ kind: 'contact', identifier: QUOTED }, { businessId: BUSINESS });
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: QUOTED }));
 
       const item = plan.items.find((i) => i.table === 'approval_requests' && i.action === 'delete');
       expect(item?.count).toBe(1);
@@ -619,7 +580,7 @@ describe('buildErasurePlan', () => {
         [BUSINESS, `ENV-${ulid()}`, JSON.stringify({ lookFor: QUOTED }), `idem-${ulid()}`, jobId],
       );
 
-      const plan = await buildErasurePlan({ kind: 'contact', identifier: QUOTED }, { businessId: BUSINESS });
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: QUOTED }));
 
       expect(plan.jobIds).toContain(jobId);
     });
@@ -631,7 +592,7 @@ describe('buildErasurePlan', () => {
         [BUSINESS, jobId, JSON.stringify({ note: `נבדק מול ${QUOTED}` })],
       );
 
-      const plan = await buildErasurePlan({ kind: 'contact', identifier: QUOTED }, { businessId: BUSINESS });
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: QUOTED }));
 
       expect(plan.jobIds).toContain(jobId);
     });
@@ -644,10 +605,7 @@ describe('buildErasurePlan', () => {
         [BUSINESS, jobId, JSON.stringify({ steps: [{ input: { to: 'axb@nowhere.example' } }] })],
       );
 
-      const plan = await buildErasurePlan(
-        { kind: 'contact', identifier: 'a_b@nowhere.example' },
-        { businessId: BUSINESS },
-      );
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: 'a_b@nowhere.example' }));
 
       expect(plan.jobIds).not.toContain(jobId);
     });
@@ -658,7 +616,7 @@ describe('buildErasurePlan', () => {
     await withBusiness(BUSINESS, (db) => writeMemory(db, { jobId, kind: 'chunk', subjectKey: 'c_1', body: { t: 'x' } }));
 
     // `%` would match every row if it reached LIKE unescaped.
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: '%' }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: '%' }));
     expect(plan.jobIds).toEqual([]);
     expect(plan.memoryIds).toEqual([]);
   });
@@ -670,12 +628,9 @@ describe('buildErasurePlan', () => {
         db,
         { jobId, kind: 'entity', subjectKey: RONIT, body: {} },
       ));
-      await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'memory', itemId: memory.memoryId, note: 'חשוב' })); // TENANCY-TODO(task 6)
+      await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'memory', itemId: memory.memoryId, note: 'חשוב' }));
 
-      const plan = await buildErasurePlan(
-        { kind: 'contact', identifier: RONIT },
-        { businessId: BUSINESS },
-      );
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
       expect(plan.memoryIds).not.toContain(memory.memoryId);
       expect(plan.excluded).toHaveLength(1);
@@ -687,9 +642,9 @@ describe('buildErasurePlan', () => {
 
     it('excludes a kept document and says why', async () => {
       const documentId = await aDocument();
-      await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'document', itemId: documentId, note: 'לשימור' })); // TENANCY-TODO(task 6)
+      await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'document', itemId: documentId, note: 'לשימור' }));
 
-      const plan = await buildErasurePlan({ kind: 'document', documentId }, { businessId: BUSINESS });
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'document', documentId }));
 
       expect(plan.documentIds).not.toContain(documentId);
       expect(plan.excluded).toHaveLength(1);
@@ -701,12 +656,9 @@ describe('buildErasurePlan', () => {
 
     it('excludes a kept job and says why', async () => {
       const jobId = await jobAbout(RONIT, 'kept-job');
-      await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'job', itemId: jobId, note: 'לשימור' })); // TENANCY-TODO(task 6)
+      await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'job', itemId: jobId, note: 'לשימור' }));
 
-      const plan = await buildErasurePlan(
-        { kind: 'contact', identifier: RONIT },
-        { businessId: BUSINESS },
-      );
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
       expect(plan.jobIds).not.toContain(jobId);
       expect(plan.excluded).toHaveLength(1);
@@ -723,10 +675,7 @@ describe('buildErasurePlan', () => {
       await withBusiness(BUSINESS, (db) => transition(db, jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
 
-    const plan = await buildErasurePlan(
-      { kind: 'contact', identifier: RONIT },
-      { businessId: BUSINESS },
-    );
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect(plan.refusals).toHaveLength(1);
     expect(plan.refusals[0]?.kind).toBe('live_job');
@@ -735,7 +684,7 @@ describe('buildErasurePlan', () => {
 
   it('refuses to erase a document that carries a signature', async () => {
     const documentId = await aDocument();
-    await withBusiness(BUSINESS, (bdb) => recordSignature( // TENANCY-TODO(task 6)
+    await withBusiness(BUSINESS, (bdb) => recordSignature(
       bdb,
       {
         signatureId: `SIG-${ulid()}`,
@@ -746,7 +695,7 @@ describe('buildErasurePlan', () => {
       }
     ));
 
-    const plan = await buildErasurePlan({ kind: 'document', documentId }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'document', documentId }));
 
     expect(plan.refusals).toHaveLength(1);
     expect(plan.refusals[0]?.kind).toBe('signed_document');
@@ -754,10 +703,7 @@ describe('buildErasurePlan', () => {
   });
 
   it('builds nothing at all for an anchor nothing matches', async () => {
-    const plan = await buildErasurePlan(
-      { kind: 'contact', identifier: 'nobody@nowhere.example' },
-      { businessId: BUSINESS },
-    );
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: 'nobody@nowhere.example' }));
     expect(plan.jobIds).toEqual([]);
     expect(plan.items.every((i) => i.count === 0)).toBe(true);
   });
@@ -775,7 +721,7 @@ describe('buildErasurePlan', () => {
   it('resolves every file path against the document root, never leaving it relative', async () => {
     const documentId = await aDocument();
 
-    const plan = await buildErasurePlan({ kind: 'document', documentId }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'document', documentId }));
 
     expect(plan.filePaths).toHaveLength(1);
     expect(plan.filePaths.every((path) => isAbsolute(path))).toBe(true);
@@ -786,10 +732,7 @@ describe('buildErasurePlan', () => {
     const documentId = await aDocument();
     const root = join(tmpdir(), 'erase-plan-root');
 
-    const plan = await buildErasurePlan(
-      { kind: 'document', documentId },
-      { businessId: BUSINESS, documentRoot: root },
-    );
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'document', documentId }, { documentRoot: root }));
 
     expect(plan.filePaths[0]).toBe(join(root, `${BUSINESS}/${documentId}/original.txt`));
   });
@@ -889,7 +832,7 @@ describe('the task ledger', () => {
     await anItem({ itemId: 'LI-match', originJobId: origin, ...fields });
     await anItem({ itemId: 'LI-decoy', originJobId: decoyOrigin, description: 'משהו אחר לגמרי' });
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect(plan.ledgerItemIds).toEqual(['LI-match']);
     expect(plan.jobIds).toContain(origin);
@@ -907,7 +850,7 @@ describe('the task ledger', () => {
     const premise = await getPool().query(`SELECT 1 FROM ledger_items WHERE stages::text ILIKE $1`, [`%${NAME}%`]);
     expect(premise.rows).toHaveLength(0);
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: NAME }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: NAME }));
     expect(plan.ledgerItemIds).toEqual(['LI-quote']);
   });
 
@@ -922,7 +865,7 @@ describe('the task ledger', () => {
     await anItem({ itemId: 'LI-other', originJobId: await bareJob('ledger-other') });
     await anEvent('LI-other', 'LE-other', 'בלי שמות');
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect([...plan.ledgerItemIds].sort()).toEqual(['LI-note', 'LI-rem']);
     expect(count(plan, 'ledger_items')).toBe(2);
@@ -937,7 +880,7 @@ describe('the task ledger', () => {
     await anItem({ itemId: 'LI-n', originJobId: origin, counterpartyEmail: RONIT, nudgeJobId: nudge });
     await anEvent('LI-n', 'LE-n', null, eventJob);
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect(plan.jobIds).toEqual(expect.arrayContaining([origin, nudge, eventJob]));
   });
@@ -946,7 +889,7 @@ describe('the task ledger', () => {
     const origin = await jobAbout(RONIT, 'instruction naming ronit');
     await anItem({ itemId: 'LI-member', originJobId: origin, description: 'לגבות תשלום' });
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect(plan.ledgerItemIds).toEqual(['LI-member']);
   });
@@ -957,10 +900,7 @@ describe('the task ledger', () => {
     await anItem({ itemId: 'LI-in', originJobId: inside, createdAt: '2020-03-10T12:00:00Z' });
     await anItem({ itemId: 'LI-out', originJobId: outside, createdAt: '2020-03-20T12:00:00Z' });
 
-    const plan = await buildErasurePlan(
-      { kind: 'window', fromIso: '2020-03-01T00:00:00Z', toIso: '2020-03-15T00:00:00Z' },
-      { businessId: BUSINESS },
-    );
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'window', fromIso: '2020-03-01T00:00:00Z', toIso: '2020-03-15T00:00:00Z' }));
 
     expect(plan.ledgerItemIds).toEqual(['LI-in']);
   });
@@ -979,7 +919,7 @@ describe('the task ledger', () => {
       [BUSINESS],
     );
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect(plan.ledgerRuleIds).toEqual(['LC-ronit']);
     expect(count(plan, 'ledger_critical_rules')).toBe(1);
@@ -1008,8 +948,8 @@ describe('the task ledger', () => {
       [BUSINESS, RONIT],
     );
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
-    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
+    const outcome = await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     const LEDGER = [
       'ledger_items:delete',
@@ -1165,10 +1105,7 @@ describe('document production', () => {
     await aProduction({ productionId: 'PR-decoy', originJobId: decoyOrigin, instructionText: 'דוח רווח והפסד' });
     const decoy = await aVersion('PR-decoy', 'VER-decoy');
 
-    const plan = await buildErasurePlan(
-      { kind: 'contact', identifier: RONIT },
-      { businessId: BUSINESS, documentRoot: root },
-    );
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }, { documentRoot: root }));
 
     expect(plan.productionIds).toEqual(['PR-match']);
     expect(plan.jobIds).toEqual(expect.arrayContaining([origin, delivery]));
@@ -1180,7 +1117,7 @@ describe('document production', () => {
     expect(count(plan, 'document_cards')).toBe(1);
     expect(count(plan, 'document_deliveries')).toBe(1);
 
-    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+    const outcome = await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     // The executor's own row counts agree with the preview — the explicit
     // deletes ran before the cascades that could have pre-empted them.
@@ -1219,10 +1156,7 @@ describe('document production', () => {
       await aVersion('PR-col', 'VER-col', versionOpts);
       await aProduction({ productionId: 'PR-other', originJobId: await bareJob('other'), instructionText: 'משהו אחר' });
 
-      const plan = await buildErasurePlan(
-        { kind: 'contact', identifier: RONIT },
-        { businessId: BUSINESS, documentRoot: root },
-      );
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }, { documentRoot: root }));
 
       expect(plan.productionIds).toEqual(['PR-col']);
       expect(plan.jobIds).toContain(origin);
@@ -1232,19 +1166,13 @@ describe('document production', () => {
   it('reaches a production on a window anchor and, on a document anchor, by its source', async () => {
     await aProduction({ productionId: 'PR-in', originJobId: await bareJob('in'), createdAt: '2026-03-01T10:00:00Z' });
     await aProduction({ productionId: 'PR-out', originJobId: await bareJob('out'), createdAt: '2026-04-01T10:00:00Z' });
-    const window = await buildErasurePlan(
-      { kind: 'window', fromIso: '2026-03-01T00:00:00Z', toIso: '2026-03-02T00:00:00Z' },
-      { businessId: BUSINESS, documentRoot: root },
-    );
+    const window = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'window', fromIso: '2026-03-01T00:00:00Z', toIso: '2026-03-02T00:00:00Z' }, { documentRoot: root }));
     expect(window.productionIds).toContain('PR-in');
     expect(window.productionIds).not.toContain('PR-out');
 
     const source = await aDocument();
     await aProduction({ productionId: 'PR-src', originJobId: await bareJob('src'), sourceDocumentIds: [source] });
-    const byDocument = await buildErasurePlan(
-      { kind: 'document', documentId: source },
-      { businessId: BUSINESS, documentRoot: root },
-    );
+    const byDocument = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'document', documentId: source }, { documentRoot: root }));
     expect(byDocument.productionIds).toEqual(['PR-src']);
   });
 
@@ -1257,13 +1185,10 @@ describe('document production', () => {
       stage: 'check1',
       work: { finished: false },
     });
-    const plan = await buildErasurePlan(
-      { kind: 'contact', identifier: RONIT },
-      { businessId: BUSINESS, documentRoot: root },
-    );
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }, { documentRoot: root }));
     expect(plan.productionIds).toEqual(['PR-live']);
     expect(plan.refusals.map((r) => r.kind)).toEqual(['live_job']);
-    await expect(executeErasure(plan, { businessId: BUSINESS })).rejects.toThrow();
+    await expect(withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan))).rejects.toThrow();
     expect((await getPool().query('SELECT 1 FROM document_productions')).rows).toHaveLength(1);
   });
 
@@ -1281,10 +1206,7 @@ describe('document production', () => {
     await writeFile(second, 'docx-bytes');
     await aDelivery(v.cardId, 'VER-saved', delivery, [saved, second]);
 
-    const plan = await buildErasurePlan(
-      { kind: 'contact', identifier: RONIT },
-      { businessId: BUSINESS, documentRoot: root },
-    );
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }, { documentRoot: root }));
 
     expect(plan.savedCopies).toEqual([saved, second].sort());
     // Listed, never queued for deletion.
@@ -1293,7 +1215,7 @@ describe('document production', () => {
     expect(html).toContain('נשארים בתיקייה שלך');
     expect(html).toContain('הצעה לרונית (2).docx');
 
-    await executeErasure(plan, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
     expect((await stat(saved)).isFile()).toBe(true);
     expect((await stat(second)).isFile()).toBe(true);
     // The row that recorded the path went with its job.
@@ -1308,7 +1230,7 @@ describe('document production', () => {
     await aDelivery(v.cardId, 'VER-path', delivery, [`/home/owner/${RONIT}.docx`]);
     await aProduction({ productionId: 'PR-other', originJobId: await bareJob('other') });
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS, documentRoot: root });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }, { documentRoot: root }));
 
     expect(plan.productionIds).toEqual(['PR-path']);
     expect(plan.jobIds).toEqual(expect.arrayContaining([origin, delivery]));
@@ -1318,7 +1240,7 @@ describe('document production', () => {
     const origin = await bareJob('flip-origin');
     await aProduction({ productionId: 'PR-flip', originJobId: origin, instructionText: `מסמך ל-${RONIT}` });
     const v = await aVersion('PR-flip', 'VER-flip');
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS, documentRoot: root });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }, { documentRoot: root }));
     // Finished when the preview was built: no refusal in the plan.
     expect(plan.refusals).toEqual([]);
     expect(plan.productionIds).toEqual(['PR-flip']);
@@ -1327,7 +1249,7 @@ describe('document production', () => {
       `UPDATE document_productions SET stage = 'fixing', work = jsonb_set(work, '{finished}', 'false') WHERE production_id = 'PR-flip'`,
     );
 
-    await expect(executeErasure(plan, { businessId: BUSINESS })).rejects.toBeInstanceOf(ErasureRefusedError);
+    await expect(withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan))).rejects.toBeInstanceOf(ErasureRefusedError);
     const db = getPool();
     expect((await db.query('SELECT 1 FROM document_productions')).rows).toHaveLength(1);
     expect((await db.query('SELECT 1 FROM document_versions')).rows).toHaveLength(1);
@@ -1340,7 +1262,7 @@ describe('document production', () => {
     const origin = await bareJob('race-origin');
     await aProduction({ productionId: 'PR-race', originJobId: origin, instructionText: `מסמך ל-${RONIT}` });
     const v = await aVersion('PR-race', 'VER-race');
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS, documentRoot: root });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }, { documentRoot: root }));
     expect(plan.refusals).toEqual([]);
 
     // The owner approves the card between the preview and the confirm.
@@ -1350,7 +1272,7 @@ describe('document production', () => {
       v.cardId,
     ]);
 
-    await expect(executeErasure(plan, { businessId: BUSINESS })).rejects.toBeInstanceOf(ErasureRefusedError);
+    await expect(withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan))).rejects.toBeInstanceOf(ErasureRefusedError);
     expect((await getPool().query('SELECT 1 FROM document_cards')).rows).toHaveLength(1);
     expect((await stat(v.file)).isFile()).toBe(true);
   });
@@ -1365,9 +1287,9 @@ describe('document production', () => {
       v.cardId,
     ]);
     await aDelivery(v.cardId, 'VER-held', delivery);
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS, documentRoot: root });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }, { documentRoot: root }));
     expect(plan.jobIds).toContain(delivery);
-    await executeErasure(plan, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
     expect((await getPool().query('SELECT 1 FROM document_cards')).rows).toHaveLength(0);
   });
 
@@ -1384,7 +1306,7 @@ describe('document production', () => {
       [other, JSON.stringify({ previewPath: badPreview })],
     );
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS, documentRoot: root });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }, { documentRoot: root }));
 
     expect(plan.filePaths).not.toContain(join(root, outside));
     expect(plan.filePaths).not.toContain(join(root, other));
@@ -1462,13 +1384,13 @@ describe('calendar scheduling', () => {
     await aMeeting('MT-1', job, { internalNote: `לזכור: ${RONIT} מעדיפה בבוקר`, reminderJobId: reminder });
     await aMeeting('MT-2', unrelated, { internalNote: 'שום קשר' });
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect(plan.jobIds).toEqual(expect.arrayContaining([job, reminder]));
     expect(plan.jobIds).not.toContain(unrelated);
     expect(plan.items.find((i) => i.table === 'meetings')?.count).toBe(1);
 
-    await executeErasure(plan, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
     const left = await getPool().query('SELECT meeting_id FROM meetings');
     expect(left.rows).toEqual([{ meeting_id: 'MT-2' }]);
   });
@@ -1478,7 +1400,7 @@ describe('calendar scheduling', () => {
     const reminder = await bareJob('reminder-of-via-plan');
     await aMeeting('MT-3', job, { reminderJobId: reminder });
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect(plan.jobIds).toEqual(expect.arrayContaining([job, reminder]));
     expect(plan.items.find((i) => i.table === 'meetings')?.count).toBe(1);
@@ -1490,10 +1412,7 @@ describe('calendar scheduling', () => {
     await aMeeting('MT-in', inside, { createdAt: '2026-03-10T10:00:00Z' });
     await aMeeting('MT-out', outside, { createdAt: '2026-05-10T10:00:00Z' });
 
-    const plan = await buildErasurePlan(
-      { kind: 'window', fromIso: '2026-03-01T00:00:00Z', toIso: '2026-04-01T00:00:00Z' },
-      { businessId: BUSINESS },
-    );
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'window', fromIso: '2026-03-01T00:00:00Z', toIso: '2026-04-01T00:00:00Z' }));
 
     expect(plan.items.find((i) => i.table === 'meetings')?.count).toBe(1);
   });
@@ -1504,10 +1423,10 @@ describe('calendar scheduling', () => {
     await aHold('H-1', job, 'ev-hold-1');
     await aHold('H-2', other, 'ev-hold-2');
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
     expect(plan.items.find((i) => i.table === 'meeting_holds')?.count).toBe(1);
 
-    await executeErasure(plan, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
     const left = await getPool().query('SELECT hold_id FROM meeting_holds');
     expect(left.rows).toEqual([{ hold_id: 'H-2' }]);
   });
@@ -1522,7 +1441,7 @@ describe('calendar scheduling', () => {
     await aHold('H-released', job, 'ev-released', 'released');
     await aMeeting('MT-other', other, { eventId: 'ev-other' });
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect(plan.calendarEventsKept).toEqual([
       { calendarId: 'cal-1', eventId: 'ev-a', start: null, kind: 'meeting' },
@@ -1547,16 +1466,16 @@ describe('calendar scheduling', () => {
     const meetingJob = await bareJob('kept-meeting-job');
     const reminder = await bareJob(`תזכורת ל-${RONIT}`);
     await aMeeting('MT-kept', meetingJob, { eventId: 'ev-kept', reminderJobId: reminder });
-    await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'job', itemId: meetingJob, note: 'לשמור' })); // TENANCY-TODO(task 6)
+    await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'job', itemId: meetingJob, note: 'לשמור' }));
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect(plan.jobIds).toContain(reminder);
     expect(plan.jobIds).not.toContain(meetingJob);
     expect(plan.items.find((i) => i.table === 'meetings')?.count).toBe(0);
     expect(plan.calendarEventsKept).toEqual([]);
 
-    await executeErasure(plan, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
     const left = await getPool().query('SELECT meeting_id FROM meetings');
     expect(left.rows).toEqual([{ meeting_id: 'MT-kept' }]);
   });
@@ -1568,7 +1487,7 @@ describe('calendar scheduling', () => {
     await aHold('H-conv-only', job, 'ev-conv-only', 'converted');
     await aHold('H-live', job, 'ev-live');
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect(plan.calendarEventsKept.map((e) => [e.eventId, e.kind])).toEqual([
       ['ev-conv', 'meeting'],
@@ -1609,7 +1528,7 @@ describe('calendar scheduling', () => {
     );
     await aMeeting('MT-late', nudge, { reminderJobId: reminder });
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect(plan.jobIds).toEqual(expect.arrayContaining([nudge, reminder]));
   });

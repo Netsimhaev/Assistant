@@ -740,8 +740,8 @@ export async function handleOAuthCallback(
   // this commits.
   await withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 10)
     await writeGrant(
+      tx,
       {
-        businessId,
         system,
         provider,
         credentialRef,
@@ -751,7 +751,6 @@ export async function handleOAuthCallback(
         grantedBy: session.username,
       },
       key,
-      { db: tx },
     );
 
     await appendAudit(
@@ -865,14 +864,14 @@ export async function handleOAuthRevoke(
     keyUnavailable = true;
   }
 
-  const grant = key !== null ? await readGrantBySystem(system, businessId, key) : null;
+  const grant = key !== null ? await withBusiness(businessId, (db) => readGrantBySystem(db, system, key)) : null; // TENANCY-TODO(task 10)
 
   // Local-first, and authoritative: written before any network call to the
   // provider, matching `killswitch.ts`'s `trip()` writing its state before
   // recording it, for the identical reason. `changed` is `revokeGrant`'s own
   // report of whether a live row actually existed to revoke -- used below
   // instead of assuming the call itself proves something was live.
-  const changed = await revokeGrant(system, businessId, session.username);
+  const changed = await withBusiness(businessId, (db) => revokeGrant(db, system, session.username)); // TENANCY-TODO(task 10)
 
   type ProviderOutcome = 'revoked' | 'failed' | 'no_live_grant' | 'key_unavailable' | 'no_revoke_endpoint';
   let providerOutcome: ProviderOutcome;

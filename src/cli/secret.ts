@@ -153,7 +153,7 @@ export async function runSecretCli(argv: string[], deps: SecretCliDeps): Promise
 
     const key = await loadKeyFromEnv();
     const value = await deps.readSecret();
-    await putSecret({ businessId, ref, value, updatedBy: operator }, key);
+    await withBusiness(businessId, (db) => putSecret(db, { ref, value, updatedBy: operator }, key)); // TENANCY-TODO(task 7)
     await auditAction({
       businessId,
       ref,
@@ -171,7 +171,7 @@ export async function runSecretCli(argv: string[], deps: SecretCliDeps): Promise
       throw new Error(usage());
     }
 
-    const items = await listSecretRefs(businessId);
+    const items = await withBusiness(businessId, (db) => listSecretRefs(db)); // TENANCY-TODO(task 7)
     await auditAction({
       businessId,
       ref: null,
@@ -198,7 +198,7 @@ export async function runSecretCli(argv: string[], deps: SecretCliDeps): Promise
       throw new Error(usage());
     }
 
-    const removed = await removeSecret(ref, businessId);
+    const removed = await withBusiness(businessId, (db) => removeSecret(db, ref)); // TENANCY-TODO(task 7)
     await auditAction({
       businessId,
       ref,

@@ -13,8 +13,7 @@
  * and reading never writes one — writing on read would turn a question into
  * a decision.
  */
-import type { Queryable } from '../db/pool.js';
-import { getPool } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 export interface ActionUpdateSettings {
   toWhatsApp: boolean;
@@ -49,28 +48,24 @@ function toSettings(row: SettingsRow): ActionUpdateSettings {
   };
 }
 
-export async function loadActionUpdateSettings(options: {
-  businessId: string;
-  db?: Queryable;
-}): Promise<ActionUpdateSettings> {
-  const db = options.db ?? getPool();
+export async function loadActionUpdateSettings(db: BusinessDb): Promise<ActionUpdateSettings> {
   const { rows } = await db.query<SettingsRow>(
     `SELECT to_whatsapp, to_email, to_screen
        FROM action_update_settings WHERE business_id = $1`,
-    [options.businessId],
+    [db.businessId],
   );
   const row = rows[0];
   return row === undefined ? { ...ACTION_UPDATE_DEFAULTS } : toSettings(row);
 }
 
 export async function saveActionUpdateSettings(
+  db: BusinessDb,
   settings: ActionUpdateSettings,
-  options: { businessId: string; updatedBy: string; db?: Queryable },
+  options: { updatedBy: string },
 ): Promise<void> {
   if (!(settings.toWhatsApp || settings.toEmail || settings.toScreen)) {
     throw new Error(AT_LEAST_ONE_CHANNEL);
   }
-  const db = options.db ?? getPool();
   await db.query(
     `INSERT INTO action_update_settings (business_id, to_whatsapp, to_email, to_screen, updated_by)
      VALUES ($1, $2, $3, $4, $5)
@@ -80,6 +75,6 @@ export async function saveActionUpdateSettings(
            to_screen = EXCLUDED.to_screen,
            updated_at = now(),
            updated_by = EXCLUDED.updated_by`,
-    [options.businessId, settings.toWhatsApp, settings.toEmail, settings.toScreen, options.updatedBy],
+    [db.businessId, settings.toWhatsApp, settings.toEmail, settings.toScreen, options.updatedBy],
   );
 }

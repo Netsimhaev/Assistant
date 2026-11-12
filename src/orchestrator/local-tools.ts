@@ -528,7 +528,7 @@ const HANDLERS: Record<string, LocalHandler> = {
     const suppliedDomain =
       parsed.counterpartyDomain === undefined ? null : normaliseDomainString(parsed.counterpartyDomain);
 
-    const instruction = await loadInstructionForJob(ctx.jobId, { businessId: ctx.db.businessId, db: env.db });
+    const instruction = await loadInstructionForJob(env.db, ctx.jobId);
     const counterpartyEmailVerified =
       counterpartyEmail === null
         ? false
@@ -784,7 +784,7 @@ const HANDLERS: Record<string, LocalHandler> = {
     if (!productionToolsUp(ctx.production)) {
       throw new StepChannelError('production_tools_missing', PRODUCTION_TOOLS_MISSING_REASON, false);
     }
-    const instruction = await loadInstructionForJob(ctx.jobId, { businessId: ctx.db.businessId, db });
+    const instruction = await loadInstructionForJob(db, ctx.jobId);
     if (instruction === null) throw new Error(`runLocalTool: doc.produce found no instruction for ${ctx.jobId}`);
     const active = await loadActiveCharter(ctx.db);
     if (active === null) throw new Error(`runLocalTool: doc.produce needs an active charter (${ctx.db.businessId})`);
@@ -813,7 +813,7 @@ const HANDLERS: Record<string, LocalHandler> = {
       destination = parsed.destination;
     }
 
-    const attached = await attachedDocumentsForJob(ctx.jobId, { businessId: ctx.db.businessId, db });
+    const attached = await attachedDocumentsForJob(db, ctx.jobId);
     const sources = await resolveSourceDocuments(
       db,
       parsed.sourceHints ?? [],

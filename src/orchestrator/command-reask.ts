@@ -292,7 +292,7 @@ async function reaskOne(
   if (chosen === undefined) {
     throw new Error(`command re-ask: job ${oldJobId}'s chosen plan is not among its options`);
   }
-  const instruction = await loadInstructionForJob(oldJobId, { businessId });
+  const instruction = await loadInstructionForJob(db, oldJobId);
   if (instruction === null) throw new Error(`command re-ask: job ${oldJobId} has no instruction`);
 
   // One fact, one hash: the plan the old job is bound to must be the one the
@@ -366,10 +366,7 @@ async function reaskOne(
 
   let confirmed = false;
   try {
-    await saveInstruction(
-      { jobId: job.jobId, text: instruction.text, textOrigin: instruction.textOrigin },
-      { businessId },
-    );
+    await saveInstruction(db, { jobId: job.jobId, text: instruction.text, textOrigin: instruction.textOrigin });
     for (const to of ['understand', 'plan'] as const) {
       await transition(db, job.jobId, {
         to,
@@ -386,16 +383,13 @@ async function reaskOne(
     // no message to go to — the owner would never hear how it ended.
     try {
       await transaction(db, async (tx) => {
-        await createConfirmation(
-          {
-            jobId: job.jobId,
-            options: [option],
-            presentedText: rendered.text,
-            channel: candidate.channel,
-            reaskOf: oldJobId,
-          },
-          { businessId, db: tx },
-        );
+        await createConfirmation(tx, {
+          jobId: job.jobId,
+          options: [option],
+          presentedText: rendered.text,
+          channel: candidate.channel,
+          reaskOf: oldJobId,
+        });
         if (candidate.whatsapp_message_id !== null) {
           await linkWhatsAppMessage(tx, job.jobId, candidate.whatsapp_message_id);
         }
@@ -435,7 +429,7 @@ async function reaskOne(
   const sent = await messenger.send({ text: rendered.text, jobId: job.jobId });
   if (!sent.ok) return { reasked, delivery: 'failed' };
   // Only now does a WhatsApp "כן" answer it (`openConfirmations`).
-  await markConfirmationDelivered(job.jobId, { businessId });
+  await markConfirmationDelivered(db, job.jobId);
   return { reasked, delivery: 'sent' };
 }
 

@@ -24,8 +24,7 @@
 import { constants } from 'node:fs';
 import { access as fsAccess, realpath, stat } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
-import type { Queryable } from '../db/pool.js';
-import { getPool } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 export interface DocumentSettings {
   toWhatsApp: boolean;
@@ -66,12 +65,11 @@ function toSettings(row: SettingsRow): DocumentSettings {
   };
 }
 
-export async function loadDocumentSettings(options: { businessId: string; db?: Queryable }): Promise<DocumentSettings> {
-  const db = options.db ?? getPool();
+export async function loadDocumentSettings(db: BusinessDb): Promise<DocumentSettings> {
   const { rows } = await db.query<SettingsRow>(
     `SELECT to_whatsapp, to_email, to_screen, base_folder
        FROM document_settings WHERE business_id = $1`,
-    [options.businessId],
+    [db.businessId],
   );
   const row = rows[0];
   return row === undefined ? { ...DOCUMENT_SETTINGS_DEFAULTS } : toSettings(row);
@@ -118,19 +116,17 @@ async function checkedBaseFolder(
 }
 
 export async function saveDocumentSettings(
+  db: BusinessDb,
   settings: DocumentSettings,
   options: {
-    businessId: string;
-    db?: Queryable;
     /** `fs.access` — injectable so a test can drive the not-writable refusal on any OS. */
     access?: (path: string, mode: number) => Promise<void>;
-  },
+  } = {},
 ): Promise<void> {
   if (!(settings.toWhatsApp || settings.toEmail || settings.toScreen)) {
     throw new Error(DOCUMENT_SETTINGS_HE.noChannel);
   }
   const baseFolder = await checkedBaseFolder(settings.baseFolder, options.access ?? fsAccess);
-  const db = options.db ?? getPool();
   await db.query(
     `INSERT INTO document_settings (business_id, to_whatsapp, to_email, to_screen, base_folder)
      VALUES ($1, $2, $3, $4, $5)
@@ -140,6 +136,6 @@ export async function saveDocumentSettings(
            to_screen = EXCLUDED.to_screen,
            base_folder = EXCLUDED.base_folder,
            updated_at = now()`,
-    [options.businessId, settings.toWhatsApp, settings.toEmail, settings.toScreen, baseFolder],
+    [db.businessId, settings.toWhatsApp, settings.toEmail, settings.toScreen, baseFolder],
   );
 }

@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { randomBytes } from 'node:crypto';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { decryptSecret } from './secret-cipher.js';
 import { writeKeyState } from './master-key.js';
@@ -46,9 +46,9 @@ describe('the OAuth grant store', () => {
   });
 
   it('round-trips a grant, and the token is nowhere but the ciphertext', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
 
-    const read = await readGrantByRef(GRANT.credentialRef, BUSINESS, KEY);
+    const read = await withBusiness(BUSINESS, (bdb) => readGrantByRef(bdb, GRANT.credentialRef, KEY));
     expect(read?.refreshToken).toBe(GRANT.refreshToken);
     expect(read?.account).toBe(GRANT.account);
     expect(read?.scopes).toEqual([...GRANT.scopes]);
@@ -65,15 +65,15 @@ describe('the OAuth grant store', () => {
   });
 
   it('gives each business its own grant when both store the same ref', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
-    await writeGrant({ businessId: OTHER, ...GRANT, refreshToken: 'refresh-token-value-B' }, KEY);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
+    await withBusiness(OTHER, (bdb) => writeGrant(bdb, { ...GRANT, refreshToken: 'refresh-token-value-B' }, KEY));
 
-    expect((await readGrantByRef(GRANT.credentialRef, BUSINESS, KEY))?.refreshToken).toBe('refresh-token-value-A');
-    expect((await readGrantByRef(GRANT.credentialRef, OTHER, KEY))?.refreshToken).toBe('refresh-token-value-B');
+    expect((await withBusiness(BUSINESS, (bdb) => readGrantByRef(bdb, GRANT.credentialRef, KEY)))?.refreshToken).toBe('refresh-token-value-A');
+    expect((await withBusiness(OTHER, (bdb) => readGrantByRef(bdb, GRANT.credentialRef, KEY)))?.refreshToken).toBe('refresh-token-value-B');
   });
 
   it('cannot be opened as if it were a secret', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
     const { rows } = await getPool().query<{ ciphertext: Buffer; nonce: Buffer }>(
       'SELECT ciphertext, nonce FROM oauth_grants WHERE business_id = $1 AND system = $2',
       [BUSINESS, GRANT.system],
@@ -88,22 +88,22 @@ describe('the OAuth grant store', () => {
   });
 
   it('revokes softly: the row stays, and a read refuses it', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
-    expect(await revokeGrant(GRANT.system, BUSINESS, 'owner')).toBe(true);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
+    expect(await withBusiness(BUSINESS, (bdb) => revokeGrant(bdb, GRANT.system, 'owner'))).toBe(true);
 
     // Both read paths, not just one -- a mutation dropping the
     // `revoked_at IS NULL` predicate from `readGrantByRef` alone would stay
     // green if only `readGrantBySystem` were checked here.
-    expect(await readGrantBySystem(GRANT.system, BUSINESS, KEY)).toBeNull();
-    expect(await readGrantByRef(GRANT.credentialRef, BUSINESS, KEY)).toBeNull();
-    const summaries = await listGrants(BUSINESS);
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, GRANT.system, KEY))).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantByRef(bdb, GRANT.credentialRef, KEY))).toBeNull();
+    const summaries = await withBusiness(BUSINESS, (bdb) => listGrants(bdb));
     expect(summaries).toHaveLength(1);
     expect(summaries[0]?.revokedAt).not.toBeNull();
   });
 
   it('never returns the token from listGrants', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
-    const summaries = await listGrants(BUSINESS);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
+    const summaries = await withBusiness(BUSINESS, (bdb) => listGrants(bdb));
     expect(JSON.stringify(summaries)).not.toContain(GRANT.refreshToken);
     expect(summaries[0]?.account).toBe(GRANT.account);
   });
@@ -111,18 +111,15 @@ describe('the OAuth grant store', () => {
   // 035_oauth_grants_partial_ref.sql: the unique index on (business_id,
   // credential_ref) only covers live rows, because revocation is soft.
   it('frees a ref for reuse once the grant holding it is revoked', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
-    await revokeGrant(GRANT.system, BUSINESS, 'owner');
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
+    await withBusiness(BUSINESS, (bdb) => revokeGrant(bdb, GRANT.system, 'owner'));
 
     // Before 035 this raised a raw Postgres unique-violation instead of
     // succeeding: the old, unconditional index still counted the revoked
     // row as occupying the ref.
-    await writeGrant(
-      { businessId: BUSINESS, ...GRANT, system: 'office-calendar-v2' },
-      KEY,
-    );
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT, system: 'office-calendar-v2' }, KEY));
 
-    const revived = await readGrantByRef(GRANT.credentialRef, BUSINESS, KEY);
+    const revived = await withBusiness(BUSINESS, (bdb) => readGrantByRef(bdb, GRANT.credentialRef, KEY));
     expect(revived?.system).toBe('office-calendar-v2');
   });
 
@@ -130,14 +127,14 @@ describe('the OAuth grant store', () => {
   // `resetDatabase` + `writeKeyState`, exactly as every test above does.
   describe('recordRefresh', () => {
     it('advances the count and timestamp without touching the token when nothing rotated', async () => {
-      await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
-      const before = await readGrantBySystem(GRANT.system, BUSINESS, KEY);
+      await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
+      const before = await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, GRANT.system, KEY));
       expect(before?.refreshCount).toBe(0);
       expect(before?.lastRefreshedAt).toBeNull();
 
-      await recordRefresh(GRANT.system, BUSINESS, null, KEY);
+      await withBusiness(BUSINESS, (bdb) => recordRefresh(bdb, GRANT.system, null, KEY));
 
-      const after = await readGrantBySystem(GRANT.system, BUSINESS, KEY);
+      const after = await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, GRANT.system, KEY));
       // The positive half: the token is UNCHANGED, not merely "no error".
       expect(after?.refreshToken).toBe(GRANT.refreshToken);
       expect(after?.refreshCount).toBe(1);
@@ -145,11 +142,11 @@ describe('the OAuth grant store', () => {
     });
 
     it('reseals the ciphertext when the provider rotated the refresh token', async () => {
-      await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+      await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
 
-      await recordRefresh(GRANT.system, BUSINESS, 'refresh-token-value-rotated', KEY);
+      await withBusiness(BUSINESS, (bdb) => recordRefresh(bdb, GRANT.system, 'refresh-token-value-rotated', KEY));
 
-      const after = await readGrantBySystem(GRANT.system, BUSINESS, KEY);
+      const after = await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, GRANT.system, KEY));
       expect(after?.refreshToken).toBe('refresh-token-value-rotated');
       expect(after?.refreshCount).toBe(1);
     });
@@ -158,19 +155,19 @@ describe('the OAuth grant store', () => {
       // Both branches -- the plain count bump and the re-seal -- have their
       // own UPDATE statement, so both need their own proof that a miss is
       // not indistinguishable from success.
-      await expect(recordRefresh('no-such-system', BUSINESS, null, KEY)).rejects.toThrow(
+      await expect(withBusiness(BUSINESS, (bdb) => recordRefresh(bdb, 'no-such-system', null, KEY))).rejects.toThrow(
         OAuthGrantError,
       );
       await expect(
-        recordRefresh('no-such-system', BUSINESS, 'rotated-value', KEY),
+        withBusiness(BUSINESS, (bdb) => recordRefresh(bdb, 'no-such-system', 'rotated-value', KEY)),
       ).rejects.toThrow(OAuthGrantError);
     });
 
     it('refuses to refresh a grant the owner already revoked', async () => {
-      await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
-      expect(await revokeGrant(GRANT.system, BUSINESS, 'owner')).toBe(true);
+      await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
+      expect(await withBusiness(BUSINESS, (bdb) => revokeGrant(bdb, GRANT.system, 'owner'))).toBe(true);
 
-      await expect(recordRefresh(GRANT.system, BUSINESS, null, KEY)).rejects.toThrow(
+      await expect(withBusiness(BUSINESS, (bdb) => recordRefresh(bdb, GRANT.system, null, KEY))).rejects.toThrow(
         OAuthGrantError,
       );
     });
@@ -178,25 +175,25 @@ describe('the OAuth grant store', () => {
 
   describe('markNeedsReauth', () => {
     it('flags a live grant for re-consent', async () => {
-      await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
-      const before = await listGrants(BUSINESS);
+      await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
+      const before = await withBusiness(BUSINESS, (bdb) => listGrants(bdb));
       expect(before[0]?.needsReauthAt).toBeNull();
 
-      await markNeedsReauth(GRANT.system, BUSINESS);
+      await withBusiness(BUSINESS, (bdb) => markNeedsReauth(bdb, GRANT.system));
 
-      const after = await listGrants(BUSINESS);
+      const after = await withBusiness(BUSINESS, (bdb) => listGrants(bdb));
       expect(after[0]?.needsReauthAt).not.toBeNull();
     });
 
     it('throws rather than silently doing nothing when no live grant matches', async () => {
-      await expect(markNeedsReauth('no-such-system', BUSINESS)).rejects.toThrow(OAuthGrantError);
+      await expect(withBusiness(BUSINESS, (bdb) => markNeedsReauth(bdb, 'no-such-system'))).rejects.toThrow(OAuthGrantError);
     });
 
     it('refuses to flag a grant the owner already revoked', async () => {
-      await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
-      expect(await revokeGrant(GRANT.system, BUSINESS, 'owner')).toBe(true);
+      await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
+      expect(await withBusiness(BUSINESS, (bdb) => revokeGrant(bdb, GRANT.system, 'owner'))).toBe(true);
 
-      await expect(markNeedsReauth(GRANT.system, BUSINESS)).rejects.toThrow(OAuthGrantError);
+      await expect(withBusiness(BUSINESS, (bdb) => markNeedsReauth(bdb, GRANT.system))).rejects.toThrow(OAuthGrantError);
     });
   });
 });

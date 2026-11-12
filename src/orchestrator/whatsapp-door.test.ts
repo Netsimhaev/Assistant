@@ -1658,17 +1658,14 @@ describe('confirming a held command over WhatsApp', () => {
   /** A boss job parked in `plan` on a WhatsApp confirmation — what `runInstruction` leaves. */
   async function held(options: ConfirmationOption[], bind = true): Promise<string> {
     const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
-    await saveInstruction({ jobId: job.jobId, text: 'תשלחי לדנה', textOrigin: 'typed' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { jobId: job.jobId, text: 'תשלחי לדנה', textOrigin: 'typed' }));
     await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't' }));
     await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'plan', actor: 'orchestrator', reason: 't' }));
     const only = options.length === 1 ? options[0] : undefined;
     if (bind && only !== undefined) await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, only.plan));
-    await createConfirmation(
-      { jobId: job.jobId, options, presentedText: 'שאלה', channel: 'whatsapp' },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => createConfirmation(bdb, { jobId: job.jobId, options, presentedText: 'שאלה', channel: 'whatsapp' }));
     // What a successful send of the question leaves behind.
-    await markConfirmationDelivered(job.jobId, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => markConfirmationDelivered(bdb, job.jobId));
     return job.jobId;
   }
 
@@ -1694,7 +1691,7 @@ describe('confirming a held command over WhatsApp', () => {
   }
 
   async function confirmationState(jobId: string): Promise<string | undefined> {
-    return (await loadConfirmation(jobId, { businessId: BUSINESS }))?.state;
+    return (await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, jobId)))?.state;
   }
 
   async function raiseMailCard(): Promise<string> {
@@ -1745,7 +1742,7 @@ describe('confirming a held command over WhatsApp', () => {
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי ל-dana@example.com את ההצעה' }));
     await pass(plannedWith(mailPlan()));
     const jobId = (await openJobs(BUSINESS))[0]?.jobId ?? '';
-    expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.deliveredAt).toBeInstanceOf(Date);
+    expect((await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, jobId)))?.deliveredAt).toBeInstanceOf(Date);
   });
 
   it('a question whose send failed is never confirmed by a later "כן" on WhatsApp — the dashboard still lists it', async () => {
@@ -1754,7 +1751,7 @@ describe('confirming a held command over WhatsApp', () => {
     await pass(plannedWith(mailPlan()));
     const jobId = (await openJobs(BUSINESS))[0]?.jobId ?? '';
     expect(await phase(jobId)).toBe('plan');
-    expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.deliveredAt).toBeNull();
+    expect((await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, jobId)))?.deliveredAt).toBeNull();
 
     gateway.enqueue(reply('כן'));
     const result = await pass(async () => ({ status: 'planned', plan: recallPlan() }));
@@ -1778,7 +1775,7 @@ describe('confirming a held command over WhatsApp', () => {
     await pass(plannedWith(plan));
 
     const jobId = (await openJobs(BUSINESS))[0]?.jobId ?? '';
-    const stored = await loadConfirmation(jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, jobId));
     expect(stored?.presentedText.length).toBeGreaterThan(WHATSAPP_MESSAGE_MAX_CHARS);
     expect(stored?.deliveredAt).toBeNull();
     expect(lastSent()).toContain(WHATSAPP_QUESTION_TOO_LONG);
@@ -1863,7 +1860,7 @@ describe('confirming a held command over WhatsApp', () => {
     gateway.enqueue(reply('2', 2_000));
     await pass();
     expect(await phase(jobId)).toBe('execute');
-    const stored = await loadConfirmation(jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, jobId));
     expect(stored?.chosenPlanHash).toBe(OPTION_B.planHash);
   });
 
@@ -2083,7 +2080,7 @@ describe('confirming a held command over WhatsApp', () => {
       expect(result.confirmationReplies).toBe(1);
       expect(result.ledgerReplies).toBe(0);
       expect(await confirmationState(jobId)).toBe('confirmed');
-      expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.chosenPlanHash).toBe(fathi.planHash);
+      expect((await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, jobId)))?.chosenPlanHash).toBe(fathi.planHash);
       expect(await ledgerStatus(only)).toBe('done');
     });
 
@@ -2203,7 +2200,7 @@ describe('confirming a held command over WhatsApp', () => {
 
     it('"שמרי" approves the single save option', async () => {
       const cardId = await documentCard({ mode: 'send', to: ['dana@example.com'] });
-      await saveDocumentSettings({ toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }));
       gateway.enqueue(reply('שמרי'));
       const result = await pass();
 

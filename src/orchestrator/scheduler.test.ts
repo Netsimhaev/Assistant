@@ -423,11 +423,7 @@ describe('the digest field on SchedulerPassResult', () => {
 
   it('carries the produced window and no error when the schedule is on', async () => {
     await install();
-    await setDigestSettings(
-      { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: false },
-      'owner',
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => setDigestSettings(bdb, { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: false }, 'owner'));
     const inert: Runtime = {
       registry: new AdapterRegistry([]),
       credentials: envCredentials({}, 'TEST_CRED_'),

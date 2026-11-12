@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { resetDatabase } from '../test/db.js';
+import { withBusiness } from '../db/pool.js';
 import { DIGEST_DEFAULTS, loadDigestSettings, setDigestSettings } from './digest-settings.js';
 
 const BUSINESS = 'test-business';
@@ -15,7 +16,7 @@ describe('digest settings', () => {
    * and the document inbox already hold.
    */
   it('reads as off for a business that never chose, without writing a row', async () => {
-    const settings = await loadDigestSettings({ businessId: BUSINESS });
+    const settings = await withBusiness(BUSINESS, (bdb) => loadDigestSettings(bdb));
     expect(settings.schedule).toBe('off');
     expect(settings.toEmail).toBe(false);
     expect(settings.toWhatsApp).toBe(false);
@@ -23,13 +24,9 @@ describe('digest settings', () => {
   });
 
   it('round-trips a choice the owner made', async () => {
-    await setDigestSettings(
-      { schedule: 'both', dailyHour: 7, weeklyDay: 0, weeklyHour: 9, toEmail: true, toWhatsApp: false },
-      'owner',
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => setDigestSettings(bdb, { schedule: 'both', dailyHour: 7, weeklyDay: 0, weeklyHour: 9, toEmail: true, toWhatsApp: false }, 'owner'));
 
-    const settings = await loadDigestSettings({ businessId: BUSINESS });
+    const settings = await withBusiness(BUSINESS, (bdb) => loadDigestSettings(bdb));
     expect(settings.schedule).toBe('both');
     expect(settings.dailyHour).toBe(7);
     expect(settings.weeklyHour).toBe(9);
@@ -44,22 +41,14 @@ describe('digest settings', () => {
    */
   it('refuses an hour outside the day at the database level', async () => {
     await expect(
-      setDigestSettings(
-        { schedule: 'daily', dailyHour: 25, weeklyDay: 0, weeklyHour: 9, toEmail: false, toWhatsApp: false },
-        'owner',
-        { businessId: BUSINESS },
-      ),
+      withBusiness(BUSINESS, (bdb) => setDigestSettings(bdb, { schedule: 'daily', dailyHour: 25, weeklyDay: 0, weeklyHour: 9, toEmail: false, toWhatsApp: false }, 'owner')),
     ).rejects.toThrow();
   });
 
   it('keeps one business out of another, under the same defaults', async () => {
-    await setDigestSettings(
-      { schedule: 'daily', dailyHour: 6, weeklyDay: 0, weeklyHour: 9, toEmail: true, toWhatsApp: false },
-      'owner',
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => setDigestSettings(bdb, { schedule: 'daily', dailyHour: 6, weeklyDay: 0, weeklyHour: 9, toEmail: true, toWhatsApp: false }, 'owner'));
 
-    const other = await loadDigestSettings({ businessId: 'other-business' });
+    const other = await withBusiness('other-business', (bdb) => loadDigestSettings(bdb));
     expect(other.schedule).toBe('off');
   });
 });

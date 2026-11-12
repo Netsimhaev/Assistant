@@ -1153,7 +1153,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // Only an `ok` send stamps the question: a failed send left the owner
     // with nothing to answer, and a later "כן" must not confirm it.
     if (questionSent && sent.ok && jobId !== null) {
-      await markConfirmationDelivered(jobId, { businessId: ctx.db.businessId });
+      await markConfirmationDelivered(ctx.db, jobId);
     }
 
     // The answered question's own job is retired only now, for the

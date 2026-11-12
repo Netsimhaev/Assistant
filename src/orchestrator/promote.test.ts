@@ -465,7 +465,7 @@ describe('the evaluation pass', () => {
     expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toContain('email.reply');
 
     const command = await failedJobDeclaring('email.reply');
-    await saveInstruction({ jobId: command, text: 'תעני לדנה', textOrigin: 'typed' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { jobId: command, text: 'תעני לדנה', textOrigin: 'typed' }));
 
     const held = await withBusiness(BUSINESS, (db) => evaluateAutonomy(db));
     expect(held.demoted).toEqual([]);
@@ -484,7 +484,7 @@ describe('the evaluation pass', () => {
     expect((await withBusiness(BUSINESS, (db) => evaluateAutonomy(db))).promoted).toContain('email.reply');
 
     const command = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
-    await saveInstruction({ jobId: command.jobId, text: 'תעני לדנה', textOrigin: 'typed' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { jobId: command.jobId, text: 'תעני לדנה', textOrigin: 'typed' }));
     const mark = async (markId: string, jobId: string): Promise<void> => {
       await testDb().query(
         `INSERT INTO autonomy_marks

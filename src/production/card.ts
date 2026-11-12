@@ -412,7 +412,7 @@ async function notifyCard(
   seams: CardSeams,
   documentRoot: string,
 ): Promise<CardNotice> {
-  const settings = await loadDocumentSettings({ businessId: db.businessId, db });
+  const settings = await loadDocumentSettings(db);
   const notice: CardNotice = { email: null, whatsapp: null };
   // A fresh id per notice (I2) — see `NOTICE_ID_LABEL`.
   text = `${text}\n${NOTICE_ID_LABEL}: ${ulid()}`;
@@ -478,7 +478,7 @@ async function notifyCard(
  * committed.
  */
 async function recordNoticeFailure(db: BusinessDb, card: { cardId: string }): Promise<CardNotice> {
-  const settings = await loadDocumentSettings({ businessId: db.businessId, db });
+  const settings = await loadDocumentSettings(db);
   const notice: CardNotice = {
     email: settings.toEmail ? 'failed' : null,
     whatsapp: settings.toWhatsApp ? 'failed' : null,
@@ -605,7 +605,7 @@ export async function onProductionFinished(
     finished.reason ??
     (production?.findings.map((f) => f.he).join('; ') || 'המסמך לא עבר את הבדיקות');
   const text = productionFailedText(reason, finished.productionId);
-  const settings = await loadDocumentSettings({ businessId: db.businessId, db });
+  const settings = await loadDocumentSettings(db);
   if (settings.toEmail && options.sendAlert !== undefined) {
     await settle(() => options.sendAlert!('הפקת מסמך נכשלה', text));
   }
@@ -719,7 +719,7 @@ export async function approveDocumentCard(
     // A save with nowhere to save to would only fail in `doc.save`
     // (`save_no_base_folder`) and come back as a returned card; refuse it here.
     if (rebuilt.option === 'save') {
-      const settings = await loadDocumentSettings({ businessId, db: tx });
+      const settings = await loadDocumentSettings(tx);
       if (settings.baseFolder === null) return { status: 'no_base_folder', reason: SAVE_NO_BASE_FOLDER_HE };
     }
 
@@ -732,10 +732,7 @@ export async function approveDocumentCard(
       provenance: 'boss',
       title: toOneLine(`מסירת מסמך: ${version.spec.title}`).slice(0, 80),
     });
-    await saveInstruction(
-      { jobId: job.jobId, text: production.instructionText, textOrigin: production.textOrigin },
-      { businessId, db: tx },
-    );
+    await saveInstruction(tx, { jobId: job.jobId, text: production.instructionText, textOrigin: production.textOrigin });
     for (const to of ['understand', 'plan'] as const) {
       await transition(tx, job.jobId, { to, actor: 'human', reason: `document card ${cardId}` });
     }
@@ -751,16 +748,13 @@ export async function approveDocumentCard(
       stage,
       currency: active.bundle.ceilings.currency,
     });
-    await createConfirmation(
-      {
-        jobId: job.jobId,
-        options: [{ label: rebuilt.label, planHash, plan: rebuilt.plan, contactSource: null }],
-        presentedText,
-        channel: actor,
-      },
-      { businessId, db: tx },
-    );
-    if (!(await confirmChoice(job.jobId, planHash, `owner:${actor}`, { businessId, db: tx }))) {
+    await createConfirmation(tx, {
+      jobId: job.jobId,
+      options: [{ label: rebuilt.label, planHash, plan: rebuilt.plan, contactSource: null }],
+      presentedText,
+      channel: actor,
+    });
+    if (!(await confirmChoice(tx, job.jobId, planHash, `owner:${actor}`))) {
       throw new Error(`approveDocumentCard: confirmation for ${job.jobId} could not be confirmed`);
     }
     await transition(tx, job.jobId, {
@@ -1013,7 +1007,7 @@ export async function requestFix(
       provenance: 'boss',
       title: toOneLine(`תיקון מסמך: ${version.spec.title}`).slice(0, 80),
     });
-    await saveInstruction({ jobId: job.jobId, text: instruction, textOrigin: origin }, { businessId, db: tx });
+    await saveInstruction(tx, { jobId: job.jobId, text: instruction, textOrigin: origin });
     for (const to of ['understand', 'plan', 'execute'] as const) {
       await transition(tx, job.jobId, { to, actor: 'human', reason: `document card ${cardId}: fix (${actor})` });
     }

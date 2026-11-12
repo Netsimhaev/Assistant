@@ -37,7 +37,7 @@ async function aJob(
   }));
   const text = options.instruction === undefined ? 'תזכירי לי לגבות מדנה' : options.instruction;
   if (text !== null) {
-    await saveInstruction({ jobId: job.jobId, text, textOrigin: options.origin ?? 'typed' }, { businessId });
+    await withBusiness(businessId, (bdb) => saveInstruction(bdb, { jobId: job.jobId, text, textOrigin: options.origin ?? 'typed' }));
   }
   return job.jobId;
 }

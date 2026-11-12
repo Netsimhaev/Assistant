@@ -308,7 +308,7 @@ describe('responses and alerts', () => {
   });
 
   it('sends the decline alert over WhatsApp only when the owner chose it', async () => {
-    await saveActionUpdateSettings({ toWhatsApp: true, toEmail: false, toScreen: true }, { businessId: B, updatedBy: 'owner' });
+    await withBusiness(B, (bdb) => saveActionUpdateSettings(bdb, { toWhatsApp: true, toEmail: false, toScreen: true }, { updatedBy: 'owner' }));
     await seed({ state: 'active', eventId: 'ev-w' });
     const { client } = fakeCalendar(new Map([['ev-w', [{ email: 'dani@acme.co.il', response: 'declined' }]]]));
     const emails: { subject: string; body: string }[] = [];

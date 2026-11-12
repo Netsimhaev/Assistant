@@ -276,7 +276,7 @@
  */
 import { isAbsolute, join, normalize, sep } from 'node:path';
 import { config } from '../config.js';
-import { getPool, withBusiness, type Queryable } from '../db/pool.js';
+import type { BusinessDb, Queryable } from '../db/pool.js';
 import { keptIds, type KeptItemKind } from './kept-items.js';
 import { LIKE_ESCAPE, likeLiteral } from '../util/like.js';
 import { TERMINAL_STAGES } from '../production/store.js';
@@ -1129,11 +1129,11 @@ async function idsFrom(
 }
 
 export async function buildErasurePlan(
+  db: BusinessDb,
   anchor: ErasureAnchor,
-  options: { businessId?: string; db?: Queryable; documentRoot?: string } = {},
+  options: { documentRoot?: string } = {},
 ): Promise<ErasurePlan> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const documentRoot = options.documentRoot ?? config.documentRoot;
 
   const jobIds = new Set<string>();
@@ -1747,9 +1747,9 @@ export async function buildErasurePlan(
         );
 
   // Kept items drop out of the plan and into the exclusions, never silently.
-  const keptDocuments = await withBusiness(businessId, (bdb) => keptIds(bdb, 'document')); // TENANCY-TODO(task 6)
-  const keptMemories = await withBusiness(businessId, (bdb) => keptIds(bdb, 'memory')); // TENANCY-TODO(task 6)
-  const keptJobs = await withBusiness(businessId, (bdb) => keptIds(bdb, 'job')); // TENANCY-TODO(task 6)
+  const keptDocuments = await keptIds(db, 'document');
+  const keptMemories = await keptIds(db, 'memory');
+  const keptJobs = await keptIds(db, 'job');
 
   const excluded: KeptExclusion[] = [];
   const { rows: keptRows } = await db.query<{
@@ -1936,7 +1936,7 @@ export async function buildErasurePlan(
   const ledgerItemList = [...ledgerItemIds];
   const ledgerRuleList = [...ledgerRuleIds];
   const items = await countItems(
-    db, businessId, anchor, jobList, documentList, memoryIds, digestList, draftList, mailList,
+    db, anchor, jobList, documentList, memoryIds, digestList, draftList, mailList,
     ledgerItemList, ledgerRuleList, productionList,
   );
 
@@ -1969,8 +1969,7 @@ export async function buildErasurePlan(
  * stays and is emptied, so audit rows keep pointing at jobs that exist.
  */
 async function countItems(
-  db: Queryable,
-  businessId: string,
+  db: BusinessDb,
   anchor: ErasureAnchor,
   jobIds: string[],
   documentIds: string[],
@@ -1982,6 +1981,7 @@ async function countItems(
   ledgerRuleIds: string[],
   productionIds: string[],
 ): Promise<ErasureItem[]> {
+  const businessId = db.businessId;
   const one = async (
     table: string,
     action: 'delete' | 'scrub' | 'fail',

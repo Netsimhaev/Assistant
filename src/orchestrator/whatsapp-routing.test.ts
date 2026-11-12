@@ -94,7 +94,7 @@ async function askOverWhatsApp(body: string, question = 'למי בדיוק?'): P
 }
 
 async function openQuestions(): Promise<InstructionRecord[]> {
-  return pendingQuestions({ businessId: BUSINESS, channel: 'whatsapp' });
+  return withBusiness(BUSINESS, (bdb) => pendingQuestions(bdb, { channel: 'whatsapp' }));
 }
 
 describe('decideWhatsAppRoute', () => {
@@ -262,7 +262,7 @@ describe('decideWhatsAppRoute', () => {
     const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לרונית' }, { textOrigin: 'typed', channel: 'dashboard', planner: asks('למי בדיוק?') }));
     expect(outcome.status).toBe('needs_answer');
 
-    expect(await pendingQuestions({ businessId: BUSINESS })).toHaveLength(1);
+    expect(await withBusiness(BUSINESS, (bdb) => pendingQuestions(bdb))).toHaveLength(1);
     expect(await openQuestions()).toHaveLength(0);
 
     const route = await withBusiness(BUSINESS, (db) => decideWhatsAppRoute(db, {

@@ -1,16 +1,17 @@
 import { randomBytes } from 'node:crypto';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { canonicalJson } from '../util/canonical.js';
 import { resetDatabase } from '../test/db.js';
-import type { Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { MasterKeyError, writeKeyState } from './master-key.js';
 import {
   CredentialStoreError,
   listSecretRefs,
   putSecret,
   removeSecret,
+  resolveStoredSecret,
   storedCredentials,
 } from './credential-store.js';
 
@@ -42,20 +43,22 @@ afterAll(async () => {
  * query: a stub that merely returned an empty result would let the test pass
  * whether the query ran or not.
  */
-function refusingDb(): { db: Queryable; calls: () => number } {
+function refusingDb(): { db: BusinessDb; calls: () => number } {
   let calls = 0;
   const db = {
+    businessId: BIZ_A,
+    inTransaction: false,
     query: async () => {
       calls += 1;
       throw new Error('the store reached the database when it should not have');
     },
-  } as unknown as Queryable;
+  } as unknown as BusinessDb;
   return { db, calls: () => calls };
 }
 
 describe('storedCredentials', () => {
   it('returns the secret that was stored', async () => {
-    await putSecret({ businessId: BIZ_A, ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY);
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY));
 
     const handle = await storedCredentials(KEY).resolve(REF, BIZ_A);
 
@@ -79,7 +82,7 @@ describe('storedCredentials', () => {
    * all.
    */
   it("does not return another business's secret", async () => {
-    await putSecret({ businessId: BIZ_A, ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY);
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY));
     const source = storedCredentials(KEY);
 
     expect((await source.resolve(REF, BIZ_A))?.value).toBe(SECRET);
@@ -100,8 +103,8 @@ describe('storedCredentials', () => {
    * that is.
    */
   it('returns each business its own secret when both have stored the same ref', async () => {
-    await putSecret({ businessId: BIZ_A, ref: REF, value: 'a-secret', updatedBy: OPERATOR }, KEY);
-    await putSecret({ businessId: BIZ_B, ref: REF, value: 'b-secret', updatedBy: OPERATOR }, KEY);
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: 'a-secret', updatedBy: OPERATOR }, KEY));
+    await withBusiness(BIZ_B, (bdb) => putSecret(bdb, { ref: REF, value: 'b-secret', updatedBy: OPERATOR }, KEY));
     const source = storedCredentials(KEY);
 
     expect((await source.resolve(REF, BIZ_A))?.value).toBe('a-secret');
@@ -119,7 +122,7 @@ describe('storedCredentials', () => {
    * cipher's AAD binding deleted.
    */
   it('refuses a row whose ciphertext belongs to another business, even when the query hands it over', async () => {
-    await putSecret({ businessId: BIZ_A, ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY);
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY));
     // Sealed for BIZ_A, now sitting in BIZ_B's row — the hand-copied row of
     // spec §4.4. Nothing about the bytes changes; only which business the
     // query will find them under.
@@ -138,8 +141,8 @@ describe('storedCredentials', () => {
   });
 
   it('replaces a secret rather than storing a second row for the same ref', async () => {
-    await putSecret({ businessId: BIZ_A, ref: REF, value: 'first', updatedBy: OPERATOR }, KEY);
-    await putSecret({ businessId: BIZ_A, ref: REF, value: 'second', updatedBy: 'someone-else' }, KEY);
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: 'first', updatedBy: OPERATOR }, KEY));
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: 'second', updatedBy: 'someone-else' }, KEY));
 
     const { rows } = await getPool().query<{ n: string }>(
       'SELECT count(*)::text AS n FROM credentials WHERE business_id = $1 AND ref = $2',
@@ -150,7 +153,7 @@ describe('storedCredentials', () => {
   });
 
   it('returns null for a ref that was never stored', async () => {
-    await putSecret({ businessId: BIZ_A, ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY);
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY));
 
     // A stored ref alongside, so the null below is "this ref is absent" and
     // not "this business has nothing at all".
@@ -159,17 +162,21 @@ describe('storedCredentials', () => {
 
   it('refuses a ref that is not the legal shape, without reaching the database', async () => {
     const { db, calls } = refusingDb();
-    const source = storedCredentials(KEY, { db });
 
-    expect(await source.resolve('office_mail', BIZ_A)).toBeNull();
-    expect(await source.resolve('OFFICE-MAIL', BIZ_A)).toBeNull();
-    expect(await source.resolve('', BIZ_A)).toBeNull();
-    expect(await source.resolve('OFFICE MAIL', BIZ_A)).toBeNull();
+    expect(await resolveStoredSecret(db, KEY, 'office_mail')).toBeNull();
+    expect(await resolveStoredSecret(db, KEY, 'OFFICE-MAIL')).toBeNull();
+    expect(await resolveStoredSecret(db, KEY, '')).toBeNull();
+    expect(await resolveStoredSecret(db, KEY, 'OFFICE MAIL')).toBeNull();
     expect(calls()).toBe(0);
+
+    // And the source answers before it even checks out a business-scoped
+    // connection: a business id `withBusiness` would refuse is never reached.
+    const source = storedCredentials(KEY);
+    expect(await source.resolve('office_mail', 'Not A Business!')).toBeNull();
   });
 
   it('refuses to open a row sealed under a different key', async () => {
-    await putSecret({ businessId: BIZ_A, ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY);
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY));
 
     // Same row, same business, same ref — only the key is wrong.
     expect(await storedCredentials(randomBytes(32)).resolve(REF, BIZ_A)).toBeNull();
@@ -183,7 +190,7 @@ describe('storedCredentials', () => {
    * as a claim about the type (spec §9.2).
    */
   it('hands back a handle whose value survives neither JSON nor the canonical serialiser', async () => {
-    await putSecret({ businessId: BIZ_A, ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY);
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY));
 
     const handle = await storedCredentials(KEY).resolve(REF, BIZ_A);
     if (handle === null) throw new Error('expected a handle');
@@ -211,7 +218,7 @@ describe('putSecret', () => {
   it('refuses a ref that is not the legal shape, and seals nothing', async () => {
     for (const ref of ['key-check', 'office_mail', 'OFFICE-MAIL', '']) {
       await expect(
-        putSecret({ businessId: BIZ_A, ref, value: SECRET, updatedBy: OPERATOR }, KEY),
+        withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref, value: SECRET, updatedBy: OPERATOR }, KEY)),
       ).rejects.toThrow(CredentialStoreError);
     }
 
@@ -222,7 +229,7 @@ describe('putSecret', () => {
   });
 
   it('labels the row with the installation key id rather than one the caller chose', async () => {
-    await putSecret({ businessId: BIZ_A, ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY);
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY));
 
     const { rows } = await getPool().query<{ key_id: string }>(
       'SELECT key_id FROM credentials WHERE business_id = $1 AND ref = $2',
@@ -233,7 +240,7 @@ describe('putSecret', () => {
 
   it('refuses a key that is not the one this installation sealed its rows with', async () => {
     await expect(
-      putSecret({ businessId: BIZ_A, ref: REF, value: SECRET, updatedBy: OPERATOR }, randomBytes(32)),
+      withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, randomBytes(32))),
     ).rejects.toThrow(MasterKeyError);
 
     const { rows } = await getPool().query<{ n: string }>(
@@ -248,12 +255,12 @@ describe('putSecret', () => {
     ]);
 
     await expect(
-      putSecret({ businessId: BIZ_A, ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY),
+      withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY)),
     ).rejects.toThrow(CredentialStoreError);
   });
 
   it('writes the value nowhere but the ciphertext column', async () => {
-    await putSecret({ businessId: BIZ_A, ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY);
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY));
 
     // Every text column of the row, read back as text. The secret must not be
     // in any of them, and the ciphertext must not be the plaintext either.
@@ -272,14 +279,11 @@ describe('putSecret', () => {
 
 describe('listSecretRefs', () => {
   it('lists refs with their metadata and never a value', async () => {
-    await putSecret({ businessId: BIZ_A, ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY);
-    await putSecret(
-      { businessId: BIZ_A, ref: 'CALENDAR_TOKEN', value: 'tok', updatedBy: OPERATOR },
-      KEY,
-    );
-    await putSecret({ businessId: BIZ_B, ref: REF, value: 'other', updatedBy: OPERATOR }, KEY);
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY));
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: 'CALENDAR_TOKEN', value: 'tok', updatedBy: OPERATOR }, KEY));
+    await withBusiness(BIZ_B, (bdb) => putSecret(bdb, { ref: REF, value: 'other', updatedBy: OPERATOR }, KEY));
 
-    const list = await listSecretRefs(BIZ_A);
+    const list = await withBusiness(BIZ_A, (bdb) => listSecretRefs(bdb));
 
     // `toEqual` against the exact shape, not a field-by-field check: an extra
     // property carrying the value would fail here, and a subset assertion
@@ -300,22 +304,22 @@ describe('listSecretRefs', () => {
 
 describe('removeSecret', () => {
   it('removes the named secret and reports that it did', async () => {
-    await putSecret({ businessId: BIZ_A, ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY);
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY));
 
-    expect(await removeSecret(REF, BIZ_A)).toBe(true);
+    expect(await withBusiness(BIZ_A, (bdb) => removeSecret(bdb, REF))).toBe(true);
     expect(await storedCredentials(KEY).resolve(REF, BIZ_A)).toBeNull();
   });
 
   it("does not remove another business's secret", async () => {
-    await putSecret({ businessId: BIZ_A, ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY);
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY));
 
-    expect(await removeSecret(REF, BIZ_B)).toBe(false);
+    expect(await withBusiness(BIZ_B, (bdb) => removeSecret(bdb, REF))).toBe(false);
     // Still there — the false above is a refusal, not a silent deletion
     // reported as a miss.
     expect((await storedCredentials(KEY).resolve(REF, BIZ_A))?.value).toBe(SECRET);
   });
 
   it('reports false for a ref that was never stored', async () => {
-    expect(await removeSecret('CALENDAR_TOKEN', BIZ_A)).toBe(false);
+    expect(await withBusiness(BIZ_A, (bdb) => removeSecret(bdb, 'CALENDAR_TOKEN'))).toBe(false);
   });
 });

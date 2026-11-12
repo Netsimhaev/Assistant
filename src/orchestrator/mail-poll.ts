@@ -276,7 +276,7 @@ export async function pollMailbox(db: BusinessDb, options: PollMailboxOptions): 
     await writeCursor({ lastError: 'needs_reauth' });
     return emptyResult('needs_reauth');
   };
-  const grant = (await listGrants(businessId)).find((g) => g.credentialRef === ref);
+  const grant = (await listGrants(db)).find((g) => g.credentialRef === ref);
   if (grant !== undefined && (grant.revokedAt !== null || grant.needsReauthAt !== null)) {
     return needsReauth();
   }

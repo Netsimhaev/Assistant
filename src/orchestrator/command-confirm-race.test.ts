@@ -93,13 +93,10 @@ async function parkedJob(options: ConfirmationOption[], businessId = BUSINESS): 
     versions.set(businessId, version);
   }
   const job = await withBusiness(businessId, (db) => createJob(db, { charterVersion: version, provenance: 'boss' }));
-  await saveInstruction({ jobId: job.jobId, text: 'תשלחי לדנה', textOrigin: 'typed' }, { businessId });
+  await withBusiness(businessId, (bdb) => saveInstruction(bdb, { jobId: job.jobId, text: 'תשלחי לדנה', textOrigin: 'typed' }));
   await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't' }));
   await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'plan', actor: 'orchestrator', reason: 't' }));
-  await createConfirmation(
-    { jobId: job.jobId, options, presentedText: 'שאלה', channel: 'whatsapp' },
-    { businessId },
-  );
+  await withBusiness(businessId, (bdb) => createConfirmation(bdb, { jobId: job.jobId, options, presentedText: 'שאלה', channel: 'whatsapp' }));
   return job.jobId;
 }
 
@@ -115,7 +112,6 @@ async function stepsTo(jobId: string, to: string): Promise<number> {
   return rows.length;
 }
 
-const by = { businessId: BUSINESS };
 
 beforeEach(async () => {
   await resetDatabase();
@@ -130,7 +126,7 @@ afterAll(async () => {
 describe('the settle sweep loses a race to the owner', () => {
   it('several options: the owner binds and executes after the sweep read nothing bound — skipped, never failed', async () => {
     const jobId = await parkedJob([OPTION_A, OPTION_B]);
-    expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
+    expect(await withBusiness(BUSINESS, (bdb) => confirmChoice(bdb, jobId, HASH_A, 'owner'))).toBe(true);
     race.afterRead = async () => {
       // applyConfirmation's second half, from the dashboard.
       await withBusiness(TEST_BUSINESS, (db) => bindChosenPlan(db, jobId, HASH_A));
@@ -145,7 +141,7 @@ describe('the settle sweep loses a race to the owner', () => {
 
   it('single option, nothing bound at the read: the owner binds and executes — skipped, never failed', async () => {
     const jobId = await parkedJob([SINGLE]);
-    expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
+    expect(await withBusiness(BUSINESS, (bdb) => confirmChoice(bdb, jobId, HASH_A, 'owner'))).toBe(true);
     race.afterRead = async () => {
       await withBusiness(TEST_BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN_A));
       await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'execute', actor: 'human', reason: 'command: confirmed' }));
@@ -159,7 +155,7 @@ describe('the settle sweep loses a race to the owner', () => {
   it('single option, bound: the owner moves it to execute first — skipped quietly, not errored', async () => {
     const jobId = await parkedJob([SINGLE]);
     await withBusiness(TEST_BUSINESS, (db) => bindPlanToJob(db, jobId, PLAN_A));
-    expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
+    expect(await withBusiness(BUSINESS, (bdb) => confirmChoice(bdb, jobId, HASH_A, 'owner'))).toBe(true);
     race.afterRead = async () => {
       await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'execute', actor: 'human', reason: 'command: confirmed' }));
     };
@@ -172,9 +168,9 @@ describe('the settle sweep loses a race to the owner', () => {
 describe('the settle sweep stays in its own business', () => {
   it('leaves another business decided confirmation untouched', async () => {
     const mine = await parkedJob([SINGLE]);
-    await cancelConfirmation(mine, 'owner', by);
+    await withBusiness(BUSINESS, (bdb) => cancelConfirmation(bdb, mine, 'owner'));
     const theirs = await parkedJob([SINGLE], OTHER);
-    await cancelConfirmation(theirs, 'owner', { businessId: OTHER });
+    await withBusiness(OTHER, (bdb) => cancelConfirmation(bdb, theirs, 'owner'));
 
     expect(await withBusiness(TEST_BUSINESS, (db) => settleDecidedConfirmations(db))).toEqual({
       settled: [{ jobId: mine, to: 'closed' }],

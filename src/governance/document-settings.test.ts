@@ -2,7 +2,7 @@ import { mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import {
   DOCUMENT_SETTINGS_DEFAULTS,
@@ -36,18 +36,15 @@ async function rowCount(): Promise<number> {
 describe('document settings', () => {
   it('an absent row reads as the defaults — email and screen, no base folder — and writes nothing', async () => {
     expect(DOCUMENT_SETTINGS_DEFAULTS).toEqual({ toWhatsApp: false, toEmail: true, toScreen: true, baseFolder: null });
-    expect(await loadDocumentSettings({ businessId: B })).toEqual(DOCUMENT_SETTINGS_DEFAULTS);
+    expect(await withBusiness(B, (bdb) => loadDocumentSettings(bdb))).toEqual(DOCUMENT_SETTINGS_DEFAULTS);
     expect(await rowCount()).toBe(0);
   });
 
   it('round-trips, storing the realpath of the base folder', async () => {
     await symlink(scratch, join(tmpdir(), `doc-settings-link-${process.pid}`), process.platform === 'win32' ? 'junction' : 'dir');
     try {
-      await saveDocumentSettings(
-        { ...channels, baseFolder: join(tmpdir(), `doc-settings-link-${process.pid}`) },
-        { businessId: B },
-      );
-      expect(await loadDocumentSettings({ businessId: B })).toEqual({ ...channels, baseFolder: await realpath(scratch) });
+      await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { ...channels, baseFolder: join(tmpdir(), `doc-settings-link-${process.pid}`) }));
+      expect(await withBusiness(B, (bdb) => loadDocumentSettings(bdb))).toEqual({ ...channels, baseFolder: await realpath(scratch) });
     } finally {
       await rm(join(tmpdir(), `doc-settings-link-${process.pid}`), { force: true, recursive: false }).catch(() => undefined);
     }
@@ -55,7 +52,7 @@ describe('document settings', () => {
 
   it('settings refuse all-false, in Hebrew, before touching the database', async () => {
     const none: DocumentSettings = { toWhatsApp: false, toEmail: false, toScreen: false, baseFolder: null };
-    await expect(saveDocumentSettings(none, { businessId: B })).rejects.toThrow(DOCUMENT_SETTINGS_HE.noChannel);
+    await expect(withBusiness(B, (bdb) => saveDocumentSettings(bdb, none))).rejects.toThrow(DOCUMENT_SETTINGS_HE.noChannel);
     expect(DOCUMENT_SETTINGS_HE.noChannel).toMatch(/[א-ת]/);
     expect(await rowCount()).toBe(0);
   });
@@ -71,7 +68,7 @@ describe('document settings', () => {
 
   it('settings refuse a relative base folder', async () => {
     for (const relative of ['מסמכים', './docs', 'docs\\a', '\\no-drive', '\\\\.\\C:\\x', '\\\\?\\C:\\x', '\\\\?\\UNC\\srv\\share']) {
-      await expect(saveDocumentSettings({ ...channels, baseFolder: relative }, { businessId: B })).rejects.toThrow(
+      await expect(withBusiness(B, (bdb) => saveDocumentSettings(bdb, { ...channels, baseFolder: relative }))).rejects.toThrow(
         DOCUMENT_SETTINGS_HE.notAbsolute,
       );
     }
@@ -80,7 +77,7 @@ describe('document settings', () => {
 
   it('refuses a base folder that does not exist', async () => {
     await expect(
-      saveDocumentSettings({ ...channels, baseFolder: join(scratch, 'missing') }, { businessId: B }),
+      withBusiness(B, (bdb) => saveDocumentSettings(bdb, { ...channels, baseFolder: join(scratch, 'missing') })),
     ).rejects.toThrow(DOCUMENT_SETTINGS_HE.missing);
     expect(await rowCount()).toBe(0);
   });
@@ -88,31 +85,25 @@ describe('document settings', () => {
   it('refuses a base folder that is a file', async () => {
     await writeFile(join(scratch, 'file'), 'x');
     await expect(
-      saveDocumentSettings({ ...channels, baseFolder: join(scratch, 'file') }, { businessId: B }),
+      withBusiness(B, (bdb) => saveDocumentSettings(bdb, { ...channels, baseFolder: join(scratch, 'file') })),
     ).rejects.toThrow(DOCUMENT_SETTINGS_HE.notDirectory);
   });
 
   it('refuses a base folder that is not writable (fs.access W_OK)', async () => {
     const calls: string[] = [];
     await expect(
-      saveDocumentSettings(
-        { ...channels, baseFolder: scratch },
-        {
-          businessId: B,
-          access: async (path) => {
+      withBusiness(B, (bdb) => saveDocumentSettings(bdb, { ...channels, baseFolder: scratch }, { access: async (path) => {
             calls.push(path);
             throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
-          },
-        },
-      ),
+          } })),
     ).rejects.toThrow(DOCUMENT_SETTINGS_HE.notWritable);
     expect(calls).toHaveLength(1);
     expect(await rowCount()).toBe(0);
   });
 
   it('a null or blank base folder clears it', async () => {
-    await saveDocumentSettings({ ...channels, baseFolder: scratch }, { businessId: B });
-    await saveDocumentSettings({ ...channels, baseFolder: '  ' }, { businessId: B });
-    expect((await loadDocumentSettings({ businessId: B })).baseFolder).toBeNull();
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { ...channels, baseFolder: scratch }));
+    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { ...channels, baseFolder: '  ' }));
+    expect((await withBusiness(B, (bdb) => loadDocumentSettings(bdb))).baseFolder).toBeNull();
   });
 });

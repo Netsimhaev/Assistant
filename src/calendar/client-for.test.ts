@@ -53,21 +53,9 @@ describe('resolveCalendarAccess', () => {
   it('is needs_reauth when the grant was revoked, without resolving a credential', async () => {
     const key = randomBytes(32);
     await writeKeyState(key, 'KEY-test');
-    await writeGrant(
-      {
-        businessId: BUSINESS,
-        system: CALENDAR_SYSTEM,
-        provider: 'google',
-        credentialRef: REF,
-        account: 'owner@business.example',
-        scopes: ['https://www.googleapis.com/auth/calendar'],
-        refreshToken: 'refresh-token-value',
-        grantedBy: 'owner',
-      },
-      key,
-    );
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { system: CALENDAR_SYSTEM, provider: 'google', credentialRef: REF, account: 'owner@business.example', scopes: ['https://www.googleapis.com/auth/calendar'], refreshToken: 'refresh-token-value', grantedBy: 'owner' }, key));
     await bind();
-    await revokeGrant(CALENDAR_SYSTEM, BUSINESS, 'owner');
+    await withBusiness(BUSINESS, (bdb) => revokeGrant(bdb, CALENDAR_SYSTEM, 'owner'));
     const r = await withBusiness(BUSINESS, (db) => resolveCalendarAccess(db, { runtime: neverCalled }));
     expect(r).toEqual({ unavailable: 'needs_reauth' });
   });

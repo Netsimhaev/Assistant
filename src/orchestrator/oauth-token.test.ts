@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { randomBytes } from 'node:crypto';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { writeKeyState } from '../governance/master-key.js';
 import {
   listGrants,
@@ -127,7 +127,7 @@ describe('oauthCredentials', () => {
   });
 
   it('mints an access token from a stored grant, consulting the fallback once to rule out ambiguity', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
     const fallback = stubSource({});
     const http = recordingHttp({ accessToken: 'access-1', expiresInSeconds: 3600 });
     const source = oauthCredentials({ key: KEY, fallback, http });
@@ -151,7 +151,7 @@ describe('oauthCredentials', () => {
   });
 
   it('refuses a ref that exists as BOTH a grant and a secret', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
     const fallback = stubSource({ [GRANT.credentialRef]: 'also-a-secret' });
     const source = oauthCredentials({ key: KEY, fallback, http: NEVER_CALLED_HTTP });
 
@@ -162,7 +162,7 @@ describe('oauthCredentials', () => {
   });
 
   it('reuses a cached access token without re-consulting the fallback, and refuses outright once revoked', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
     const fallback = stubSource({});
     const http = recordingHttp({ accessToken: 'access-1', expiresInSeconds: 3600 });
     const source = oauthCredentials({ key: KEY, fallback, http });
@@ -175,7 +175,7 @@ describe('oauthCredentials', () => {
     expect(http.calls).toHaveLength(1);
     expect(fallback.calls).toEqual([GRANT.credentialRef]);
 
-    await revokeGrant(GRANT.system, BUSINESS, 'owner');
+    await withBusiness(BUSINESS, (bdb) => revokeGrant(bdb, GRANT.system, 'owner'));
     // Fix round 1, I3: a revoked grant refuses outright -- it does not fall
     // through to the (honest, empty) fallback and does not return null.
     await expect(source.resolve(GRANT.credentialRef, BUSINESS)).rejects.toThrow(
@@ -186,7 +186,7 @@ describe('oauthCredentials', () => {
   });
 
   it('marks the grant for re-authorisation when the provider rejects the refresh token, and threads the provider message through', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
     const source = oauthCredentials({ key: KEY, fallback: stubSource({}), http: REJECTING_HTTP });
 
     let caught: unknown;
@@ -197,7 +197,7 @@ describe('oauthCredentials', () => {
     }
     expect(caught).toBeInstanceOf(OAuthRefreshRejectedError);
     expect((caught as Error).message).toContain('invalid_grant');
-    expect((await listGrants(BUSINESS))[0]?.needsReauthAt).not.toBeNull();
+    expect((await withBusiness(BUSINESS, (bdb) => listGrants(bdb)))[0]?.needsReauthAt).not.toBeNull();
   });
 
   /**
@@ -211,7 +211,7 @@ describe('oauthCredentials', () => {
    * re-consenting cannot fix a local secret nobody provisioned.
    */
   it('reports a missing local configuration as terminal, WITHOUT the audit row or the re-auth flag a real rejection gets', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
     const source = oauthCredentials({ key: KEY, fallback: stubSource({}), http: MISCONFIGURED_HTTP });
 
     const before = await getPool().query<{ count: string }>(
@@ -244,11 +244,11 @@ describe('oauthCredentials', () => {
     // "terminal" from "the provider refused you", and the one an owner's
     // actual experience depends on: a grant flagged here would tell them to
     // re-consent, which does nothing for a secret nobody put in the store.
-    expect((await listGrants(BUSINESS))[0]?.needsReauthAt).toBeNull();
+    expect((await withBusiness(BUSINESS, (bdb) => listGrants(bdb)))[0]?.needsReauthAt).toBeNull();
   });
 
   it('reports a transient failure as retryable, distinct from a rejection, and does not flag re-auth', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
     const source = oauthCredentials({
       key: KEY,
       fallback: stubSource({}),
@@ -268,7 +268,7 @@ describe('oauthCredentials', () => {
     expect(caught).toBeInstanceOf(OAuthRefreshTransientError);
     expect((caught as Error).message).toContain('gateway_timeout');
     // Unlike a rejection, a transient failure does not flag the grant for re-auth.
-    expect((await listGrants(BUSINESS))[0]?.needsReauthAt).toBeNull();
+    expect((await withBusiness(BUSINESS, (bdb) => listGrants(bdb)))[0]?.needsReauthAt).toBeNull();
   });
 
   /**
@@ -290,14 +290,14 @@ describe('oauthCredentials', () => {
    * call.
    */
   it('reads the rotated refresh token back on the next call, not just persists it', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
     const http = recordingHttp({ accessToken: 'a', expiresInSeconds: 1, rotatedRefreshToken: 'refresh-2' });
     const source = oauthCredentials({ key: KEY, fallback: stubSource({}), http, now: clock() });
 
     await source.resolve(GRANT.credentialRef, BUSINESS);
     // Positive half: rotation really was persisted before the second call
     // depends on it.
-    expect((await readGrantBySystem(GRANT.system, BUSINESS, KEY))?.refreshToken).toBe('refresh-2');
+    expect((await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, GRANT.system, KEY)))?.refreshToken).toBe('refresh-2');
 
     await source.resolve(GRANT.credentialRef, BUSINESS);
     // The load-bearing assertion the old title promised and never checked:
@@ -309,7 +309,7 @@ describe('oauthCredentials', () => {
   });
 
   it('writes one audit row when the provider rejects the refresh token', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
     const source = oauthCredentials({ key: KEY, fallback: stubSource({}), http: REJECTING_HTTP });
 
     await expect(source.resolve(GRANT.credentialRef, BUSINESS)).rejects.toThrow(
@@ -328,11 +328,8 @@ describe('oauthCredentials', () => {
   });
 
   it('gives each business its own cached access token under the same ref and system', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
-    await writeGrant(
-      { businessId: OTHER_BUSINESS, ...GRANT, refreshToken: 'refresh-token-value-B' },
-      KEY,
-    );
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
+    await withBusiness(OTHER_BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT, refreshToken: 'refresh-token-value-B' }, KEY));
     const http = recordingHttp({ accessToken: 'access-for-a', expiresInSeconds: 3600 });
     const source = oauthCredentials({ key: KEY, fallback: stubSource({}), http, now: clock() });
 
@@ -358,7 +355,7 @@ describe('oauthCredentials', () => {
    * entry.
    */
   it('invalidate forces the next resolve to mint a fresh token, even though the cached one has not expired', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
     const http = recordingHttp({ accessToken: 'access-1', expiresInSeconds: 3600 });
     const source = oauthCredentials({ key: KEY, fallback: stubSource({}), http, now: clock() });
 

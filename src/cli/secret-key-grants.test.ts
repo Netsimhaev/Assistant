@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { putSecret, storedCredentials } from '../governance/credential-store.js';
 import { KEY_BYTES, loadMasterKey, writeKeyState } from '../governance/master-key.js';
 import {
@@ -79,7 +79,7 @@ describe('rotate re-encrypts oauth_grants', () => {
     const OLD_KEY = randomBytes(KEY_BYTES);
     await writeFile(KEY_PATH, OLD_KEY, { mode: 0o600 });
     await writeKeyState(OLD_KEY, 'KEY-old', { businessId: BUSINESS });
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, OLD_KEY);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, OLD_KEY));
 
     await runRotate();
 
@@ -87,10 +87,10 @@ describe('rotate re-encrypts oauth_grants', () => {
     // The positive half first: the new key is genuinely different, so the read
     // below proves re-encryption and not that nothing happened.
     expect(newKey.equals(OLD_KEY)).toBe(false);
-    expect((await readGrantBySystem(GRANT.system, BUSINESS, newKey))?.refreshToken).toBe(
+    expect((await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, GRANT.system, newKey)))?.refreshToken).toBe(
       GRANT.refreshToken,
     );
-    expect(await readGrantBySystem(GRANT.system, BUSINESS, OLD_KEY)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, GRANT.system, OLD_KEY))).toBeNull();
   });
 
   /**
@@ -106,14 +106,14 @@ describe('rotate re-encrypts oauth_grants', () => {
     const OLD_KEY = randomBytes(KEY_BYTES);
     await writeFile(KEY_PATH, OLD_KEY, { mode: 0o600 });
     await writeKeyState(OLD_KEY, 'KEY-old', { businessId: BUSINESS });
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, OLD_KEY);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, OLD_KEY));
 
-    const revoked = await revokeGrant(GRANT.system, BUSINESS, OPERATOR);
+    const revoked = await withBusiness(BUSINESS, (bdb) => revokeGrant(bdb, GRANT.system, OPERATOR));
     expect(revoked).toBe(true);
     // Positive half first: confirm the row is really gone from the read
     // paths pre-rotation, so the row we inspect after rotation is read a
     // different way on purpose, not because the normal path happens to work.
-    expect(await readGrantBySystem(GRANT.system, BUSINESS, OLD_KEY)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, GRANT.system, OLD_KEY))).toBeNull();
 
     await runRotate();
 
@@ -151,11 +151,8 @@ describe('rotate re-encrypts oauth_grants', () => {
     const OLD_KEY = randomBytes(KEY_BYTES);
     await writeFile(KEY_PATH, OLD_KEY, { mode: 0o600 });
     await writeKeyState(OLD_KEY, 'KEY-old', { businessId: BUSINESS });
-    await putSecret(
-      { businessId: BUSINESS, ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR },
-      OLD_KEY,
-    );
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, OLD_KEY);
+    await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, OLD_KEY));
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, OLD_KEY));
 
     // A second grant row sealed under a key this installation never held —
     // the shape of a row that survived some earlier, incomplete migration.
@@ -190,7 +187,7 @@ describe('rotate re-encrypts oauth_grants', () => {
     expect((await storedCredentials(OLD_KEY).resolve('ONE', BUSINESS))?.value).toBe(
       'first-secret',
     );
-    expect((await readGrantBySystem(GRANT.system, BUSINESS, OLD_KEY))?.refreshToken).toBe(
+    expect((await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, GRANT.system, OLD_KEY)))?.refreshToken).toBe(
       GRANT.refreshToken,
     );
 
@@ -201,7 +198,7 @@ describe('rotate re-encrypts oauth_grants', () => {
     expect((await storedCredentials(OLD_KEY).resolve('ONE', BUSINESS))?.value).toBe(
       'first-secret',
     );
-    expect((await readGrantBySystem(GRANT.system, BUSINESS, OLD_KEY))?.refreshToken).toBe(
+    expect((await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, GRANT.system, OLD_KEY)))?.refreshToken).toBe(
       GRANT.refreshToken,
     );
   });

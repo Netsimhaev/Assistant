@@ -1,7 +1,5 @@
 import { z } from 'zod';
-import { config } from '../config.js';
-import type { Queryable } from '../db/pool.js';
-import { getPool } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 export const DigestSchedule = z.enum(['off', 'daily', 'weekly', 'both']);
 export type DigestSchedule = z.infer<typeof DigestSchedule>;
@@ -65,15 +63,11 @@ function toSettings(row: SettingsRow): DigestSettings {
 const COLUMNS = `schedule, daily_hour, weekly_day, weekly_hour, to_email, to_whatsapp,
                  updated_at::text AS updated_at, updated_by`;
 
-export async function loadDigestSettings(
-  options: { businessId?: string; db?: Queryable } = {},
-): Promise<DigestSettings> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+export async function loadDigestSettings(db: BusinessDb): Promise<DigestSettings> {
 
   const { rows } = await db.query<SettingsRow>(
     `SELECT ${COLUMNS} FROM digest_settings WHERE business_id = $1`,
-    [businessId],
+    [db.businessId],
   );
 
   const row = rows[0];
@@ -81,12 +75,10 @@ export async function loadDigestSettings(
 }
 
 export async function setDigestSettings(
+  db: BusinessDb,
   input: Omit<DigestSettings, 'updatedAt' | 'updatedBy'>,
   updatedBy: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<DigestSettings> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
 
   const { rows } = await db.query<SettingsRow>(
     `INSERT INTO digest_settings
@@ -102,7 +94,7 @@ export async function setDigestSettings(
            updated_at = now(),
            updated_by = EXCLUDED.updated_by
      RETURNING ${COLUMNS}`,
-    [businessId, input.schedule, input.dailyHour, input.weeklyDay, input.weeklyHour,
+    [db.businessId, input.schedule, input.dailyHour, input.weeklyDay, input.weeklyHour,
      input.toEmail, input.toWhatsApp, updatedBy],
   );
 

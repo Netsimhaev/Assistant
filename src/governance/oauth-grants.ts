@@ -30,14 +30,16 @@
  * never match. That is a structural guarantee, not a naming convention: no
  * blocklist has to be kept in sync for it to hold.
  *
- * `businessId` is required everywhere here, with no fallback to
+ * The business is required everywhere here, with no fallback to
  * `config.businessId` — the same rule `CredentialSource.resolve`
- * (`src/orchestrator/credentials.ts`) states at length. An omitted business
- * would read silently as "the installation's own", which is exactly the
- * mechanism by which one business's connector would reach another's grant.
+ * (`src/orchestrator/credentials.ts`) states at length. It is the
+ * `BusinessDb` every function takes (`db.businessId`), so the connection and
+ * the business can never disagree. An omitted business would read silently
+ * as "the installation's own", which is exactly the mechanism by which one
+ * business's connector would reach another's grant.
  */
-import { acquireAdvisoryLock, getPool, withTransaction } from '../db/pool.js';
-import type { Queryable } from '../db/pool.js';
+import { acquireAdvisoryLock, transaction } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { ROTATION_LOCK_SCOPE, liveKeyId } from './credential-store.js';
 import { verifyKeyState } from './master-key.js';
 import { decryptSecret, encryptSecret } from './secret-cipher.js';
@@ -90,7 +92,6 @@ export interface OAuthGrant extends OAuthGrantSummary {
 }
 
 export interface WriteGrantInput {
-  businessId: string;
   system: string;
   provider: string;
   credentialRef: string;
@@ -99,10 +100,6 @@ export interface WriteGrantInput {
   scopes: readonly string[];
   refreshToken: string;
   grantedBy: string;
-}
-
-interface GrantOptions {
-  db?: Queryable;
 }
 
 interface SummaryRow {
@@ -154,28 +151,27 @@ function toSummary(row: SummaryRow): OAuthGrantSummary {
  * sealed with a different one; same `liveKeyId` read, from the exported
  * function in `credential-store.ts` rather than a second query against
  * `credential_key_state`, so there is exactly one place that decides which
- * key id a freshly sealed row is labelled with; same optional-`db`-or-own
- * -transaction shape, for tests that need to observe the statements this
- * function issues.
+ * key id a freshly sealed row is labelled with; same `transaction(db, …)`
+ * shape — it joins a caller's open transaction, or opens its own.
  *
  * The refresh token reaches the ciphertext column and nothing else: not a
  * log line, not an error message, not the returned value (there is none).
  */
 export async function writeGrant(
+  db: BusinessDb,
   input: WriteGrantInput,
   key: Buffer,
-  options: GrantOptions = {},
 ): Promise<void> {
-  const write = async (db: Queryable): Promise<void> => {
+  const write = async (db: BusinessDb): Promise<void> => {
     await acquireAdvisoryLock(db, ROTATION_LOCK_SCOPE);
-    // Install-wide, exactly like `putSecret` — not `{ businessId: input.businessId, db }`.
+    // Install-wide, exactly like `putSecret` — not `{ businessId: db.businessId, db }`.
     // The key is per-installation (see `liveKeyId`'s own docblock); checking
     // it against one row while `liveKeyId` reads another is the very
     // opens-for-nobody hazard both docblocks describe, just with the mismatch
     // moved one level up.
     await verifyKeyState(key, { db });
     const keyId = await liveKeyId(db);
-    const sealed = encryptSecret(input.refreshToken, key, grantAad(input.businessId, input.system));
+    const sealed = encryptSecret(input.refreshToken, key, grantAad(db.businessId, input.system));
 
     await db.query(
       `INSERT INTO oauth_grants
@@ -197,7 +193,7 @@ export async function writeGrant(
              revoked_at = NULL,
              needs_reauth_at = NULL`,
       [
-        input.businessId,
+        db.businessId,
         input.system,
         input.provider,
         input.credentialRef,
@@ -210,11 +206,7 @@ export async function writeGrant(
       ],
     );
   };
-  if (options.db) {
-    await write(options.db);
-    return;
-  }
-  await withTransaction((tx) => write(tx));
+  await transaction(db, write);
 }
 
 const SELECT_GRANT = `
@@ -242,12 +234,11 @@ function openGrant(row: SealedGrantRow, businessId: string, key: Buffer): OAuthG
 }
 
 export async function readGrantByRef(
+  db: BusinessDb,
   credentialRef: string,
-  businessId: string,
   key: Buffer,
-  options: GrantOptions = {},
 ): Promise<OAuthGrant | null> {
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<SealedGrantRow>(
     `${SELECT_GRANT} WHERE business_id = $1 AND credential_ref = $2 AND revoked_at IS NULL`,
     [businessId, credentialRef],
@@ -272,11 +263,10 @@ export async function readGrantByRef(
  * refuses by name, reappearing through the one door revocation opens.
  */
 export async function grantStatusByRef(
+  db: BusinessDb,
   credentialRef: string,
-  businessId: string,
-  options: GrantOptions = {},
 ): Promise<'none' | 'live' | 'revoked'> {
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<{ revoked_at: Date | null }>(
     'SELECT revoked_at FROM oauth_grants WHERE business_id = $1 AND credential_ref = $2',
     [businessId, credentialRef],
@@ -287,12 +277,11 @@ export async function grantStatusByRef(
 }
 
 export async function readGrantBySystem(
+  db: BusinessDb,
   system: string,
-  businessId: string,
   key: Buffer,
-  options: GrantOptions = {},
 ): Promise<OAuthGrant | null> {
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<SealedGrantRow>(
     `${SELECT_GRANT} WHERE business_id = $1 AND system = $2 AND revoked_at IS NULL`,
     [businessId, system],
@@ -307,11 +296,8 @@ export async function readGrantBySystem(
  * alone makes that a guarantee: `listGrants` takes no key, so there is
  * nothing here it could decrypt with even by mistake.
  */
-export async function listGrants(
-  businessId: string,
-  options: GrantOptions = {},
-): Promise<OAuthGrantSummary[]> {
-  const db = options.db ?? getPool();
+export async function listGrants(db: BusinessDb): Promise<OAuthGrantSummary[]> {
+  const businessId = db.businessId;
   const { rows } = await db.query<SummaryRow>(
     `SELECT system, provider, credential_ref, account, scopes,
             granted_at, granted_by, last_refreshed_at, refresh_count,
@@ -346,13 +332,13 @@ export async function listGrants(
  * `credential_key_state`.
  */
 export async function recordRefresh(
+  db: BusinessDb,
   system: string,
-  businessId: string,
   rotatedRefreshToken: string | null,
   key: Buffer,
-  options: GrantOptions = {},
 ): Promise<void> {
-  const write = async (db: Queryable): Promise<void> => {
+  const businessId = db.businessId;
+  const write = async (db: BusinessDb): Promise<void> => {
     if (rotatedRefreshToken === null) {
       const result = await db.query(
         `UPDATE oauth_grants
@@ -384,11 +370,7 @@ export async function recordRefresh(
       );
     }
   };
-  if (options.db) {
-    await write(options.db);
-    return;
-  }
-  await withTransaction((tx) => write(tx));
+  await transaction(db, write);
 }
 
 /**
@@ -405,12 +387,11 @@ export async function recordRefresh(
  * that lands.
  */
 export async function revokeGrant(
+  db: BusinessDb,
   system: string,
-  businessId: string,
   _by: string,
-  options: GrantOptions = {},
 ): Promise<boolean> {
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const result = await db.query(
     `UPDATE oauth_grants SET revoked_at = now()
        WHERE business_id = $1 AND system = $2 AND revoked_at IS NULL`,
@@ -432,11 +413,10 @@ export async function revokeGrant(
  * silence with nothing pointing at why.
  */
 export async function markNeedsReauth(
+  db: BusinessDb,
   system: string,
-  businessId: string,
-  options: GrantOptions = {},
 ): Promise<void> {
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const result = await db.query(
     `UPDATE oauth_grants SET needs_reauth_at = now()
        WHERE business_id = $1 AND system = $2 AND revoked_at IS NULL`,

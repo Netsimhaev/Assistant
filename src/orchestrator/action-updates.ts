@@ -147,7 +147,7 @@ export async function dispatchActionUpdates(db: BusinessDb, options: {
     skippedNotConnected: 0,
   };
 
-  const settings = await loadActionUpdateSettings({ businessId, db });
+  const settings = await loadActionUpdateSettings(db);
   // The bound is in SQL, not a filter afterwards: `listAutonomousActions`
   // throws on a stored plan that does not parse, and an unbounded read would
   // let one such row anywhere in history stop every update on every pass.

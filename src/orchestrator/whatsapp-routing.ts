@@ -153,11 +153,7 @@ export async function answerableWhatsAppQuestions(
 ): Promise<InstructionRecord[]> {
   const nowMs = input.now ?? Date.now();
   const windowMinutes = input.windowMinutes ?? config.whatsappQuestionWindowMinutes;
-  const open = await pendingQuestions({
-    businessId: db.businessId,
-    channel: 'whatsapp',
-    db,
-  });
+  const open = await pendingQuestions(db, { channel: 'whatsapp' });
   return open.filter((record) => withinQuestionWindow(record, nowMs, windowMinutes));
 }
 
@@ -176,11 +172,7 @@ export async function decideWhatsAppRoute(
   const nowMs = input.now ?? Date.now();
   const windowMinutes = input.windowMinutes ?? config.whatsappQuestionWindowMinutes;
 
-  const open = await pendingQuestions({
-    businessId: db.businessId,
-    channel: 'whatsapp',
-    db,
-  });
+  const open = await pendingQuestions(db, { channel: 'whatsapp' });
 
   // Closure is read BEFORE the window is applied, and that is deliberate: a
   // question that aged out is still open (the owner's rule — it stays open
@@ -212,10 +204,7 @@ export async function claimAsAnswer(
   instruction: InstructionRecord,
   answer: string,
 ): Promise<boolean> {
-  return claimAnswer(instruction.instructionId, answer, {
-    businessId: db.businessId,
-    db,
-  });
+  return claimAnswer(db, instruction.instructionId, answer);
 }
 
 /**

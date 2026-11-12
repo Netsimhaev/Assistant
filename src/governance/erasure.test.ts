@@ -3,7 +3,7 @@ import { access, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ulid } from 'ulid';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, getPool, transaction, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -21,7 +21,7 @@ const RONIT = 'ronit@beta-log.example';
 const SIGNED_SECRET = 'zz-signed-approval-content';
 
 async function seed(): Promise<{ jobId: string }> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'erase-exec' }))); // TENANCY-TODO(task 6)
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'erase-exec' })));
   const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
@@ -41,7 +41,7 @@ async function seed(): Promise<{ jobId: string }> {
 
 /** A bare job, a fresh charter, nothing else attached. */
 async function bareJob(title: string): Promise<string> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `er-x-${ulid()}` }))); // TENANCY-TODO(task 6)
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `er-x-${ulid()}` })));
   const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
@@ -121,11 +121,29 @@ describe('executeErasure', () => {
     await closePool();
   });
 
+  /**
+   * The erasure's transaction must commit before the disk and the audit row.
+   * Joined to a caller's open transaction it could still roll back after the
+   * files were unlinked, so a db already inside one is refused — and nothing
+   * is deleted.
+   */
+  it('refuses a db that is already inside a transaction, deleting nothing', async () => {
+    await seed();
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
+
+    await expect(
+      withBusiness(BUSINESS, (bdb) => transaction(bdb, (tx) => executeErasure(tx, plan))),
+    ).rejects.toThrow(/outside a transaction/);
+
+    const memories = await getPool().query('SELECT 1 FROM memories WHERE business_id=$1', [BUSINESS]);
+    expect(memories.rows).toHaveLength(1);
+  });
+
   it('deletes what the plan lists and scrubs what it says to scrub', async () => {
     const { jobId } = await seed();
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
-    await executeErasure(plan, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     const memories = await getPool().query('SELECT 1 FROM memories WHERE business_id=$1', [BUSINESS]);
     expect(memories.rows).toHaveLength(0);
@@ -161,11 +179,8 @@ describe('executeErasure', () => {
     await writeFile(join(root, relative), 'תוכן', 'utf8');
     await insertDocument('DOC-REL', relative);
 
-    const plan = await buildErasurePlan(
-      { kind: 'document', documentId: 'DOC-REL' },
-      { businessId: BUSINESS, documentRoot: root },
-    );
-    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'document', documentId: 'DOC-REL' }, { documentRoot: root }));
+    const outcome = await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     expect(outcome.filesRemoved).toBe(1);
     expect(outcome.filesAlreadyGone).toEqual([]);
@@ -183,11 +198,8 @@ describe('executeErasure', () => {
     const relative = `${BUSINESS}/DOC-GONE/original.txt`;
     await insertDocument('DOC-GONE', relative);
 
-    const plan = await buildErasurePlan(
-      { kind: 'document', documentId: 'DOC-GONE' },
-      { businessId: BUSINESS, documentRoot: root },
-    );
-    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'document', documentId: 'DOC-GONE' }, { documentRoot: root }));
+    const outcome = await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     expect(outcome.filesRemoved).toBe(0);
     expect(outcome.filesAlreadyGone).toEqual([join(root, relative)]);
@@ -199,10 +211,10 @@ describe('executeErasure', () => {
     for (const to of ['understand', 'plan', 'execute'] as const) {
       await withBusiness(BUSINESS, (db) => transition(db, jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
     expect(plan.refusals.length).toBeGreaterThan(0);
 
-    await expect(executeErasure(plan, { businessId: BUSINESS })).rejects.toBeInstanceOf(
+    await expect(withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan))).rejects.toBeInstanceOf(
       ErasureRefusedError,
     );
 
@@ -218,9 +230,9 @@ describe('executeErasure', () => {
    */
   it('records that an erasure happened, with counts and without the identity', async () => {
     await seed();
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
-    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+    const outcome = await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
     // The real total, from the statements' own row counts — not a loose
     // "contains a digit" check, which almost any reason string would satisfy.
     const total = outcome.deleted.reduce((sum, item) => sum + item.count, 0);
@@ -267,12 +279,12 @@ describe('executeErasure', () => {
       [proposalId, BUSINESS, readingId, jobId],
     );
 
-    const plan = await buildErasurePlan({ kind: 'document', documentId }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'document', documentId }));
     const proposalsItem = plan.items.find((item) => item.table === 'proposals');
     expect(proposalsItem?.count).toBe(1);
     expect(plan.jobIds).toContain(jobId);
 
-    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+    const outcome = await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
     const deletedProposals = outcome.deleted.find((item) => item.table === 'proposals');
     expect(deletedProposals?.count).toBe(1);
 
@@ -306,7 +318,7 @@ describe('executeErasure', () => {
 
     const documentId = `DOC-${ulid()}`;
     await insertDocument(documentId, `nowhere/${documentId}.txt`);
-    await withBusiness(BUSINESS, (bdb) => recordSignature( // TENANCY-TODO(task 6)
+    await withBusiness(BUSINESS, (bdb) => recordSignature(
       bdb,
       {
         signatureId: `SIG-${ulid()}`,
@@ -337,7 +349,7 @@ describe('executeErasure', () => {
       refusals: [],
     };
 
-    await expect(executeErasure(plan, { businessId: BUSINESS })).rejects.toThrow();
+    await expect(withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan))).rejects.toThrow();
 
     const memories = await getPool().query('SELECT 1 FROM memories WHERE memory_id=$1', [memory.memoryId]);
     expect(memories.rows).toHaveLength(1);
@@ -423,7 +435,7 @@ describe('executeErasure', () => {
     );
     const otherDocument = `DOC-${ulid()}`;
     await insertDocument(otherDocument, `nowhere/${otherDocument}.txt`, 'b'.repeat(64));
-    await withBusiness(BUSINESS, (bdb) => recordSignature( // TENANCY-TODO(task 6)
+    await withBusiness(BUSINESS, (bdb) => recordSignature(
       bdb,
       {
         signatureId: `SIG-${ulid()}`,
@@ -514,7 +526,7 @@ describe('executeErasure', () => {
       refusals: [],
     };
 
-    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+    const outcome = await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
     // Keyed by table AND action: `approval_requests` now reports both a
     // delete and a scrub, and a map keyed by table alone would silently let
     // one stand in for the other.
@@ -640,7 +652,7 @@ describe('executeErasure', () => {
       awaitingEnvelopeId: envelopeId,
     }));
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier }));
     expect(plan.jobIds).toContain(jobId);
     expect(plan.refusals).toEqual([]);
     // Side one of the pair: the preview counts it before anything runs.
@@ -650,7 +662,7 @@ describe('executeErasure', () => {
       count: 1,
     });
 
-    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+    const outcome = await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
     // Side two of the pair: the executor reports the same disposition.
     expect(outcome.deleted.find((i) => i.table === 'jobs' && i.action === 'fail')).toEqual({
       table: 'jobs',
@@ -707,7 +719,7 @@ describe('executeErasure', () => {
    */
   it('refuses at execution time when a job the plan touches went live after the preview was built', async () => {
     const { jobId } = await seed();
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
     expect(plan.refusals).toEqual([]);
     expect(plan.jobIds).toContain(jobId);
 
@@ -717,7 +729,7 @@ describe('executeErasure', () => {
       await withBusiness(BUSINESS, (db) => transition(db, jobId, { to, actor: 'orchestrator', reason: 'woke mid-flight' }));
     }
 
-    await expect(executeErasure(plan, { businessId: BUSINESS })).rejects.toBeInstanceOf(ErasureRefusedError);
+    await expect(withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan))).rejects.toBeInstanceOf(ErasureRefusedError);
 
     const memories = await getPool().query('SELECT 1 FROM memories WHERE business_id=$1', [BUSINESS]);
     expect(memories.rows).toHaveLength(1);
@@ -766,7 +778,7 @@ describe('executeErasure', () => {
     const proposalB = `PROP-${ulid()}`;
     await insertProposal(proposalB, readingId, jobB);
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
     expect(plan.jobIds).toContain(jobA);
     expect(plan.jobIds).not.toContain(jobB);
     expect(plan.documentIds).toContain(documentId);
@@ -774,7 +786,7 @@ describe('executeErasure', () => {
     const proposalsItem = plan.items.find((item) => item.table === 'proposals');
     expect(proposalsItem?.count).toBe(2);
 
-    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+    const outcome = await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
     const deletedProposals = outcome.deleted.find((item) => item.table === 'proposals');
     expect(deletedProposals?.count).toBe(2);
 
@@ -812,7 +824,7 @@ describe('executeErasure', () => {
     const fromIso = new Date(jobATime.getTime() - 1000).toISOString();
     const toIso = new Date(jobATime.getTime() + 1000).toISOString();
 
-    const plan = await buildErasurePlan({ kind: 'window', fromIso, toIso }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'window', fromIso, toIso }));
     expect(plan.jobIds).toContain(jobA);
     expect(plan.jobIds).not.toContain(jobB);
     expect(plan.documentIds).toContain(documentId);
@@ -820,7 +832,7 @@ describe('executeErasure', () => {
     const proposalsItem = plan.items.find((item) => item.table === 'proposals');
     expect(proposalsItem?.count).toBe(2);
 
-    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+    const outcome = await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
     const deletedProposals = outcome.deleted.find((item) => item.table === 'proposals');
     expect(deletedProposals?.count).toBe(2);
 
@@ -883,16 +895,13 @@ describe('executeErasure', () => {
       const mine = await orphanApproval(RONIT);
       const theirs = await orphanApproval('avi@gamma-lift.example');
 
-      const plan = await buildErasurePlan(
-        { kind: 'contact', identifier: RONIT },
-        { businessId: BUSINESS },
-      );
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
       // Listed. Without this the owner confirms a preview that never
       // mentioned the row holding the address and the message body.
       expect(countOf(plan, 'approval_requests', 'delete')).toBe(1);
 
-      await executeErasure(plan, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
       const survivors = await getPool().query<{ approval_id: string }>(
         'SELECT approval_id FROM approval_requests WHERE business_id=$1',
@@ -927,14 +936,11 @@ describe('executeErasure', () => {
       // that stopped escaping would sweep this one in too and fail here.
       const theirs = await orphanApproval('danaXcohen@beta-log.example');
 
-      const plan = await buildErasurePlan(
-        { kind: 'contact', identifier: underscored },
-        { businessId: BUSINESS },
-      );
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: underscored }));
 
       expect(countOf(plan, 'approval_requests', 'delete')).toBe(1);
 
-      await executeErasure(plan, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
       const survivors = await getPool().query<{ approval_id: string }>(
         'SELECT approval_id FROM approval_requests WHERE business_id=$1',
@@ -952,18 +958,15 @@ describe('executeErasure', () => {
         [outside],
       );
 
-      const plan = await buildErasurePlan(
-        {
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, {
           kind: 'window',
           fromIso: new Date(Date.now() - 3600_000).toISOString(),
           toIso: new Date(Date.now() + 3600_000).toISOString(),
-        },
-        { businessId: BUSINESS },
-      );
+        }));
 
       expect(countOf(plan, 'approval_requests', 'delete')).toBe(1);
 
-      await executeErasure(plan, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
       const survivors = await getPool().query<{ approval_id: string }>(
         'SELECT approval_id FROM approval_requests WHERE business_id=$1',
@@ -999,19 +1002,16 @@ describe('executeErasure', () => {
         [approvalId, BUSINESS, jobId, new Date(Date.now() + 3600_000).toISOString()],
       );
 
-      const plan = await buildErasurePlan(
-        {
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, {
           kind: 'window',
           fromIso: new Date(Date.now() - 3600_000).toISOString(),
           toIso: new Date(Date.now() + 3600_000).toISOString(),
-        },
-        { businessId: BUSINESS },
-      );
+        }));
 
       expect(plan.jobIds).not.toContain(jobId);
       expect(countOf(plan, 'approval_requests', 'delete')).toBe(0);
 
-      await executeErasure(plan, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
       const survivors = await getPool().query('SELECT 1 FROM approval_requests WHERE approval_id=$1', [
         approvalId,
@@ -1027,14 +1027,11 @@ describe('executeErasure', () => {
       const orphanProposal = `PROP-${ulid()}`;
       await insertProposal(orphanProposal, readingId, null);
 
-      const plan = await buildErasurePlan(
-        { kind: 'document', documentId },
-        { businessId: BUSINESS },
-      );
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'document', documentId }));
 
       expect(countOf(plan, 'proposals', 'delete')).toBe(1);
 
-      await executeErasure(plan, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
       const rows = await getPool().query('SELECT 1 FROM proposals WHERE proposal_id=$1', [
         orphanProposal,
@@ -1094,7 +1091,7 @@ describe('executeErasure', () => {
       // refusal never fires and what is measured here is the approval branch.
       const elsewhere = `DOC-${ulid()}`;
       await insertDocument(elsewhere, `nowhere/${elsewhere}.txt`);
-      await withBusiness(BUSINESS, (bdb) => recordSignature( // TENANCY-TODO(task 6)
+      await withBusiness(BUSINESS, (bdb) => recordSignature(
         bdb,
         {
           signatureId: `SIG-${ulid()}`,
@@ -1105,10 +1102,7 @@ describe('executeErasure', () => {
         }
       ));
 
-      const plan = await buildErasurePlan(
-        { kind: 'contact', identifier: RONIT },
-        { businessId: BUSINESS },
-      );
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
       expect(plan.refusals).toEqual([]);
 
       // The preview says both things, separately: one row goes, one is emptied.
@@ -1117,7 +1111,7 @@ describe('executeErasure', () => {
       expect(item('delete')).toBe(1);
       expect(item('scrub')).toBe(1);
 
-      await executeErasure(plan, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
       const rows = await getPool().query<{
         approval_id: string;
@@ -1209,7 +1203,7 @@ describe('executeErasure', () => {
     };
 
     // Between the preview and the confirm.
-    await withBusiness(BUSINESS, (bdb) => recordSignature( // TENANCY-TODO(task 6)
+    await withBusiness(BUSINESS, (bdb) => recordSignature(
       bdb,
       {
         signatureId: `SIG-${ulid()}`,
@@ -1222,7 +1216,7 @@ describe('executeErasure', () => {
 
     let caught: unknown;
     try {
-      await executeErasure(plan, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
     } catch (error) {
       caught = error;
     }
@@ -1261,11 +1255,11 @@ describe('executeErasure', () => {
     it('throws ErasureAuditUnrecordedError carrying the real, completed outcome', async () => {
       await installAuditFailureTrigger();
       const { jobId } = await seed();
-      const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+      const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
       let caught: unknown;
       try {
-        await executeErasure(plan, { businessId: BUSINESS });
+        await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
       } catch (error) {
         caught = error;
       }

@@ -203,10 +203,7 @@ describe('approval notification wiring', () => {
     // registry below never touches `envCredentials`.
     const key = randomBytes(32);
     await writeKeyState(key, 'key-1');
-    await putSecret(
-      { businessId: BUSINESS, ref: 'OFFICE_MAIL', value: 'סוד-מהמאגר', updatedBy: 'test' },
-      key,
-    );
+    await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: 'OFFICE_MAIL', value: 'סוד-מהמאגר', updatedBy: 'test' }, key));
 
     const captured: string[] = [];
     const registry = new AdapterRegistry([
@@ -299,8 +296,8 @@ describe('approval notification wiring', () => {
     // Two refs, two rows: the binding's and the notifier's. The notifier must
     // resolve its own, which is what makes `captured` below evidence about
     // NOTIFY_MAIL specifically rather than about whatever else is stored.
-    await putSecret({ businessId: BUSINESS, ref: 'OFFICE_MAIL', value: 'סוד-החיבור', updatedBy: 'test' }, key);
-    await putSecret({ businessId: BUSINESS, ref: 'NOTIFY_MAIL', value: secret, updatedBy: 'test' }, key);
+    await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: 'OFFICE_MAIL', value: 'סוד-החיבור', updatedBy: 'test' }, key));
+    await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: 'NOTIFY_MAIL', value: secret, updatedBy: 'test' }, key));
 
     const captured: string[] = [];
     const notifier = createEmailNotifier({

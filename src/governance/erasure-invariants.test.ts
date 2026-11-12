@@ -145,7 +145,7 @@ describe('what an erasure leaves behind', () => {
    * project's own documentation fell into.
    */
   it('leaves the probe in no text or JSON column of any table, anywhere', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'probe' }))); // TENANCY-TODO(task 6)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'probe' })));
     const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -633,7 +633,7 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS, meetingJob.jobId],
     );
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PROBE }));
     for (const table of ['meetings', 'meeting_holds']) {
       expect(plan.items.find((item) => item.table === table && item.action === 'delete')?.count, table).toBe(1);
     }
@@ -664,7 +664,7 @@ describe('what an erasure leaves behind', () => {
     expect(
       plan.items.find((item) => item.table === 'charter_interview_drafts' && item.action === 'delete')?.count,
     ).toBe(1);
-    await executeErasure(plan, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     const draft = await db.query('SELECT 1 FROM charter_interview_drafts WHERE draft_id = $1', ['DR-probe']);
     expect(draft.rows).toHaveLength(0);
@@ -755,7 +755,7 @@ describe('what an erasure leaves behind', () => {
     // A real `"` inside the name and a real newline right after it: both are
     // escaped in the plan's JSONB text form.
     const BODY = `לכבוד ${NAME}\nשלום, שלחתי את ההצעה`;
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'update-only' }))); // TENANCY-TODO(task 6)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'update-only' })));
     const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -781,8 +781,8 @@ describe('what an erasure leaves behind', () => {
     );
     expect(premise.rows).toHaveLength(0);
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: NAME }, { businessId: BUSINESS });
-    await executeErasure(plan, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: NAME }));
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     const updates = await db.query('SELECT 1 FROM action_updates WHERE update_id = $1', ['AU-update-only']);
     expect(updates.rows).toHaveLength(0);
@@ -804,7 +804,7 @@ describe('what an erasure leaves behind', () => {
    */
   it('reaches a confirmation whose name appears only in the question or only JSON-escaped in an option', async () => {
     const NAME = 'אלפא בע"מ';
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'confirmation-only' }))); // TENANCY-TODO(task 6)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'confirmation-only' })));
     const db = getPool();
     const textJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
@@ -858,8 +858,8 @@ describe('what an erasure leaves behind', () => {
     );
     expect(premise.rows).toHaveLength(0);
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: NAME }, { businessId: BUSINESS });
-    await executeErasure(plan, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: NAME }));
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     const left = await db.query<{ job_id: string }>(
       'SELECT job_id FROM instruction_confirmations WHERE business_id = $1',
@@ -888,7 +888,7 @@ describe('what an erasure leaves behind', () => {
    * erasure of that very contact permanently.
    */
   it('reaches a correction note that names a counterparty the job otherwise never mentions', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'note-only' }))); // TENANCY-TODO(task 6)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'note-only' })));
     const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -903,8 +903,8 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS, job.jobId, `לא היה צריך להעתיק את ${PROBE} בטעות`],
     );
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
-    await executeErasure(plan, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PROBE }));
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     const { rows } = await getPool().query(
       'SELECT 1 FROM autonomy_marks WHERE business_id = $1 AND mark_id = $2',
@@ -933,7 +933,7 @@ describe('what an erasure leaves behind', () => {
    * point: the subject job's own plan row going away says nothing here.
    */
   it('reaches a gov.verify job whose bound plan names the document, on a document anchor', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'doc-anchor' }))); // TENANCY-TODO(task 6)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'doc-anchor' })));
     const db = getPool();
     const documentId = `DOC-anchor-${Date.now()}`;
 
@@ -1002,7 +1002,7 @@ describe('what an erasure leaves behind', () => {
       ],
     );
 
-    const plan = await buildErasurePlan({ kind: 'document', documentId }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'document', documentId }));
     // The precondition the gap lived in: the `proposals` query reaches the
     // subject job only. If a future change makes the verifier job reachable
     // that way too, this assertion fails and the test below stops proving the
@@ -1010,7 +1010,7 @@ describe('what an erasure leaves behind', () => {
     expect(plan.jobIds).toContain(subject.jobId);
     expect(plan.jobIds).toContain(verifier.jobId);
 
-    await executeErasure(plan, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     const { rows } = await db.query(
       'SELECT 1 FROM job_plans WHERE business_id = $1 AND job_id = $2',
@@ -1043,7 +1043,7 @@ describe('what an erasure leaves behind', () => {
    * found is explicitly kept, is the next test below (Critical 1).
    */
   it('leaves a second contact entirely intact', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'two' }))); // TENANCY-TODO(task 6)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'two' })));
     const mk = async (identifier: string, title: string): Promise<string> => {
       const job = await withBusiness(BUSINESS, (db) => createJob(db, {
         charterVersion: bundle.charterVersion,
@@ -1072,8 +1072,8 @@ describe('what an erasure leaves behind', () => {
     const probeJob = await mk(PROBE, 'probe');
     const keptJob = await mk('keeper@nowhere.example', 'keeper');
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
-    await executeErasure(plan, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PROBE }));
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     const memories = await getPool().query<{ subject_key: string }>(
       'SELECT subject_key FROM memories WHERE business_id=$1',
@@ -1102,7 +1102,7 @@ describe('what an erasure leaves behind', () => {
    * job's opening message while the preview reports it as kept.
    */
   it('leaves a kept job’s own WhatsApp message alone', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'wa-kept' }))); // TENANCY-TODO(task 6)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'wa-kept' })));
     const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -1120,12 +1120,12 @@ describe('what an erasure leaves behind', () => {
        VALUES ('WA-kept-job', $1, 'wamid-kept-job', 'inbound', $2, 'principal', $3, now(), 'handled', $4)`,
       [BUSINESS, PROBE, `הודעה מ-${PROBE}`, job.jobId],
     );
-    await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'job', itemId: job.jobId, note: 'לשימור' })); // TENANCY-TODO(task 6)
+    await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'job', itemId: job.jobId, note: 'לשימור' }));
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PROBE }));
     expect(plan.jobIds).not.toContain(job.jobId);
 
-    await executeErasure(plan, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     const rows = await getPool().query('SELECT 1 FROM whatsapp_messages WHERE job_id=$1', [job.jobId]);
     expect(rows.rows).toHaveLength(1);
@@ -1153,7 +1153,7 @@ describe('what an erasure leaves behind', () => {
    * the message rides along for the wrong reason.
    */
   it('reaches a job whose only trace of the contact is its own WhatsApp message', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'wa-discovery' }))); // TENANCY-TODO(task 6)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'wa-discovery' })));
     const job = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -1185,10 +1185,10 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS, `כן, תשלחי את זה ל${PROBE}`, `תמלול: כן, תשלחי את זה ל${PROBE}`, job.jobId],
     );
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PROBE }));
     expect(plan.jobIds).toContain(job.jobId);
 
-    await executeErasure(plan, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     const rows = await getPool().query('SELECT 1 FROM whatsapp_messages WHERE job_id=$1', [job.jobId]);
     expect(rows.rows).toHaveLength(0);
@@ -1201,7 +1201,7 @@ describe('what an erasure leaves behind', () => {
    * same identifier, survives untouched. Fix round 1, Important 2.
    */
   it('reaches an orphan whatsapp message by window, and leaves one outside the window alone', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'wa-window' }))); // TENANCY-TODO(task 6)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'wa-window' })));
 
     // The window arm matches `created_at` (when the row was WRITTEN), not
     // `provider_timestamp` (what GREEN-API says about when the message was
@@ -1225,11 +1225,8 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS, PROBE, `הודעה מ-${PROBE} מחוץ לחלון`],
     );
 
-    const plan = await buildErasurePlan(
-      { kind: 'window', fromIso: '2026-01-01T00:00:00.000Z', toIso: '2026-01-02T00:00:00.000Z' },
-      { businessId: BUSINESS },
-    );
-    await executeErasure(plan, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'window', fromIso: '2026-01-01T00:00:00.000Z', toIso: '2026-01-02T00:00:00.000Z' }));
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     const remaining = await getPool().query<{ id: string }>(
       'SELECT id FROM whatsapp_messages WHERE business_id=$1',
@@ -1250,7 +1247,7 @@ describe('what an erasure leaves behind', () => {
    * mail went.
    */
   it('contact erasure deletes the mail and its reply job', async () => {
-    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'mail' }))); // TENANCY-TODO(task 6)
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'mail' })));
     const db = getPool();
     const NAME = 'רונית_כהן';
     const SENDER = 'ronit@client.example';
@@ -1334,12 +1331,12 @@ describe('what an erasure leaves behind', () => {
       { jobId: triageJob, kind: 'chunk', subjectKey: SENDER, body: { claim: 'שאלה על מחיר' } },
     ));
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: NAME }, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: NAME }));
     expect([...plan.jobIds].sort()).toEqual([triageJob, replyJob, failedReplyJob].sort());
     expect(plan.documentIds).toEqual([documentId]);
     expect(plan.mailIds).toEqual(['M-ronit']);
 
-    await executeErasure(plan, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     const count = async (sql: string, params: unknown[]): Promise<number> =>
       (await db.query(sql, params)).rows.length;
@@ -1355,7 +1352,7 @@ describe('what an erasure leaves behind', () => {
 
   /** The window arm: `received_at`, inside the window gone, outside kept. */
   it('reaches mail by received_at on a window anchor', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'mail-window' }))); // TENANCY-TODO(task 6)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'mail-window' })));
     for (const [mailId, at] of [
       ['M-in', '2026-01-01T12:00:00.000Z'],
       ['M-out', '2026-03-01T12:00:00.000Z'],
@@ -1372,11 +1369,8 @@ describe('what an erasure leaves behind', () => {
         [`INV-${mailId}`, BUSINESS, mailId, at],
       );
     }
-    const plan = await buildErasurePlan(
-      { kind: 'window', fromIso: '2026-01-01T00:00:00.000Z', toIso: '2026-01-02T00:00:00.000Z' },
-      { businessId: BUSINESS },
-    );
-    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'window', fromIso: '2026-01-01T00:00:00.000Z', toIso: '2026-01-02T00:00:00.000Z' }));
+    const outcome = await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
     // The explicit invoice delete is credited, not pre-empted by the cascade.
     expect(outcome.deleted.find((i) => i.table === 'mail_invoices')?.count).toBe(1);
     expect(outcome.deleted.find((i) => i.table === 'mail_messages')?.count).toBe(1);
@@ -1392,7 +1386,7 @@ describe('what an erasure leaves behind', () => {
    * the mail that delivered it is not the document and stays.
    */
   it('removes the invoice of an erased document and keeps the mail', async () => {
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'mail-doc' }))); // TENANCY-TODO(task 6)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'mail-doc' })));
     const db = getPool();
     const documentId = `DOC-inv-${Date.now()}`;
     await db.query(
@@ -1413,8 +1407,8 @@ describe('what an erasure leaves behind', () => {
               ('INV-other', $1, 'M-doc', 'a@b.example', NULL, now())`,
       [BUSINESS, documentId],
     );
-    const plan = await buildErasurePlan({ kind: 'document', documentId }, { businessId: BUSINESS });
-    await executeErasure(plan, { businessId: BUSINESS });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'document', documentId }));
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
     const invoices = await db.query<{ invoice_id: string }>('SELECT invoice_id FROM mail_invoices');
     expect(invoices.rows.map((r) => r.invoice_id)).toEqual(['INV-other']);

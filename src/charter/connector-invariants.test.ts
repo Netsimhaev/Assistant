@@ -12,7 +12,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import { join, sep } from 'node:path';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { writeKeyState } from '../governance/master-key.js';
 import { writeGrant } from '../governance/oauth-grants.js';
@@ -251,19 +251,7 @@ describe('an OAuth refresh token leaves no trace outside its own ciphertext', ()
    * and demand zero occurrences anywhere but the grant's own ciphertext.
    */
   it('never writes the refresh token anywhere the schema can hold text', async () => {
-    await writeGrant(
-      {
-        businessId: BUSINESS,
-        system: 'office-calendar',
-        provider: 'google',
-        credentialRef: 'OFFICE_CALENDAR',
-        account: 'owner@example.com',
-        scopes: ['https://www.googleapis.com/auth/calendar.readonly'],
-        refreshToken: SENTINEL,
-        grantedBy: 'owner',
-      },
-      KEY,
-    );
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { system: 'office-calendar', provider: 'google', credentialRef: 'OFFICE_CALENDAR', account: 'owner@example.com', scopes: ['https://www.googleapis.com/auth/calendar.readonly'], refreshToken: SENTINEL, grantedBy: 'owner' }, KEY));
 
     const noFallback: CredentialSource = {
       resolve: async () => null,

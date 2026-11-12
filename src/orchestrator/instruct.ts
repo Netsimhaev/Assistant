@@ -348,7 +348,6 @@ export async function runInstruction(
   input: { text: string },
   options: RunInstructionOptions,
 ): Promise<InstructionOutcome> {
-  const businessId = db.businessId;
   const planner = options.planner ?? makePlan;
   // Read once, used for the stored row and for the grant, so the bytes that
   // were saved and the bytes that were weighed for authority can never be
@@ -398,15 +397,12 @@ export async function runInstruction(
 
   let instruction: InstructionRecord;
   try {
-    instruction = await saveInstruction(
-      {
-        jobId: job.jobId,
-        text: input.text,
-        textOrigin,
-        attachedDocumentIds: attachedDocuments.map((d) => d.documentId),
-      },
-      { businessId },
-    );
+    instruction = await saveInstruction(db, {
+      jobId: job.jobId,
+      text: input.text,
+      textOrigin,
+      attachedDocumentIds: attachedDocuments.map((d) => d.documentId),
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await transition(db, job.jobId, {
@@ -500,7 +496,7 @@ export async function runInstruction(
 
     const question = renderIdentityQuestion(resolution.ambiguities);
     try {
-      await recordQuestion(instruction.instructionId, question, { businessId });
+      await recordQuestion(db, instruction.instructionId, question);
     } catch {
       // Swallowed by design, exactly as the planner's own question is.
     }
@@ -544,7 +540,7 @@ export async function runInstruction(
     // lists it regardless — with `QUESTION_UNAVAILABLE` in place of the text
     // that failed to save (`src/dashboard/views.ts`).
     try {
-      await recordQuestion(instruction.instructionId, checked.question, { businessId });
+      await recordQuestion(db, instruction.instructionId, checked.question);
     } catch {
       // Swallowed by design — see above.
     }
@@ -576,7 +572,7 @@ export async function runInstruction(
     const sourceQuestion = await sourceQuestionFor(door, checked.plan);
     if (sourceQuestion !== null) {
       try {
-        await recordQuestion(instruction.instructionId, sourceQuestion, { businessId });
+        await recordQuestion(db, instruction.instructionId, sourceQuestion);
       } catch {
         // Swallowed by design, exactly as the planner's own question is.
       }
@@ -1081,7 +1077,7 @@ async function planPerCandidate(
  */
 async function askOwner(door: DoorContext, question: string): Promise<InstructionOutcome> {
   try {
-    await recordQuestion(door.instruction.instructionId, question, { businessId: door.db.businessId });
+    await recordQuestion(door.db, door.instruction.instructionId, question);
   } catch {
     // Swallowed by design — see above.
   }
@@ -1206,10 +1202,7 @@ async function askAndPark(
   identityNote: string | null,
 ): Promise<InstructionOutcome> {
   try {
-    await createConfirmation(
-      { jobId: door.jobId, options, presentedText: question, channel: door.channel },
-      { businessId: door.db.businessId },
-    );
+    await createConfirmation(door.db, { jobId: door.jobId, options, presentedText: question, channel: door.channel });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await failJob(door, `instruction door: confirmation could not be stored (${message})`);

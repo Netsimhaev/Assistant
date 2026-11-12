@@ -89,14 +89,8 @@ beforeEach(async () => {
   // only, not `input.businessId` — one row here is enough regardless of
   // which business this file's requests are scoped to.
   await writeKeyState(key, 'KEY-test');
-  await putSecret(
-    { businessId: BUSINESS, ref: GOOGLE_CLIENT_ID_REF, value: 'test-client-id', updatedBy: 'test' },
-    key,
-  );
-  await putSecret(
-    { businessId: BUSINESS, ref: GOOGLE_CLIENT_SECRET_REF, value: 'test-client-secret', updatedBy: 'test' },
-    key,
-  );
+  await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: GOOGLE_CLIENT_ID_REF, value: 'test-client-id', updatedBy: 'test' }, key));
+  await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: GOOGLE_CLIENT_SECRET_REF, value: 'test-client-secret', updatedBy: 'test' }, key));
   await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
 });
 
@@ -232,7 +226,7 @@ describe('GET /oauth/:system/start', () => {
    * any redirect happens.
    */
   it('refuses to start when the client secret is not provisioned, even though the client id is', async () => {
-    await removeSecret(GOOGLE_CLIENT_SECRET_REF, BUSINESS);
+    await withBusiness(BUSINESS, (bdb) => removeSecret(bdb, GOOGLE_CLIENT_SECRET_REF));
     const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
     const cookie = await loginWithPassword(baseUrl);
 
@@ -248,7 +242,7 @@ describe('GET /oauth/:system/start', () => {
   });
 
   it('refuses to start when the client id is not provisioned, even though the secret is', async () => {
-    await removeSecret(GOOGLE_CLIENT_ID_REF, BUSINESS);
+    await withBusiness(BUSINESS, (bdb) => removeSecret(bdb, GOOGLE_CLIENT_ID_REF));
     const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
     const cookie = await loginWithPassword(baseUrl);
 
@@ -294,7 +288,7 @@ describe('GET /oauth/:system/start', () => {
     // write — a refused ceremony must leave exactly the state it found.
     const { rows } = await getPool().query('SELECT count(*)::text AS n FROM oauth_states');
     expect(rows[0]?.['n']).toBe('0');
-    expect(await readGrantBySystem('office-mail', BUSINESS, key)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, 'office-mail', key))).toBeNull();
     const bindings = await withBusiness(BUSINESS, (db) => loadBindings(db));
     expect(bindings.find((b) => b.system === 'office-mail')).toBeUndefined();
   });
@@ -389,7 +383,7 @@ describe('GET /oauth/callback', () => {
     expect(body).toMatch(/scheduler|תזמון/);
     expect(body).toMatch(/הפעל(ה|ה מחדש|ת)|restart/);
 
-    const grant = await readGrantBySystem(SYSTEM, BUSINESS, key);
+    const grant = await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, SYSTEM, key));
     expect(grant?.provider).toBe('google');
     expect(grant?.account).toBe('owner@example.com');
     expect(grant?.scopes).toEqual(['https://www.googleapis.com/auth/calendar.readonly']);
@@ -435,7 +429,7 @@ describe('GET /oauth/callback', () => {
       headers: { cookie: cookieB },
     });
     expect(res.status).toBe(400);
-    expect(await readGrantBySystem(SYSTEM, BUSINESS, key)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, SYSTEM, key))).toBeNull();
   });
 
   /**
@@ -468,7 +462,7 @@ describe('GET /oauth/callback', () => {
     });
     expect(res.status).toBe(200);
 
-    const grant = await readGrantBySystem(SYSTEM, BUSINESS, key);
+    const grant = await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, SYSTEM, key));
     expect(grant?.scopes).toEqual([grantedInstead]);
     expect(grant?.scopes).not.toContain('https://www.googleapis.com/auth/calendar.readonly');
   });
@@ -493,7 +487,7 @@ describe('GET /oauth/callback', () => {
       headers: { cookie },
     });
     expect(res.status).toBe(400);
-    expect(await readGrantBySystem(SYSTEM, BUSINESS, key)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, SYSTEM, key))).toBeNull();
   });
 
   it('refuses without a session, before even reading the query string (M11)', async () => {
@@ -518,13 +512,13 @@ describe('GET /oauth/callback', () => {
       headers: { cookie },
     });
     expect(fabricated.status).toBe(400);
-    expect(await readGrantBySystem(SYSTEM, BUSINESS, key)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, SYSTEM, key))).toBeNull();
 
     const real = await fetch(`${baseUrl}/oauth/callback?state=${state}&code=auth-code-value`, {
       headers: { cookie },
     });
     expect(real.status).toBe(200);
-    expect(await readGrantBySystem(SYSTEM, BUSINESS, key)).not.toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, SYSTEM, key))).not.toBeNull();
   });
 
   it('refuses the same state a second time (single-use)', async () => {
@@ -560,8 +554,8 @@ describe('GET /oauth/callback', () => {
     );
     expect(res.status).toBe(200);
 
-    expect(await readGrantBySystem(SYSTEM, BUSINESS, key)).not.toBeNull();
-    expect(await readGrantBySystem('some-other-system', BUSINESS, key)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, SYSTEM, key))).not.toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, 'some-other-system', key))).toBeNull();
   });
 
   it('renders a readable page, not a crash, when the provider reports access_denied', async () => {
@@ -575,7 +569,7 @@ describe('GET /oauth/callback', () => {
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(body).toContain(SYSTEM);
-    expect(await readGrantBySystem(SYSTEM, BUSINESS, key)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, SYSTEM, key))).toBeNull();
   });
 });
 
@@ -608,7 +602,7 @@ describe('POST /oauth/:system/revoke', () => {
 
     // `readGrantBySystem` filters `revoked_at IS NULL` — a revoked grant is
     // no longer readable through the ordinary path, which is the point.
-    expect(await readGrantBySystem(SYSTEM, BUSINESS, key)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, SYSTEM, key))).toBeNull();
 
     const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'credential_change' })); // TENANCY-TODO(task 10)
     expect(audit.some((row) => row.reason.includes('revoked'))).toBe(true);
@@ -626,7 +620,7 @@ describe('POST /oauth/:system/revoke', () => {
       redirect: 'manual',
     });
     expect(res.status).toBe(403);
-    expect(await readGrantBySystem(SYSTEM, BUSINESS, key)).not.toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, SYSTEM, key))).not.toBeNull();
   });
 
   /**
@@ -727,7 +721,7 @@ describe('POST /oauth/:system/revoke', () => {
       redirect: 'manual',
     });
     expect(res.status).toBe(302);
-    expect(await readGrantBySystem(SYSTEM, BUSINESS, key)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, SYSTEM, key))).toBeNull();
   });
 });
 
@@ -813,19 +807,7 @@ describe('GET /connections', () => {
   it("shows an authorised connection's account and granted scopes, offers a revoke control, and never renders the refresh token itself", async () => {
     await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
     const secretToken = 'super-secret-refresh-token-value-should-never-render';
-    await writeGrant(
-      {
-        businessId: BUSINESS,
-        system: SYSTEM,
-        provider: 'google',
-        credentialRef: 'OFFICE_CALENDAR',
-        account: 'owner@example.com',
-        scopes: ['https://www.googleapis.com/auth/calendar.readonly'],
-        refreshToken: secretToken,
-        grantedBy: USERNAME,
-      },
-      key,
-    );
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { system: SYSTEM, provider: 'google', credentialRef: 'OFFICE_CALENDAR', account: 'owner@example.com', scopes: ['https://www.googleapis.com/auth/calendar.readonly'], refreshToken: secretToken, grantedBy: USERNAME }, key));
 
     const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl);
@@ -852,21 +834,9 @@ describe('GET /connections', () => {
 
   it('reads a grant needing reauth as "דורש אישור מחדש", and a revoked grant as not yet authorised again', async () => {
     await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
-    await writeGrant(
-      {
-        businessId: BUSINESS,
-        system: SYSTEM,
-        provider: 'google',
-        credentialRef: 'OFFICE_CALENDAR',
-        account: 'owner@example.com',
-        scopes: ['https://www.googleapis.com/auth/calendar.readonly'],
-        refreshToken: 'refresh-token-value',
-        grantedBy: USERNAME,
-      },
-      key,
-    );
-    await recordRefresh(SYSTEM, BUSINESS, null, key);
-    await markNeedsReauth(SYSTEM, BUSINESS);
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { system: SYSTEM, provider: 'google', credentialRef: 'OFFICE_CALENDAR', account: 'owner@example.com', scopes: ['https://www.googleapis.com/auth/calendar.readonly'], refreshToken: 'refresh-token-value', grantedBy: USERNAME }, key));
+    await withBusiness(BUSINESS, (bdb) => recordRefresh(bdb, SYSTEM, null, key));
+    await withBusiness(BUSINESS, (bdb) => markNeedsReauth(bdb, SYSTEM));
 
     const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl);
@@ -879,7 +849,7 @@ describe('GET /connections', () => {
     expect(firstBody).toContain('דורש אישור מחדש');
     expect(firstBody).not.toContain('יש הרשאה');
 
-    await revokeGrant(SYSTEM, BUSINESS, USERNAME);
+    await withBusiness(BUSINESS, (bdb) => revokeGrant(bdb, SYSTEM, USERNAME));
 
     const secondRead = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
     const secondBody = await secondRead.text();
@@ -1027,14 +997,8 @@ describe('mailbox ceremony', () => {
   beforeEach(async () => {
     await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     await installMailboxCharter('microsoft');
-    await putSecret(
-      { businessId: BUSINESS, ref: 'MICROSOFT_OAUTH_CLIENT_ID', value: 'ms-client-id', updatedBy: 'test' },
-      key,
-    );
-    await putSecret(
-      { businessId: BUSINESS, ref: 'MICROSOFT_OAUTH_CLIENT_SECRET', value: 'ms-client-secret', updatedBy: 'test' },
-      key,
-    );
+    await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: 'MICROSOFT_OAUTH_CLIENT_ID', value: 'ms-client-id', updatedBy: 'test' }, key));
+    await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: 'MICROSOFT_OAUTH_CLIENT_SECRET', value: 'ms-client-secret', updatedBy: 'test' }, key));
   });
 
   function microsoftFetch(): typeof fetch {
@@ -1096,7 +1060,7 @@ describe('mailbox ceremony', () => {
       headers: { cookie },
     });
     expect(res.status).toBe(200);
-    const grant = await readGrantBySystem('mailbox', BUSINESS, key);
+    const grant = await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, 'mailbox', key));
     expect(grant?.provider).toBe('microsoft');
     expect(grant?.account).toBe('owner@contoso.example');
     expect(grant?.refreshToken).toBe('ms-refresh');
@@ -1134,7 +1098,7 @@ describe('mailbox ceremony', () => {
       headers: { cookie },
     });
     expect(res.status).toBe(200);
-    const grant = await readGrantBySystem('mailbox', BUSINESS, key);
+    const grant = await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, 'mailbox', key));
     expect(grant?.provider).toBe('google');
     expect(grant?.account).toBe('me@gmail.example');
   });
@@ -1148,19 +1112,7 @@ describe('mailbox ceremony', () => {
       }) as typeof fetch,
     });
     const cookie = await loginWithPassword(baseUrl);
-    await writeGrant(
-      {
-        businessId: BUSINESS,
-        system: 'mailbox',
-        provider: 'microsoft',
-        credentialRef: 'OAUTH_MAILBOX',
-        account: 'owner@contoso.example',
-        scopes: ['Mail.Send'],
-        refreshToken: 'ms-refresh',
-        grantedBy: 'test',
-      },
-      key,
-    );
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { system: 'mailbox', provider: 'microsoft', credentialRef: 'OAUTH_MAILBOX', account: 'owner@contoso.example', scopes: ['Mail.Send'], refreshToken: 'ms-refresh', grantedBy: 'test' }, key));
     const csrf = issueCsrfToken(sessionIdFromCookie(cookie));
     const res = await fetch(`${baseUrl}/oauth/mailbox/revoke`, {
       method: 'POST',
@@ -1169,7 +1121,7 @@ describe('mailbox ceremony', () => {
       redirect: 'manual',
     });
     expect(res.status).toBe(302);
-    expect(await readGrantBySystem('mailbox', BUSINESS, key)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, 'mailbox', key))).toBeNull();
     // The route swallows provider-call errors, so a throwing stub proves
     // nothing: count invocations, and check the audit row names the branch.
     expect(providerCalls).toBe(0);

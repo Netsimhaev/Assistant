@@ -142,10 +142,7 @@ describe('the erasure screen', () => {
   it('shows a preview that names every table it will touch', async () => {
     await seedRonit();
 
-    const plan = await buildErasurePlan(
-      { kind: 'contact', identifier: RONIT },
-      { businessId: BUSINESS },
-    );
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
     const html = renderErasure({ csrf: 'token', plan, anchorLabel: RONIT });
 
     expect(html).toContain(RONIT);

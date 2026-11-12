@@ -65,7 +65,7 @@ const recallPlan: Plan = {
 
 async function ownerJob(text: string, attached: string[]): Promise<Job> {
   const job = await withBusiness(B, (db) => createJob(db, { charterVersion: 'v-owner', provenance: 'boss' }));
-  await saveInstruction({ jobId: job.jobId, text, textOrigin: 'typed', attachedDocumentIds: attached }, { businessId: B });
+  await withBusiness(B, (bdb) => saveInstruction(bdb, { jobId: job.jobId, text, textOrigin: 'typed', attachedDocumentIds: attached }));
   for (const to of ['understand', 'plan', 'execute'] as const) {
     await withBusiness(B, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
@@ -97,7 +97,7 @@ describe('owner-attached sources', () => {
     expect(outcome.status).toBe('planned');
     expect(seen[0]?.attachedDocuments).toEqual([{ documentId: mine, name: 'מחירון אלפא.xlsx' }]);
     if (outcome.status !== 'planned') return;
-    expect(await attachedDocumentsForJob(outcome.jobId, { businessId: B })).toEqual([mine]);
+    expect(await withBusiness(B, (bdb) => attachedDocumentsForJob(bdb, outcome.jobId))).toEqual([mine]);
   });
 
   it('the planner prompt lists the attached files in a fence, after the instruction', async () => {

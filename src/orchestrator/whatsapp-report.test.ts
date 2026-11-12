@@ -1259,25 +1259,22 @@ describe('reportWhatsAppJobs — boss commands (spec §4.6)', () => {
     const bundle = await install();
     const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
     if (o.instruction) {
-      await saveInstruction({ jobId: job.jobId, text: 'תשלחי לדנה', textOrigin: 'typed' }, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { jobId: job.jobId, text: 'תשלחי לדנה', textOrigin: 'typed' }));
     }
     for (const to of ['understand', 'plan'] as const) {
       await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
     const binding = await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, SEND_PLAN));
     if (binding.status === 'conflict') throw new Error('setup: plan conflict');
-    await createConfirmation(
-      {
+    await withBusiness(BUSINESS, (bdb) => createConfirmation(bdb, {
         jobId: job.jobId,
         options: [{ label: 'לשלוח', planHash: binding.planHash, plan: SEND_PLAN, contactSource: null }],
         presentedText: 'לשלוח?',
         channel: 'whatsapp',
         ...(o.reaskOf !== undefined ? { reaskOf: o.reaskOf } : {}),
-      },
-      { businessId: BUSINESS },
-    );
+      }));
     if (o.confirm) {
-      expect(await confirmChoice(job.jobId, binding.planHash, 'p_boss', { businessId: BUSINESS })).toBe(true);
+      expect(await withBusiness(BUSINESS, (bdb) => confirmChoice(bdb, job.jobId, binding.planHash, 'p_boss'))).toBe(true);
     }
     await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'setup' }));
     await withBusinessTransaction(BUSINESS, async (tx) => {

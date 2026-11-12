@@ -102,27 +102,21 @@ async function setup(options: SetupOptions = {}): Promise<Setup> {
     provenance: options.provenance ?? 'boss',
   }));
   if (options.instruction !== false) {
-    await saveInstruction(
-      { jobId: job.jobId, text: 'תשלחי לדנה את ההצעה', textOrigin: 'typed' },
-      { businessId: options.instructionBusiness ?? BUSINESS },
-    );
+    await withBusiness(options.instructionBusiness ?? BUSINESS, (bdb) => saveInstruction(bdb, { jobId: job.jobId, text: 'תשלחי לדנה את ההצעה', textOrigin: 'typed' }));
   }
   const plan = planOf(options.toolName ?? 'mail.send', options.input ?? SEND, undefined, options.stepAgent);
   const planHash = planHashOf(plan);
   await withBusiness(options.planBusiness ?? BUSINESS, (db) => bindPlanToJob(db, job.jobId, plan));
 
   const confirmationBusiness = options.confirmationBusiness ?? BUSINESS;
-  await createConfirmation(
-    {
+  await withBusiness(confirmationBusiness, (bdb) => createConfirmation(bdb, {
       jobId: job.jobId,
       options: [{ label: 'לשלוח', planHash, plan, contactSource: null }],
       presentedText: 'לשלוח לדנה?',
       channel: 'dashboard',
-    },
-    { businessId: confirmationBusiness },
-  );
+    }));
   if (options.confirm !== false) {
-    expect(await confirmChoice(job.jobId, planHash, 'p_boss', { businessId: confirmationBusiness }))
+    expect(await withBusiness(confirmationBusiness, (bdb) => confirmChoice(bdb, job.jobId, planHash, 'p_boss')))
       .toBe(true);
   }
 

@@ -32,8 +32,8 @@
  * `WHERE` clause that is wrong in some way we have not thought of.
  */
 import { config } from '../config.js';
-import { acquireAdvisoryLock, getPool, withTransaction } from '../db/pool.js';
-import type { Queryable } from '../db/pool.js';
+import { acquireAdvisoryLock, transaction, withBusiness } from '../db/pool.js';
+import type { BusinessDb, Queryable } from '../db/pool.js';
 import { createCredentialHandle } from '../orchestrator/adapters/types.js';
 import type { CredentialHandle } from '../orchestrator/adapters/types.js';
 import { CREDENTIAL_REF_PATTERN } from '../orchestrator/credentials.js';
@@ -70,20 +70,17 @@ export interface SecretSummary {
   updatedBy: string;
 }
 
+/**
+ * The business is not a field here: it is the `BusinessDb` `putSecret`
+ * takes, required, with no fallback to `config.businessId` — the same rule
+ * the read path states at length in `credentials.ts`. A secret written under
+ * the wrong business is a secret another customer's `resolve` can reach, and
+ * one source for it means the connection and the AAD cannot disagree.
+ */
 export interface PutSecretInput {
-  /**
-   * Required, with no fallback to `config.businessId` — the same rule the
-   * read path states at length in `credentials.ts`. A secret written under
-   * the wrong business is a secret another customer's `resolve` can reach.
-   */
-  businessId: string;
   ref: string;
   value: string;
   updatedBy: string;
-}
-
-export interface CredentialStoreOptions {
-  db?: Queryable;
 }
 
 /** Only ever the sealed halves: no column of this row is readable as-is. */
@@ -152,7 +149,7 @@ function assertLegalRef(ref: string): void {
 export async function liveKeyId(db: Queryable): Promise<string> {
   const { rows } = await db.query<{ key_id: string }>(
     'SELECT key_id FROM credential_key_state WHERE business_id = $1',
-    [config.businessId],
+    [config.businessId], // TENANCY-TODO(task 12)
   );
   const row = rows[0];
   if (row === undefined) {
@@ -170,49 +167,62 @@ export async function liveKeyId(db: Queryable): Promise<string> {
  * (`loadMasterKey`) and held in process memory — never in the environment,
  * which is inherited by child processes and reaches crash dumps and logs.
  */
-export function storedCredentials(
-  key: Buffer,
-  options: CredentialStoreOptions = {},
-): CredentialSource {
+export function storedCredentials(key: Buffer): CredentialSource {
   return {
     async resolve(ref: string, businessId: string): Promise<CredentialHandle | null> {
-      // Before any database call: a ref outside the legal shape is not a ref
-      // that was ever stored, so there is nothing to look up.
+      // Before any database call — before even a connection is checked out:
+      // a ref outside the legal shape is not a ref that was ever stored, so
+      // there is nothing to look up.
       if (!CREDENTIAL_REF_PATTERN.test(ref)) return null;
-
-      const db = options.db ?? getPool();
-      const { rows } = await db.query<SealedRow>(
-        'SELECT ciphertext, nonce FROM credentials WHERE business_id = $1 AND ref = $2',
-        [businessId, ref],
-      );
-      const row = rows[0];
-      if (row === undefined) return null;
-
-      // The authenticated data is built from the business the CALLER asked
-      // for — never from the row. The row's own `business_id` is not even
-      // selected above, so there is nothing here to reach for by accident.
-      //
-      // Using the row's value would make the second control approve itself:
-      // the cipher would be asked whether the bytes belong to the row they
-      // were just read out of, which they always do. Measured, not assumed:
-      // swapping this for `row.business_id` while the `WHERE` clause stands
-      // changes no test result at all, because the filter makes the two
-      // values the same string — but with the filter ALSO gone, the pair
-      // hands one business another's secret in full, where the filter alone
-      // or the cipher alone each refuse. That is the whole reason this reads
-      // from the request rather than from the stored bytes.
-      const value = decryptSecret({ ciphertext: row.ciphertext, nonce: row.nonce }, key, {
-        businessId,
-        ref,
-      });
-      // `null` for every failure, undistinguished: a wrong key, a wrong
-      // business, altered bytes. The caller's correct response to all of them
-      // is the same final `credential_unavailable`.
-      if (value === null) return null;
-
-      return createCredentialHandle(ref, value);
+      // `CredentialSource.resolve` carries the business as a string (its
+      // signature is the documented control in `credentials.ts`), so this
+      // is an entry point and opens its own business-scoped connection.
+      return withBusiness(businessId, (db) => resolveStoredSecret(db, key, ref));
     },
   };
+}
+
+/**
+ * The read behind `storedCredentials`, on a connection already scoped to the
+ * business — `db.businessId` is both the `WHERE` filter and the AAD.
+ */
+export async function resolveStoredSecret(
+  db: BusinessDb,
+  key: Buffer,
+  ref: string,
+): Promise<CredentialHandle | null> {
+  if (!CREDENTIAL_REF_PATTERN.test(ref)) return null;
+  const businessId = db.businessId;
+  const { rows } = await db.query<SealedRow>(
+    'SELECT ciphertext, nonce FROM credentials WHERE business_id = $1 AND ref = $2',
+    [businessId, ref],
+  );
+  const row = rows[0];
+  if (row === undefined) return null;
+
+  // The authenticated data is built from the business the CALLER asked
+  // for — never from the row. The row's own `business_id` is not even
+  // selected above, so there is nothing here to reach for by accident.
+  //
+  // Using the row's value would make the second control approve itself:
+  // the cipher would be asked whether the bytes belong to the row they
+  // were just read out of, which they always do. Measured, not assumed:
+  // swapping this for `row.business_id` while the `WHERE` clause stands
+  // changes no test result at all, because the filter makes the two
+  // values the same string — but with the filter ALSO gone, the pair
+  // hands one business another's secret in full, where the filter alone
+  // or the cipher alone each refuse. That is the whole reason this reads
+  // from the request rather than from the stored bytes.
+  const value = decryptSecret({ ciphertext: row.ciphertext, nonce: row.nonce }, key, {
+    businessId,
+    ref,
+  });
+  // `null` for every failure, undistinguished: a wrong key, a wrong
+  // business, altered bytes. The caller's correct response to all of them
+  // is the same final `credential_unavailable`.
+  if (value === null) return null;
+
+  return createCredentialHandle(ref, value);
 }
 
 /**
@@ -238,28 +248,25 @@ export function storedCredentials(
  * own transaction, so the two genuinely exclude each other instead of a
  * lock on only one side of the race.
  *
- * When the caller supplies `options.db`, it is used as-is and no
- * transaction is opened here — the same convention `verifyKeyState` and
- * `liveKeyId` already follow, on the assumption (documented at every other
- * call site that does this, e.g. `sign-decision.ts`) that a caller passing
- * its own client is already inside one. No production caller does this
- * today; it exists for tests that need to observe the statements this
- * function issues.
+ * Runs in `transaction(db, …)`: on a db already inside a transaction it
+ * joins it (the caller's transaction then holds the lock to its own end),
+ * and otherwise it opens one — so the advisory lock, the key reads and the
+ * insert always share one connection and one transaction.
  */
 export async function putSecret(
+  db: BusinessDb,
   input: PutSecretInput,
   key: Buffer,
-  options: CredentialStoreOptions = {},
 ): Promise<void> {
   assertLegalRef(input.ref);
 
-  const write = async (db: Queryable): Promise<void> => {
+  const write = async (db: BusinessDb): Promise<void> => {
     await acquireAdvisoryLock(db, ROTATION_LOCK_SCOPE);
     await verifyKeyState(key, { db });
     const keyId = await liveKeyId(db);
 
     const sealed = encryptSecret(input.value, key, {
-      businessId: input.businessId,
+      businessId: db.businessId,
       ref: input.ref,
     });
 
@@ -272,15 +279,11 @@ export async function putSecret(
              key_id = EXCLUDED.key_id,
              updated_at = now(),
              updated_by = EXCLUDED.updated_by`,
-      [input.businessId, input.ref, sealed.ciphertext, sealed.nonce, keyId, input.updatedBy],
+      [db.businessId, input.ref, sealed.ciphertext, sealed.nonce, keyId, input.updatedBy],
     );
   };
 
-  if (options.db) {
-    await write(options.db);
-    return;
-  }
-  await withTransaction((tx) => write(tx));
+  await transaction(db, write);
 }
 
 /**
@@ -288,15 +291,10 @@ export async function putSecret(
  * can tell "gone now" from "there was nothing there" — a distinction an
  * operator removing a ref by hand needs and a bare `void` would swallow.
  */
-export async function removeSecret(
-  ref: string,
-  businessId: string,
-  options: CredentialStoreOptions = {},
-): Promise<boolean> {
+export async function removeSecret(db: BusinessDb, ref: string): Promise<boolean> {
   assertLegalRef(ref);
-  const db = options.db ?? getPool();
   const result = await db.query('DELETE FROM credentials WHERE business_id = $1 AND ref = $2', [
-    businessId,
+    db.businessId,
     ref,
   ]);
   return (result.rowCount ?? 0) > 0;
@@ -310,17 +308,13 @@ export async function removeSecret(
  * function can print a value even by mistake. Ordered by ref so a listing is
  * stable between runs.
  */
-export async function listSecretRefs(
-  businessId: string,
-  options: CredentialStoreOptions = {},
-): Promise<SecretSummary[]> {
-  const db = options.db ?? getPool();
+export async function listSecretRefs(db: BusinessDb): Promise<SecretSummary[]> {
   const { rows } = await db.query<SummaryRow>(
     `SELECT ref, key_id, updated_at, updated_by
        FROM credentials
       WHERE business_id = $1
       ORDER BY ref`,
-    [businessId],
+    [db.businessId],
   );
   return rows.map(toSecretSummary);
 }

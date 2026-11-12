@@ -231,24 +231,8 @@ describe('buildRuntime', () => {
    * `SmtpConfig.createTransport` one layer down.
    */
   it('notifies using the configured NOTIFY_CREDENTIAL_REF resolved from the real store, not a different stored ref', async () => {
-    await putSecret(
-      {
-        businessId: config.businessId,
-        ref: 'NOTIFY_MAIL',
-        value: 'סוד-הנוטיפייר',
-        updatedBy: 'operator@example.com',
-      },
-      KEY,
-    );
-    await putSecret(
-      {
-        businessId: config.businessId,
-        ref: 'DECOY_REF',
-        value: 'סוד-אחר-לגמרי',
-        updatedBy: 'operator@example.com',
-      },
-      KEY,
-    );
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'NOTIFY_MAIL', value: 'סוד-הנוטיפייר', updatedBy: 'operator@example.com' }, KEY));
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'DECOY_REF', value: 'סוד-אחר-לגמרי', updatedBy: 'operator@example.com' }, KEY));
 
     const captured: Array<{ user?: string; pass?: string }> = [];
     const runtime = await buildRuntime(FULL, {
@@ -281,15 +265,7 @@ describe('buildRuntime', () => {
    * real encrypted store and the real `transport.send` call shape.
    */
   it('sendAlert resolves NOTIFY_CREDENTIAL_REF through the real store and reaches the transport', async () => {
-    await putSecret(
-      {
-        businessId: config.businessId,
-        ref: 'NOTIFY_MAIL',
-        value: 'סוד-התראת-הבריאות',
-        updatedBy: 'operator@example.com',
-      },
-      KEY,
-    );
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'NOTIFY_MAIL', value: 'סוד-התראת-הבריאות', updatedBy: 'operator@example.com' }, KEY));
 
     const captured: Array<{ to: string; subject: string; text: string; auth?: { user?: string; pass?: string } }> = [];
     const runtime = await buildRuntime(FULL, {
@@ -329,10 +305,7 @@ describe('buildRuntime', () => {
    * must carry the new value.
    */
   it('sendAlert resolves a fresh credential on every call, so a rotation takes effect on the next alert', async () => {
-    await putSecret(
-      { businessId: config.businessId, ref: 'NOTIFY_MAIL', value: 'סוד-ראשון', updatedBy: 'operator@example.com' },
-      KEY,
-    );
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'NOTIFY_MAIL', value: 'סוד-ראשון', updatedBy: 'operator@example.com' }, KEY));
     const captured: Array<{ pass?: string }> = [];
     const runtime = await buildRuntime(FULL, {
       createTransport: (opts) => ({
@@ -349,10 +322,7 @@ describe('buildRuntime', () => {
     expect(first.ok).toBe(true);
     expect(captured[0]?.pass).toBe('סוד-ראשון');
 
-    await putSecret(
-      { businessId: config.businessId, ref: 'NOTIFY_MAIL', value: 'סוד-שני', updatedBy: 'operator@example.com' },
-      KEY,
-    );
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'NOTIFY_MAIL', value: 'סוד-שני', updatedBy: 'operator@example.com' }, KEY));
     const second = await notify.sendAlert('נושא', 'גוף');
     expect(second.ok).toBe(true);
     expect(captured[1]?.pass).toBe('סוד-שני');
@@ -374,10 +344,7 @@ describe('buildRuntime', () => {
       return { sendMail: () => Promise.resolve({ messageId: 'stub-message-id' }) };
     };
 
-    await putSecret(
-      { businessId: config.businessId, ref: 'NOTIFY_MAIL', value: 'pw', updatedBy: 'test' },
-      KEY,
-    );
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'NOTIFY_MAIL', value: 'pw', updatedBy: 'test' }, KEY));
 
     const strict = await buildRuntime(FULL, { createTransport: capture });
     expect(strict.warnings.join(' ')).not.toMatch(/SMTP_ALLOW_CLEARTEXT/);
@@ -486,14 +453,8 @@ describe('buildRuntime', () => {
    * progress over the unconfigured case above, and the warning says so.
    */
   it('warns that no gateway implementation is wired in yet, once both refs resolve', async () => {
-    await putSecret(
-      { businessId: config.businessId, ref: 'GREEN_API_INSTANCE', value: 'inst-1', updatedBy: 'operator@example.com' },
-      KEY,
-    );
-    await putSecret(
-      { businessId: config.businessId, ref: 'GREEN_API_TOKEN', value: 'tok-1', updatedBy: 'operator@example.com' },
-      KEY,
-    );
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'GREEN_API_INSTANCE', value: 'inst-1', updatedBy: 'operator@example.com' }, KEY));
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'GREEN_API_TOKEN', value: 'tok-1', updatedBy: 'operator@example.com' }, KEY));
     const runtime = await buildRuntime({
       ...FULL,
       GREEN_API_INSTANCE_REF: 'GREEN_API_INSTANCE',
@@ -511,10 +472,7 @@ describe('buildRuntime', () => {
    * instance ref is actually stored.
    */
   it('builds no gateway when only one of the two GREEN-API refs resolves, even with a factory supplied', async () => {
-    await putSecret(
-      { businessId: config.businessId, ref: 'GREEN_API_INSTANCE', value: 'inst-half', updatedBy: 'operator@example.com' },
-      KEY,
-    );
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'GREEN_API_INSTANCE', value: 'inst-half', updatedBy: 'operator@example.com' }, KEY));
     const runtime = await buildRuntime(
       {
         ...FULL,
@@ -533,14 +491,8 @@ describe('buildRuntime', () => {
    * from the resolved credentials, not from anything this function invented.
    */
   it('builds a WhatsApp gateway from the resolved credentials when a factory is supplied', async () => {
-    await putSecret(
-      { businessId: config.businessId, ref: 'GREEN_API_INSTANCE', value: 'inst-42', updatedBy: 'operator@example.com' },
-      KEY,
-    );
-    await putSecret(
-      { businessId: config.businessId, ref: 'GREEN_API_TOKEN', value: 'tok-42', updatedBy: 'operator@example.com' },
-      KEY,
-    );
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'GREEN_API_INSTANCE', value: 'inst-42', updatedBy: 'operator@example.com' }, KEY));
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'GREEN_API_TOKEN', value: 'tok-42', updatedBy: 'operator@example.com' }, KEY));
     let seenInstance: string | null = null;
     let seenToken: string | null = null;
     const runtime = await buildRuntime(
@@ -921,15 +873,7 @@ describe('buildRuntime', () => {
    * both assertions; one that supplied both sources would fail the second.
    */
   it('resolves secrets from the encrypted store, and not from the process environment', async () => {
-    await putSecret(
-      {
-        businessId: config.businessId,
-        ref: 'OFFICE_MAIL',
-        value: 'sealed-in-the-database',
-        updatedBy: 'operator@example.com',
-      },
-      KEY,
-    );
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'OFFICE_MAIL', value: 'sealed-in-the-database', updatedBy: 'operator@example.com' }, KEY));
 
     const runtime = await buildRuntime({
       ...FULL,

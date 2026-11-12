@@ -941,7 +941,7 @@ export async function schedulerPass(
   let settledConfirmations: SettleResult = { settled: [], skipped: [], errored: [] };
   let expiredConfirmationsError: string | null = null;
   try {
-    expiredConfirmations = await expireConfirmations({ businessId });
+    expiredConfirmations = await withBusiness(businessId, (db) => expireConfirmations(db)); // TENANCY-TODO(task 9)
     settledConfirmations = await withBusiness(businessId, (db) => settleDecidedConfirmations(db)); // TENANCY-TODO(task 9)
   } catch (err) {
     expiredConfirmationsError = err instanceof Error ? err.message : String(err);
@@ -1291,7 +1291,7 @@ export async function schedulerPass(
   // `runDigests` itself reloads the settings (it has no way to be handed the
   // ones already read here without widening its signature past what Tasks
   // 1–5 fixed), and is never called at all when they say `off`.
-  const digestSettings = await loadDigestSettings({ businessId });
+  const digestSettings = await withBusiness(businessId, (db) => loadDigestSettings(db)); // TENANCY-TODO(task 9)
   let digest: DigestRunResult | null = null;
   if (digestSettings.schedule !== 'off') {
     digest = await withBusiness(businessId, (db) => runDigests(db, { // TENANCY-TODO(task 9)

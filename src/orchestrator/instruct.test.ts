@@ -76,7 +76,7 @@ describe('runInstruction', () => {
     expect(jobs.rows[0]?.phase).toBe('plan');
 
     expect(await withBusiness(BUSINESS, (db) => loadPlanBody(db, result.jobId))).not.toBeNull();
-    const stored = await loadInstructionForJob(result.jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, result.jobId));
     expect(stored?.text).toBe('תשלחי ל-dana@example.com את ההצעה');
   });
 
@@ -144,7 +144,7 @@ describe('runInstruction', () => {
     // row it lives only in the HTTP response that carried it, and a reload
     // orphans the job in `understand` with the owner unable to see what they
     // were asked.
-    const stored = await loadInstructionForJob(result.jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, result.jobId));
     expect(stored?.question).toBe('איזו דנה?');
     expect(result.instructionText).toBe('תשלחי לדנה את ההצעה');
   });
@@ -926,7 +926,7 @@ describe('an instruction whose text came from a recording', () => {
     // Stored on the row, not merely used in passing: the next hop (an answer
     // joined onto this text) reads it back, and without the column a typed
     // answer would relabel this instruction as typed.
-    const stored = await loadInstructionForJob(result.jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, result.jobId));
     expect(stored?.textOrigin).toBe('transcribed');
   });
 
@@ -941,7 +941,7 @@ describe('an instruction whose text came from a recording', () => {
     if (result.status !== 'needs_confirmation') throw new Error('unreachable');
     // The paired positive: typed, so the grant is written.
     expect(await authorisationRows(result.jobId)).toHaveLength(1);
-    const stored = await loadInstructionForJob(result.jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, result.jobId));
     expect(stored?.textOrigin).toBe('typed');
   });
 
@@ -1087,7 +1087,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     expect(await phaseOf(result.jobId)).toBe('plan');
     expect(await everReached(result.jobId, 'execute')).toBe(false);
 
-    const confirmation = await loadConfirmation(result.jobId, { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, result.jobId));
     expect(confirmation?.state).toBe('pending');
     expect(confirmation?.channel).toBe('whatsapp');
     expect(confirmation?.options).toHaveLength(1);
@@ -1115,7 +1115,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     expect(result.status).toBe('planned');
     if (result.status !== 'planned') throw new Error('unreachable');
     expect(await phaseOf(result.jobId)).toBe('execute');
-    expect(await loadConfirmation(result.jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, result.jobId))).toBeNull();
   });
 
   /** Spec §10.10: on the instruction path the catalogue is rendered at `auto`. */
@@ -1150,7 +1150,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     expect(result.optionCount).toBe(2);
 
     expect(requests).toHaveLength(2);
-    const stored = await loadInstructionForJob(result.jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, result.jobId));
     for (const request of requests) {
       // Byte-identical to what was stored — the identity travels elsewhere.
       expect(request.instruction).toBe(stored?.text);
@@ -1170,7 +1170,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     const auths = await testDb().query('SELECT 1 FROM job_authorizations');
     expect(auths.rows).toHaveLength(0);
 
-    const confirmation = await loadConfirmation(result.jobId, { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, result.jobId));
     expect(confirmation?.state).toBe('pending');
     expect(confirmation?.options.map((option) => option.planHash).sort()).toEqual(
       [
@@ -1210,7 +1210,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     expect(requests.map((request) => request.resolvedContact ?? '')).toHaveLength(1);
     expect(requests[0]?.resolvedContact).toContain('רונית כהן');
     expect(result.question).not.toContain('ronit.levi@gamma.example');
-    const confirmation = await loadConfirmation(result.jobId, { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, result.jobId));
     expect(confirmation?.options.map((option) => option.planHash)).toEqual([
       planHashOf(mailPlan('ronit@beta-log.example')),
     ]);
@@ -1225,7 +1225,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
       }));
 
     if (result.status !== 'needs_confirmation') throw new Error(`unexpected ${result.status}`);
-    const confirmation = await loadConfirmation(result.jobId, { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, result.jobId));
     const sourceByLabel = new Map(
       (confirmation?.options ?? []).map((option) => [option.label, option.contactSource]),
     );
@@ -1246,7 +1246,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
       }));
 
     if (result.status !== 'needs_confirmation') throw new Error(`unexpected ${result.status}`);
-    const confirmation = await loadConfirmation(result.jobId, { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, result.jobId));
     expect(confirmation?.options[0]?.contactSource).toBe('unverified');
   });
 
@@ -1271,7 +1271,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     expect(result.status).toBe('needs_confirmation');
     if (result.status !== 'needs_confirmation') throw new Error('unreachable');
     expect(result.optionCount).toBe(1);
-    const confirmation = await loadConfirmation(result.jobId, { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, result.jobId));
     expect(confirmation?.options[0]?.label).toContain('רונית לוי');
     // The one left is the ordinary single-option case: bound at once.
     const bound = await withBusiness(BUSINESS, (db) => loadPlanBody(db, result.jobId));
@@ -1358,10 +1358,10 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     expect(result.status).toBe('needs_answer');
     if (result.status !== 'needs_answer') throw new Error('unreachable');
     expect(result.question).toBe('שאלה 1');
-    const stored = await loadInstructionForJob(result.jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, result.jobId));
     expect(stored?.question).toBe('שאלה 1');
     expect(await phaseOf(result.jobId)).toBe('understand');
-    expect(await loadConfirmation(result.jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, result.jobId))).toBeNull();
   });
 
   it('asks the identity question when every candidate plan is reads only', async () => {
@@ -1385,7 +1385,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     expect(result.question).toContain('רונית כהן');
     expect(result.question).toContain('רונית לוי');
     expect(await phaseOf(result.jobId)).toBe('understand');
-    expect(await loadConfirmation(result.jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, result.jobId))).toBeNull();
     expect(await withBusiness(BUSINESS, (db) => loadPlanBody(db, result.jobId))).toBeNull();
   });
 

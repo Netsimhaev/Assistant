@@ -15,7 +15,7 @@ const BUSINESS = 'test-business';
 
 async function aBossJob(): Promise<string> {
   const charter = buildCharter();
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, charter)); // TENANCY-TODO(task 6)
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, charter));
   const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: charter.charterVersion,
     provenance: 'boss',
@@ -40,8 +40,8 @@ describe('the instruction record', () => {
     // change what counts as "named in the instruction".
     const text = 'תשלחי לדנה  \ndana@example.com את ההצעה';
 
-    const saved = await saveInstruction({ textOrigin: 'typed', jobId, text }, { businessId: BUSINESS });
-    const read = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    const saved = await withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId, text }));
+    const read = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, jobId));
 
     expect(saved.text).toBe(text);
     expect(read?.text).toBe(text);
@@ -51,16 +51,11 @@ describe('the instruction record', () => {
 
   it('records an answer beside the instruction, not in place of it', async () => {
     const jobId = await aBossJob();
-    const saved = await saveInstruction(
-      { textOrigin: 'typed', jobId, text: 'תשלחי לדנה את ההצעה' },
-      { businessId: BUSINESS },
-    );
+    const saved = await withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId, text: 'תשלחי לדנה את ההצעה' }));
 
-    await claimAnswer(saved.instructionId, 'דנה כהן, dana@example.com', {
-      businessId: BUSINESS,
-    });
+    await withBusiness(BUSINESS, (bdb) => claimAnswer(bdb, saved.instructionId, 'דנה כהן, dana@example.com'));
 
-    const read = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    const read = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, jobId));
     expect(read?.text).toBe('תשלחי לדנה את ההצעה');
     expect(read?.answer).toBe('דנה כהן, dana@example.com');
   });
@@ -72,7 +67,7 @@ describe('the instruction record', () => {
     // only the database CHECK caught it, leaving the owner with a raw
     // Postgres error instead of a Hebrew sentence.
     await expect(
-      saveInstruction({ textOrigin: 'typed', jobId, text: '   ' }, { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId, text: '   ' })),
     ).rejects.toThrow('ההוראה ריקה');
   });
 
@@ -83,24 +78,24 @@ describe('the instruction record', () => {
     // is what tells the owner where a whole document belongs instead of the
     // instruction box. A Postgres CHECK violation carries neither.
     await expect(
-      saveInstruction({ textOrigin: 'typed', jobId, text: tooLong }, { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId, text: tooLong })),
     ).rejects.toThrow(/4000/);
     await expect(
-      saveInstruction({ textOrigin: 'typed', jobId, text: tooLong }, { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId, text: tooLong })),
     ).rejects.toThrow(/תיקיית הקליטה/);
   });
 
   it('never returns another business\'s instruction', async () => {
     const jobId = await aBossJob();
-    await saveInstruction({ textOrigin: 'typed', jobId, text: 'תשלחי לדנה' }, { businessId: BUSINESS });
-    expect(await loadInstructionForJob(jobId, { businessId: 'someone-else' })).toBeNull();
+    await withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId, text: 'תשלחי לדנה' }));
+    expect(await withBusiness('someone-else', (bdb) => loadInstructionForJob(bdb, jobId))).toBeNull();
   });
 
   it('refuses a second instruction on the same job', async () => {
     const jobId = await aBossJob();
-    await saveInstruction({ textOrigin: 'typed', jobId, text: 'ראשונה' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId, text: 'ראשונה' }));
     await expect(
-      saveInstruction({ textOrigin: 'typed', jobId, text: 'שנייה' }, { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId, text: 'שנייה' })),
     ).rejects.toThrow();
     const { rows } = await getPool().query(`SELECT 1 FROM boss_instructions`);
     expect(rows).toHaveLength(1);

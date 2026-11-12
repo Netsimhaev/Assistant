@@ -319,7 +319,7 @@ describe('runMeetingOperation through runInstruction', () => {
 
     const job = await withBusiness(BUSINESS, (db) => loadJob(db, outcome.jobId));
     expect(job?.phase).toBe('plan');
-    const confirmation = await loadConfirmation(outcome.jobId, { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, outcome.jobId));
     expect(confirmation?.state).toBe('pending');
     expect(confirmation?.options[0]?.planHash).toBe(stored?.planHash);
     // The summary is shown, and the step echo is still there under it.
@@ -341,7 +341,7 @@ describe('runMeetingOperation through runInstruction', () => {
     const { extractor } = extractorOf({ status: 'extracted', request: createRequest(day, { email: 'dani@example.com' }) });
     const outcome = await instruct(`תקבעי פגישה עם דני כהן dani@example.com ביום ${day}`, cal.client, extractor);
     if (outcome.status !== 'needs_confirmation') throw new Error(`expected a confirmation, got ${outcome.status}`);
-    const confirmation = await loadConfirmation(outcome.jobId, { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, outcome.jobId));
     const planHash = confirmation?.options[0]?.planHash as string;
     const [hold] = await holds();
 
@@ -531,7 +531,7 @@ describe('runMeetingOperation through runInstruction', () => {
     if (second.status !== 'needs_confirmation') return;
 
     // The old question is gone and its hold released.
-    expect((await loadConfirmation(first.jobId, { businessId: BUSINESS }))?.state).toBe('cancelled');
+    expect((await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, first.jobId)))?.state).toBe('cancelled');
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, first.jobId)))?.phase).toBe('closed');
     const rows = await holds();
     expect(rows.find((h) => h.hold_id === firstHold?.hold_id)?.state).toBe('released');
@@ -581,7 +581,7 @@ describe('runMeetingOperation through runInstruction', () => {
     const { extractor } = extractorOf({ status: 'extracted', request: createRequest(day, { email: 'dani@example.com' }) });
     const outcome = await instruct(`תקבעי פגישה עם דני כהן dani@example.com ביום ${day}`, cal.client, extractor);
     if (outcome.status !== 'needs_confirmation') throw new Error(`expected a confirmation, got ${outcome.status}`);
-    const planHash = (await loadConfirmation(outcome.jobId, { businessId: BUSINESS }))?.options[0]?.planHash as string;
+    const planHash = (await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, outcome.jobId)))?.options[0]?.planHash as string;
     expect(
       await withBusiness(BUSINESS, (db) => applyConfirmation(db, outcome.jobId, { kind: 'confirm', planHash }, 'dashboard:owner')),
     ).toBe('executing');
@@ -616,12 +616,12 @@ describe('runMeetingOperation — fix round 1', () => {
     const { extractor, texts } = extractorOf({ status: 'extracted', request: createRequest(day) });
     const first = await instruct(`תקבעי פגישה עם דני כהן ביום ${day}`, cal.client, extractor);
     if (first.status !== 'needs_confirmation') throw new Error(`expected a confirmation, got ${first.status}`);
-    const planHash = (await loadConfirmation(first.jobId, { businessId: BUSINESS }))?.options[0]?.planHash as string;
+    const planHash = (await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, first.jobId)))?.options[0]?.planHash as string;
 
     // The owner confirms on the dashboard exactly between the door's read of
     // the pending question and its cancel (the calendar access read sits there).
     let race: (() => Promise<void>) | null = async () => {
-      expect(await confirmChoice(first.jobId, planHash, 'dashboard:owner', { businessId: BUSINESS })).toBe(true);
+      expect(await withBusiness(BUSINESS, (bdb) => confirmChoice(bdb, first.jobId, planHash, 'dashboard:owner'))).toBe(true);
     };
     const racing: CredentialSource = {
       async resolve(ref, businessId) {
@@ -634,7 +634,7 @@ describe('runMeetingOperation — fix round 1', () => {
     const outcome = await instruct('תני אחר', cal.client, extractor, { credentials: racing });
 
     expect(outcome).toEqual({ status: 'refused', reason: ALREADY_CONFIRMED_REPLY });
-    expect((await loadConfirmation(first.jobId, { businessId: BUSINESS }))?.state).toBe('confirmed');
+    expect((await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, first.jobId)))?.state).toBe('confirmed');
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, first.jobId)))?.phase).toBe('plan');
     expect((await holds()).map((h) => h.state)).toEqual(['held']);
     expect(cal.calls.filter((c) => c.op === 'delete')).toHaveLength(0);

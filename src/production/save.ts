@@ -351,7 +351,7 @@ export async function runDocSave(
   const approved = await deliveryVersionOf(db, ctx.jobId);
   if (approved === null || approved !== input.producedVersionId) throw refuse('save_not_supported');
 
-  const settings = await loadDocumentSettings({ businessId: db.businessId, db });
+  const settings = await loadDocumentSettings(db);
   if (settings.baseFolder === null) throw refuse('save_no_base_folder');
 
   const version = await loadVersionFile(db, input.producedVersionId);

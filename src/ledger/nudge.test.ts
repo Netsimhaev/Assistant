@@ -387,7 +387,7 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
     ]);
     expect((await withBusiness(B, (db) => loadLedgerItem(db, item.itemId)))?.nudgeCount).toBe(0);
 
-    const plan = await buildErasurePlan({ kind: 'contact', identifier: 'רונית לוי' }, { businessId: B });
+    const plan = await withBusiness(B, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: 'רונית לוי' }));
     expect(plan.ledgerItemIds).toEqual([item.itemId]);
     expect(plan.jobIds).toContain(jobId);
   });

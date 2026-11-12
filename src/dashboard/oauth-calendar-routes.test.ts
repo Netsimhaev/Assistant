@@ -59,7 +59,7 @@ beforeEach(async () => {
     ['MICROSOFT_OAUTH_CLIENT_ID', 'ms-id'],
     ['MICROSOFT_OAUTH_CLIENT_SECRET', 'ms-secret'],
   ] as const) {
-    await putSecret({ businessId: BUSINESS, ref, value, updatedBy: 'test' }, key);
+    await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref, value, updatedBy: 'test' }, key));
   }
   await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
 });
@@ -163,7 +163,7 @@ describe('calendar OAuth ceremony and the signed provider', () => {
     const res = await fetch(`${baseUrl}/oauth/callback?state=${state}&code=c`, { headers: { cookie } });
     expect(res.status).toBe(400);
     expect(calls).toEqual([]);
-    expect(await readGrantBySystem('calendar', BUSINESS, key)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, 'calendar', key))).toBeNull();
     expect((await withBusiness(BUSINESS, (db) => loadBindings(db))).some((b) => b.system === 'calendar')).toBe(false);
   });
 });

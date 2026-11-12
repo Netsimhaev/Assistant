@@ -94,26 +94,20 @@ async function seedCommand(options: { confirm: boolean }): Promise<string> {
     provenance: 'boss',
     title: 'confirmed-command',
   }));
-  await saveInstruction(
-    { jobId: job.jobId, text: 'תשלחי ל-stranger@nowhere.example את ההצעה', textOrigin: 'typed' },
-    { businessId: BUSINESS },
-  );
+  await withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { jobId: job.jobId, text: 'תשלחי ל-stranger@nowhere.example את ההצעה', textOrigin: 'typed' }));
   for (const to of ['understand', 'plan'] as const) {
     await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
   await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, PLAN));
   const planHash = planHashOf(PLAN);
-  await createConfirmation(
-    {
+  await withBusiness(BUSINESS, (bdb) => createConfirmation(bdb, {
       jobId: job.jobId,
       options: [{ label: 'לשלוח', planHash, plan: PLAN, contactSource: null }],
       presentedText: 'לשלוח?',
       channel: 'dashboard',
-    },
-    { businessId: BUSINESS },
-  );
+    }));
   if (options.confirm) {
-    expect(await confirmChoice(job.jobId, planHash, 'p_boss', { businessId: BUSINESS })).toBe(true);
+    expect(await withBusiness(BUSINESS, (bdb) => confirmChoice(bdb, job.jobId, planHash, 'p_boss'))).toBe(true);
   }
   await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'setup' }));
 

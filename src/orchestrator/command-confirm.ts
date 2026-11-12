@@ -398,7 +398,7 @@ export async function applyConfirmation(
   if (job?.phase !== 'plan') return 'already_decided';
 
   if (reading.kind === 'cancel') {
-    const cancelled = await cancelConfirmation(jobId, by, { businessId: db.businessId });
+    const cancelled = await cancelConfirmation(db, jobId, by);
     if (!cancelled) return 'already_decided';
     try {
       await moveTo(db, jobId, 'closed', 'command: cancelled', 'human');
@@ -409,14 +409,13 @@ export async function applyConfirmation(
     return 'cancelled';
   }
 
-  const confirmed = await confirmChoice(jobId, reading.planHash, by, {
-    businessId: db.businessId,
+  const confirmed = await confirmChoice(db, jobId, reading.planHash, by, {
     ...(o.whatsappInboundAt !== undefined ? { whatsappInboundAt: o.whatsappInboundAt } : {}),
   });
   if (!confirmed) return 'already_decided';
 
   try {
-    const confirmation = await loadConfirmation(jobId, { businessId: db.businessId });
+    const confirmation = await loadConfirmation(db, jobId);
     if (confirmation === null) {
       throw new Error(`command confirm: job ${jobId} lost its confirmation row`);
     }

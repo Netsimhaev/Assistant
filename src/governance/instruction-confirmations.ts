@@ -44,14 +44,14 @@
  * so the first claimant of a step gets `true` and every later one `false` —
  * and a refused claim means "this may already have run", never "run it".
  *
- * `businessId` is required on every call, with no default: every statement is
+ * The business is required on every call, with no default — it is the
+ * `BusinessDb` each function takes (`db.businessId`): every statement is
  * scoped by it, and a same-job-id row in another business is never touched.
  *
  * Both tables are wired into erasure (`erasure-plan.ts`, `erasure.ts`).
  */
 import { z } from 'zod';
-import type { Queryable } from '../db/pool.js';
-import { getPool } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { config } from '../config.js';
 import { Plan } from '../domain/plan.js';
 import { planHashOf } from '../orchestrator/plan-store.js';
@@ -136,12 +136,8 @@ export function toConfirmation(row: ConfirmationRow): InstructionConfirmation {
   };
 }
 
-interface Scope {
-  businessId: string;
-  db?: Queryable;
-}
-
 export async function createConfirmation(
+  db: BusinessDb,
   input: {
     jobId: string;
     options: ConfirmationOption[];
@@ -149,9 +145,7 @@ export async function createConfirmation(
     channel: ConfirmationChannel;
     reaskOf?: string;
   },
-  options: Scope,
 ): Promise<void> {
-  const db = options.db ?? getPool();
   const parsed = ConfirmationOptions.min(1).parse(input.options);
   const seen = new Set<string>();
   for (const option of parsed) {
@@ -169,7 +163,7 @@ export async function createConfirmation(
        (business_id, job_id, options, presented_text, channel, reask_of)
      VALUES ($1, $2, $3::jsonb, $4, $5, $6)`,
     [
-      options.businessId,
+      db.businessId,
       input.jobId,
       JSON.stringify(parsed),
       input.presentedText,
@@ -180,16 +174,15 @@ export async function createConfirmation(
 }
 
 export async function loadConfirmation(
+  db: BusinessDb,
   jobId: string,
-  options: Scope,
 ): Promise<InstructionConfirmation | null> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<ConfirmationRow>(
     `SELECT job_id, options, presented_text, presented_at, delivered_at, channel, state,
             chosen_plan_hash, decided_at, decided_by, reask_of
        FROM instruction_confirmations
       WHERE business_id = $1 AND job_id = $2`,
-    [options.businessId, jobId],
+    [db.businessId, jobId],
   );
   const row = rows[0];
   return row ? toConfirmation(row) : null;
@@ -209,16 +202,16 @@ export async function loadConfirmation(
  * nothing. Absent (the dashboard), none of this applies.
  */
 export async function confirmChoice(
+  db: BusinessDb,
   jobId: string,
   planHash: string,
   decidedBy: string,
-  options: Scope & { windowMinutes?: number; whatsappInboundAt?: Date },
+  options: { windowMinutes?: number; whatsappInboundAt?: Date } = {},
 ): Promise<boolean> {
   const windowMinutes = options.windowMinutes ?? config.whatsappQuestionWindowMinutes;
   if (windowMinutes <= 0) return false;
   const inboundAt = options.whatsappInboundAt;
   if (inboundAt !== undefined && Number.isNaN(inboundAt.getTime())) return false;
-  const db = options.db ?? getPool();
   const result = await db.query(
     `UPDATE instruction_confirmations
         SET state = 'confirmed', chosen_plan_hash = $3, decided_at = now(), decided_by = $4
@@ -227,7 +220,7 @@ export async function confirmChoice(
         AND options @> jsonb_build_array(jsonb_build_object('planHash', $3::text))
         AND ($6::timestamptz IS NULL
              OR (channel = 'whatsapp' AND delivered_at IS NOT NULL AND delivered_at < $6::timestamptz))`,
-    [options.businessId, jobId, planHash, decidedBy, windowMinutes, inboundAt ?? null],
+    [db.businessId, jobId, planHash, decidedBy, windowMinutes, inboundAt ?? null],
   );
   return result.rowCount === 1;
 }
@@ -238,30 +231,28 @@ export async function confirmChoice(
  * WhatsApp row not yet stamped, in this business. On the database clock, the
  * one `openConfirmations` compares the provider's date against.
  */
-export async function markConfirmationDelivered(jobId: string, options: Scope): Promise<boolean> {
-  const db = options.db ?? getPool();
+export async function markConfirmationDelivered(db: BusinessDb, jobId: string): Promise<boolean> {
   const result = await db.query(
     `UPDATE instruction_confirmations
         SET delivered_at = now()
       WHERE business_id = $1 AND job_id = $2
         AND channel = 'whatsapp' AND state = 'pending' AND delivered_at IS NULL`,
-    [options.businessId, jobId],
+    [db.businessId, jobId],
   );
   return result.rowCount === 1;
 }
 
 /** Flip a pending row to `cancelled`. `true` only for the call that flipped it. */
 export async function cancelConfirmation(
+  db: BusinessDb,
   jobId: string,
   decidedBy: string,
-  options: Scope,
 ): Promise<boolean> {
-  const db = options.db ?? getPool();
   const result = await db.query(
     `UPDATE instruction_confirmations
         SET state = 'cancelled', decided_at = now(), decided_by = $3
       WHERE business_id = $1 AND job_id = $2 AND state = 'pending'`,
-    [options.businessId, jobId, decidedBy],
+    [db.businessId, jobId, decidedBy],
   );
   return result.rowCount === 1;
 }
@@ -276,20 +267,18 @@ export async function cancelConfirmation(
  * question is open, so every pending row of the business expires. Measured on
  * the database clock (`now()`), the clock that wrote `presented_at`.
  */
-export async function expireConfirmations(options: {
-  businessId: string;
-  windowMinutes?: number;
-  db?: Queryable;
-}): Promise<string[]> {
+export async function expireConfirmations(
+  db: BusinessDb,
+  options: { windowMinutes?: number } = {},
+): Promise<string[]> {
   const windowMinutes = options.windowMinutes ?? config.whatsappQuestionWindowMinutes;
-  const db = options.db ?? getPool();
   const { rows } = await db.query<{ job_id: string }>(
     `UPDATE instruction_confirmations
         SET state = 'expired', decided_at = now()
       WHERE business_id = $1 AND state = 'pending'
         AND ($2 <= 0 OR presented_at <= now() - make_interval(mins => $2))
       RETURNING job_id`,
-    [options.businessId, windowMinutes],
+    [db.businessId, windowMinutes],
   );
   return rows.map((row) => row.job_id).sort();
 }
@@ -300,16 +289,15 @@ export async function expireConfirmations(options: {
  * must not run again.
  */
 export async function claimConfirmedStep(
+  db: BusinessDb,
   input: { jobId: string; stepId: string; planHash: string },
-  options: Scope,
 ): Promise<boolean> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query(
     `INSERT INTO confirmed_step_claims (business_id, job_id, step_id, plan_hash)
      VALUES ($1, $2, $3, $4)
      ON CONFLICT (business_id, job_id, step_id) DO NOTHING
      RETURNING step_id`,
-    [options.businessId, input.jobId, input.stepId, input.planHash],
+    [db.businessId, input.jobId, input.stepId, input.planHash],
   );
   return rows.length === 1;
 }

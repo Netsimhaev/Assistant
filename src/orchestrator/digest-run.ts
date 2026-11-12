@@ -106,7 +106,7 @@ export async function runDigests(db: BusinessDb, options: {
   const businessId = db.businessId;
   const now = options.now ?? new Date();
 
-  const settings = await loadDigestSettings({ businessId, db });
+  const settings = await loadDigestSettings(db);
   if (settings.schedule === 'off') {
     return { produced: [], screenOnly: 0, errored: null };
   }

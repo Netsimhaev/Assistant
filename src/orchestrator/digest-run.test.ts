@@ -52,10 +52,7 @@ describe('runDigests', () => {
    * not — and then he misses the day that mattered.
    */
   it('stores an empty window for the screen without sending email', async () => {
-    await setDigestSettings(
-      { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: true, toWhatsApp: false },
-      'owner', { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => setDigestSettings(bdb, { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: true, toWhatsApp: false }, 'owner'));
     const calls: string[] = [];
     const result = await withBusiness(BUSINESS, (db) => runDigests(db, {
       now: new Date('2026-10-07T09:00:00+03:00'),
@@ -75,10 +72,7 @@ describe('runDigests', () => {
    * not silenced. "Not sent" and "nothing to send" must not look alike.
    */
   it('records that WhatsApp was wanted and not connected, rather than skipping quietly', async () => {
-    await setDigestSettings(
-      { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: true },
-      'owner', { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => setDigestSettings(bdb, { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: true }, 'owner'));
     // Seed one closed job so the window has content. The daily window for
     // `now` below is [2026-10-06T05:00:00.000Z, 2026-10-07T05:00:00.000Z) —
     // see `digest-window.test.ts` for the same arithmetic spelled out.
@@ -91,10 +85,7 @@ describe('runDigests', () => {
 
   /** Spec §6: a send failure is recorded on the row and never thrown. */
   it('records a failed email without failing the digest', async () => {
-    await setDigestSettings(
-      { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: true, toWhatsApp: false },
-      'owner', { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => setDigestSettings(bdb, { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: true, toWhatsApp: false }, 'owner'));
     // Seed content — same window as above.
     await seedClosedJob(new Date('2026-10-07T07:00:00+03:00'));
 
@@ -118,10 +109,7 @@ describe('runDigests', () => {
    * this test fail — see the task report.
    */
   it('records a successful email send', async () => {
-    await setDigestSettings(
-      { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: true, toWhatsApp: false },
-      'owner', { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => setDigestSettings(bdb, { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: true, toWhatsApp: false }, 'owner'));
     await seedClosedJob(new Date('2026-10-07T07:00:00+03:00'));
 
     const calls: string[] = [];
@@ -138,10 +126,7 @@ describe('runDigests', () => {
 
   /** Fix round 1, item 3 — the same happy path, for WhatsApp. */
   it('records a successful WhatsApp send', async () => {
-    await setDigestSettings(
-      { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: true },
-      'owner', { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => setDigestSettings(bdb, { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: true }, 'owner'));
     await seedClosedJob(new Date('2026-10-07T07:00:00+03:00'));
 
     const texts: string[] = [];
@@ -174,10 +159,7 @@ describe('runDigests', () => {
    * row would never exist at all.
    */
   it('stores the digest even when the email send throws outright', async () => {
-    await setDigestSettings(
-      { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: true, toWhatsApp: false },
-      'owner', { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => setDigestSettings(bdb, { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: true, toWhatsApp: false }, 'owner'));
     await seedClosedJob(new Date('2026-10-07T07:00:00+03:00'));
 
     const result = await withBusiness(BUSINESS, (db) => runDigests(db, {
@@ -193,10 +175,7 @@ describe('runDigests', () => {
 
   /** Spec §5: the same window is not sent twice. */
   it('does not resend a window it already sent', async () => {
-    await setDigestSettings(
-      { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: false },
-      'owner', { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => setDigestSettings(bdb, { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: false }, 'owner'));
     const now = new Date('2026-10-07T09:00:00+03:00');
     await withBusiness(BUSINESS, (db) => runDigests(db, { now }));
     await withBusiness(BUSINESS, (db) => runDigests(db, { now }));
@@ -205,10 +184,7 @@ describe('runDigests', () => {
 
   /** Spec §5: both kinds fire independently, and the overlap is deliberate. */
   it('sends a daily and a weekly for the same moment when both are on', async () => {
-    await setDigestSettings(
-      { schedule: 'both', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: false },
-      'owner', { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => setDigestSettings(bdb, { schedule: 'both', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: false }, 'owner'));
     const result = await withBusiness(BUSINESS, (db) => runDigests(db, {
       now: new Date('2026-10-11T09:00:00+03:00'), // Sunday
     }));

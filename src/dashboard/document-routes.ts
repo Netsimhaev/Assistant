@@ -282,7 +282,7 @@ async function renderCard(
   const context = await charterContext(businessId);
   if (context === null) return charterUnreadable(res);
   const { currency } = context;
-  const settings = await loadDocumentSettings({ businessId });
+  const settings = await withBusiness(businessId, (db) => loadDocumentSettings(db)); // TENANCY-TODO(task 10)
   const previewPath = previewPathOf(version.check2);
   const hasPreview = previewPath !== null && (await containedFile(previewPath, documentRoot)) !== null;
   const failedChecks = production.stage === 'failed_checks';
@@ -486,7 +486,7 @@ export async function handleDocumentAddress(
 // ---------------------------------------------------------------- settings
 
 export async function handleDocumentSettingsGet(res: ServerResponse, businessId: string, session: DocumentSession): Promise<void> {
-  const settings = await loadDocumentSettings({ businessId });
+  const settings = await withBusiness(businessId, (db) => loadDocumentSettings(db)); // TENANCY-TODO(task 10)
   html(res, 200, renderDocumentSettings({ csrf: issueCsrfToken(session.sessionId), ...settings }));
 }
 
@@ -506,7 +506,7 @@ export async function handleDocumentSettingsPost(
     baseFolder: (form.get('baseFolder') ?? '').trim() || null,
   };
   try {
-    await saveDocumentSettings(chosen, { businessId });
+    await withBusiness(businessId, (db) => saveDocumentSettings(db, chosen)); // TENANCY-TODO(task 10)
   } catch (err) {
     const message = err instanceof Error ? err.message : '';
     if (!SETTINGS_REFUSALS.has(message)) throw err;

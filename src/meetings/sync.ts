@@ -108,7 +108,7 @@ function message(err: unknown): string {
 }
 
 interface OwnerChannels {
-  businessId: string;
+  db: BusinessDb;
   sendAlert?: SendAlert;
   messenger?: BossMessenger;
   dashboardBaseUrl?: string;
@@ -216,7 +216,7 @@ export function uncertainWriteText(name: string): string {
 async function alertOwner(o: OwnerChannels, subject: string, text: string): Promise<void> {
   let settings;
   try {
-    settings = await loadActionUpdateSettings({ businessId: o.businessId });
+    settings = await loadActionUpdateSettings(o.db);
   } catch {
     return;
   }
@@ -294,7 +294,7 @@ export async function syncMeetings(db: BusinessDb, o: {
     result.errored.push({ meetingId, error: message(err) });
   };
   const owner: OwnerChannels = {
-    businessId,
+    db,
     ...(o.sendAlert !== undefined ? { sendAlert: o.sendAlert } : {}),
     ...(o.messenger !== undefined ? { messenger: o.messenger } : {}),
     ...(o.dashboardBaseUrl !== undefined ? { dashboardBaseUrl: o.dashboardBaseUrl } : {}),

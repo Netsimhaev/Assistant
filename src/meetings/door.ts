@@ -200,7 +200,7 @@ async function failMeetingJob(door: DoorContext, audit: string, reason: string):
 
 async function askMeetingQuestion(door: DoorContext, question: string): Promise<InstructionOutcome> {
   try {
-    await recordQuestion(door.instruction.instructionId, question, { businessId: door.db.businessId });
+    await recordQuestion(door.db, door.instruction.instructionId, question);
   } catch {
     // Best effort, exactly as the instruction door's own questions are.
   }
@@ -352,7 +352,7 @@ async function pendingMeetingQuestion(door: DoorContext): Promise<{ jobId: strin
   );
   const jobId = rows[0]?.job_id;
   if (jobId === undefined) return null;
-  const confirmation = await loadConfirmation(jobId, { businessId: door.db.businessId });
+  const confirmation = await loadConfirmation(door.db, jobId);
   const option = confirmation?.options[0];
   if (confirmation === null || option === undefined || confirmation.options.length !== 1) return null;
   return { jobId, plan: option.plan };
@@ -375,7 +375,7 @@ async function turnedDownBy(door: DoorContext, jobId: string): Promise<{ jobId: 
   );
   const turnedDown = rows[0]?.job_id;
   if (turnedDown === undefined) return null;
-  const confirmation = await loadConfirmation(turnedDown, { businessId: door.db.businessId });
+  const confirmation = await loadConfirmation(door.db, turnedDown);
   const option = confirmation?.options[0];
   if (confirmation === null || option === undefined || confirmation.options.length !== 1) return null;
   return { jobId: turnedDown, plan: option.plan };
@@ -516,7 +516,7 @@ export async function runMeetingOperation(
     if (n !== null) choose = (_name, candidates) => candidates[n - 1] ?? null;
   }
   const parked =
-    o.answerTo !== undefined ? await loadInstructionForJob(o.answerTo.jobId, { businessId: door.db.businessId }) : null;
+    o.answerTo !== undefined ? await loadInstructionForJob(door.db, o.answerTo.jobId) : null;
 
   if (o.request !== undefined) {
     // The dashboard's meeting form: every field was typed by the owner into the
@@ -532,7 +532,7 @@ export async function runMeetingOperation(
     const markers = markersOf(prior.plan);
     sourceJobId = markers.sourceJobId ?? prior.jobId;
     exclude = [...markers.exclude, ...slotsOf(prior.plan)];
-    const source = await loadInstructionForJob(sourceJobId, { businessId: door.db.businessId });
+    const source = await loadInstructionForJob(door.db, sourceJobId);
     if (source === null) return failMeetingJob(door, 'source instruction not found', OTHER_SLOT_FAILED_REPLY);
     sourceText = `${source.text}\n\n${o.answerTo.answer}`;
     sourceOrigin = source.textOrigin === 'typed' && door.textOrigin === 'typed' ? 'typed' : 'transcribed';
@@ -554,9 +554,7 @@ export async function runMeetingOperation(
     // The question is turned down first — only if it is still pending. One the
     // owner confirmed meanwhile (the dashboard, a second channel) is about to
     // run: its job and its hold are not ours to touch.
-    const cancelled = await cancelConfirmation(previous.jobId, `${OTHER_SLOT_DECIDED_BY}${door.jobId}`, {
-      businessId: door.db.businessId,
-    });
+    const cancelled = await cancelConfirmation(door.db, previous.jobId, `${OTHER_SLOT_DECIDED_BY}${door.jobId}`);
     if (!cancelled) return failMeetingJob(door, 'the turned-down question was already decided', ALREADY_CONFIRMED_REPLY);
     try {
       await transition(door.db, previous.jobId, {
@@ -574,7 +572,7 @@ export async function runMeetingOperation(
     const markers = markersOf(previous.plan);
     sourceJobId = markers.sourceJobId ?? previous.jobId;
     exclude = [...markers.exclude, ...slotsOf(previous.plan)];
-    const source = await loadInstructionForJob(sourceJobId, { businessId: door.db.businessId });
+    const source = await loadInstructionForJob(door.db, sourceJobId);
     if (source === null) return failMeetingJob(door, 'source instruction not found', OTHER_SLOT_FAILED_REPLY);
     sourceText = source.text;
     // The SOURCE instruction's origin, not this message's: "תני אחר" typed under a

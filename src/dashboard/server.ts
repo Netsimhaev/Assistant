@@ -722,7 +722,7 @@ async function handleConnections(res: ServerResponse, businessId: string, sessio
 
   const [bindings, grants] = await Promise.all([
     withBusiness(businessId, (db) => loadBindings(db)), // TENANCY-TODO(task 10)
-    listGrants(businessId),
+    withBusiness(businessId, (db) => listGrants(db)), // TENANCY-TODO(task 10)
   ]);
 
   sendHtml(
@@ -822,7 +822,7 @@ async function handleDigestGet(
   session: Session,
   error?: string,
 ): Promise<void> {
-  const settings = await loadDigestSettings({ businessId });
+  const settings = await withBusiness(businessId, (db) => loadDigestSettings(db)); // TENANCY-TODO(task 10)
   const stored = await withBusiness(businessId, (db) => recentDigests(db)); // TENANCY-TODO(task 10)
 
   let active: ActiveCharter | null;
@@ -940,7 +940,7 @@ async function handleDigestSettingsPost(
   const toWhatsApp = form.get('toWhatsApp') === 'on';
 
   try {
-    await setDigestSettings({ ...parsed.data, toEmail, toWhatsApp }, session.username, { businessId });
+    await withBusiness(businessId, (db) => setDigestSettings(db, { ...parsed.data, toEmail, toWhatsApp }, session.username)); // TENANCY-TODO(task 10)
   } catch {
     return handleDigestGet(
       res,
@@ -1031,7 +1031,7 @@ export async function renderInstructionOutcome(
   // `planHash` it was shown with — and a cancel. The options come from the
   // stored row, the same row `POST /instruct/:jobId/confirm` checks against.
   if (outcome.status === 'needs_confirmation') {
-    const confirmation = await loadConfirmation(outcome.jobId, { businessId });
+    const confirmation = await withBusiness(businessId, (db) => loadConfirmation(db, outcome.jobId)); // TENANCY-TODO(task 10)
     sendHtml(
       res,
       200,
@@ -1111,7 +1111,7 @@ async function handleInstructGet(
 async function openOnInstructScreen(
   businessId: string,
 ): Promise<{ confirmations: PendingConfirmation[]; pending: PendingQuestion[] }> {
-  const waiting = await pendingQuestions({ businessId });
+  const waiting = await withBusiness(businessId, (db) => pendingQuestions(db)); // TENANCY-TODO(task 10)
   const confirmations = await withBusiness(businessId, (db) => dashboardConfirmations(db)); // TENANCY-TODO(task 10)
   return {
     confirmations: confirmations.map((c) => ({
@@ -1557,7 +1557,7 @@ async function handleInstructAnswer(
     return sendHtml(res, 403, renderForbidden());
   }
 
-  const instruction = await loadInstructionForJob(jobId, { businessId });
+  const instruction = await withBusiness(businessId, (db) => loadInstructionForJob(db, jobId)); // TENANCY-TODO(task 10)
   if (instruction === null) return sendHtml(res, 404, renderNotFound());
 
   // A schedule question typed into the answer box is a READ, judged on the new
@@ -1645,7 +1645,7 @@ async function handleInstructConfirm(
     return sendHtml(res, 403, renderForbidden());
   }
 
-  const confirmation = await loadConfirmation(jobId, { businessId });
+  const confirmation = await withBusiness(businessId, (db) => loadConfirmation(db, jobId)); // TENANCY-TODO(task 10)
   if (confirmation === null) return sendHtml(res, 404, renderNotFound());
 
   const csrf = issueCsrfToken(session.sessionId);
@@ -1743,7 +1743,7 @@ async function answerUnderClaim(
   // round 1), so the guard lives with the function rather than in the
   // assumption that every caller holds a lock. A `false` here means the row
   // was answered between the phase read above and this line.
-  const took = await claimAnswer(instruction.instructionId, answer, { businessId });
+  const took = await withBusiness(businessId, (db) => claimAnswer(db, instruction.instructionId, answer)); // TENANCY-TODO(task 10)
   if (!took) {
     return sendHtml(
       res,
@@ -1776,7 +1776,7 @@ async function answerUnderClaim(
       sourceAsked: true,
       // The files the owner attached to the original instruction stay his
       // sources on the second pass (document production D14).
-      attachedDocumentIds: await attachedDocumentsForJob(jobId, { businessId }),
+      attachedDocumentIds: await withBusiness(businessId, (db) => attachedDocumentsForJob(db, jobId)), // TENANCY-TODO(task 10)
       // Calendar access for the meeting door: an answer to a meeting question
       // (which meeting, "תזיזי את X", another window) goes back to it. The
       // schedule routing stays OFF: the joined text is not a schedule question,
@@ -2069,10 +2069,7 @@ async function resolvePlan(
   businessId: string,
   documentRoot: string | undefined,
 ): Promise<ErasurePlan> {
-  return buildErasurePlan(anchor, {
-    businessId,
-    ...(documentRoot === undefined ? {} : { documentRoot }),
-  });
+  return withBusiness(businessId, (db) => buildErasurePlan(db, anchor, documentRoot === undefined ? {} : { documentRoot })); // TENANCY-TODO(task 10)
 }
 
 /**
@@ -2188,7 +2185,7 @@ async function handleEraseConfirm(
   let outcome: ErasureOutcome;
   let auditUnrecorded = false;
   try {
-    outcome = await executeErasure(plan, { businessId });
+    outcome = await withBusiness(businessId, (db) => executeErasure(db, plan)); // TENANCY-TODO(task 10)
   } catch (error) {
     // It happened. The transaction committed and every unlink was attempted;
     // only the record of it is missing, and reporting that as a failure
@@ -2835,7 +2832,7 @@ async function renderAutonomyScreen(
   settings?: ActionUpdateSettings,
 ): Promise<void> {
   const mode = await withBusiness(businessId, (bdb) => loadAutonomyMode(bdb)); // TENANCY-TODO(task 10)
-  const shown = settings ?? (await loadActionUpdateSettings({ businessId }));
+  const shown = settings ?? (await withBusiness(businessId, (db) => loadActionUpdateSettings(db))); // TENANCY-TODO(task 10)
   sendHtml(
     res,
     status,
@@ -2895,7 +2892,7 @@ async function handleAutonomyUpdatesPost(
     toScreen: form.get('toScreen') === 'on',
   };
   try {
-    await saveActionUpdateSettings(settings, { businessId, updatedBy: session.username });
+    await withBusiness(businessId, (db) => saveActionUpdateSettings(db, settings, { updatedBy: session.username })); // TENANCY-TODO(task 10)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return renderAutonomyScreen(res, businessId, session, 400, message, settings);
@@ -2913,7 +2910,7 @@ async function handleAutonomyUpdatesPost(
  */
 async function handleAutonomousActionsGet(res: ServerResponse, businessId: string, session: Session): Promise<void> {
   const actions = await listAutonomousActions({ businessId });
-  const settings = await loadActionUpdateSettings({ businessId });
+  const settings = await withBusiness(businessId, (db) => loadActionUpdateSettings(db)); // TENANCY-TODO(task 10)
   const fresh = settings.toScreen ? await unseenUpdateKeys(actions, { businessId }) : new Set<string>();
   const html = renderAutonomousActions(actions, issueCsrfToken(session.sessionId), undefined, fresh);
   await markUpdatesSeen(fresh, { businessId });

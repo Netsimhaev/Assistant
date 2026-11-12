@@ -72,7 +72,7 @@ beforeEach(async () => {
     ['MICROSOFT_OAUTH_CLIENT_ID', 'ms-id'],
     ['MICROSOFT_OAUTH_CLIENT_SECRET', 'ms-secret'],
   ] as const) {
-    await putSecret({ businessId: BUSINESS, ref, value, updatedBy: 'test' }, key);
+    await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref, value, updatedBy: 'test' }, key));
   }
   await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
   await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [OFFICE_MAIL] }))); // TENANCY-TODO(task 10)
@@ -221,7 +221,7 @@ describe('GET /connections/mailbox', () => {
     expect(html).toContain('פעילה');
     expect(html).toContain('owner@contoso.example');
 
-    await markNeedsReauth('mailbox', BUSINESS);
+    await withBusiness(BUSINESS, (bdb) => markNeedsReauth(bdb, 'mailbox'));
     html = await (await fetch(`${baseUrl}/connections/mailbox`, { headers: { cookie } })).text();
     expect(html).toContain('דורשת אישור מחדש');
     expect(html).toContain('href="/oauth/mailbox/start?provider=microsoft"');
@@ -384,7 +384,7 @@ describe('the OAuth ceremony for the signed mailbox', () => {
     const state = new URL(start.headers.get('location') ?? '').searchParams.get('state');
     const res = await fetch(`${baseUrl}/oauth/callback?state=${state}&code=c`, { headers: { cookie } });
     expect(res.status).toBe(502);
-    expect(await readGrantBySystem('mailbox', BUSINESS, key)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, 'mailbox', key))).toBeNull();
     expect((await withBusiness(BUSINESS, (db) => loadBindings(db))).some((b) => b.system === 'mailbox')).toBe(false);
     expect(await withBusiness(BUSINESS, (db) => getCursor(db))).toBeNull();
   });
@@ -432,7 +432,7 @@ async function activeVersion(): Promise<string | undefined> {
 
 describe('fix round 1: preflight before signing', () => {
   it('refuses the sign page and the sign POST when the provider client secret is missing, and installs nothing', async () => {
-    await removeSecret('MICROSOFT_OAUTH_CLIENT_SECRET', BUSINESS);
+    await withBusiness(BUSINESS, (bdb) => removeSecret(bdb, 'MICROSOFT_OAUTH_CLIENT_SECRET'));
     const before = await activeVersion();
     const baseUrl = await startServer();
     const cookie = await login(baseUrl);
@@ -518,7 +518,7 @@ describe('fix round 1: the way back', () => {
     const baseUrl = await startServer({ oauthFetch: microsoftFetch(), mailboxClientFor: fakeClientFor({ calls: [] }) });
     const cookie = await login(baseUrl);
     expect((await completeCeremony(baseUrl, cookie)).status).toBe(200);
-    await markNeedsReauth('mailbox', BUSINESS);
+    await withBusiness(BUSINESS, (bdb) => markNeedsReauth(bdb, 'mailbox'));
     const status = await (await fetch(`${baseUrl}/connections/mailbox`, { headers: { cookie } })).text();
     expect(status).toContain('action="/connections/mailbox/revert"');
     expect(status).toContain('מיילים שיגיעו עד שהתיבה תחובר מחדש לא ייקראו.');
@@ -638,7 +638,7 @@ describe('fix round 1: callback', () => {
 
     const res = await fetch(`${baseUrl}/oauth/callback?state=${state}&code=c`, { headers: { cookie } });
     expect(res.status).toBe(400);
-    expect(await readGrantBySystem('mailbox', BUSINESS, key)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, 'mailbox', key))).toBeNull();
     expect((await withBusiness(BUSINESS, (db) => loadBindings(db))).some((b) => b.system === 'mailbox')).toBe(false);
     expect(await withBusiness(BUSINESS, (db) => getCursor(db))).toBeNull();
   });

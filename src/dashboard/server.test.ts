@@ -812,13 +812,8 @@ describe('GET /instruct, POST /instruct', () => {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
     }));
-    const instruction = await saveInstruction(
-      { textOrigin: 'typed', jobId: job.jobId, text: 'תשלחי לדנה את ההצעה' },
-      { businessId: BUSINESS },
-    );
-    await recordQuestion(instruction.instructionId, 'לאיזו דנה — כהן או לוי?', {
-      businessId: BUSINESS,
-    });
+    const instruction = await withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId: job.jobId, text: 'תשלחי לדנה את ההצעה' }));
+    await withBusiness(BUSINESS, (bdb) => recordQuestion(bdb, instruction.instructionId, 'לאיזו דנה — כהן או לוי?'));
     await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'understand',
       actor: 'orchestrator',
@@ -841,13 +836,8 @@ describe('GET /instruct, POST /instruct', () => {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
     }));
-    const answeredInstruction = await saveInstruction(
-      { textOrigin: 'typed', jobId: answeredJob.jobId, text: 'תשלחי לדנה את ההצעה' },
-      { businessId: BUSINESS },
-    );
-    await recordQuestion(answeredInstruction.instructionId, 'לאיזו דנה?', {
-      businessId: BUSINESS,
-    });
+    const answeredInstruction = await withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId: answeredJob.jobId, text: 'תשלחי לדנה את ההצעה' }));
+    await withBusiness(BUSINESS, (bdb) => recordQuestion(bdb, answeredInstruction.instructionId, 'לאיזו דנה?'));
     await withBusiness(BUSINESS, (db) => transition(db, answeredJob.jobId, {
       to: 'understand',
       actor: 'orchestrator',
@@ -856,7 +846,7 @@ describe('GET /instruct, POST /instruct', () => {
     // The answer is recorded but the re-run refused, so the job is still
     // parked in `understand`. Phase alone would keep listing this as an open
     // question the owner has in fact already answered.
-    await claimAnswer(answeredInstruction.instructionId, 'דנה כהן', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => claimAnswer(bdb, answeredInstruction.instructionId, 'דנה כהן'));
 
     // A second, still-open question on a different parked job. Without it,
     // an assertion that the answered question is absent would hold just as
@@ -866,13 +856,8 @@ describe('GET /instruct, POST /instruct', () => {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
     }));
-    const openInstruction = await saveInstruction(
-      { textOrigin: 'typed', jobId: openJob.jobId, text: 'תזמיני פגישה עם רואה החשבון' },
-      { businessId: BUSINESS },
-    );
-    await recordQuestion(openInstruction.instructionId, 'איזה יום מתאים?', {
-      businessId: BUSINESS,
-    });
+    const openInstruction = await withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId: openJob.jobId, text: 'תזמיני פגישה עם רואה החשבון' }));
+    await withBusiness(BUSINESS, (bdb) => recordQuestion(bdb, openInstruction.instructionId, 'איזה יום מתאים?'));
     await withBusiness(BUSINESS, (db) => transition(db, openJob.jobId, {
       to: 'understand',
       actor: 'orchestrator',
@@ -1151,7 +1136,7 @@ describe('POST /instruct/:jobId/answer', () => {
   async function anInstructionJob(businessId: string, text: string): Promise<string> {
     const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     const job = await withBusiness(businessId, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
-    await saveInstruction({ textOrigin: 'typed', jobId: job.jobId, text }, { businessId });
+    await withBusiness(businessId, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId: job.jobId, text }));
     await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'understand', actor: 'orchestrator', reason: 'test setup' }));
     return job.jobId;
   }
@@ -1168,7 +1153,7 @@ describe('POST /instruct/:jobId/answer', () => {
     });
     expect(res.status).toBe(403);
 
-    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, jobId));
     expect(stored?.answer).toBeNull();
   });
 
@@ -1202,7 +1187,7 @@ describe('POST /instruct/:jobId/answer', () => {
     });
     expect(res.status).toBe(404);
 
-    const stored = await loadInstructionForJob(otherJobId, { businessId: OTHER_BUSINESS });
+    const stored = await withBusiness(OTHER_BUSINESS, (bdb) => loadInstructionForJob(bdb, otherJobId));
     expect(stored?.answer).toBeNull();
   });
 
@@ -1227,7 +1212,7 @@ describe('POST /instruct/:jobId/answer', () => {
     expect(res.status).toBe(400);
     expect(await res.text()).toContain('התשובה ריקה');
 
-    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, jobId));
     expect(stored?.answer).toBeNull();
     // The parked job is untouched — refused before the close-out transition
     // too, and still `understand` (fix round 2: `anInstructionJob` parks the
@@ -1258,7 +1243,7 @@ describe('POST /instruct/:jobId/answer', () => {
     // ("התשובה ארוכה מ-...") appears nowhere else on the page.
     expect(await res.text()).toContain('התשובה ארוכה מ-4000 תווים');
 
-    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, jobId));
     expect(stored?.answer).toBeNull();
   });
 
@@ -1294,7 +1279,7 @@ describe('POST /instruct/:jobId/answer', () => {
     expect(res.status).toBe(400);
     expect(await res.text()).toContain('ההוראה ארוכה מ-4000 תווים');
 
-    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, jobId));
     expect(stored?.answer).toBe(answer);
   });
 
@@ -1348,7 +1333,7 @@ describe('POST /instruct/:jobId/answer', () => {
     // Nothing is left for `GET /instruct` to show, which is the point: it
     // could not have shown it anyway (the answer is recorded), so the state
     // now matches what the owner can see.
-    expect(await pendingQuestions({ businessId: BUSINESS })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (bdb) => pendingQuestions(bdb))).toEqual([]);
 
     // The retry — same job, a different (still over-cap-when-joined) answer.
     // The property fix round 2 bought is unchanged: a readable refusal, never
@@ -1396,7 +1381,7 @@ describe('POST /instruct/:jobId/answer', () => {
 
     // The guard fires before `claimAnswer` — the row from the original
     // answer (never set in this test) stays untouched, not overwritten.
-    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, jobId));
     expect(stored?.answer).toBeNull();
   });
 
@@ -1469,7 +1454,7 @@ describe('POST /instruct/:jobId/answer', () => {
     // Nothing was written: no answer recorded, and no second job opened. The
     // parked job is still the only one. Without the claim this request reaches
     // `claimAnswer` and `createJob` and both of these go red.
-    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, jobId));
     expect(stored?.answer).toBeNull();
     const { rows } = await getPool().query<{ n: string }>(
       'SELECT count(*)::text AS n FROM jobs WHERE business_id = $1',
@@ -1508,7 +1493,7 @@ describe('POST /instruct/:jobId/answer', () => {
 
     const job = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
     expect(job?.phase).toBe('execute');
-    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, jobId));
     expect(stored?.answer).toBeNull();
   });
 
@@ -3048,7 +3033,7 @@ describe('GET /autonomy — the learning level and the update channels', () => {
     });
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/autonomy');
-    expect(await loadActionUpdateSettings({ businessId: BUSINESS })).toEqual({
+    expect(await withBusiness(BUSINESS, (bdb) => loadActionUpdateSettings(bdb))).toEqual({
       toWhatsApp: true,
       toEmail: false,
       toScreen: false,
@@ -3138,10 +3123,7 @@ describe('GET /autonomy/actions — "חדש" on the screen channel', () => {
   it('marks nothing, and records nothing seen, when the screen is not a chosen channel', async () => {
     const { jobId, stepId } = await seedAutonomousAction(BUSINESS);
     await updateRow(BUSINESS, jobId, stepId);
-    await saveActionUpdateSettings(
-      { toWhatsApp: false, toEmail: true, toScreen: false },
-      { businessId: BUSINESS, updatedBy: USERNAME },
-    );
+    await withBusiness(BUSINESS, (bdb) => saveActionUpdateSettings(bdb, { toWhatsApp: false, toEmail: true, toScreen: false }, { updatedBy: USERNAME }));
     const baseUrl = await startServer(BUSINESS);
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -3346,7 +3328,7 @@ describe('digest screen', () => {
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/digest');
 
-    const settings = await loadDigestSettings({ businessId: BUSINESS });
+    const settings = await withBusiness(BUSINESS, (bdb) => loadDigestSettings(bdb));
     expect(settings.schedule).toBe('daily');
     expect(settings.dailyHour).toBe(7);
     expect(settings.toEmail).toBe(true);
@@ -3370,7 +3352,7 @@ describe('digest screen', () => {
     });
     expect(res.status).toBe(403);
 
-    const settings = await loadDigestSettings({ businessId: BUSINESS });
+    const settings = await withBusiness(BUSINESS, (bdb) => loadDigestSettings(bdb));
     expect(settings.schedule).toBe('off');
   });
 
@@ -3402,7 +3384,7 @@ describe('digest screen', () => {
     const body = await res.text();
     expect(body).toContain('אינם בטווח התקין');
 
-    const settings = await loadDigestSettings({ businessId: BUSINESS });
+    const settings = await withBusiness(BUSINESS, (bdb) => loadDigestSettings(bdb));
     expect(settings.schedule).toBe('off');
   });
 
@@ -3465,11 +3447,7 @@ describe('digest screen', () => {
    */
   it('previews the weekly shape for a weekly-only schedule, not the daily one', async () => {
     const { baseUrl, cookie } = await digestSession(BUSINESS);
-    await setDigestSettings(
-      { schedule: 'weekly', dailyHour: 8, weeklyDay: 0, weeklyHour: 9, toEmail: false, toWhatsApp: false },
-      'owner',
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => setDigestSettings(bdb, { schedule: 'weekly', dailyHour: 8, weeklyDay: 0, weeklyHour: 9, toEmail: false, toWhatsApp: false }, 'owner'));
 
     const res = await fetch(`${baseUrl}/digest`, { headers: { cookie } });
     expect(res.status).toBe(200);
@@ -3530,7 +3508,7 @@ describe('digest screen', () => {
     const body = await res.text();
     expect(body).toContain('יש לבחור ערכים תקינים בכל שדות התדריך');
 
-    const settings = await loadDigestSettings({ businessId: BUSINESS });
+    const settings = await withBusiness(BUSINESS, (bdb) => loadDigestSettings(bdb));
     expect(settings.schedule).toBe('off');
     expect(settings.dailyHour).toBe(8);
   });
@@ -3599,18 +3577,12 @@ describe('boss-command confirmation on the dashboard', () => {
       active?.charter.charterVersion ??
       (await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter()))).charterVersion; // TENANCY-TODO(task 10)
     const job = await withBusiness(businessId, (db) => createJob(db, { charterVersion, provenance: 'boss' }));
-    await saveInstruction(
-      { textOrigin: 'typed', jobId: job.jobId, text: 'תשלחי לדנה תזכורת' },
-      { businessId },
-    );
+    await withBusiness(businessId, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId: job.jobId, text: 'תשלחי לדנה תזכורת' }));
     await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't' }));
     await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'plan', actor: 'orchestrator', reason: 't' }));
     const only = options.length === 1 ? options[0] : undefined;
     if (only !== undefined) await withBusiness(businessId, (db) => bindPlanToJob(db, job.jobId, only.plan));
-    await createConfirmation(
-      { jobId: job.jobId, options, presentedText: QUESTION, channel },
-      { businessId },
-    );
+    await withBusiness(businessId, (bdb) => createConfirmation(bdb, { jobId: job.jobId, options, presentedText: QUESTION, channel }));
     return job.jobId;
   }
 
@@ -3709,7 +3681,7 @@ describe('boss-command confirmation on the dashboard', () => {
     const res = await confirmPost(baseUrl, cookie, jobId, { planHash: SINGLE.planHash });
     expect(res.status).toBe(403);
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('plan');
-    expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.state).toBe('pending');
+    expect((await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, jobId)))?.state).toBe('pending');
   });
 
   it('refuses without a session', async () => {
@@ -3734,7 +3706,7 @@ describe('boss-command confirmation on the dashboard', () => {
     // The refusal keeps the buttons: the question is still open.
     expect(body).toContain(`action="/instruct/${jobId}/confirm"`);
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('plan');
-    const stored = await loadConfirmation(jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, jobId));
     expect(stored?.state).toBe('pending');
     expect(stored?.chosenPlanHash).toBeNull();
   });
@@ -3747,7 +3719,7 @@ describe('boss-command confirmation on the dashboard', () => {
     expect(first.status).toBe(302);
     expect(first.headers.get('location')).toBe('/');
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('execute');
-    const stored = await loadConfirmation(jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, jobId));
     expect(stored?.state).toBe('confirmed');
     expect(stored?.chosenPlanHash).toBe(OPTION_B.planHash);
     expect(stored?.decidedBy).toBe(`dashboard:${USERNAME}`);
@@ -3756,7 +3728,7 @@ describe('boss-command confirmation on the dashboard', () => {
     expect(second.status).toBe(409);
     expect(await second.text()).toContain('כבר טופל.');
     expect(await executeMoves(jobId)).toBe(1);
-    expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.chosenPlanHash).toBe(OPTION_B.planHash);
+    expect((await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, jobId)))?.chosenPlanHash).toBe(OPTION_B.planHash);
   });
 
   it('confirms a single option bound before the question', async () => {
@@ -3781,7 +3753,7 @@ describe('boss-command confirmation on the dashboard', () => {
     const res = await confirmPost(baseUrl, cookie, jobId, { csrf, cancel: '1' });
     expect(res.status).toBe(302);
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('closed');
-    expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.state).toBe('cancelled');
+    expect((await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, jobId)))?.state).toBe('cancelled');
   });
 
   it('keeps the other open confirmations on the 409 page', async () => {
@@ -3800,7 +3772,7 @@ describe('boss-command confirmation on the dashboard', () => {
     const res = await confirmPost(baseUrl, cookie, otherJob, { csrf, planHash: SINGLE.planHash });
     expect(res.status).toBe(404);
     expect((await withBusiness(OTHER_BUSINESS, (db) => loadJob(db, otherJob)))?.phase).toBe('plan');
-    expect((await loadConfirmation(otherJob, { businessId: OTHER_BUSINESS }))?.state).toBe('pending');
+    expect((await withBusiness(OTHER_BUSINESS, (bdb) => loadConfirmation(bdb, otherJob)))?.state).toBe('pending');
   });
 
   it('escapes the label, the question and the hidden inputs, and strips bidi controls', () => {

@@ -27,8 +27,7 @@
  * `documents`.
  */
 import { unlink } from 'node:fs/promises';
-import { config } from '../config.js';
-import { getPool, withBusiness } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import type { ErasureItem, ErasurePlan, ErasureRefusal } from './erasure-plan.js';
@@ -160,10 +159,18 @@ export class ErasureAuditUnrecordedError extends Error {
 }
 
 export async function executeErasure(
+  db: BusinessDb,
   plan: ErasurePlan,
-  options: { businessId?: string } = {},
 ): Promise<ErasureOutcome> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
+  // The erasure's own transaction must be the one that commits before the
+  // disk and the audit row (see "Order" above). Joined to a caller's open
+  // transaction, the files would be unlinked and the audit row written while
+  // the deletions could still roll back — so a db already inside one is
+  // refused rather than joined.
+  if (db.inTransaction) {
+    throw new Error('executeErasure must run outside a transaction: it commits before touching the disk');
+  }
 
   if (plan.refusals.length > 0) {
     // The kind travels with the message so the screen re-shows the refusal it
@@ -175,11 +182,8 @@ export async function executeErasure(
   }
 
   const { jobIds, documentIds, memoryIds, digestIds, draftIds, mailIds, ledgerItemIds, ledgerRuleIds, productionIds } = plan;
-  const client = await getPool().connect();
   const results: ErasureItem[] = [];
-  let txError: unknown;
-  try {
-    await client.query('BEGIN');
+  await transaction(db, async (client) => {
 
     // Re-check liveness under a row lock. The plan-time refusal in
     // `buildErasurePlan` reads `jobs.phase` with no lock and is never read
@@ -583,26 +587,14 @@ export async function executeErasure(
       );
     }
 
-    await client.query('COMMIT');
-  } catch (err) {
-    txError = err;
-    try {
-      await client.query('ROLLBACK');
-    } catch {
-      // Rollback itself failing means the connection is already broken; the
-      // error that caused the rollback is what is worth propagating, not the
-      // secondary failure of trying to undo it.
-    }
-    throw err;
-  } finally {
-    // A poisoned connection (anything reached the `catch` above) is
-    // destroyed rather than returned to the pool for the next caller to
-    // inherit; a clean run releases normally. `pg`'s `release` only wants
-    // `Error | boolean`, and what was caught here is `unknown` and not
-    // necessarily an `Error`, so it is collapsed to a flag rather than
-    // passed through.
-    client.release(txError !== undefined);
-  }
+    // COMMIT here, ROLLBACK on any throw: `transaction` runs both. Rollback
+    // itself failing means the connection is already broken; the error that
+    // caused the rollback is what is worth propagating, not the secondary
+    // failure of trying to undo it. A poisoned connection — one left inside
+    // a transaction by a failed rollback — is destroyed by `withBusiness`
+    // rather than returned to the pool for the next caller to inherit, the
+    // rule this function used to enforce with its own `release(true)`.
+  });
 
   // Only now the disk.
   let filesRemoved = 0;
@@ -654,8 +646,8 @@ export async function executeErasure(
     .reduce((sum, item) => sum + item.count, 0);
 
   try {
-    await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 6)
-      bdb,
+    await appendAudit(
+      db,
       {
         actor: 'human',
         kind: 'erasure',
@@ -676,8 +668,8 @@ export async function executeErasure(
             ? ` · ${filesAlreadyGone.length} קבצים כבר לא היו על הדיסק`
             : '') +
           (filesFailed.length > 0 ? ` · ${filesFailed.length} קבצים לא נמחקו מהדיסק` : ''),
-      }
-    ));
+      },
+    );
   } catch (err) {
     throw new ErasureAuditUnrecordedError(outcome, err);
   }

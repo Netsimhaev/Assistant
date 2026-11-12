@@ -30,7 +30,7 @@ export async function resolveCalendarAccess(db: BusinessDb, o: {
   if (ref === null) return { unavailable: 'not_connected' };
   const provider: CalendarProvider = binding.provider;
 
-  const grant = (await listGrants(db.businessId)).find((g) => g.credentialRef === ref);
+  const grant = (await listGrants(db)).find((g) => g.credentialRef === ref);
   if (grant !== undefined && (grant.revokedAt !== null || grant.needsReauthAt !== null)) {
     return { unavailable: 'needs_reauth' };
   }

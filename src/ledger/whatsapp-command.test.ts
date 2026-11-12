@@ -489,12 +489,9 @@ describe('handleLedgerWhatsApp', () => {
     const x = await item({ description: 'נמחק', counterpartyEmail: 'gone@erased.example', originJobId: 'J-erased' });
     const b = await item({ description: 'שלישי' });
     await batch([a, x, b], T1);
-    const plan = await buildErasurePlan(
-      { kind: 'contact', identifier: 'gone@erased.example' },
-      { businessId: B },
-    );
+    const plan = await withBusiness(B, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: 'gone@erased.example' }));
     expect(plan.ledgerItemIds).toEqual([x]);
-    await executeErasure(plan, { businessId: B });
+    await withBusiness(B, (bdb) => executeErasure(bdb, plan));
 
     expect((await handle('3 בוצע', T3)).outcome).toBe('applied');
     expect((await load(b)).status).toBe('done');

@@ -168,21 +168,18 @@ async function seedCommand(o: {
     provenance: 'boss',
     title: 'הצעה לזר',
   }));
-  await saveInstruction({ jobId: job.jobId, text: INSTRUCTION, textOrigin: 'typed' }, { businessId });
+  await withBusiness(businessId, (bdb) => saveInstruction(bdb, { jobId: job.jobId, text: INSTRUCTION, textOrigin: 'typed' }));
   for (const to of ['understand', 'plan'] as const) {
     await withBusiness(businessId, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
   }
   await withBusiness(businessId, (db) => bindPlanToJob(db, job.jobId, plan));
-  await createConfirmation(
-    {
+  await withBusiness(businessId, (bdb) => createConfirmation(bdb, {
       jobId: job.jobId,
       options: [{ label: 'לשלוח', planHash, plan, contactSource: null }],
       presentedText: 'לשלוח?',
       channel: o.channel ?? 'whatsapp',
-    },
-    { businessId },
-  );
-  expect(await confirmChoice(job.jobId, planHash, 'p_boss', { businessId })).toBe(true);
+    }));
+  expect(await withBusiness(businessId, (bdb) => confirmChoice(bdb, job.jobId, planHash, 'p_boss'))).toBe(true);
   await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'setup' }));
   await withBusiness(businessId, (db) => upsertBinding(db, {
       system: 'office-mail',
@@ -315,7 +312,7 @@ describe('reaskFailedCommands', () => {
     );
     expect(instructions).toEqual([{ text: INSTRUCTION, text_origin: 'typed' }]);
 
-    const confirmation = await loadConfirmation(newJobId, { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, newJobId));
     expect(confirmation?.state).toBe('pending');
     expect(confirmation?.reaskOf).toBe(jobId);
     expect(confirmation?.channel).toBe('whatsapp');
@@ -362,16 +359,13 @@ describe('reaskFailedCommands', () => {
     // A second job naming the same old one, written behind the sweep's back.
     const other = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
     await expect(
-      createConfirmation(
-        {
+      withBusiness(BUSINESS, (bdb) => createConfirmation(bdb, {
           jobId: other.jobId,
           options: [{ label: 'לשלוח', planHash: PLAN_HASH, plan: PLAN, contactSource: null }],
           presentedText: 'לשלוח?',
           channel: 'dashboard',
           reaskOf: jobId,
-        },
-        { businessId: BUSINESS },
-      ),
+        })),
     ).rejects.toMatchObject({ code: '23505' });
   });
 
@@ -393,7 +387,7 @@ describe('reaskFailedCommands', () => {
     // No messenger: still written, and counted rather than silent.
     expect(result.notConnected).toBe(1);
     const newJobId = result.reasked[0]?.newJobId ?? '';
-    const confirmation = await loadConfirmation(newJobId, { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, newJobId));
     expect(confirmation?.presentedText.startsWith(REASK_PREFIX)).toBe(true);
     expect(sent).toHaveLength(1);
   });
@@ -416,7 +410,7 @@ describe('reaskFailedCommands', () => {
     expect(result.reasked).toHaveLength(1);
     expect(result.reasked[0]?.uncertain).toBe(false);
     const newJobId = result.reasked[0]?.newJobId ?? '';
-    const confirmation = await loadConfirmation(newJobId, { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, newJobId));
     expect(confirmation?.presentedText.includes(REASK_PREFIX)).toBe(false);
     expect(confirmation?.presentedText.startsWith('לשלוח')).toBe(true);
     expect(messenger.sent.map((m) => m.text)).toEqual([confirmation?.presentedText]);
@@ -452,7 +446,7 @@ describe('reaskFailedCommands', () => {
     );
     const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger: fakeMessenger() }));
     expect(result.reasked).toHaveLength(1);
-    const confirmation = await loadConfirmation(result.reasked[0]?.newJobId ?? '', { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, result.reasked[0]?.newJobId ?? ''));
     expect(confirmation?.presentedText).toContain('ארשום: ממתינים לצד שני · תשובה מהזר');
   });
 
@@ -462,7 +456,7 @@ describe('reaskFailedCommands', () => {
     const unsent = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
     expect(unsent.notConnected).toBe(1);
     const unsentJob = unsent.reasked[0]?.newJobId ?? '';
-    expect((await loadConfirmation(unsentJob, { businessId: BUSINESS }))?.deliveredAt).toBeNull();
+    expect((await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, unsentJob)))?.deliveredAt).toBeNull();
 
     const second = await seedCommand();
     await timeOut(second.jobId, second.bundle);
@@ -475,7 +469,7 @@ describe('reaskFailedCommands', () => {
     const failed = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger: failing }));
     expect(failed.sendFailed).toBe(1);
     const failedJob = failed.reasked[0]?.newJobId ?? '';
-    expect((await loadConfirmation(failedJob, { businessId: BUSINESS }))?.deliveredAt).toBeNull();
+    expect((await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, failedJob)))?.deliveredAt).toBeNull();
   });
 
   it('a WhatsApp re-ask too long for one message sends a pointer to the dashboard instead, and stays undelivered', async () => {
@@ -497,7 +491,7 @@ describe('reaskFailedCommands', () => {
     const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger }));
     expect(result.errored).toEqual([]);
     const newJobId = result.reasked[0]?.newJobId ?? '';
-    const confirmation = await loadConfirmation(newJobId, { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, newJobId));
     expect(confirmation?.presentedText.length).toBeGreaterThan(WHATSAPP_MESSAGE_MAX_CHARS);
     expect(confirmation?.deliveredAt).toBeNull();
     expect(messenger.sent).toEqual([{ text: WHATSAPP_QUESTION_TOO_LONG, jobId: newJobId }]);
@@ -582,7 +576,7 @@ describe('reaskFailedCommands', () => {
     expect(result.sent).toBe(0);
     expect(result.notConnected).toBe(0);
     expect(messenger.sent).toEqual([]);
-    const confirmation = await loadConfirmation(result.reasked[0]?.newJobId ?? '', { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, result.reasked[0]?.newJobId ?? ''));
     expect(confirmation?.channel).toBe('dashboard');
   });
 
@@ -619,7 +613,7 @@ describe('reaskFailedCommands', () => {
     const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
     expect(result.errored).toEqual([]);
     const newJobId = result.reasked[0]?.newJobId ?? '';
-    const confirmation = await loadConfirmation(newJobId, { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, newJobId));
     const option = confirmation?.options[0];
     if (confirmation === null || option === undefined) throw new Error('no re-ask');
     // Only s2, its edge to the completed s1 pruned, and a valid plan.
@@ -631,7 +625,7 @@ describe('reaskFailedCommands', () => {
     expect(confirmation.presentedText).not.toContain('first@nowhere.example');
 
     // The owner says yes; the new job runs.
-    expect(await confirmChoice(newJobId, option.planHash, 'p_boss', { businessId: BUSINESS })).toBe(true);
+    expect(await withBusiness(BUSINESS, (bdb) => confirmChoice(bdb, newJobId, option.planHash, 'p_boss'))).toBe(true);
     await withBusiness(BUSINESS, (db) => transition(db, newJobId, { to: 'execute', actor: 'human', reason: 'command: confirmed' }));
     const after: MailMessage[] = [];
     const ran = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: sendingRuntime(after), now: NOON }));
@@ -659,7 +653,7 @@ describe('reaskFailedCommands', () => {
 
     const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
     expect(result.reasked).toEqual([{ oldJobId: jobId, newJobId: expect.any(String), uncertain: true }]);
-    const confirmation = await loadConfirmation(result.reasked[0]?.newJobId ?? '', { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, result.reasked[0]?.newJobId ?? ''));
     expect(confirmation?.presentedText.startsWith(`${REASK_PREFIX}\n\n${alreadyDoneLine(1)}`)).toBe(true);
     expect(confirmation?.options[0]?.plan.steps.map((st) => st.id)).toEqual(['s2']);
   });
@@ -698,7 +692,7 @@ describe('reaskFailedCommands', () => {
     // Woken, run, refused on the stale "yes", failed — then re-asked.
     expect(await lastReason(jobId)).toContain('draft_only');
     expect(pass.reasked.reasked).toEqual([{ oldJobId: jobId, newJobId: expect.any(String), uncertain: false }]);
-    const confirmation = await loadConfirmation(pass.reasked.reasked[0]?.newJobId ?? '', { businessId: BUSINESS });
+    const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, pass.reasked.reasked[0]?.newJobId ?? ''));
     expect(confirmation?.presentedText.includes(REASK_PREFIX)).toBe(false);
 
     const next = await schedulerPass({ businessId: BUSINESS, runtime: sendingRuntime(sent), now: NOON, inbox: null });

@@ -359,7 +359,7 @@ export function oauthCredentials(options: {
       // is what makes revocation take effect on the next call rather than
       // merely "once the cached token's own lifetime runs out".
       const grant = await withOAuthDeadline(
-        readGrantByRef(ref, businessId, options.key),
+        withBusiness(businessId, (db) => readGrantByRef(db, ref, options.key)),
         'קריאת ההרשאה',
       );
 
@@ -369,7 +369,7 @@ export function oauthCredentials(options: {
         // the master key, and is worth the extra query only here, on the
         // already-uncommon null path.
         const status = await withOAuthDeadline(
-          grantStatusByRef(ref, businessId),
+          withBusiness(businessId, (db) => grantStatusByRef(db, ref)),
           'בדיקת מצב ההרשאה',
         );
         if (status === 'revoked') {
@@ -423,7 +423,7 @@ export function oauthCredentials(options: {
           provider: grant.provider,
           message: outcome.message,
         });
-        await markNeedsReauth(grant.system, businessId);
+        await withBusiness(businessId, (db) => markNeedsReauth(db, grant.system));
         throw new OAuthRefreshRejectedError(
           `הספק (${grant.provider}) דחה את ריענון ההרשאה למערכת "${grant.system}" — ` +
             `נדרשת הרשאה מחדש (${outcome.message})`,
@@ -446,7 +446,9 @@ export function oauthCredentials(options: {
         );
       }
 
-      await recordRefresh(grant.system, businessId, outcome.rotatedRefreshToken, options.key);
+      await withBusiness(businessId, (db) =>
+        recordRefresh(db, grant.system, outcome.rotatedRefreshToken, options.key),
+      );
       cache.set(key, {
         accessToken: outcome.accessToken,
         expiresAtMs: nowMs() + outcome.expiresInSeconds * 1000,

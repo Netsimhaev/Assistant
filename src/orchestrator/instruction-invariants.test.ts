@@ -300,7 +300,7 @@ describe('the planner never receives an instruction the owner did not write', ()
     expect(requests.every((request) => (request.resolvedContact ?? '') !== '')).toBe(true);
     if (outcome.status !== 'needs_confirmation') throw new Error(`unexpected ${outcome.status}`);
 
-    const stored = await loadInstructionForJob(outcome.jobId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, outcome.jobId));
     expect(stored?.text).toBe(text);
     for (const request of requests) {
       expect(request.instruction).toBe(stored?.text);

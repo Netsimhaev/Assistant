@@ -317,11 +317,7 @@ describe('schedulerPass', () => {
     // `ask` clamps floor AND ceiling to `approve_required` for every class —
     // the plan step must queue an approval rather than send or sit in draft.
     await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'owner@example.com'));
-    await setDigestSettings(
-      { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: false },
-      'owner',
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => setDigestSettings(bdb, { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: false }, 'owner'));
 
     const sent: MailMessage[] = [];
     const pass = await schedulerPass({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });

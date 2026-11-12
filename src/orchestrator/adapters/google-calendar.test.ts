@@ -240,19 +240,7 @@ describe('createGoogleCalendarAdapter', () => {
         lastOkAt: null,
         lastError: null,
       }, { by: 'test' }));
-    await writeGrant(
-      {
-        businessId: BUSINESS,
-        system: 'office-calendar',
-        provider: 'google',
-        credentialRef: 'OFFICE_CALENDAR',
-        account: 'owner@example.com',
-        scopes: ['https://www.googleapis.com/auth/calendar.readonly'],
-        refreshToken: 'refresh-e2e',
-        grantedBy: 'owner',
-      },
-      KEY,
-    );
+    await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { system: 'office-calendar', provider: 'google', credentialRef: 'OFFICE_CALENDAR', account: 'owner@example.com', scopes: ['https://www.googleapis.com/auth/calendar.readonly'], refreshToken: 'refresh-e2e', grantedBy: 'owner' }, KEY));
 
     const seen: string[] = [];
     const credentials = oauthCredentials({

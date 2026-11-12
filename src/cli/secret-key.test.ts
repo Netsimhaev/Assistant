@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { putSecret, storedCredentials } from '../governance/credential-store.js';
 import { KEY_BYTES, MasterKeyError, loadMasterKey, verifyKeyState } from '../governance/master-key.js';
 import { encryptSecret } from '../governance/secret-cipher.js';
@@ -200,10 +200,7 @@ describe('a refused passphrase changes nothing', () => {
   it('leaves the key, the rows and the recovery copy untouched when rotate is given an empty passphrase', async () => {
     await runSecretKeyCli(['create', OPERATOR], deps());
     const key = await loadMasterKey(KEY_PATH);
-    await putSecret(
-      { businessId: config.businessId, ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR },
-      key,
-    );
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, key));
     const recoveryBefore = await readFile(`${KEY_PATH}.recovery`, 'utf8');
 
     await expect(
@@ -307,14 +304,8 @@ describe('runSecretKeyCli rotate', () => {
     await runSecretKeyCli(['create', OPERATOR], deps());
     const oldKey = await loadMasterKey(KEY_PATH);
 
-    await putSecret(
-      { businessId: config.businessId, ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR },
-      oldKey,
-    );
-    await putSecret(
-      { businessId: config.businessId, ref: 'TWO', value: 'second-secret', updatedBy: OPERATOR },
-      oldKey,
-    );
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, oldKey));
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'TWO', value: 'second-secret', updatedBy: OPERATOR }, oldKey));
 
     const { rows: beforeRows } = await getPool().query<{ key_id: string }>(
       'SELECT key_id FROM credentials ORDER BY ref',
@@ -384,10 +375,7 @@ describe('a rotation that committed says so even when its record does not', () =
   it('throws RotationAuditUnrecordedError naming the key ids and the row count, with the rotation in force', async () => {
     await runSecretKeyCli(['create', OPERATOR], deps());
     const oldKey = await loadMasterKey(KEY_PATH);
-    await putSecret(
-      { businessId: config.businessId, ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR },
-      oldKey,
-    );
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, oldKey));
     const { rows: before } = await getPool().query<{ key_id: string }>(
       'SELECT key_id FROM credential_key_state WHERE business_id = $1',
       [config.businessId],
@@ -530,10 +518,7 @@ describe('a new recovery passphrase must be long enough, and typed twice', () =>
   it('refuses a mistyped confirmation on rotate, leaving the key and the rows untouched', async () => {
     await runSecretKeyCli(['create', OPERATOR], deps());
     const key = await loadMasterKey(KEY_PATH);
-    await putSecret(
-      { businessId: config.businessId, ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR },
-      key,
-    );
+    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, key));
     const recoveryBefore = await readFile(`${KEY_PATH}.recovery`, 'utf8');
 
     await expect(

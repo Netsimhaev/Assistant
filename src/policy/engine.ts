@@ -726,10 +726,11 @@ async function confirmedCommand(
     risk,
   });
 
-  const claimed = await claimConfirmedStep(
-    { jobId: ctx.jobId ?? '', stepId: confirmed.stepId, planHash: confirmed.planHash },
-    { businessId: ctx.db.businessId, db: ctx.db },
-  );
+  const claimed = await claimConfirmedStep(ctx.db, {
+    jobId: ctx.jobId ?? '',
+    stepId: confirmed.stepId,
+    planHash: confirmed.planHash,
+  });
   if (!claimed) {
     // The marker row above is already written, and on its own it would read as
     // one more execution on the owner's confirmation. This row, citing it by
