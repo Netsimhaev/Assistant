@@ -184,9 +184,10 @@ describe('GET /meetings/settings', () => {
     const keyPath = join(dir, 'master.key');
     await writeFile(keyPath, key, { mode: 0o600 });
     try {
+      // The server's one key-state row, which `verifyKeyState` reads, so the
+      // check really opens it. Written as the migrator: the app login may read
+      // `server_key_state` but not write it (migration 068).
       await writeKeyState(key, 'KEY-pool-test', testDb());
-      // The row `verifyKeyState` reads for this business, so the check really opens it.
-      await withBusiness(BUSINESS, (db) => writeKeyState(key, 'KEY-pool-test', db));
       await withBusiness(BUSINESS, (db) => putSecret(db, { ref: 'OAUTH_CALENDAR', value: 'stored-token', updatedBy: 'test' }, key));
       await bindCalendar();
       server = createServer({ port: 0, calendarClient: clientListing(CALENDARS), credentialKeyPath: keyPath });

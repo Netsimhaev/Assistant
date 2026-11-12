@@ -14,6 +14,15 @@ export interface RoleLogins {
 /** The NOLOGIN group every app login belongs to. Owns nothing, NOBYPASSRLS. */
 export const APP_GROUP_ROLE = 'assistant_app';
 
+/**
+ * The NOLOGIN group that holds the platform login's privileges on the
+ * server's own tables (`businesses`, `platform_credentials`,
+ * `server_key_state`) — migration 068 revoked those from `assistant_app`,
+ * through which the platform login took everything else. The app login must
+ * never belong to it.
+ */
+export const PLATFORM_GROUP_ROLE = 'assistant_platform_group';
+
 /** A plain lowercase Postgres identifier — no quoting games in a role name. */
 const ROLE_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
 
@@ -21,8 +30,8 @@ function assertRoleName(name: string): void {
   if (!ROLE_NAME.test(name)) {
     throw new Error('role name must match ^[a-z_][a-z0-9_]{0,62}$');
   }
-  if (name === APP_GROUP_ROLE) {
-    throw new Error(`a login cannot be the group role ${APP_GROUP_ROLE} itself`);
+  if (name === APP_GROUP_ROLE || name === PLATFORM_GROUP_ROLE) {
+    throw new Error(`a login cannot be the group role ${name} itself`);
   }
 }
 
@@ -94,7 +103,7 @@ async function ensureLogin(
       );
       if (member[0]?.m === true) {
         throw new Error(
-          `refusing ${login.user} as the app login: it is a member of ${other}, the BYPASSRLS platform login — revoke that membership`,
+          `refusing ${login.user} as the app login: it is a member of ${other}, ${other === PLATFORM_GROUP_ROLE ? "the platform login's group" : 'the BYPASSRLS platform login'} — revoke that membership`,
         );
       }
     }
@@ -124,14 +133,21 @@ async function ensureRolesOnce(admin: Queryable, logins: RoleLogins): Promise<vo
       await admin.query(`CREATE ROLE ${APP_GROUP_ROLE} NOLOGIN NOBYPASSRLS`);
     }
     await admin.query(`ALTER ROLE ${APP_GROUP_ROLE} NOLOGIN NOBYPASSRLS ${LOGIN_LIMITS}`);
+    if (!(await roleExists(admin, PLATFORM_GROUP_ROLE))) {
+      await admin.query(`CREATE ROLE ${PLATFORM_GROUP_ROLE} NOLOGIN NOBYPASSRLS`);
+    }
+    await admin.query(`ALTER ROLE ${PLATFORM_GROUP_ROLE} NOLOGIN NOBYPASSRLS ${LOGIN_LIMITS}`);
 
     // The app login: NOBYPASSRLS, a member of the group — table grants come
     // through the group (migration 062).
-    await ensureLogin(admin, logins.app, 'NOBYPASSRLS', [logins.platform.user]);
+    await ensureLogin(admin, logins.app, 'NOBYPASSRLS', [logins.platform.user, PLATFORM_GROUP_ROLE]);
     // The platform login: BYPASSRLS on the login itself, since BYPASSRLS is
     // not inherited. Also a member of the group, so it holds the same table
     // privileges: BYPASSRLS skips policies, not GRANTs.
     await ensureLogin(admin, logins.platform, 'BYPASSRLS', []);
+    // And the server's own tables, which `assistant_app` no longer reaches
+    // (migration 068).
+    await execFormatted(admin, `GRANT ${PLATFORM_GROUP_ROLE} TO %I`, [logins.platform.user]);
 
     const database = await currentDatabase(admin);
     for (const role of [APP_GROUP_ROLE, logins.app.user, logins.platform.user]) {
