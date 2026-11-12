@@ -15,10 +15,22 @@ pg.types.setTypeParser(20, (value: string) => BigInt(value));
  * deliberate: anything that surfaces here is a decimal we must not float.
  */
 
-const APP_POOL_DEFAULT_MAX = 10;
-
+/**
+ * The app pool's size: `DATABASE_POOL_MAX`, default 20 (`config.ts`).
+ *
+ * **A capacity bound, not a tuning knob.** Every authenticated dashboard
+ * request holds ONE connection for its whole life (`withBusiness` in the
+ * server's `handleRequest`) — including slow ones: a model call behind
+ * `/instruct`, a provider round trip behind an OAuth callback, an upload. So
+ * the number of requests in flight at once, plus whatever the scheduler holds,
+ * is capped by this. Code on a request path must therefore never acquire a
+ * SECOND connection while its request's one is held — that is hold-and-wait,
+ * and at pool-size concurrency every request waits for a connection only
+ * another waiting request can free. Pass the request's `db` down instead
+ * (`CredentialSource.resolve`'s optional `db` exists for exactly that).
+ */
 let pool: pg.Pool | undefined;
-let appPoolMax = APP_POOL_DEFAULT_MAX;
+let appPoolMax = config.databasePoolMax;
 let migratorPool: pg.Pool | undefined;
 
 function buildPool(connectionString: string, max: number): pg.Pool {

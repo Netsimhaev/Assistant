@@ -77,6 +77,17 @@ function hashToken(token: string): string {
 }
 
 /**
+ * What a row that must be bound to one session stores in place of the session
+ * itself: the sha256 of the cookie value, never the value. `oauth_states.
+ * session_id` holds this — a leaked backup of that table is then not a list
+ * of working session cookies, exactly as `dashboard_sessions.session_id`
+ * already holds a hash and never the token.
+ */
+export function sessionBinding(sessionValue: string): string {
+  return hashToken(sessionValue);
+}
+
+/**
  * The login as it is stored and matched: trimmed and lower-cased, the same
  * normalisation `resolveLogin` (src/tenancy/platform.ts) and the unique index
  * on `lower(login)` (migration 066) use. One function, so the three cannot
@@ -165,11 +176,6 @@ export async function createOwner(
 }
 
 /**
- * The password login, inside the business `resolveLogin` already found for
- * `input.login`. The failure counters and the lock are this business's own
- * row's (spec §5.5); the session is minted for the row's `username`.
- */
-/**
  * A password login whose address names no account: the dashboard calls this
  * when `resolveLogin` found nothing, on a connection with no business
  * (`withNoBusiness`), and `login` calls it when the row vanished.
@@ -208,6 +214,11 @@ export async function loginUnknown(
   return { ok: false, code: 'bad_credentials' };
 }
 
+/**
+ * The password login, inside the business `resolveLogin` already found for
+ * `input.login`. The failure counters and the lock are this business's own
+ * row's (spec §5.5); the session is minted for the row's `username`.
+ */
 export async function login(
   db: BusinessDb,
   input: { login: string; password: string; now?: Date },
@@ -406,6 +417,20 @@ export async function startSession(
   );
 
   return token;
+}
+
+/**
+ * Revoke the one session this token names — used when a correct password
+ * lands on a suspended business: `login` has already minted a session, and it
+ * must not outlive the refusal. Every other session of the account is left as
+ * it is (a suspension revokes nothing).
+ */
+export async function revokeSession(db: BusinessDb, token: string): Promise<void> {
+  await db.query(
+    `UPDATE dashboard_sessions SET revoked_at = now()
+      WHERE session_id = $1 AND business_id = $2 AND revoked_at IS NULL`,
+    [hashToken(token), db.businessId],
+  );
 }
 
 export async function revokeAllSessions(db: BusinessDb, username: string): Promise<number> {

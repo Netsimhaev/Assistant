@@ -1,4 +1,5 @@
 import { closePlatformPool, withPlatform } from '../db/platform-pool.js';
+import { normaliseLogin } from '../dashboard/auth.js';
 
 /**
  * Close the platform pool on shutdown, for a process outside the modules that
@@ -34,13 +35,14 @@ export async function listActiveBusinesses(): Promise<string[]> {
  * password check, the failure counters, the lock) runs inside that
  * business's own `withBusiness`, on the app role, never here.
  *
- * Trimmed and lower-cased exactly as the index is: `" Dana@X.example "` and
- * `dana@x.example` are one mailbox.
+ * Normalised by `normaliseLogin` (dashboard/auth.ts), the one function the
+ * stored value and the index's `lower(login)` agree with: `" Dana@X.example "`
+ * and `dana@x.example` are one mailbox.
  */
 export async function resolveLogin(
   login: string,
 ): Promise<{ businessId: string; status: 'active' | 'suspended' } | null> {
-  const normalised = login.trim().toLowerCase();
+  const normalised = normaliseLogin(login);
   if (normalised.length === 0) return null;
   return withPlatform(async (db) => {
     const { rows } = await db.query<{ business_id: string; status: 'active' | 'suspended' }>(

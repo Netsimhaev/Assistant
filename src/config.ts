@@ -37,6 +37,13 @@ export function positiveInt(name: string, fallback: number): number {
   return parsed;
 }
 
+/** `positiveInt`, refusing zero too — for a size where zero means "nothing works". */
+function atLeastOne(name: string, fallback: number): number {
+  const value = positiveInt(name, fallback);
+  if (value < 1) throw new Error(`${name} must be at least 1 (got: ${value})`);
+  return value;
+}
+
 /**
  * Vitest sets NODE_ENV=test via vitest.config.ts. A CLI run cannot rely on
  * that: `NODE_ENV=test <cmd>` is not portable to Windows shells, and pulling
@@ -116,6 +123,13 @@ export const config = {
    * (`src/db/platform-pool.ts`). Required outside tests: a deploy that forgot
    * it must not quietly reuse the app login for cross-business work.
    */
+  /**
+   * Connections in the APPLICATION pool (`getPool`/`withBusiness`). Each
+   * authenticated dashboard request holds one for its whole life, so this is
+   * the bound on concurrent requests plus the scheduler's work (see `pool.ts`).
+   * Zero is refused: a pool of none serves nothing.
+   */
+  databasePoolMax: atLeastOne('DATABASE_POOL_MAX', 20),
   databasePlatformUrl:
     testDatabaseUrl !== null && testLogins !== null
       ? withLogin(testDatabaseUrl, testLogins.platform)

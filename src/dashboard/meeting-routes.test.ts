@@ -10,7 +10,12 @@ import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import type { CalendarClient, CalendarEvent, CalendarInfo } from '../calendar/types.js';
 import { calendarConnection } from '../charter/amend-calendar.js';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { __setAppPoolMaxForTest, closePool, getPool, withBusiness } from '../db/pool.js';
+import { randomBytes } from 'node:crypto';
+import { config } from '../config.js';
+import { KEY_BYTES, writeKeyState } from '../governance/master-key.js';
+import { putSecret, storedCredentials } from '../governance/credential-store.js';
+import { oauthCredentials } from '../orchestrator/oauth-token.js';
 import { localParts, localToInstant } from '../util/local-time.js';
 import { upsertBinding } from '../orchestrator/bindings.js';
 import type { CredentialSource } from '../orchestrator/credentials.js';
@@ -130,6 +135,37 @@ describe('GET /meetings/settings', () => {
     expect(html).not.toMatch(/name="write" value="family-id"[^>]*disabled/);
     expect(html).not.toContain('‮');
     expect(html).toContain('משפחה');
+  });
+
+  /**
+   * Task 10 fix round 1 (ruling R15): a request holds ONE pooled connection for
+   * its whole life, so nothing it calls may acquire a second. With the app
+   * pool at a single connection, a nested `withBusiness` (as the OAuth and
+   * stored-credential resolve used to open) waits for the request's own
+   * connection forever and the page never renders. The real credential
+   * sources run here — the OAuth source reads the grant tables, finds no
+   * grant, and falls through to the stored secret — all on the request's db.
+   */
+  it('renders with an app pool of one connection: the credential resolve reuses the request connection', async () => {
+    const key = randomBytes(KEY_BYTES);
+    await writeKeyState(key, 'KEY-pool-test');
+    await withBusiness(BUSINESS, (db) => putSecret(db, { ref: 'OAUTH_CALENDAR', value: 'stored-token', updatedBy: 'test' }, key));
+    await bindCalendar();
+    const credentials = oauthCredentials({
+      key,
+      fallback: storedCredentials(key),
+      http: { exchangeRefresh: async () => { throw new Error('no grant: the refresh is never reached'); } },
+    });
+    const baseUrl = await start(clientListing(CALENDARS), credentials);
+    const cookie = await login(baseUrl);
+    await __setAppPoolMaxForTest(1);
+    try {
+      const res = await fetch(`${baseUrl}/meetings/settings`, { headers: { cookie } });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain('משפחה');
+    } finally {
+      await __setAppPoolMaxForTest(config.databasePoolMax);
+    }
   });
 
   it('says the calendar is not connected, and still renders the other fields', async () => {

@@ -147,8 +147,8 @@ import {
 import { canonicalHash } from '../util/canonical.js';
 import { createCredentialHandle } from './adapters/types.js';
 import type { CredentialHandle } from './adapters/types.js';
-import type { CredentialSource } from './credentials.js';
-import { withBusiness } from '../db/pool.js';
+import { onBusinessDb, type CredentialSource } from './credentials.js';
+import { withBusiness, type BusinessDb } from '../db/pool.js';
 
 /**
  * The one network call this module makes. Injectable for the same reason
@@ -313,10 +313,12 @@ async function auditRefreshRejection(params: {
   system: string;
   provider: string;
   message: string;
+  db: BusinessDb | undefined;
 }): Promise<void> {
-  // A credential resolve carries only the business id (`CredentialSource`),
-  // so this entry point opens its own connection for it.
-  await withBusiness(params.businessId, (db) => appendAudit(
+  // A credential resolve carries the business id (`CredentialSource`), and
+  // the caller's connection when it holds one; otherwise this entry point
+  // opens its own connection for it.
+  await onBusinessDb(params.businessId, params.db, (db) => appendAudit(
     db,
     {
       actor: 'orchestrator',
@@ -332,7 +334,7 @@ async function auditRefreshRejection(params: {
         `ריענון ההרשאה למערכת "${params.system}" (ספק: ${params.provider}) נדחה ` +
         `על ידי הספק — נדרשת הרשאה מחדש (${params.message})`,
     },
-  ));
+  ), withBusiness);
 }
 
 /**
@@ -354,12 +356,18 @@ export function oauthCredentials(options: {
   const cache = new Map<string, CachedToken>();
 
   return {
-    async resolve(ref: string, businessId: string): Promise<CredentialHandle | null> {
+    async resolve(ref: string, businessId: string, db?: BusinessDb): Promise<CredentialHandle | null> {
+      // Every database step below runs on the caller's connection when one
+      // was passed (a dashboard request holds exactly one — opening a second
+      // here was hold-and-wait), else on a connection of its own. A `db` of
+      // another business is refused by `onBusinessDb`.
+      const on = <T>(fn: (own: BusinessDb) => Promise<T>): Promise<T> =>
+        onBusinessDb(businessId, db, fn, withBusiness);
       // The governance read happens on EVERY call, cache hit or miss. This
       // is what makes revocation take effect on the next call rather than
       // merely "once the cached token's own lifetime runs out".
       const grant = await withOAuthDeadline(
-        withBusiness(businessId, (db) => readGrantByRef(db, ref, options.key)),
+        on((own) => readGrantByRef(own, ref, options.key)),
         'קריאת ההרשאה',
       );
 
@@ -369,7 +377,7 @@ export function oauthCredentials(options: {
         // the master key, and is worth the extra query only here, on the
         // already-uncommon null path.
         const status = await withOAuthDeadline(
-          withBusiness(businessId, (db) => grantStatusByRef(db, ref)),
+          on((own) => grantStatusByRef(own, ref)),
           'בדיקת מצב ההרשאה',
         );
         if (status === 'revoked') {
@@ -382,7 +390,7 @@ export function oauthCredentials(options: {
         // `readGrantByRef` itself treats a wrong key as a configuration
         // fact rather than a crash. Let a rejection from `fallback.resolve`
         // propagate as-is -- see the module docblock's C1 section.
-        return options.fallback.resolve(ref, businessId);
+        return options.fallback.resolve(ref, businessId, db);
       }
 
       const key = cacheKey(businessId, ref);
@@ -394,7 +402,7 @@ export function oauthCredentials(options: {
       // Cache miss: about to mint or refresh a real token for this ref, so
       // this is the moment an ambiguous configuration actually matters. A
       // rejection here propagates as-is, same reasoning as above.
-      const conflicting = await options.fallback.resolve(ref, businessId);
+      const conflicting = await options.fallback.resolve(ref, businessId, db);
       if (conflicting !== null) {
         throw new AmbiguousCredentialRefError(
           `ההפניה "${ref}" קיימת גם כסוד וגם כהרשאת OAuth — יש להסיר אחת מהן`,
@@ -422,8 +430,9 @@ export function oauthCredentials(options: {
           system: grant.system,
           provider: grant.provider,
           message: outcome.message,
+          db,
         });
-        await withBusiness(businessId, (db) => markNeedsReauth(db, grant.system));
+        await on((own) => markNeedsReauth(own, grant.system));
         throw new OAuthRefreshRejectedError(
           `הספק (${grant.provider}) דחה את ריענון ההרשאה למערכת "${grant.system}" — ` +
             `נדרשת הרשאה מחדש (${outcome.message})`,
@@ -446,8 +455,8 @@ export function oauthCredentials(options: {
         );
       }
 
-      await withBusiness(businessId, (db) =>
-        recordRefresh(db, grant.system, outcome.rotatedRefreshToken, options.key),
+      await on((own) =>
+        recordRefresh(own, grant.system, outcome.rotatedRefreshToken, options.key),
       );
       cache.set(key, {
         accessToken: outcome.accessToken,

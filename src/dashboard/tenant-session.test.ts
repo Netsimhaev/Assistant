@@ -21,7 +21,7 @@ import type { RiskAssessment } from '../domain/risk.js';
 import { resolveLogin } from '../tenancy/platform.js';
 import { run as createOwnerRun } from '../cli/create-owner.js';
 import type { PromptIo } from '../cli/prompt-io.js';
-import { createOwner, parseSessionCookie, sessionCookieValue } from './auth.js';
+import { createOwner, parseSessionCookie, sessionBinding, sessionCookieValue } from './auth.js';
 import { createServer } from './server.js';
 
 const A = 'tenant-a';
@@ -218,6 +218,8 @@ describe('one dashboard for every business', () => {
     const res = await fetch(`${baseUrl}/`, { headers: { cookie: `sid=${token}` }, redirect: 'manual' });
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');
+    // And the browser is told to drop it, so it stops sending it.
+    expect(res.headers.get('set-cookie')).toMatch(/^sid=; .*Max-Age=0/);
   });
 
   it('a suspended business is refused at login and on the next request of a live session', async () => {
@@ -225,17 +227,25 @@ describe('one dashboard for every business', () => {
     const cookie = await loginCookie(baseUrl, A_LOGIN);
 
     await registerBusiness(B, 'suspended');
-    // Refused without a password check: a wrong password gets the same answer
-    // and spends nothing from the account's failure budget.
-    const refused = await postLogin(baseUrl, B_LOGIN, 'wrong password entirely');
+    // A wrong password gets the ordinary generic reply: the suspension is
+    // never told to someone who has not proved the password.
+    const wrong = await postLogin(baseUrl, B_LOGIN, 'wrong password entirely');
+    expect(wrong.status).toBe(401);
+    const wrongBody = await wrong.text();
+    expect(wrongBody).toContain('שם משתמש או סיסמה שגויים.');
+    expect(wrongBody).not.toContain(SUSPENDED);
+    // The correct password is told — with no cookie, and the session `login`
+    // minted on the way is revoked at once.
+    const refused = await postLogin(baseUrl, B_LOGIN, PASSWORD);
     expect(refused.status).toBe(403);
     expect(refused.headers.get('set-cookie')).toBeNull();
     expect(await refused.text()).toContain(SUSPENDED);
-    const { rows: counters } = await testDb().query<{ failed_attempts: number }>(
-      `SELECT failed_attempts FROM dashboard_users WHERE business_id = $1`,
+    const { rows: minted } = await testDb().query<{ revoked_at: Date | null }>(
+      `SELECT revoked_at FROM dashboard_sessions WHERE business_id = $1`,
       [B],
     );
-    expect(counters[0]?.failed_attempts).toBe(0);
+    expect(minted).toHaveLength(1);
+    expect(minted[0]?.revoked_at).not.toBeNull();
 
     await registerBusiness(A, 'suspended');
     const live = await fetch(`${baseUrl}/`, { headers: { cookie }, redirect: 'manual' });
@@ -260,7 +270,7 @@ describe('one dashboard for every business', () => {
     await testDb().query(
       `INSERT INTO oauth_states (state, business_id, system, session_id, code_verifier, expires_at)
        VALUES ('state-of-b', $1, 'office-calendar', $2, 'verifier', now() + interval '10 minutes')`,
-      [B, cookie.slice('sid='.length)],
+      [B, sessionBinding(cookie.slice('sid='.length))],
     );
 
     const res = await fetch(`${baseUrl}/oauth/callback?state=state-of-b&code=the-code`, { headers: { cookie } });

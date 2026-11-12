@@ -1,5 +1,31 @@
 import { createCredentialHandle } from './adapters/types.js';
 import type { CredentialHandle } from './adapters/types.js';
+import type { BusinessDb } from '../db/pool.js';
+
+/**
+ * Run `fn` on `db` when the caller handed one in, else on a connection of its
+ * own for `businessId`. A `db` for another business is refused loudly: the
+ * business is the documented control on this path, and a connection scoped
+ * elsewhere would read another customer's row (or, under RLS, nothing).
+ *
+ * Why the seam exists (fix round 1 of multi-tenant Task 10, ruling R15): a
+ * dashboard request holds ONE pooled connection for its whole life. A resolve
+ * that opened a second `withBusiness` while the first was still held is
+ * hold-and-wait — at pool-size concurrent requests every request waits for a
+ * connection that only another waiting request can free.
+ */
+export async function onBusinessDb<T>(
+  businessId: string,
+  db: BusinessDb | undefined,
+  fn: (db: BusinessDb) => Promise<T>,
+  open: (businessId: string, fn: (db: BusinessDb) => Promise<T>) => Promise<T>,
+): Promise<T> {
+  if (db === undefined) return open(businessId, fn);
+  if (db.businessId !== businessId) {
+    throw new Error('credential resolve: the connection belongs to another business');
+  }
+  return fn(db);
+}
 
 /**
  * Where a `credential_ref` turns into an actual secret.
@@ -20,7 +46,7 @@ export interface CredentialSource {
    * reads another's secret. Required means an omission is a compile error
    * rather than a wrong lookup at run time.
    */
-  resolve(ref: string, businessId: string): Promise<CredentialHandle | null>;
+  resolve(ref: string, businessId: string, db?: BusinessDb): Promise<CredentialHandle | null>;
 
   /**
    * Forget any cached value for `ref`, so the next `resolve` mints a fresh

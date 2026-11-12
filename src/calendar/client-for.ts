@@ -36,7 +36,9 @@ export async function resolveCalendarAccess(db: BusinessDb, o: {
   }
   let token: string;
   try {
-    const handle = await o.runtime.credentials.resolve(ref, db.businessId);
+    // This request's own connection: a dashboard request holds one and must
+    // not acquire a second (hold-and-wait, Task 10 fix round 1).
+    const handle = await o.runtime.credentials.resolve(ref, db.businessId, db);
     if (handle === null) return { unavailable: 'needs_reauth' };
     token = handle.value;
   } catch (error) {

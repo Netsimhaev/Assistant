@@ -323,3 +323,17 @@ describe('removeSecret', () => {
     expect(await withBusiness(BIZ_A, (bdb) => removeSecret(bdb, 'CALENDAR_TOKEN'))).toBe(false);
   });
 });
+
+describe('storedCredentials.resolve on the caller connection (Task 10 fix round 1)', () => {
+  it('reads on the db it is handed, and refuses a db of another business', async () => {
+    await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY));
+    const source = storedCredentials(KEY);
+    const handle = await withBusiness(BIZ_A, (bdb) => source.resolve(REF, BIZ_A, bdb));
+    expect(handle?.value).toBe(SECRET);
+    // The business is the control on this path: a connection scoped to
+    // another business is refused loudly, never read from.
+    await expect(withBusiness(BIZ_B, (bdb) => source.resolve(REF, BIZ_A, bdb))).rejects.toThrow(
+      /another business/,
+    );
+  });
+});

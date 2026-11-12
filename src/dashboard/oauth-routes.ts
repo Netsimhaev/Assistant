@@ -36,6 +36,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { appendAudit } from '../audit/log.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { transaction, type BusinessDb } from '../db/pool.js';
+import { sessionBinding } from './auth.js';
 import { canonicalHash } from '../util/canonical.js';
 import { platformSecrets } from '../tenancy/platform-credentials.js';
 import { MasterKeyError, loadMasterKey, verifyKeyState } from '../governance/master-key.js';
@@ -513,7 +514,9 @@ export async function handleOAuthStart(
   const clientId = client.clientId;
 
   const codeVerifier = createCodeVerifier();
-  const state = await createState(db, { system, sessionId: session.sessionId, codeVerifier, ...(system === MAILBOX_SYSTEM || system === CALENDAR_SYSTEM ? { provider } : {}) });
+  // Bound to the session by its hash, never the raw cookie value (see
+  // `sessionBinding`); the callback compares hashes.
+  const state = await createState(db, { system, sessionId: sessionBinding(session.sessionId), codeVerifier, ...(system === MAILBOX_SYSTEM || system === CALENDAR_SYSTEM ? { provider } : {}) });
   const consentUrl = buildConsentUrl({
     provider,
     authorizeUrl: profile.authorizeUrl,
@@ -529,7 +532,16 @@ export async function handleOAuthStart(
 const INVALID_STATE_MESSAGE =
   'הבקשה אינה תקפה — פגה, כבר נוצלה, או לא נפתחה מהסשן הזה. יש להתחיל את תהליך ההרשאה מחדש.';
 
-/** A state minted for another business than the session's (spec §5.5). */
+/**
+ * A state minted for another business than the session's (spec §5.5).
+ *
+ * **Unreachable today — defence in depth, kept on purpose.** `consumeState`
+ * filters `business_id = $2` (and RLS will too), so another business's state
+ * is a miss and gets `INVALID_STATE_MESSAGE` before this check runs; and the
+ * state is bound to a hash of the session cookie, whose business part names
+ * this business. The comparison on the consumed row is the second,
+ * independent control, should the first ever be loosened.
+ */
 const OTHER_BUSINESS_STATE_MESSAGE = 'ההרשאה התחילה בחשבון אחר — התחילי מחדש';
 
 /**
@@ -558,7 +570,7 @@ export async function handleOAuthCallback(
   }
 
   const consumed = await consumeState(db, stateParam);
-  if (consumed === null || consumed.sessionId !== session.sessionId) {
+  if (consumed === null || consumed.sessionId !== sessionBinding(session.sessionId)) {
     return sendHtml(res, 400, page('הבקשה אינה תקפה', errorBlock(INVALID_STATE_MESSAGE)));
   }
   // The row's business must be the session's, or a callback opened in one

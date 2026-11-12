@@ -36,7 +36,7 @@ import { acquireAdvisoryLock, transaction, withBusiness } from '../db/pool.js';
 import type { BusinessDb, Queryable } from '../db/pool.js';
 import { createCredentialHandle } from '../orchestrator/adapters/types.js';
 import type { CredentialHandle } from '../orchestrator/adapters/types.js';
-import { CREDENTIAL_REF_PATTERN } from '../orchestrator/credentials.js';
+import { CREDENTIAL_REF_PATTERN, onBusinessDb } from '../orchestrator/credentials.js';
 import type { CredentialSource } from '../orchestrator/credentials.js';
 import { verifyKeyState } from './master-key.js';
 import { decryptSecret, encryptSecret } from './secret-cipher.js';
@@ -169,15 +169,17 @@ export async function liveKeyId(db: Queryable): Promise<string> {
  */
 export function storedCredentials(key: Buffer): CredentialSource {
   return {
-    async resolve(ref: string, businessId: string): Promise<CredentialHandle | null> {
+    async resolve(ref: string, businessId: string, db?: BusinessDb): Promise<CredentialHandle | null> {
       // Before any database call — before even a connection is checked out:
       // a ref outside the legal shape is not a ref that was ever stored, so
       // there is nothing to look up.
       if (!CREDENTIAL_REF_PATTERN.test(ref)) return null;
       // `CredentialSource.resolve` carries the business as a string (its
-      // signature is the documented control in `credentials.ts`), so this
-      // is an entry point and opens its own business-scoped connection.
-      return withBusiness(businessId, (db) => resolveStoredSecret(db, key, ref));
+      // signature is the documented control in `credentials.ts`). A caller
+      // already holding that business's connection passes it (a dashboard
+      // request must never acquire a second one); otherwise this is an entry
+      // point and opens its own business-scoped connection.
+      return onBusinessDb(businessId, db, (own) => resolveStoredSecret(own, key, ref), withBusiness);
     },
   };
 }

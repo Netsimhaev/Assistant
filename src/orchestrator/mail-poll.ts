@@ -283,7 +283,7 @@ export async function pollMailbox(db: BusinessDb, options: PollMailboxOptions): 
   }
   let token: string;
   try {
-    const handle = await options.runtime.credentials.resolve(ref, businessId);
+    const handle = await options.runtime.credentials.resolve(ref, businessId, db);
     if (handle === null) return needsReauth();
     token = handle.value;
   } catch (error) {

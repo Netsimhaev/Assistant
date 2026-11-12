@@ -144,6 +144,7 @@ import {
   loginUnknown,
   parseSessionCookie,
   revokeAllSessions,
+  revokeSession,
   sessionCookieValue,
   setPassword,
   startSession,
@@ -153,6 +154,7 @@ import {
 } from './auth.js';
 import { redeemRecoveryCode, redeemUnknown, remainingCodes } from './recovery.js';
 import { resolveLogin } from '../tenancy/platform.js';
+import { withSessionLockOn } from '../orchestrator/session-lock.js';
 import { getBusiness } from '../tenancy/businesses.js';
 import { issueCsrfToken, verifyCsrfToken } from './csrf.js';
 import {
@@ -490,15 +492,18 @@ function redirect(res: ServerResponse, location: string, headers: Record<string,
 type Session = { sessionId: string; username: string; mustChangePassword: boolean };
 
 /**
- * The cookie's business and token, or `null` — no cookie, or one that does
- * not parse (an old token-only cookie from before migration 066 among them:
- * logged out, never an error page, Review Focus 6).
+ * The cookie's business and token; `'none'` when there is no cookie; or
+ * `'unparseable'` for one that does not parse (an old token-only cookie from
+ * before migration 066 among them) — logged out, never an error page (Review
+ * Focus 6), and the caller clears it so the browser stops sending it.
  */
-function sessionCookieFrom(req: IncomingMessage): { value: string; businessId: string; token: string } | null {
+function sessionCookieFrom(
+  req: IncomingMessage,
+): { value: string; businessId: string; token: string } | 'none' | 'unparseable' {
   const value = parseCookies(req.headers.cookie)[SESSION_COOKIE];
-  if (!value) return null;
+  if (!value) return 'none';
   const parsed = parseSessionCookie(value);
-  return parsed === null ? null : { value, ...parsed };
+  return parsed === null ? 'unparseable' : { value, ...parsed };
 }
 
 /**
@@ -534,10 +539,15 @@ async function handleLoginGet(res: ServerResponse): Promise<void> {
  *   2. No such address: the failure goes to the server-wide unknown-login
  *      bucket, on a connection with no business, and the reply is the same
  *      generic failure a wrong password gets.
- *   3. A suspended business is refused here, before any password or code is
- *      checked — nothing is spent from the account's failure budget either.
- *   4. Otherwise everything — the hash check, the counters and the lock, the
- *      new session — runs inside that business's own `withBusiness`.
+ *   3. Everything else — the hash check, the counters and the lock, the new
+ *      session — runs inside that business's own `withBusiness`.
+ *   4. A suspended business is told so only AFTER a correct password: the
+ *      session `login` just minted is revoked and no cookie is set. A wrong
+ *      password gets the ordinary generic reply, so the suspension notice
+ *      never tells a prober that an address exists. A recovery code against
+ *      a suspended business is refused like an unknown address (decoy cost,
+ *      server-wide bucket) and never redeemed: redeeming would spend the code
+ *      and revoke every session of an account that cannot be entered anyway.
  */
 async function handleLoginPost(
   req: IncomingMessage,
@@ -555,14 +565,12 @@ async function handleLoginPost(
   }
 
   const resolved = await resolveLogin(email);
-  if (resolved !== null && resolved.status !== 'active') {
-    return sendHtml(res, 403, renderLogin({ error: SUSPENDED_MESSAGE }));
-  }
+  const suspended = resolved !== null && resolved.status !== 'active';
 
   if (withCode) {
     const codeRefused = (): void =>
       sendHtml(res, 401, renderLogin({ error: 'קוד שגוי, כבר נוצל, או שהמערכת נעולה זמנית.' }));
-    if (resolved === null) {
+    if (resolved === null || suspended) {
       await withNoBusiness((db) => redeemUnknown(db, code));
       return codeRefused();
     }
@@ -583,7 +591,13 @@ async function handleLoginPost(
   const result =
     resolved === null
       ? await withNoBusiness((db) => loginUnknown(db, typed))
-      : await withBusiness(resolved.businessId, (db) => login(db, { login: email, password: typed }));
+      : await withBusiness(resolved.businessId, async (db) => {
+          const attempt = await login(db, { login: email, password: typed });
+          // Correct password, suspended business: the session must not
+          // survive this request.
+          if (attempt.ok && suspended) await revokeSession(db, attempt.sessionId);
+          return attempt;
+        });
   if (!result.ok) {
     const message =
       result.code === 'locked'
@@ -593,6 +607,7 @@ async function handleLoginPost(
   }
   // `loginUnknown` never succeeds, so a success always has a business.
   if (resolved === null) return sendHtml(res, 401, renderLogin({ error: 'שם משתמש או סיסמה שגויים.' }));
+  if (suspended) return sendHtml(res, 403, renderLogin({ error: SUSPENDED_MESSAGE }));
 
   redirect(res, '/', { 'Set-Cookie': sessionCookie(resolved.businessId, result.sessionId) });
 }
@@ -1511,27 +1526,21 @@ export function reasonForSupersededJob(
  * POST on a different job occupies its own connection for as long as its
  * model call runs, same as this one does. What is avoided is an open
  * *transaction* held across that call: no row locks, no held MVCC snapshot,
- * nothing blocking `VACUUM` for minutes while the network call runs. The
- * lock is always released before the connection goes back: an unlock that
- * fails is rethrown, and a connection whose unlock fails is one whose
- * `RESET` in `withBusiness` fails too, so it is destroyed rather than pooled
- * while still holding the lock.
+ * nothing blocking `VACUUM` for minutes while the network call runs.
+ *
+ * The lock and its release are `withSessionLockOn`'s (orchestrator/
+ * session-lock.ts), on this request's connection: an unlock that fails never
+ * masks the body's own error, and it poisons the connection (leaves it inside
+ * a `BEGIN`) so `withBusiness` destroys it rather than pooling a session that
+ * still holds the lock.
  */
 async function withJobClaim<T>(
   db: BusinessDb,
   scope: string,
   body: () => Promise<T>,
 ): Promise<{ claimed: true; value: T } | { claimed: false }> {
-  const lock = await db.query<{ locked: boolean }>(
-    'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
-    [scope],
-  );
-  if (lock.rows[0]?.locked !== true) return { claimed: false };
-  try {
-    return { claimed: true, value: await body() };
-  } finally {
-    await db.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [scope]);
-  }
+  const held = await withSessionLockOn(db, scope, body);
+  return held.locked ? { claimed: true, value: held.value } : { claimed: false };
 }
 
 /**
@@ -3087,7 +3096,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
 
   // Everything past this point requires a session.
   const cookie = sessionCookieFrom(req);
-  if (cookie === null) return redirect(res, '/login');
+  if (cookie === 'none') return redirect(res, '/login');
+  if (cookie === 'unparseable') return redirect(res, '/login', { 'Set-Cookie': clearedCookie() });
 
   return withBusiness(cookie.businessId, async (db) => {
     const session = await loadSession(db, cookie);
