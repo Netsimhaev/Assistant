@@ -25,6 +25,7 @@
     "dashboard": "tsx src/dashboard/run-dashboard.ts",
     "owner:create": "tsx src/cli/create-owner.ts",
     "owner:password": "tsx src/cli/owner-password.ts",
+    "owner:email": "tsx src/cli/owner-email.ts",
     "job:seed": "tsx src/cli/seed-job.ts",
     "ramp:set": "tsx src/cli/set-ramp.ts",
     "kill": "tsx src/cli/kill.ts",

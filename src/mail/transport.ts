@@ -83,9 +83,10 @@ export interface SmtpConfig {
    * (`src/dashboard/server.ts`) and for the same reason: the dangerous
    * configuration stays reachable, because an operator who genuinely needs it
    * is better served by a named switch than by a workaround, but it is never
-   * what happens by default and never silent — `buildRuntime`
-   * (`src/orchestrator/runtime.ts`) reads `SMTP_ALLOW_CLEARTEXT=1` for this
-   * and pushes a warning whenever it is on. A silent default is what this
+   * what happens by default and never silent — `businessRuntime`
+   * (`src/orchestrator/runtime.ts`) reads the business's
+   * `notify_smtp_allow_cleartext` for this and pushes a warning whenever it is
+   * on (the env name `SMTP_ALLOW_CLEARTEXT` is read only by `tenancy:import-env`). A silent default is what this
    * field removes; a visible opt-out is not the same thing.
    */
   allowCleartext?: boolean;

@@ -13,9 +13,10 @@ import {
   MISSING_BUSINESS_MESSAGE,
   unknownBusinessMessage,
 } from './business-arg.js';
-import { run as createOwnerRun } from './create-owner.js';
 import { main as ingestMain } from './ingest-doc.js';
 import { main as killMain } from './kill.js';
+import { BAD_EMAIL_MESSAGE, LOGIN_TAKEN_MESSAGE, run as createOwnerRun } from './create-owner.js';
+import { main as ownerEmailMain } from './owner-email.js';
 import { run as ownerPasswordRun } from './owner-password.js';
 import type { PromptIo } from './prompt-io.js';
 import { main as secretMain } from './secret.js';
@@ -174,6 +175,75 @@ describe('owner:password', () => {
   });
 });
 
+describe('owner:email', () => {
+  const NEW_EMAIL = 'dana@new-address.example';
+
+  function out(): { log: (l: string) => void; error: (l: string) => void; lines: string[]; errors: string[] } {
+    const lines: string[] = [];
+    const errors: string[] = [];
+    return { lines, errors, log: (l) => lines.push(l), error: (l) => errors.push(l) };
+  }
+
+  async function loginOf(businessId: string, username: string): Promise<string | undefined> {
+    const { rows } = await testDb().query<{ login: string }>(
+      'SELECT login FROM dashboard_users WHERE business_id = $1 AND username = $2',
+      [businessId, username],
+    );
+    return rows[0]?.login;
+  }
+
+  beforeEach(async () => {
+    await createOwnerRun([USERNAME, ...BIZ, ...EMAIL], fakeIo([PASSWORD, PASSWORD]));
+  });
+
+  it('sets the login, normalised, and the new address logs in while the old one does not', async () => {
+    const io = out();
+    const code = await ownerEmailMain([...BIZ, '--username', USERNAME, '--email', '  Dana@New-Address.example '], io);
+    expect(io.errors).toEqual([]);
+    expect(code).toBe(0);
+    expect(await loginOf(TEST_BUSINESS, USERNAME)).toBe(NEW_EMAIL);
+    const withNew = await withBusiness(TEST_BUSINESS, (db) => login(db, { login: NEW_EMAIL, password: PASSWORD }));
+    expect(withNew.ok).toBe(true);
+    const withOld = await withBusiness(TEST_BUSINESS, (db) => login(db, { login: ownerLogin(TEST_BUSINESS, USERNAME), password: PASSWORD }));
+    expect(withOld.ok).toBe(false);
+  });
+
+  it('refuses an address another business already holds, in any case, and changes nothing', async () => {
+    await createBusiness('other-business', 'עסק אחר');
+    await createOwnerRun(
+      [USERNAME, '--business', 'other-business', '--email', NEW_EMAIL],
+      fakeIo([PASSWORD, PASSWORD]),
+    );
+    const io = out();
+    const code = await ownerEmailMain([...BIZ, '--username', USERNAME, '--email', 'DANA@new-address.EXAMPLE'], io);
+    expect(code).toBe(1);
+    expect(io.errors).toEqual([LOGIN_TAKEN_MESSAGE]);
+    expect(await loginOf(TEST_BUSINESS, USERNAME)).toBe(ownerLogin(TEST_BUSINESS, USERNAME));
+  });
+
+  it('refuses a malformed address and changes nothing', async () => {
+    const io = out();
+    const code = await ownerEmailMain([...BIZ, '--username', USERNAME, '--email', 'owner'], io);
+    expect(code).toBe(1);
+    expect(io.errors).toEqual([BAD_EMAIL_MESSAGE]);
+    expect(await loginOf(TEST_BUSINESS, USERNAME)).toBe(ownerLogin(TEST_BUSINESS, USERNAME));
+  });
+
+  it('refuses an account that does not exist', async () => {
+    const io = out();
+    const code = await ownerEmailMain([...BIZ, '--username', 'no-such-owner', '--email', NEW_EMAIL], io);
+    expect(code).toBe(1);
+    expect(io.errors[0]).toContain('אין חשבון');
+  });
+
+  it('refuses without --username', async () => {
+    const io = out();
+    const code = await ownerEmailMain([...BIZ, '--email', NEW_EMAIL], io);
+    expect(code).toBe(2);
+    expect(await loginOf(TEST_BUSINESS, USERNAME)).toBe(ownerLogin(TEST_BUSINESS, USERNAME));
+  });
+});
+
 /**
  * `--business <id>` (spec §5.8, plan Task 7). Every business-scoped command
  * refuses without it, and refuses an id no business is registered under —
@@ -235,6 +305,7 @@ describe('--business', () => {
   const families: Array<[string, (b: string[], out: ReturnType<typeof io>) => Promise<number>]> = [
     ['owner:create', (b, out) => createOwnerRun([USERNAME, ...b], promptIo(out))],
     ['owner:password', (b, out) => ownerPasswordRun([USERNAME, ...b], promptIo(out))],
+    ['owner:email', (b, out) => ownerEmailMain(['--username', USERNAME, '--email', 'dana@example.com', ...b], out)],
     ['kill', (b, out) => killMain(['stop', 'all', 'operator', 'drill', ...b], out)],
     [
       'secret',

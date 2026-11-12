@@ -8,7 +8,7 @@
 ## פקודות
 
 ```bash
-npm test          # vitest run — 4737 מבחנים ב-309 קבצים (4736 עוברים, 1 מדולג; נמדד 12/11 על בסיס ייעודי)
+npm test          # vitest run — 4745 מבחנים ב-309 קבצים (4744 עוברים, 1 מדולג; נמדד 12/11 על בסיס ייעודי)
 npm run typecheck # tsc --noEmit
 npm run build     # tsc
 npm run migrate   # מריץ מיגרציות על DATABASE_MIGRATE_URL (בעלי הטבלאות — לעולם לא חשבון זמן הריצה)
@@ -28,6 +28,7 @@ npm run business:settings -- --business <מזהה> [--notify-to …] [--smtp-hos
 npm run tenancy:import-env -- --business <מזהה>   # חד-פעמי: מעביר הגדרות מהסביבה ל-business_runtime_settings ואת לקוחות ה-OAuth ל-platform_credentials
 npm run owner:create -- --business <מזהה> --email <כתובת>   # הכתובת היא הכניסה, ייחודית בכל השרת
 npm run owner:password -- --business <מזהה>
+npm run owner:email -- --business <מזהה> --username <שם> --email <כתובת>   # מחליף את כתובת הכניסה של חשבון; חובה לחשבון שעבר את מיגרציה 066 (שם הכניסה שלו הוא שם המשתמש)
 npm run secret -- put|list|remove|test <REF> ... --business <מזהה>
 npm run kill -- stop|resume <היקף> <מפעיל> "<נימוק>" | status --business <מזהה>  # מתג העצירה הוא של עסק; אין מתג לכל השרת
 npm run ramp:set -- <מחלקה> <רמה> --business <מזהה>  # מעלה מחלקת פעולה מהרצפה, ומדפיס היכן ההעלאה באמת מורגשת
@@ -694,11 +695,11 @@ TEST_DATABASE_URL="$SDD" npx vitest run <קבצים> --no-file-parallelism
    - `SCHEDULER_INTERVAL_MS` ו-`SCHEDULER_BUSINESS_DEADLINE_MS` — רשות (ברירות מחדל 30000 ו-120000).
    - **להשאיר בינתיים** את `SMTP_*`, `APPROVAL_NOTIFY_TO`, `NOTIFY_CREDENTIAL_REF`, `MAIL_SYSTEM`, `GREEN_API_*_REF` ו-`DOCUMENT_INBOX` — צעד 7 קורא אותם. `BUSINESS_ID` אפשר למחוק כבר עכשיו; שום דבר לא קורא אותו.
 4. `npm run db:roles` — יוצר את הקבוצות ואת שני חשבונות הכניסה עם הסיסמאות שב-URL.
-5. `npm run migrate` — מריץ 062–068. **066 נכשל ברעש אם בשני עסקים יש משתמש באותו שם** (למשל `owner`): הכניסה הופכת ייחודית בכל השרת, והמילוי הוא `login = username`. אם זה קורה — לשנות ידנית את ה-`login` של אחד מהם ולהריץ שוב. **067 מסרב** אם יש יותר משורת מצב-מפתח אחת ואין שורת שרת — אז בוחרים את מפתח השרת ביד.
+5. `npm run migrate` — מריץ 062–068. **066 נכשל ברעש אם בשני עסקים יש משתמש באותו שם** (למשל `owner`): הכניסה הופכת ייחודית בכל השרת, והמילוי הוא `login = username`. כל מיגרציה היא טרנזקציה אחת, ולכן כשל משאיר את הבסיס לפני 066: צריך להכריע ביד איזה חשבון מקבל שם אחר לפני שמריצים שוב (עמודת `login` עוד לא קיימת, ושם המשתמש מופיע גם בסשנים ובקודי השחזור של החשבון — לא לשנות בלי לבדוק). בהתקנת הפיתוח יש עסק אחד, ולכן זה לא צפוי שם. **067 מסרב** אם יש יותר משורת מצב-מפתח אחת ואין שורת שרת — אז בוחרים את מפתח השרת ביד.
 6. `npm run business -- list` — צפוי `dev-business	dev-business	פעיל` (השם הוא המזהה; המילוי לוקח כל עסק שכבר מופיע בתקנונים, במשימות או במשתמשי הדשבורד, ולכן ייתכנו שורות נוספות).
 7. `npm run tenancy:import-env -- --business dev-business` — מעביר את ההגדרות מהסביבה לשורה של העסק, מעתיק את סודות ההתראה והוואטסאפ לשמות הקבועים, ומעביר את ארבעת סודות לקוחות ה-OAuth ל-`platform_credentials`. מדפיס שמות בלבד, לעולם לא ערך. אם `DOCUMENT_INBOX` היה מוגדר, הוא אומר לאן להעביר את הקבצים (`<DOCUMENT_INBOX_ROOT>/dev-business`) — **ההעברה עצמה ידנית**.
 8. **למחוק מ-`.env`** את `SMTP_*`, `APPROVAL_NOTIFY_TO`, `NOTIFY_CREDENTIAL_REF`, `MAIL_SYSTEM`, `GREEN_API_*_REF` ו-`DOCUMENT_INBOX`. התקרות היומיות נשארות — הן ברירת המחדל של השרת.
-9. **הכניסה לדשבורד:** אחרי 066 ה-login של המשתמש הקיים הוא שם המשתמש הישן (`owner`) — מקלידים אותו בשדה המייל, והוא עובד. כדי לעבור לכתובת אמיתית, כ-migrator: `UPDATE dashboard_users SET login = '<הכתובת>' WHERE business_id = 'dev-business' AND username = 'owner';` (על migrator שאינו superuser חל `FORCE`, ואז צריך `SET app.business_id = 'dev-business'` לפני). עוגייה ישנה בדפדפן נקראת כ"לא מחובר" — נכנסים מחדש.
+9. **חובה, לפני ההפעלה מחדש ולפני הכניסה הראשונה — כתובת מייל לכל חשבון דשבורד:** `npm run owner:email -- --business dev-business --username owner --email <הכתובת>` (ולכל חשבון נוסף, אם יש). אחרי 066 שדה הכניסה של חשבון ישן הוא שם המשתמש (`owner`), ושדה הכניסה בטופס הוא `type="email"` — הדפדפן לא ישלח אותו, והחשבון נעול עד שיש לו כתובת אמיתית. הפקודה מסרבת לכתובת לא תקינה ולכתובת שעסק כלשהו כבר מחזיק (`הכתובת כבר רשומה`). עוגייה ישנה בדפדפן נקראת כ"לא מחובר" — נכנסים מחדש עם הכתובת.
 10. להפעיל שוב את `npm run scheduler` — בעלייה הוא בודק את מפתח האב מול `server_key_state` (`verifyServerKeyState`) ומסרב לעלות על אי-התאמה, ושורת ה-log של הסבב צריכה לומר `1 businesses`. ואז `npm run dashboard` וכניסה.
 11. **בסיס הבדיקות של ה-hook** (`assistant_test`): `npm run migrate:test`. מיגרציה 067 תוקנה במקום לפני שהגיעה לייצור (R19), ולכן בסיס בדיקות שכבר הריץ את הגרסה הקודמת שלה צריך להימחק ולהיבנות מחדש, ואז `migrate:test`.
 
