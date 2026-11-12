@@ -27,8 +27,15 @@ import { getBusiness } from '../tenancy/businesses.js';
 /** The exit code of every refusal over `--business`, matching a usage error. */
 export const BUSINESS_ARG_EXIT_CODE = 2;
 
-/** Printed when the flag is absent, empty, repeated or malformed. */
+/** Printed when the flag is absent, empty or repeated. */
 export const MISSING_BUSINESS_MESSAGE = 'חסר מזהה עסק: --business <id>';
+
+/**
+ * Printed when the id fails `isValidBusinessId`. `<id>` is the literal
+ * placeholder: the input itself is not echoed, since it is whatever the
+ * operator typed and cannot name a business anyway.
+ */
+export const MALFORMED_BUSINESS_MESSAGE = 'מזהה עסק לא תקין: --business <id>';
 
 /** Printed when the id is well formed but no such business is registered. */
 export function unknownBusinessMessage(id: string): string {
@@ -81,14 +88,16 @@ export function takeBusinessFlag(argv: readonly string[]): { businessId: string 
 }
 
 /**
- * Parse and check `--business`. A malformed id gets the "missing" message,
- * not the "unknown" one: it is not echoed back, since it is whatever the
- * operator typed and cannot name a business anyway.
+ * Parse and check `--business`: missing, malformed (not echoed back), then
+ * unknown. All three refuse with exit code 2.
  */
 export async function resolveBusinessArg(argv: readonly string[]): Promise<BusinessArg> {
   const { businessId, rest } = takeBusinessFlag(argv);
-  if (businessId === null || !isValidBusinessId(businessId)) {
+  if (businessId === null) {
     return { ok: false, message: MISSING_BUSINESS_MESSAGE };
+  }
+  if (!isValidBusinessId(businessId)) {
+    return { ok: false, message: MALFORMED_BUSINESS_MESSAGE };
   }
   if ((await getBusiness(businessId)) === null) {
     return { ok: false, message: unknownBusinessMessage(businessId) };

@@ -104,20 +104,45 @@ export interface GateHookBinding {
  *                    resume from it.
  */
 export function createGateHook(binding: GateHookBinding) {
-  return async function gateHook(input: unknown): Promise<HookJSONOutput> {
-    try {
-      return await decide(input, binding);
-    } catch (error) {
-      // `readAmountMinor` throws on a decimal amount, and any database error in
-      // gate steps 1-2 throws too. What the SDK does with a hook that rejects is
-      // unspecified, and "unspecified" on the permission path is not a risk
-      // worth taking: fail closed and say so.
-      return denial(
-        'gate_error',
-        error instanceof Error ? error.message : 'שגיאה לא צפויה בשער',
-      );
-    }
+  return function gateHook(input: unknown): Promise<HookJSONOutput> {
+    return oneAtATime(binding.db, async () => {
+      try {
+        return await decide(input, binding);
+      } catch (error) {
+        // `readAmountMinor` throws on a decimal amount, and any database error in
+        // gate steps 1-2 throws too. What the SDK does with a hook that rejects is
+        // unspecified, and "unspecified" on the permission path is not a risk
+        // worth taking: fail closed and say so.
+        return denial(
+          'gate_error',
+          error instanceof Error ? error.message : 'שגיאה לא צפויה בשער',
+        );
+      }
+    });
   };
+}
+
+/**
+ * The decision still running on each connection, so the next one waits.
+ *
+ * Every decision of a run shares `binding.db` — one client. The SDK may fire
+ * two `PreToolUse` hooks at once for parallel tool calls, and `transaction()`
+ * issues BEGIN/COMMIT on that client whenever it is not already in one: two
+ * decisions interleaved there would commit each other's half-written gate and
+ * audit rows on the first COMMIT. So decisions on one connection run one
+ * after another — the gate evaluation and the ingest mark together, as one
+ * unit. Keyed by the connection, not the hook, so two hooks handed the same
+ * `db` queue behind each other too.
+ */
+const running = new WeakMap<BusinessDb, Promise<unknown>>();
+
+function oneAtATime<T>(db: BusinessDb, fn: () => Promise<T>): Promise<T> {
+  const previous = running.get(db) ?? Promise.resolve();
+  // Run after the previous decision whether it resolved or rejected — one
+  // failed decision must not refuse every decision after it.
+  const next = previous.then(fn, fn);
+  running.set(db, next.catch(() => undefined));
+  return next;
 }
 
 async function decide(
@@ -223,8 +248,9 @@ async function decide(
         const matched = await markContentIngested(binding.db, ingestingJobId);
         // `jobId` and the connection's business reach this hook as two
         // independent caller-supplied values — unlike `executeStep`, nothing
-        // here loaded a job row to derive them from. A stale id, a typo, or a jobId that
-        // names another business's job all produce a zero-row match, and
+        // here loaded a job row to derive them from. A stale id, a typo, or a
+        // jobId that names another business's job all produce a zero-row
+        // match, and
         // letting the tool run anyway would mean this read happened with
         // nothing remembering it — the one direction `content_ingested`
         // exists to prevent. So this fails closed, overriding the gate's

@@ -6,7 +6,12 @@ import { closePool } from '../db/pool.js';
 import { createBusiness } from '../tenancy/businesses.js';
 import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { main as businessMain } from './business.js';
-import { BUSINESS_ARG_EXIT_CODE, MISSING_BUSINESS_MESSAGE, unknownBusinessMessage } from './business-arg.js';
+import {
+  BUSINESS_ARG_EXIT_CODE,
+  MALFORMED_BUSINESS_MESSAGE,
+  MISSING_BUSINESS_MESSAGE,
+  unknownBusinessMessage,
+} from './business-arg.js';
 import { run as createOwnerRun } from './create-owner.js';
 import { main as ingestMain } from './ingest-doc.js';
 import { main as killMain } from './kill.js';
@@ -255,7 +260,7 @@ describe('--business', () => {
       });
 
       it('refuses a malformed business id', async () => {
-        await expectRefused(run, ['--business', 'Bad Id!'], MISSING_BUSINESS_MESSAGE);
+        await expectRefused(run, ['--business', 'Bad Id!'], MALFORMED_BUSINESS_MESSAGE);
       });
 
       it('refuses an unknown business', async () => {

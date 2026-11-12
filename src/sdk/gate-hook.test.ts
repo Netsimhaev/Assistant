@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness, type BusinessDb } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { PolicyBundle } from '../domain/policy.js';
@@ -300,6 +300,133 @@ describe('decision reporting', () => {
       { tool: 'doc.fetch', decision: 'allow', code: 'allow' },
       { tool: 'Bash', decision: 'deny', code: 'sdk_tool_unmapped' },
     ]);
+  });
+});
+
+/**
+ * Fix round 1: every decision of a run shares `binding.db`, one client, and
+ * `transaction()` issues BEGIN/COMMIT on it. Two hooks the SDK fires at once
+ * for parallel tool calls must therefore run one after the other — otherwise
+ * the first COMMIT commits the other's half-written gate and audit rows.
+ *
+ * Each statement is delayed a little, so unserialized decisions would
+ * interleave rather than happen to finish in order.
+ */
+describe('concurrent hook calls on one connection', () => {
+  it('runs them one after the other, each leaving its own audit row', async () => {
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
+      bdb,
+      buildCharter({ knownCounterpartyEmailDomain: 'b.com' }),
+    ));
+    const send = (body: string) => preToolUse('mcp__assistant__mail.send', {
+      to: 'a@b.com',
+      inReplyTo: 'm1',
+      counterpartyId: 'c_812',
+      body,
+    });
+
+    const events: string[] = [];
+    const recordingDb = (db: BusinessDb): BusinessDb => ({
+      businessId: db.businessId,
+      inTransaction: db.inTransaction,
+      query: (async (text: unknown, ...rest: unknown[]) => {
+        const sql = typeof text === 'string' ? text : String((text as { text?: string }).text);
+        events.push(/^\s*(BEGIN|COMMIT|ROLLBACK)/i.test(sql) ? sql.trim().toUpperCase() : 'q');
+        await new Promise((resolve) => setTimeout(resolve, 3));
+        return (db.query as (...a: unknown[]) => unknown)(text, ...rest);
+      }) as BusinessDb['query'],
+    });
+
+    const hookOn = (db: BusinessDb) => createGateHook({
+      agent: 'comms.email',
+      bundle,
+      provenance: 'boss',
+      db,
+      jobId: null,
+      documentRoot: DOCS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+
+    // One decision alone, to learn how many statements a decision issues.
+    const solo = await withBusiness(BUSINESS, (db) => hookOn(recordingDb(db))(send('solo')));
+    if (!('hookSpecificOutput' in solo)) throw new Error('async shape');
+    expect(solo.hookSpecificOutput?.hookEventName === 'PreToolUse' && solo.hookSpecificOutput.permissionDecision).toBe('allow');
+    const perDecision = events.length;
+    expect(perDecision).toBeGreaterThan(2);
+    events.length = 0;
+
+    await withBusiness(BUSINESS, async (db) => {
+      const hook = hookOn(recordingDb(db));
+      const first = hook(send('first')).then((out) => {
+        events.push('first done');
+        return out;
+      });
+      const second = hook(send('second')).then((out) => {
+        events.push('second done');
+        return out;
+      });
+      await Promise.all([first, second]);
+    });
+
+    // The second decision issued no statement before the first resolved.
+    expect(events.indexOf('first done')).toBe(perDecision);
+    expect(events.at(-1)).toBe('second done');
+    // And no BEGIN ever opened inside another one.
+    let open = 0;
+    for (const e of events) {
+      if (e.startsWith('BEGIN')) {
+        expect(open).toBe(0);
+        open += 1;
+      } else if (e.startsWith('COMMIT') || e.startsWith('ROLLBACK')) {
+        open -= 1;
+      }
+    }
+
+    const { rows } = await testDb().query<{ n: string }>(
+      `SELECT count(DISTINCT input_hash)::text AS n FROM audit_log
+        WHERE business_id = $1 AND kind = 'intent_to_act'`,
+      [BUSINESS],
+    );
+    expect(rows[0]?.n).toBe('3');
+  });
+
+  it('keeps the queue moving after a decision that failed', async () => {
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+    await withBusiness(BUSINESS, async (db) => {
+      let calls = 0;
+      const flaky: BusinessDb = {
+        businessId: db.businessId,
+        inTransaction: db.inTransaction,
+        query: ((...args: unknown[]) => {
+          calls += 1;
+          if (calls === 1) return Promise.reject(new Error('connection hiccup'));
+          return (db.query as (...a: unknown[]) => unknown)(...args);
+        }) as BusinessDb['query'],
+      };
+      const hook = createGateHook({
+        agent: 'know.reader',
+        bundle,
+        provenance: 'boss',
+        db: flaky,
+        jobId: null,
+        documentRoot: DOCS,
+        counterpartyTags: [],
+        rampLevel: 'auto',
+        now: NOON,
+      });
+      const [a, b] = await Promise.all([
+        hook(preToolUse('Read', { file_path: join(DOCS, 'a.txt') })),
+        hook(preToolUse('Read', { file_path: join(DOCS, 'b.txt') })),
+      ]);
+      const decisionOf = (out: Awaited<ReturnType<typeof hook>>) =>
+        'hookSpecificOutput' in out && out.hookSpecificOutput?.hookEventName === 'PreToolUse'
+          ? out.hookSpecificOutput.permissionDecision
+          : undefined;
+      expect(decisionOf(a)).toBe('deny');
+      expect(decisionOf(b)).toBe('allow');
+    });
   });
 });
 
