@@ -3,6 +3,7 @@ import { config } from '../config.js';
 import { renderReadingBrief } from '../documents/brief.js';
 import { parseReading } from '../documents/reading-parse.js';
 import type { DocumentArtifact } from '../documents/types.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { Reading } from '../domain/reading.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { TrustLevel } from '../domain/trust.js';
@@ -47,7 +48,12 @@ export interface ReadRequest {
    * quietly lift the provenance ceiling on everything downstream.
    */
   provenance?: TrustLevel;
-  businessId?: string;
+  /**
+   * The business's connection, handed to the gate hook so every tool-call
+   * decision of this read — and the `content_ingested` mark an allowed read
+   * makes — lands on it (`GateHookBinding.db`).
+   */
+  db: BusinessDb;
   /**
    * The job this read belongs to, or explicitly `null` when there isn't one.
    *
@@ -141,7 +147,7 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadOutcome> 
     onDecision: (event) => {
       if (event.decision === 'deny') denials.push(event.code);
     },
-    ...(request.businessId !== undefined ? { businessId: request.businessId } : {}),
+    db: request.db,
     jobId: request.jobId,
   };
 

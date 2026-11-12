@@ -34,7 +34,7 @@ function collector(): { log: (line: string) => void; lines: string[] } {
 describe('runSetRampCli', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
   });
 
   afterAll(async () => {
@@ -44,7 +44,7 @@ describe('runSetRampCli', () => {
   it('raises one action class and leaves every other at the floor', async () => {
     const { log } = collector();
 
-    await runSetRampCli(['email.reply', 'approve_required'], { log, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => runSetRampCli(db, ['email.reply', 'approve_required'], { log }));
 
     expect(await storedLevel('email.reply', BUSINESS)).toBe('approve_required');
     // An unset class has no row at all, so this proves the write was scoped
@@ -56,7 +56,7 @@ describe('runSetRampCli', () => {
     const { log } = collector();
 
     await expect(
-      runSetRampCli(['email.nope', 'approve_required'], { log, businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => runSetRampCli(db, ['email.nope', 'approve_required'], { log })),
     ).rejects.toThrow(/email\.reply/);
 
     expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('draft_only');
@@ -66,7 +66,7 @@ describe('runSetRampCli', () => {
     const { log } = collector();
 
     await expect(
-      runSetRampCli(['email.reply', 'whenever_you_like'], { log, businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => runSetRampCli(db, ['email.reply', 'whenever_you_like'], { log })),
     ).rejects.toThrow(/approve_required/);
 
     expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('draft_only');
@@ -80,7 +80,7 @@ describe('runSetRampCli', () => {
     // so the raise cannot be felt there however high the ramp goes.
     const { log, lines } = collector();
 
-    await runSetRampCli(['email.reply', 'approve_required'], { log, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => runSetRampCli(db, ['email.reply', 'approve_required'], { log }));
     const output = lines.join('\n');
 
     expect(output).toContain('boss');
@@ -101,7 +101,7 @@ describe('runSetRampCli', () => {
   it('does not report a raise as felt when the dial pins the class down', async () => {
     const { log, lines } = collector();
 
-    await runSetRampCli(['email.reply', 'auto_notify'], { log, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => runSetRampCli(db, ['email.reply', 'auto_notify'], { log }));
     const output = lines.join('\n');
 
     expect(output).toContain('off');
@@ -115,10 +115,10 @@ describe('runSetRampCli', () => {
 
   /** The same raise, with the dial opened, is now genuinely felt. */
   it('reports a raise as felt once the dial is opened to learn', async () => {
-    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 7)
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
     const { log, lines } = collector();
 
-    await runSetRampCli(['email.reply', 'auto_notify'], { log, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => runSetRampCli(db, ['email.reply', 'auto_notify'], { log }));
     const output = lines.join('\n');
 
     expect(output).toContain('learn');
@@ -132,7 +132,7 @@ describe('runSetRampCli', () => {
     const { log } = collector();
 
     await expect(
-      runSetRampCli(['email.reply', 'approve_required'], { log, businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => runSetRampCli(db, ['email.reply', 'approve_required'], { log })),
     ).rejects.toThrow();
 
     expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('draft_only');

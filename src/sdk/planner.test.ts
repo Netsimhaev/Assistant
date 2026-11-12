@@ -27,7 +27,7 @@ const GOOD_PLAN = {
 };
 
 async function bundle(): Promise<PolicyBundle> {
-  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
+  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
 }
 
 beforeEach(async () => {

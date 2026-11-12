@@ -287,7 +287,7 @@ async function beginVerification(
       question: VERIFICATION_QUESTION,
       answer: null,
       parentEnvelope: null,
-      businessId: ctx.db.businessId,
+      db: ctx.db,
     });
 
     return { opened: true };

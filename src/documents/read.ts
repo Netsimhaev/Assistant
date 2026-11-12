@@ -179,7 +179,7 @@ export async function readDocument(
     bundle: input.bundle,
     artifacts,
     provenance: input.provenance,
-    businessId,
+    db,
     jobId: input.jobId,
     documentRoot,
   });

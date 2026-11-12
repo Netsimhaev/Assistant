@@ -1,4 +1,3 @@
-import { config } from '../config.js';
 import type {
   HookJSONOutput,
   PreToolUseHookInput,
@@ -6,7 +5,7 @@ import type {
 import type { AgentId } from '../domain/audit.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
-import { withBusiness, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { evaluateToolCall } from '../policy/engine.js';
 import { ingestsExternalContent } from '../policy/classify.js';
 import { markContentIngested } from '../orchestrator/jobs.js';
@@ -34,7 +33,6 @@ export interface GateHookBinding {
    * this optional meant only one of the pair was actually present.
    */
   rampLevel: AutonomyLevel;
-  businessId?: string;
   /**
    * The job this call belongs to, or explicitly `null` for a run with no job
    * to remember the read against.
@@ -50,7 +48,18 @@ export interface GateHookBinding {
   jobId: string | null;
   envelopeId?: string | null;
   autonomyCeiling?: AutonomyLevel;
-  db?: Queryable;
+  /**
+   * The one connection every decision of this hook runs on — the gate's
+   * evaluation AND the `content_ingested` write that follows an allow. Its
+   * `businessId` is the business; there is no separate field to disagree
+   * with it.
+   *
+   * Required, and one connection rather than a fresh one per step: a gate
+   * decision and the ingest mark it licenses used to land on two different
+   * connections, so the mark could be filed under a business the decision
+   * was never made for.
+   */
+  db: BusinessDb;
   /**
    * Called for every decision, allow or deny.
    *
@@ -150,7 +159,7 @@ async function decide(
       }
     }
 
-    const decision = await withBusiness(binding.businessId ?? config.businessId, (db) => evaluateToolCall( // TENANCY-TODO(task 7)
+    const decision = await evaluateToolCall(
       translated.internal,
       hook.tool_input,
       {
@@ -161,14 +170,14 @@ async function decide(
         counterpartyTags: binding.counterpartyTags,
         rampLevel: binding.rampLevel,
         ...(binding.now !== undefined ? { now: binding.now } : {}),
-        db,
+        db: binding.db,
         jobId: binding.jobId,
         ...(binding.envelopeId !== undefined ? { envelopeId: binding.envelopeId } : {}),
         ...(binding.autonomyCeiling !== undefined
           ? { autonomyCeiling: binding.autonomyCeiling }
           : {}),
       },
-    ));
+    );
 
     if (decision.outcome === 'allow') {
       binding.onDecision?.({ tool: translated.internal, decision: 'allow', code: 'allow' });
@@ -211,10 +220,10 @@ async function decide(
       // (`ingestsExternalContent` defaults unknown names to `true`).
       if (binding.jobId !== null && ingestsExternalContent(translated.internal)) {
         const ingestingJobId = binding.jobId;
-        const matched = await withBusiness(binding.businessId ?? config.businessId, (db) => markContentIngested(db, ingestingJobId)); // TENANCY-TODO(task 7)
-        // `jobId` and `businessId` reach this hook as two independent
-        // caller-supplied fields — unlike `executeStep`, nothing here loaded
-        // a job row to derive them from. A stale id, a typo, or a jobId that
+        const matched = await markContentIngested(binding.db, ingestingJobId);
+        // `jobId` and the connection's business reach this hook as two
+        // independent caller-supplied values — unlike `executeStep`, nothing
+        // here loaded a job row to derive them from. A stale id, a typo, or a jobId that
         // names another business's job all produce a zero-row match, and
         // letting the tool run anyway would mean this read happened with
         // nothing remembering it — the one direction `content_ingested`

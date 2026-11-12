@@ -27,10 +27,10 @@
  * stored; that is judged cheaper than a stale credential nobody remembers
  * to revoke.
  */
-import { config } from '../config.js';
 import { setPassword } from '../dashboard/auth.js';
 import { issueRecoveryCodes } from '../dashboard/recovery.js';
-import { closePool, getPool } from '../db/pool.js';
+import { withBusiness } from '../db/pool.js';
+import { BUSINESS_ARG_EXIT_CODE, closeCliPools, resolveBusinessArg } from './business-arg.js';
 import { nodePromptIo } from './node-prompt-io.js';
 import type { PromptIo } from './prompt-io.js';
 
@@ -46,17 +46,24 @@ export async function run(argv: string[], io: PromptIo): Promise<number> {
     return 2;
   }
 
-  const username = argv[0] ?? DEFAULT_USERNAME;
-  const businessId = config.businessId;
+  // `--business` before the first prompt and before any read: a refusal
+  // here must leave nothing behind and ask for nothing (`business-arg.ts`).
+  const business = await resolveBusinessArg(argv);
+  if (!business.ok) {
+    io.error(business.message);
+    return BUSINESS_ARG_EXIT_CODE;
+  }
+  const { businessId } = business;
+  const username = business.rest[0] ?? DEFAULT_USERNAME;
 
   // setPassword's UPDATE matches zero rows and returns normally if the
   // account does not exist — it has no way to report "no such account" on
   // its own. Checked here so a typo'd username fails with a clear Hebrew
   // message instead of silently doing nothing.
-  const existing = await getPool().query(
+  const existing = await withBusiness(businessId, (db) => db.query(
     `SELECT 1 FROM dashboard_users WHERE business_id = $1 AND username = $2`,
     [businessId, username],
-  );
+  ));
   if ((existing.rowCount ?? 0) === 0) {
     io.error(`אין חשבון בשם "${username}" עבור עסק זה. הרץ owner:create כדי ליצור אותו.`);
     return 1;
@@ -91,6 +98,6 @@ const isEntrypoint =
 
 if (isEntrypoint) {
   const code = await run(process.argv.slice(2), nodePromptIo);
-  await closePool();
+  await closeCliPools();
   process.exit(code);
 }

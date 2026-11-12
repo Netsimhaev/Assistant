@@ -3,7 +3,7 @@
  * (`runMailTriage`) and the `comms.email` drafter (`runMailDrafter`) — over
  * one mail the poller already stored.
  *
- *   npm run sdk:mail-triage -- <mailId>
+ *   npm run sdk:mail-triage -- <mailId> --business <id>
  *
  * A script and not a test, for the reason every `sdk:*` script here is: it
  * costs money and needs a key, and a suite that skips silently without one
@@ -16,9 +16,9 @@
  * the triage summary, the gist and the subject — never the raw body, which is
  * the quarantine rule this script exists to let a person watch.
  */
-import { config } from '../config.js';
 import { loadActiveCharter } from '../charter/store.js';
-import { closePool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
+import { closeCliPools, runForBusiness } from '../cli/business-arg.js';
 import { getMail } from '../mail/inbox-store.js';
 import { isAutomatedSender } from '../mail/automated.js';
 import { finalCategories, keepValidAttachments } from '../domain/mail-triage.js';
@@ -28,11 +28,10 @@ import { runMailDrafter } from './mail-drafter.js';
 import { attachmentEntries } from '../orchestrator/mail-poll.js';
 import { ATTACHMENT_DOC_TYPE_LABELS } from '../domain/mail-triage.js';
 
-const mailId = process.argv[2];
-
-async function main(): Promise<void> {
+async function main(db: BusinessDb, args: string[]): Promise<void> {
+  const mailId = args[0];
   if (mailId === undefined) {
-    console.error('שימוש: npm run sdk:mail-triage -- <mailId>');
+    console.error('שימוש: npm run sdk:mail-triage -- <mailId> --business <id>');
     process.exitCode = 1;
     return;
   }
@@ -48,18 +47,18 @@ async function main(): Promise<void> {
     return;
   }
 
-  const mail = await withBusiness(config.businessId, (db) => getMail(db, mailId)); // TENANCY-TODO(task 7)
+  const mail = await getMail(db, mailId);
   if (mail === null) {
-    console.error(`לא נמצא מייל במזהה ${mailId} בעסק ${config.businessId}.`);
+    console.error(`לא נמצא מייל במזהה ${mailId} בעסק ${db.businessId}.`);
     process.exitCode = 1;
     return;
   }
 
   // No fixture fallback: installing a charter would be a write, and this
   // script promises to write nothing.
-  const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
+  const active = await loadActiveCharter(db);
   if (active === null) {
-    console.error(`אין תקנון פעיל לעסק ${config.businessId}. יש לחתום על תקנון לפני ההרצה; הסקריפט אינו כותב דבר.`);
+    console.error(`אין תקנון פעיל לעסק ${db.businessId}. יש לחתום על תקנון לפני ההרצה; הסקריפט אינו כותב דבר.`);
     process.exitCode = 1;
     return;
   }
@@ -69,7 +68,7 @@ async function main(): Promise<void> {
   if (mail.bodyText === '') console.log('(גוף ההודעה נמחק במדיניות השמירה — הסיווג רץ על הנושא בלבד)');
 
   // Reads the documents the poll pass already ingested; ingests nothing.
-  const entries = await withBusiness(config.businessId, (db) => attachmentEntries(db, mail, new Map())); // TENANCY-TODO(task 7)
+  const entries = await attachmentEntries(db, mail, new Map());
   const briefAttachments = entries.map((e) => e.brief);
   const outcome = await runMailTriage({ bundle, mail, attachments: briefAttachments });
   if (outcome.status !== 'read') {
@@ -126,7 +125,10 @@ async function main(): Promise<void> {
 }
 
 try {
-  await main();
+  // `main` sets exit code 1 itself on its own refusals; only a `--business`
+  // refusal (2) comes back from here, and 0 must not overwrite that 1.
+  const code = await runForBusiness(process.argv.slice(2), (line) => console.error(line), main);
+  if (code !== 0) process.exitCode = code;
 } finally {
-  await closePool();
+  await closeCliPools();
 }

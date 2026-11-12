@@ -13,10 +13,9 @@
  * link, nothing that touches the mailbox the assistant itself reads.
  */
 import { DatabaseError } from 'pg';
-import { config } from '../config.js';
 import { createOwner } from '../dashboard/auth.js';
 import { issueRecoveryCodes } from '../dashboard/recovery.js';
-import { closePool } from '../db/pool.js';
+import { BUSINESS_ARG_EXIT_CODE, closeCliPools, resolveBusinessArg } from './business-arg.js';
 import { nodePromptIo } from './node-prompt-io.js';
 import type { PromptIo } from './prompt-io.js';
 
@@ -39,8 +38,15 @@ export async function run(argv: string[], io: PromptIo): Promise<number> {
     return 2;
   }
 
-  const username = argv[0] ?? DEFAULT_USERNAME;
-  const businessId = config.businessId;
+  // `--business` before the first prompt and before any read: a refusal
+  // here must leave nothing behind and ask for nothing (`business-arg.ts`).
+  const business = await resolveBusinessArg(argv);
+  if (!business.ok) {
+    io.error(business.message);
+    return BUSINESS_ARG_EXIT_CODE;
+  }
+  const { businessId } = business;
+  const username = business.rest[0] ?? DEFAULT_USERNAME;
 
   const password = await io.readSecret('סיסמה חדשה: ');
   if (password.length === 0) {
@@ -93,6 +99,6 @@ const isEntrypoint =
 
 if (isEntrypoint) {
   const code = await run(process.argv.slice(2), nodePromptIo);
-  await closePool();
+  await closeCliPools();
   process.exit(code);
 }

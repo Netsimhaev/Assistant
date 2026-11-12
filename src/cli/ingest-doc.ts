@@ -14,12 +14,12 @@
  */
 import { stat } from 'node:fs/promises';
 import { basename } from 'node:path';
-import { config } from '../config.js';
-import { closePool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { ingestDocument } from '../documents/ingest.js';
 import { loadArtifacts } from '../documents/store.js';
 import type { DocumentSource } from '../documents/types.js';
 import { documentSourceLabel } from '../documents/source-label.js';
+import { closeCliPools, runForBusiness } from './business-arg.js';
 
 const SOURCES: readonly DocumentSource[] = ['manual', 'mail', 'api'];
 
@@ -29,7 +29,6 @@ function isDocumentSource(value: string): value is DocumentSource {
 
 export interface IngestCliDeps {
   log: (line: string) => void;
-  businessId?: string;
   documentRoot?: string;
 }
 
@@ -43,7 +42,7 @@ export interface IngestCliDeps {
  * readable message instead of a stack trace, and what lets a test assert
  * `.rejects.toThrow()` without spawning a process.
  */
-export async function runIngestCli(argv: string[], deps: IngestCliDeps): Promise<void> {
+export async function runIngestCli(db: BusinessDb, argv: string[], deps: IngestCliDeps): Promise<void> {
   const { log } = deps;
 
   const positionals: string[] = [];
@@ -68,7 +67,7 @@ export async function runIngestCli(argv: string[], deps: IngestCliDeps): Promise
 
   const path = positionals[0];
   if (path === undefined) {
-    throw new Error('שימוש: npm run doc:ingest -- <נתיב> [--source mail|manual|api]');
+    throw new Error('שימוש: npm run doc:ingest -- <נתיב> [--source mail|manual|api] --business <מזהה>');
   }
 
   // A readable Hebrew reason for the two common mistakes — a typo'd path or
@@ -91,13 +90,11 @@ export async function runIngestCli(argv: string[], deps: IngestCliDeps): Promise
   const options = {
     ...(deps.documentRoot !== undefined ? { documentRoot: deps.documentRoot } : {}),
   };
-  const businessId = deps.businessId ?? config.businessId;
-
-  const doc = await withBusiness(businessId, (db) => ingestDocument( // TENANCY-TODO(task 7)
+  const doc = await ingestDocument(
     db,
     { path, source, originalName: basename(path) },
     options,
-  ));
+  );
 
   log(`מסמך ${doc.documentId}`);
   log(`מקור: ${documentSourceLabel[doc.source]}`);
@@ -116,7 +113,7 @@ export async function runIngestCli(argv: string[], deps: IngestCliDeps): Promise
   }
 
   if (doc.status === 'extracted') {
-    const artifacts = await withBusiness(businessId, (db) => loadArtifacts(db, doc.documentId)); // TENANCY-TODO(task 7)
+    const artifacts = await loadArtifacts(db, doc.documentId);
     for (const artifact of artifacts) {
       log(`רכיב: ${artifact.kind} — ${artifact.partName ?? '(ללא שם)'}`);
     }
@@ -126,16 +123,19 @@ export async function runIngestCli(argv: string[], deps: IngestCliDeps): Promise
 /**
  * The process wrapper. Kept separate from `runIngestCli` so the test drives
  * the logic without spawning a process or reading argv — same reasoning as
- * `seed-job.ts`'s `main`.
+ * `seed-job.ts`'s `main`. `--business` is checked first: exit code 2 and
+ * nothing written on a refusal (`business-arg.ts`).
  */
-async function main(): Promise<void> {
-  const argv = process.argv.slice(2);
+export async function main(
+  argv: string[],
+  io: { log: (line: string) => void; error: (line: string) => void },
+): Promise<number> {
   try {
-    await runIngestCli(argv, { log: (line) => console.log(line) });
+    return await runForBusiness(argv, io.error, (db, rest) => runIngestCli(db, rest, { log: io.log }));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`שגיאה בקליטת המסמך: ${message}`);
-    process.exitCode = 1;
+    io.error(`שגיאה בקליטת המסמך: ${message}`);
+    return 1;
   }
 }
 
@@ -146,6 +146,9 @@ const isEntrypoint =
   import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href;
 
 if (isEntrypoint) {
-  await main();
-  await closePool();
+  process.exitCode = await main(process.argv.slice(2), {
+    log: (line) => console.log(line),
+    error: (line) => console.error(line),
+  });
+  await closeCliPools();
 }

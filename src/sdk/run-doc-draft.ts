@@ -2,7 +2,7 @@
  * Live run of the document drafter (`draftDocumentSpec`) against the Agent
  * SDK, from a fixture file:
  *
- *   npm run sdk:doc-draft -- src/sdk/fixtures/doc-draft-profit-table.json
+ *   npm run sdk:doc-draft -- src/sdk/fixtures/doc-draft-profit-table.json --business <id>
  *
  * A script and not a test, for the reason every `sdk:*` script here is: it
  * costs money and needs credentials, and `draftDocumentSpec` refuses under
@@ -17,8 +17,8 @@ import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { compileCharter } from '../charter/compile.js';
 import { loadActiveCharter } from '../charter/store.js';
-import { config } from '../config.js';
-import { closePool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
+import { closeCliPools, runForBusiness } from '../cli/business-arg.js';
 import { DocumentFormat, DocumentKind, DocumentLanguage } from '../domain/document-spec.js';
 import { TrustLevel } from '../domain/trust.js';
 import { validateSpec } from '../production/validate-spec.js';
@@ -43,10 +43,10 @@ const Fixture = z
   })
   .strict();
 
-async function main(): Promise<void> {
-  const path = process.argv[2];
+async function main(db: BusinessDb, args: string[]): Promise<void> {
+  const path = args[0];
   if (path === undefined) {
-    console.error('שימוש: npm run sdk:doc-draft -- <קובץ fixture>');
+    console.error('שימוש: npm run sdk:doc-draft -- <קובץ fixture> --business <id>');
     process.exitCode = 1;
     return;
   }
@@ -56,7 +56,7 @@ async function main(): Promise<void> {
     return;
   }
   const fixture = Fixture.parse(JSON.parse(readFileSync(path, 'utf8')));
-  const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
+  const active = await loadActiveCharter(db);
   const charter = active?.charter ?? buildCharter();
   const bundle = active?.bundle ?? compileCharter(charter);
   const today = localParts(new Date(), charter.identity.timezone).date;
@@ -84,9 +84,12 @@ async function main(): Promise<void> {
 }
 
 try {
-  await main();
+  // `main` sets exit code 1 itself on its own refusals; only a `--business`
+  // refusal (2) comes back from here, and 0 must not overwrite that 1.
+  const code = await runForBusiness(process.argv.slice(2), (line) => console.error(line), main);
+  if (code !== 0) process.exitCode = code;
 } catch (err) {
   console.error(err instanceof Error ? err.message : String(err));
   process.exitCode = 1;
 }
-await closePool();
+await closeCliPools();

@@ -9,6 +9,22 @@ export class TenancyError extends Error {
   }
 }
 
+/**
+ * A refusal over the business id itself — malformed, or no such business.
+ * Separate from other refusals so a command can exit 2 (a usage error) for
+ * these and 1 for the rest ("already exists", a bad display name).
+ */
+export class BusinessIdError extends TenancyError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BusinessIdError';
+  }
+}
+
+function malformedIdMessage(id: string): string {
+  return `מזהה עסק לא תקין "${id}" — אותיות אנגליות קטנות, ספרות ומקפים בלבד, באורך 3 עד 63`;
+}
+
 export type BusinessStatus = 'active' | 'suspended';
 
 export interface Business {
@@ -29,9 +45,7 @@ function toBusiness(row: BusinessRow): Business {
 
 export async function createBusiness(id: string, displayName: string): Promise<void> {
   if (!isValidBusinessId(id)) {
-    throw new TenancyError(
-      `מזהה עסק לא תקין "${id}" — אותיות אנגליות קטנות, ספרות ומקפים בלבד, באורך 3 עד 63`,
-    );
+    throw new BusinessIdError(malformedIdMessage(id));
   }
   const name = displayName.trim();
   if (name.length === 0 || name.length > 120) {
@@ -48,6 +62,12 @@ export async function createBusiness(id: string, displayName: string): Promise<v
 }
 
 export async function setBusinessStatus(id: string, status: BusinessStatus): Promise<void> {
+  // Checked before the UPDATE, as `createBusiness` checks before its INSERT:
+  // a malformed id cannot match a row, but it should be refused for what it
+  // is, not reported as "no such business".
+  if (!isValidBusinessId(id)) {
+    throw new BusinessIdError(malformedIdMessage(id));
+  }
   await withPlatform(async (db) => {
     const { rowCount } = await db.query(
       `UPDATE businesses
@@ -56,7 +76,7 @@ export async function setBusinessStatus(id: string, status: BusinessStatus): Pro
         WHERE business_id = $1`,
       [id, status],
     );
-    if (rowCount === 0) throw new TenancyError(`העסק ${id} לא קיים`);
+    if (rowCount === 0) throw new BusinessIdError(`העסק ${id} לא קיים`);
   });
 }
 

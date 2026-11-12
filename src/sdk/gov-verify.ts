@@ -136,7 +136,7 @@ import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { withBusiness, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { AgentEnvelope } from '../domain/envelope.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { READ_FOR_QUESTION_MAX_CHARS } from '../governance/intent-registry.js';
@@ -604,16 +604,16 @@ export interface VerifyDraftInput {
    * it against the stored row rather than trusting it.
    */
   parentEnvelope: AgentEnvelope | null;
-  businessId?: string;
   /**
-   * The caller's connection, when it has one. Only `saveVerdict` uses it, and
-   * only so that this write and the caller's own land on the SAME connection:
-   * `assert.evaluate` (`orchestrator/local-tools.ts`) files the returned
-   * verdict itself, and with this omitted that step's write would go through
-   * the caller's transaction while this one went to a pooled connection — a
-   * row left behind, committed, after the caller rolled back.
+   * The caller's connection, and with it the business (`db.businessId`).
+   * Required: the charter load, the delegation and `saveVerdict` all run on
+   * it, so that this function's writes and the caller's own land on the SAME
+   * connection — `assert.evaluate` (`orchestrator/local-tools.ts`) files the
+   * returned verdict itself, and a write of ours that went to a separate
+   * pooled connection would be a row left behind, committed, after the
+   * caller rolled back.
    */
-  db?: Queryable;
+  db: BusinessDb;
   now?: Date;
   /** Injected by tests. Production leaves it unset and gets the billed call. */
   judge?: Judge;
@@ -652,7 +652,8 @@ export type VerifyDraftResult = Verdict | AwaitingDelegation;
  * runs first.)
  */
 export async function verifyDraft(input: VerifyDraftInput): Promise<VerifyDraftResult> {
-  const businessId = input.businessId ?? config.businessId;
+  const { db } = input;
+  const businessId = db.businessId;
 
   QuestionInput.parse(input.question);
 
@@ -661,7 +662,7 @@ export async function verifyDraft(input: VerifyDraftInput): Promise<VerifyDraftR
   // permissive, the same posture `run-due.ts` takes at its own
   // `loadActiveCharter` call: no job of this business can be verified, or
   // can delegate, while its charter is missing.
-  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
+  const active = await loadActiveCharter(db);
   if (active === null) {
     throw new Error(`verifyDraft: no active charter for business ${businessId}`);
   }
@@ -683,7 +684,7 @@ export async function verifyDraft(input: VerifyDraftInput): Promise<VerifyDraftR
   // function does not wait for `know.reader` to answer; it ends its own run
   // the moment the request is opened.
   if (input.answer === null) {
-    const result = await withBusiness(businessId, (db) => requestHelp(db, { // TENANCY-TODO(task 7)
+    const result = await requestHelp(db, {
       parentJobId: input.parentJobId,
       // Literal, not threaded from a caller — the same reasoning
       // `conduct.ts` and `instruct.ts` apply to their own `provenance`
@@ -699,7 +700,7 @@ export async function verifyDraft(input: VerifyDraftInput): Promise<VerifyDraftR
       bundle,
       parentEnvelope: input.parentEnvelope,
       ...(input.now !== undefined ? { now: input.now } : {}),
-    }));
+    });
 
     if (result.status === 'refused') {
       throw new Error(
@@ -742,6 +743,6 @@ export async function verifyDraft(input: VerifyDraftInput): Promise<VerifyDraftR
   };
   // `subjectJobId`, never `parentJobId` — see `VerifyDraftInput.subjectJobId`'s
   // own docblock for why the two must never be the same field.
-  await withBusiness(businessId, (bdb) => saveVerdict(bdb, input.subjectJobId, verdict)); // TENANCY-TODO(task 7)
+  await saveVerdict(db, input.subjectJobId, verdict);
   return verdict;
 }

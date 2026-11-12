@@ -36,8 +36,7 @@
  * command whose answer is the live state, and "nothing is stopped" is an
  * answer, not an empty result.
  */
-import { closePool, withBusiness } from '../db/pool.js';
-import { config } from '../config.js';
+import type { BusinessDb } from '../db/pool.js';
 import {
   AGENT_DEPARTMENT,
   activeScopes,
@@ -46,6 +45,7 @@ import {
   type Department,
   type KillScope,
 } from '../governance/killswitch.js';
+import { closeCliPools, runForBusiness } from './business-arg.js';
 
 /** Every legal scope, in the order the usage message should list them. */
 const DEPARTMENTS: readonly Department[] = [
@@ -83,16 +83,16 @@ const USAGE =
  * is a stop nobody can explain afterwards, and the reason is the only part of
  * the audit row a human wrote.
  */
-export async function runKillCli(argv: string[], deps: KillCliDeps): Promise<void> {
+export async function runKillCli(db: BusinessDb, argv: string[], deps: KillCliDeps): Promise<void> {
   const { log } = deps;
-  const businessId = deps.businessId ?? config.businessId;
+  const businessId = db.businessId;
 
   const action = argv[0];
   if (action === undefined) throw new Error(USAGE);
 
   if (action === 'status') {
     if (argv.length > 1) throw new Error(`ל-status אין ארגומנטים.\n${USAGE}`);
-    const active = await withBusiness(businessId, (bdb) => activeScopes(bdb)); // TENANCY-TODO(task 7)
+    const active = await activeScopes(db);
     if (active.length === 0) {
       log(`אין שום עצירה פעילה עבור ${businessId} — כל ההיקפים פתוחים.`);
       return;
@@ -130,7 +130,7 @@ export async function runKillCli(argv: string[], deps: KillCliDeps): Promise<voi
   const scope: KillScope = rawScope;
 
   if (action === 'stop') {
-    await withBusiness(businessId, (bdb) => trip(bdb, scope, by, reason)); // TENANCY-TODO(task 7)
+    await trip(db, scope, by, reason);
     log(`העצירה בהיקף "${scope}" פעילה מעכשיו עבור ${businessId}.`);
     log('');
     explainScope(scope, log);
@@ -143,9 +143,9 @@ export async function runKillCli(argv: string[], deps: KillCliDeps): Promise<voi
     return;
   }
 
-  await withBusiness(businessId, (bdb) => release(bdb, scope, by, reason)); // TENANCY-TODO(task 7)
+  await release(db, scope, by, reason);
   log(`העצירה בהיקף "${scope}" שוחררה עבור ${businessId}.`);
-  const stillActive = await withBusiness(businessId, (bdb) => activeScopes(bdb)); // TENANCY-TODO(task 7)
+  const stillActive = await activeScopes(db);
   if (stillActive.length > 0) {
     log('');
     log('היקפים שעדיין עצורים:');
@@ -180,8 +180,22 @@ function explainScope(scope: KillScope, log: (line: string) => void): void {
   log('סוכנים במחלקות אחרות ממשיכים לעבוד כרגיל.');
 }
 
-async function main(): Promise<void> {
-  await runKillCli(process.argv.slice(2), { log: (line) => console.log(line) });
+/**
+ * The process entry: `--business` first (exit code 2 and nothing written on a
+ * refusal, `business-arg.ts`), then the command on one connection for that
+ * business. Returns the exit code rather than setting it, so a test can drive
+ * it without spawning a process.
+ */
+export async function main(
+  argv: string[],
+  io: { log: (line: string) => void; error: (line: string) => void },
+): Promise<number> {
+  try {
+    return await runForBusiness(argv, io.error, (db, rest) => runKillCli(db, rest, { log: io.log }));
+  } catch (err) {
+    io.error(err instanceof Error ? err.message : String(err));
+    return 1;
+  }
 }
 
 // Only run when executed directly — never on import from the test. Same
@@ -191,11 +205,9 @@ const isEntrypoint =
   import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href;
 
 if (isEntrypoint) {
-  try {
-    await main();
-  } catch (err) {
-    console.error(err instanceof Error ? err.message : String(err));
-    process.exitCode = 1;
-  }
-  await closePool();
+  process.exitCode = await main(process.argv.slice(2), {
+    log: (line) => console.log(line),
+    error: (line) => console.error(line),
+  });
+  await closeCliPools();
 }

@@ -4,15 +4,21 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { writeKeyState } from '../governance/master-key.js';
-import { resetDatabase } from '../test/db.js';
-import { runSecretCli } from './secret.js';
+import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
+import { runSecretCli, type SecretCliDeps } from './secret.js';
 
 const REF = 'OFFICE_MAIL';
 const SECRET = 'hunter2-the-mailbox-password';
 const OPERATOR = 'operator@example.com';
 const KEY_ID = 'key-1';
+const BUSINESS = TEST_BUSINESS;
+
+/** `runSecretCli` on a connection for `business` — what `main` does after `--business`. */
+function run(argv: string[], deps: SecretCliDeps, business: string = BUSINESS): Promise<void> {
+  return withBusiness(business, (db) => runSecretCli(db, argv, deps));
+}
 
 let DIR: string;
 let PREVIOUS_KEY_PATH: string | undefined;
@@ -98,11 +104,11 @@ describe('runSecretCli', () => {
   it('stores a secret read from the input, not from argv', async () => {
     const { log } = collector();
 
-    await runSecretCli(['put', REF, OPERATOR], { log, readSecret: reads(SECRET) });
+    await run(['put', REF, OPERATOR], { log, readSecret: reads(SECRET) });
 
     const { rows } = await getPool().query<{ n: string }>(
       'SELECT count(*)::text AS n FROM credentials WHERE business_id = $1 AND ref = $2',
-      [config.businessId, REF],
+      [BUSINESS, REF],
     );
     expect(rows[0]?.n).toBe('1');
 
@@ -111,7 +117,7 @@ describe('runSecretCli', () => {
     const { storedCredentials } = await import('../governance/credential-store.js');
     const { loadMasterKey } = await import('../governance/master-key.js');
     const key = await loadMasterKey(process.env['CREDENTIAL_KEY_PATH'] as string);
-    const handle = await storedCredentials(key).resolve(REF, config.businessId);
+    const handle = await storedCredentials(key).resolve(REF, BUSINESS);
     expect(handle?.value).toBe(SECRET);
   });
 
@@ -126,7 +132,7 @@ describe('runSecretCli', () => {
     const { log } = collector();
 
     await expect(
-      runSecretCli(['put', REF, OPERATOR, SECRET], { log, readSecret: reads('unused') }),
+      run(['put', REF, OPERATOR, SECRET], { log, readSecret: reads('unused') }),
     ).rejects.toThrow();
 
     const { rows } = await getPool().query<{ n: string }>('SELECT count(*)::text AS n FROM credentials');
@@ -140,10 +146,10 @@ describe('runSecretCli', () => {
   it('never prints the secret, in any command', async () => {
     const { log, lines } = collector();
 
-    await runSecretCli(['put', REF, OPERATOR], { log, readSecret: reads(SECRET) });
-    await runSecretCli(['list', OPERATOR], { log, readSecret: reads('unused') });
-    await runSecretCli(['test', REF, OPERATOR], { log, readSecret: reads('unused') });
-    await runSecretCli(['remove', REF, OPERATOR], { log, readSecret: reads('unused') });
+    await run(['put', REF, OPERATOR], { log, readSecret: reads(SECRET) });
+    await run(['list', OPERATOR], { log, readSecret: reads('unused') });
+    await run(['test', REF, OPERATOR], { log, readSecret: reads('unused') });
+    await run(['remove', REF, OPERATOR], { log, readSecret: reads('unused') });
 
     for (const line of lines) {
       expect(line).not.toContain(SECRET);
@@ -151,15 +157,15 @@ describe('runSecretCli', () => {
   });
 
   it('reports whether a ref resolves without revealing what it resolves to', async () => {
-    await runSecretCli(['put', REF, OPERATOR], { log: () => {}, readSecret: reads(SECRET) });
+    await run(['put', REF, OPERATOR], { log: () => {}, readSecret: reads(SECRET) });
 
     const found = collector();
-    await runSecretCli(['test', REF, OPERATOR], { ...found, readSecret: reads('unused') });
+    await run(['test', REF, OPERATOR], { ...found, readSecret: reads('unused') });
     expect(found.lines.join('\n')).not.toContain(SECRET);
     expect(found.lines.some((l) => l.includes(REF))).toBe(true);
 
     const missing = collector();
-    await runSecretCli(['test', 'CALENDAR_TOKEN', OPERATOR], {
+    await run(['test', 'CALENDAR_TOKEN', OPERATOR], {
       ...missing,
       readSecret: reads('unused'),
     });
@@ -179,7 +185,7 @@ describe('runSecretCli', () => {
       `SELECT count(*)::text AS n FROM audit_log WHERE kind = 'credential_change'`,
     );
 
-    await runSecretCli(['test', 'NEVER_STORED', OPERATOR], {
+    await run(['test', 'NEVER_STORED', OPERATOR], {
       log: () => {},
       readSecret: reads('unused'),
     });
@@ -191,22 +197,19 @@ describe('runSecretCli', () => {
   });
 
   /**
-   * `deps.businessId` follows `set-ramp.ts`'s convention
-   * (`deps.businessId ?? config.businessId`) — but unlike a ramp level, a
-   * secret written under the wrong business is a secret another customer's
-   * `resolve` can reach (`credential-store.ts`'s own docblock). A one-line
-   * regression that ignored the passed business and always used
-   * `config.businessId` would pass every other test in this file.
+   * The business is the connection's (`db.businessId`, from `--business`) —
+   * and unlike a ramp level, a secret written under the wrong business is a
+   * secret another customer's `resolve` can reach (`credential-store.ts`'s own
+   * docblock). A one-line regression that ignored the connection's business
+   * and wrote under a configured default would pass every other test in this
+   * file.
    */
-  it('stores the secret under the business passed in deps, not the configured default', async () => {
+  it("stores the secret under the connection's business, not the configured default", async () => {
     const OTHER_BUSINESS = 'other-business';
+    expect(OTHER_BUSINESS).not.toBe(BUSINESS);
     expect(OTHER_BUSINESS).not.toBe(config.businessId);
 
-    await runSecretCli(['put', REF, OPERATOR], {
-      log: () => {},
-      readSecret: reads(SECRET),
-      businessId: OTHER_BUSINESS,
-    });
+    await run(['put', REF, OPERATOR], { log: () => {}, readSecret: reads(SECRET) }, OTHER_BUSINESS);
 
     const { rows } = await getPool().query<{ business_id: string; n: string }>(
       `SELECT business_id, count(*)::text AS n FROM credentials WHERE ref = $1 GROUP BY business_id`,
@@ -216,7 +219,7 @@ describe('runSecretCli', () => {
   });
 
   it('writes an audit row naming the business, the ref and the operator', async () => {
-    await runSecretCli(['put', REF, OPERATOR], { log: () => {}, readSecret: reads(SECRET) });
+    await run(['put', REF, OPERATOR], { log: () => {}, readSecret: reads(SECRET) });
 
     const { rows } = await getPool().query<{ reason: string; on_behalf_of: string | null; business_id: string; kind: string }>(
       `SELECT reason, on_behalf_of, business_id, kind FROM audit_log WHERE kind = 'credential_change'`,
@@ -224,18 +227,18 @@ describe('runSecretCli', () => {
     expect(rows).toHaveLength(1);
     const row = rows[0];
     if (row === undefined) throw new Error('expected an audit row');
-    expect(row.business_id).toBe(config.businessId);
+    expect(row.business_id).toBe(BUSINESS);
     expect(row.on_behalf_of).toBe(OPERATOR);
     expect(row.reason).toContain(REF);
     expect(row.reason).toContain(OPERATOR);
-    expect(row.reason).toContain(config.businessId);
+    expect(row.reason).toContain(BUSINESS);
   });
 
   it('writes no audit row that contains the value', async () => {
-    await runSecretCli(['put', REF, OPERATOR], { log: () => {}, readSecret: reads(SECRET) });
-    await runSecretCli(['list', OPERATOR], { log: () => {}, readSecret: reads('unused') });
-    await runSecretCli(['test', REF, OPERATOR], { log: () => {}, readSecret: reads('unused') });
-    await runSecretCli(['remove', REF, OPERATOR], { log: () => {}, readSecret: reads('unused') });
+    await run(['put', REF, OPERATOR], { log: () => {}, readSecret: reads(SECRET) });
+    await run(['list', OPERATOR], { log: () => {}, readSecret: reads('unused') });
+    await run(['test', REF, OPERATOR], { log: () => {}, readSecret: reads('unused') });
+    await run(['remove', REF, OPERATOR], { log: () => {}, readSecret: reads('unused') });
 
     const blob = await allAuditText();
 
@@ -252,25 +255,25 @@ describe('runSecretCli', () => {
     const { log } = collector();
 
     await expect(
-      runSecretCli(['bogus'], { log, readSecret: reads('unused') }),
+      run(['bogus'], { log, readSecret: reads('unused') }),
     ).rejects.toThrow(/put/);
     await expect(
-      runSecretCli(['bogus'], { log, readSecret: reads('unused') }),
+      run(['bogus'], { log, readSecret: reads('unused') }),
     ).rejects.toThrow(/list/);
     await expect(
-      runSecretCli(['bogus'], { log, readSecret: reads('unused') }),
+      run(['bogus'], { log, readSecret: reads('unused') }),
     ).rejects.toThrow(/remove/);
     await expect(
-      runSecretCli(['bogus'], { log, readSecret: reads('unused') }),
+      run(['bogus'], { log, readSecret: reads('unused') }),
     ).rejects.toThrow(/test/);
   });
 
   describe('list', () => {
     it('lists refs and audits the view without a specific ref', async () => {
-      await runSecretCli(['put', REF, OPERATOR], { log: () => {}, readSecret: reads(SECRET) });
+      await run(['put', REF, OPERATOR], { log: () => {}, readSecret: reads(SECRET) });
 
       const { log, lines } = collector();
-      await runSecretCli(['list', OPERATOR], { log, readSecret: reads('unused') });
+      await run(['list', OPERATOR], { log, readSecret: reads('unused') });
 
       expect(lines.some((l) => l.includes(REF))).toBe(true);
 
@@ -283,21 +286,21 @@ describe('runSecretCli', () => {
 
   describe('remove', () => {
     it('removes a stored secret so it no longer resolves', async () => {
-      await runSecretCli(['put', REF, OPERATOR], { log: () => {}, readSecret: reads(SECRET) });
+      await run(['put', REF, OPERATOR], { log: () => {}, readSecret: reads(SECRET) });
 
       const { log } = collector();
-      await runSecretCli(['remove', REF, OPERATOR], { log, readSecret: reads('unused') });
+      await run(['remove', REF, OPERATOR], { log, readSecret: reads('unused') });
 
       const { rows } = await getPool().query<{ n: string }>(
         'SELECT count(*)::text AS n FROM credentials WHERE business_id = $1 AND ref = $2',
-        [config.businessId, REF],
+        [BUSINESS, REF],
       );
       expect(rows[0]?.n).toBe('0');
     });
 
     it('audits a remove of a ref that was never stored', async () => {
       const { log } = collector();
-      await runSecretCli(['remove', 'NEVER_STORED', OPERATOR], { log, readSecret: reads('unused') });
+      await run(['remove', 'NEVER_STORED', OPERATOR], { log, readSecret: reads('unused') });
 
       const { rows } = await getPool().query<{ n: string }>(
         `SELECT count(*)::text AS n FROM audit_log WHERE kind = 'credential_change'`,

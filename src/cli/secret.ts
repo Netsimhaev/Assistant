@@ -30,16 +30,15 @@
  * someone probing), so it is audited exactly like a `test` that succeeds —
  * the outcome differs, the fact that a row is written does not.
  *
- * Businesses are per-installation, not a CLI argument: this project runs one
- * deployment per business (`config.businessId`, from `BUSINESS_ID`), so
- * `deps.businessId` exists only to let a caller (a test, chiefly) override
- * that for isolation — the same shape `set-ramp.ts` already uses. There is
- * no positional business argument to keep the "fourth argument" refusal
- * unambiguous.
+ * The business is a required `--business <id>` flag, checked before
+ * anything is read or written (`business-arg.ts`) — one server holds many
+ * businesses, and a secret filed under the wrong one is a secret handed to the
+ * wrong customer. The flag is removed from argv before the commands below see
+ * it, so the "fourth argument" refusal stays unambiguous: `--business` is
+ * never mistaken for a value, and a fourth positional still is.
  */
 import { appendAudit } from '../audit/log.js';
-import { config } from '../config.js';
-import { closePool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import {
   listSecretRefs,
   putSecret,
@@ -48,13 +47,13 @@ import {
 } from '../governance/credential-store.js';
 import { loadMasterKey } from '../governance/master-key.js';
 import { canonicalHash } from '../util/canonical.js';
+import { closeCliPools, runForBusiness } from './business-arg.js';
 import { nodePromptIo } from './node-prompt-io.js';
 
 export interface SecretCliDeps {
   log: (line: string) => void;
   /** Reads the secret's value. Never given a prompt string or an argv slot. */
   readSecret: () => Promise<string>;
-  businessId?: string;
 }
 
 const COMMANDS = ['put', 'list', 'remove', 'test'] as const;
@@ -66,10 +65,10 @@ function isCommand(value: string | undefined): value is Command {
 
 function usage(): string {
   return `שימוש:\n` +
-    `  secret put <הפניה> <מפעיל>     — קורא את הסוד מהקלט הסטנדרטי\n` +
-    `  secret list <מפעיל>\n` +
-    `  secret remove <הפניה> <מפעיל>\n` +
-    `  secret test <הפניה> <מפעיל>    — בודק שההפניה נפתרת, בלי לחשוף את הערך\n` +
+    `  secret put <הפניה> <מפעיל> --business <מזהה>     — קורא את הסוד מהקלט הסטנדרטי\n` +
+    `  secret list <מפעיל> --business <מזהה>\n` +
+    `  secret remove <הפניה> <מפעיל> --business <מזהה>\n` +
+    `  secret test <הפניה> <מפעיל> --business <מזהה>    — בודק שההפניה נפתרת, בלי לחשוף את הערך\n` +
     `פקודות חוקיות: ${COMMANDS.join(', ')}`;
 }
 
@@ -95,15 +94,14 @@ async function loadKeyFromEnv(): Promise<Buffer> {
  * it is built by every call site below from the business, the ref and the
  * operator only. Never from anything that could hold a secret's value.
  */
-async function auditAction(params: {
-  businessId: string;
+async function auditAction(db: BusinessDb, params: {
   ref: string | null;
   operator: string;
   action: Command;
   reason: string;
 }): Promise<void> {
-  await withBusiness(params.businessId, (bdb) => appendAudit( // TENANCY-TODO(task 7)
-    bdb,
+  await appendAudit(
+    db,
     {
       actor: 'human',
       onBehalfOf: params.operator,
@@ -116,18 +114,18 @@ async function auditAction(params: {
       provenance: 'boss',
       inputHash: canonicalHash({
         action: params.action,
-        businessId: params.businessId,
+        businessId: db.businessId,
         ref: params.ref,
         operator: params.operator,
       }),
       reason: params.reason,
     }
-  ));
+  );
 }
 
-export async function runSecretCli(argv: string[], deps: SecretCliDeps): Promise<void> {
+export async function runSecretCli(db: BusinessDb, argv: string[], deps: SecretCliDeps): Promise<void> {
   const { log } = deps;
-  const businessId = deps.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const command = argv[0];
 
   if (!isCommand(command)) {
@@ -153,9 +151,8 @@ export async function runSecretCli(argv: string[], deps: SecretCliDeps): Promise
 
     const key = await loadKeyFromEnv();
     const value = await deps.readSecret();
-    await withBusiness(businessId, (db) => putSecret(db, { ref, value, updatedBy: operator }, key)); // TENANCY-TODO(task 7)
-    await auditAction({
-      businessId,
+    await putSecret(db, { ref, value, updatedBy: operator }, key);
+    await auditAction(db, {
       ref,
       operator,
       action: 'put',
@@ -171,9 +168,8 @@ export async function runSecretCli(argv: string[], deps: SecretCliDeps): Promise
       throw new Error(usage());
     }
 
-    const items = await withBusiness(businessId, (db) => listSecretRefs(db)); // TENANCY-TODO(task 7)
-    await auditAction({
-      businessId,
+    const items = await listSecretRefs(db);
+    await auditAction(db, {
       ref: null,
       operator,
       action: 'list',
@@ -198,9 +194,8 @@ export async function runSecretCli(argv: string[], deps: SecretCliDeps): Promise
       throw new Error(usage());
     }
 
-    const removed = await withBusiness(businessId, (db) => removeSecret(db, ref)); // TENANCY-TODO(task 7)
-    await auditAction({
-      businessId,
+    const removed = await removeSecret(db, ref);
+    await auditAction(db, {
       ref,
       operator,
       action: 'remove',
@@ -222,8 +217,7 @@ export async function runSecretCli(argv: string[], deps: SecretCliDeps): Promise
   const key = await loadKeyFromEnv();
   const handle = await storedCredentials(key).resolve(ref, businessId);
   const resolved = handle !== null;
-  await auditAction({
-    businessId,
+  await auditAction(db, {
     ref,
     operator,
     action: 'test',
@@ -234,13 +228,23 @@ export async function runSecretCli(argv: string[], deps: SecretCliDeps): Promise
   log(resolved ? `הסוד "${ref}" נפתר בהצלחה.` : `הסוד "${ref}" אינו נפתר.`);
 }
 
-async function main(): Promise<void> {
-  await runSecretCli(process.argv.slice(2), {
-    log: (line) => console.log(line),
-    // No prompt text — the argument shape `SecretCliDeps` declares takes
-    // none, and the real terminal prompt lives in `node-prompt-io.ts`.
-    readSecret: () => nodePromptIo.readSecret('סוד: '),
-  });
+/**
+ * The process entry: `--business` first (exit code 2, nothing read from stdin
+ * and nothing written on a refusal, `business-arg.ts`), then the command on
+ * one connection for that business. Returns the exit code so a test can drive
+ * it without a process.
+ */
+export async function main(
+  argv: string[],
+  io: { log: (line: string) => void; error: (line: string) => void; readSecret: () => Promise<string> },
+): Promise<number> {
+  try {
+    return await runForBusiness(argv, io.error, (db, rest) =>
+      runSecretCli(db, rest, { log: io.log, readSecret: io.readSecret }));
+  } catch (err) {
+    io.error(err instanceof Error ? err.message : String(err));
+    return 1;
+  }
 }
 
 // Only run when executed directly — never on import from the test. Same
@@ -250,11 +254,12 @@ const isEntrypoint =
   import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href;
 
 if (isEntrypoint) {
-  try {
-    await main();
-  } catch (err) {
-    console.error(err instanceof Error ? err.message : String(err));
-    process.exitCode = 1;
-  }
-  await closePool();
+  process.exitCode = await main(process.argv.slice(2), {
+    log: (line) => console.log(line),
+    error: (line) => console.error(line),
+    // No prompt text — the argument shape `SecretCliDeps` declares takes
+    // none, and the real terminal prompt lives in `node-prompt-io.ts`.
+    readSecret: () => nodePromptIo.readSecret('סוד: '),
+  });
+  await closeCliPools();
 }

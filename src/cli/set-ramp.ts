@@ -26,17 +26,16 @@
  * the same function `loadRampLevel` clamps through, so the two can never
  * disagree about what "effective" means.
  */
-import { closePool, withBusiness } from '../db/pool.js';
-import { config } from '../config.js';
+import type { BusinessDb } from '../db/pool.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { ActionClass } from '../domain/action.js';
 import { AutonomyLevel, TrustLevel, mostRestrictiveAutonomy } from '../domain/trust.js';
 import { loadAutonomyMode, rampBoundsForMode } from '../governance/autonomy-mode.js';
 import { clampToDial, setRampLevel } from '../orchestrator/ramp.js';
+import { closeCliPools, runForBusiness } from './business-arg.js';
 
 export interface SetRampCliDeps {
   log: (line: string) => void;
-  businessId?: string;
 }
 
 /**
@@ -47,16 +46,16 @@ export interface SetRampCliDeps {
  * assert `.rejects.toThrow()` without spawning a process. Nothing is written
  * before both arguments have been validated against their closed enums.
  */
-export async function runSetRampCli(argv: string[], deps: SetRampCliDeps): Promise<void> {
+export async function runSetRampCli(db: BusinessDb, argv: string[], deps: SetRampCliDeps): Promise<void> {
   const { log } = deps;
-  const businessId = deps.businessId ?? config.businessId;
+  const businessId = db.businessId;
 
   const rawClass = argv[0];
   const rawLevel = argv[1];
 
   if (rawClass === undefined || rawLevel === undefined) {
     throw new Error(
-      `שימוש: npm run ramp:set -- <מחלקת פעולה> <רמה>\n` +
+      `שימוש: npm run ramp:set -- <מחלקת פעולה> <רמה> --business <מזהה>\n` +
         `מחלקות: ${ActionClass.options.join(', ')}\n` +
         `רמות: ${AutonomyLevel.options.join(', ')}`,
     );
@@ -82,19 +81,19 @@ export async function runSetRampCli(argv: string[], deps: SetRampCliDeps): Promi
   // Read the charter before writing. Without it the ceilings cannot be
   // reported, and a raise reported without its ceilings is the exact
   // half-truth this command exists to prevent.
-  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
+  const active = await loadActiveCharter(db);
   if (active === null) {
     throw new Error(
       `אין תקנון פעיל ל-${businessId}. הרמפה נאכפת יחד עם תקרות התקנון, ובלעדיו אי אפשר לומר מה הרמה תשנה בפועל.`,
     );
   }
 
-  await withBusiness(businessId, (db) => setRampLevel(db, actionClass, level)); // TENANCY-TODO(task 7)
+  await setRampLevel(db, actionClass, level);
 
   // The dial that clamps everything `loadRampLevel` returns to the gate.
   // Read AFTER the write, same as the charter above, so what gets printed
   // matches what a gate decision made right now would actually see.
-  const mode = await withBusiness(businessId, (bdb) => loadAutonomyMode(bdb)); // TENANCY-TODO(task 7)
+  const mode = await loadAutonomyMode(db);
   const dialBounds = rampBoundsForMode(mode);
   const dialClamped = clampToDial(level, dialBounds);
 
@@ -140,8 +139,21 @@ export async function runSetRampCli(argv: string[], deps: SetRampCliDeps): Promi
   log('תקרה לפי צד-שיח מסוים עשויה להדק עוד, ואינה מוצגת כאן — היא תלויה במי שבצד השני.');
 }
 
-async function main(): Promise<void> {
-  await runSetRampCli(process.argv.slice(2), { log: (line) => console.log(line) });
+/**
+ * The process entry: `--business` first (exit code 2 and nothing written on a
+ * refusal, `business-arg.ts`), then the command on one connection for that
+ * business. Returns the exit code so a test can drive it without a process.
+ */
+export async function main(
+  argv: string[],
+  io: { log: (line: string) => void; error: (line: string) => void },
+): Promise<number> {
+  try {
+    return await runForBusiness(argv, io.error, (db, rest) => runSetRampCli(db, rest, { log: io.log }));
+  } catch (err) {
+    io.error(err instanceof Error ? err.message : String(err));
+    return 1;
+  }
 }
 
 // Only run when executed directly — never on import from the test. Same
@@ -151,11 +163,9 @@ const isEntrypoint =
   import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href;
 
 if (isEntrypoint) {
-  try {
-    await main();
-  } catch (err) {
-    console.error(err instanceof Error ? err.message : String(err));
-    process.exitCode = 1;
-  }
-  await closePool();
+  process.exitCode = await main(process.argv.slice(2), {
+    log: (line) => console.log(line),
+    error: (line) => console.error(line),
+  });
+  await closeCliPools();
 }

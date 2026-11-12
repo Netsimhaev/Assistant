@@ -41,7 +41,7 @@ describe('seedMailJob', () => {
     await resetDatabase();
     // `installCharter` returns the compiled PolicyBundle directly and takes
     // no `actor` option — see src/orchestrator/run-due.test.ts.
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION] }))); // TENANCY-TODO(task 7)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION] })));
   });
 
   afterAll(async () => {
@@ -49,12 +49,11 @@ describe('seedMailJob', () => {
   });
 
   it('leaves the job in execute, bound to a one-step plan', async () => {
-    const { jobId } = await seedMailJob({
+    const { jobId } = await withBusiness(BUSINESS, (db) => seedMailJob(db, {
       to: 'dana@example.com',
       subject: 'נושא',
       body: 'גוף',
-      businessId: BUSINESS,
-    });
+    }));
 
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('execute');
     const stored = await withBusiness(BUSINESS, (db) => loadPlanBody(db, jobId));
@@ -64,12 +63,11 @@ describe('seedMailJob', () => {
   });
 
   it('raises the ramp for email.initiate only, and only to approve_required', async () => {
-    await seedMailJob({
+    await withBusiness(BUSINESS, (db) => seedMailJob(db, {
       to: 'dana@example.com',
       subject: 'נושא',
       body: 'גוף',
-      businessId: BUSINESS,
-    });
+    }));
 
     expect(await storedLevel('email.initiate', BUSINESS)).toBe('approve_required');
     // Every other class has no row at all. A seed command that raised the
@@ -81,7 +79,7 @@ describe('seedMailJob', () => {
   it('refuses when no charter is installed', async () => {
     await resetDatabase();
     await expect(
-      seedMailJob({ to: 'dana@example.com', subject: 's', body: 'b', businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => seedMailJob(db, { to: 'dana@example.com', subject: 's', body: 'b' })),
     ).rejects.toThrow(/charter/i);
   });
 });

@@ -1,7 +1,7 @@
 /**
  * Live end-to-end run of the contact resolver, through the real planner.
  *
- *   npm run sdk:contact-resolver
+ *   npm run sdk:contact-resolver -- --business <id>
  *
  * A script and not a test, for the reason every `sdk:*` script here is one:
  * it costs money and needs a key, and a suite that skips silently without one
@@ -43,8 +43,8 @@
  * Leaving a live probe's job executable would make a demonstration into an
  * outbound message nobody asked for.
  */
-import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
+import { closeCliPools, runForBusiness } from '../cli/business-arg.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
 import { writeMemory, retireMemories } from '../memory/store.js';
@@ -53,8 +53,6 @@ import { resolveContacts } from '../memory/contact-resolver.js';
 import { runInstruction } from '../orchestrator/instruct.js';
 import { makePlan } from '../sdk/planner.js';
 import type { PlanRequest, PlanOutcome } from '../sdk/planner.js';
-
-const BUSINESS = config.businessId;
 
 /** One person, named in the instruction but never addressed in it. */
 const DANA = {
@@ -120,17 +118,18 @@ const forbiddenPlanner = async (): Promise<PlanOutcome> => {
 };
 
 async function seedContact(
+  db: BusinessDb,
   person: { entityId: string; email: string; name: string; company: string },
   charterVersion: string,
 ): Promise<void> {
-  const job = await withBusiness(BUSINESS, (db) => createJob(db, { // TENANCY-TODO(task 7)
+  const job = await createJob(db, {
     charterVersion,
     provenance: 'boss',
     title: `seed ${person.name}`,
-  }));
+  });
   created.push(job.jobId);
 
-  await withBusiness(BUSINESS, (db) => writeMemory( // TENANCY-TODO(task 7)
+  await writeMemory(
     db,
     {
       jobId: job.jobId,
@@ -138,12 +137,12 @@ async function seedContact(
       subjectKey: person.entityId,
       body: { name: person.name, company: person.company, email: person.email },
     },
-  ));
+  );
 
   // A preference stored under the ADDRESS, not the entity id — that is where
   // the curator writes, and the split between the two keys is exactly what
   // `listContacts` returning both subject keys exists to bridge (spec §8).
-  await withBusiness(BUSINESS, (db) => writeMemory( // TENANCY-TODO(task 7)
+  await writeMemory(
     db,
     {
       jobId: job.jobId,
@@ -153,7 +152,7 @@ async function seedContact(
       body: { value: `מעדיפה שכל מה שקשור להצעות מחיר יגיע במייל ולא בטלפון (${person.company})` },
       sourceRef: 'הרצה חיה של פותר אנשי הקשר',
     },
-  ));
+  );
 }
 
 function reportOutcome(outcome: Awaited<ReturnType<typeof runInstruction>>): void {
@@ -205,7 +204,8 @@ function reportPrompt(seen: PlanRequest | undefined, calls: number): void {
   console.log(seen.memoryBlock === undefined || seen.memoryBlock === '' ? '  (ריק)' : seen.memoryBlock);
 }
 
-async function main(): Promise<void> {
+async function main(db: BusinessDb): Promise<void> {
+  const BUSINESS = db.businessId;
   const hasCredentials =
     process.env['ANTHROPIC_API_KEY'] !== undefined ||
     process.env['ANTHROPIC_AUTH_TOKEN'] !== undefined;
@@ -215,7 +215,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const charter = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
+  const charter = await loadActiveCharter(db);
   if (charter === null) {
     console.error(`אין תקנון פעיל ל-${BUSINESS}. הרץ scripts/seed-charter.ts תחילה.`);
     process.exitCode = 1;
@@ -226,11 +226,11 @@ async function main(): Promise<void> {
 
   banner('הכנה: זריעת שלושה אנשי קשר');
   for (const person of SEEDED) {
-    await seedContact(person, charter.bundle.charterVersion);
+    await seedContact(db, person, charter.bundle.charterVersion);
     console.log(`  ${person.name} · ${person.company} · ${person.email}`);
   }
 
-  const contacts = await withBusiness(BUSINESS, (db) => listContacts(db)); // TENANCY-TODO(task 7)
+  const contacts = await listContacts(db);
   console.log(`\nרשימת המועמדים שנבנתה: ${contacts.length} אנשי קשר`);
 
   // ---------------------------------------------------------------- RUN A
@@ -248,7 +248,7 @@ async function main(): Promise<void> {
   // `textOrigin: 'typed'` — this script types its own instructions, exactly
   // as the dashboard box does. The option is required and has no default
   // (see `RunInstructionOptions`), so a script is made to state it too.
-  const outA = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: textA }, { textOrigin: 'typed', channel: 'dashboard', planner: spyA.planner })); // TENANCY-TODO(task 7)
+  const outA = await runInstruction(db, { text: textA }, { textOrigin: 'typed', channel: 'dashboard', planner: spyA.planner });
   console.log(`\n(${((Date.now() - startedA) / 1000).toFixed(1)}s)`);
   reportOutcome(outA);
   reportPrompt(spyA.seen(), spyA.calls());
@@ -261,7 +261,7 @@ async function main(): Promise<void> {
   const resB = resolveContacts(textB, contacts);
   console.log(`הפותר: subjects=${JSON.stringify(resB.subjects)} ambiguities=${resB.ambiguities.length}`);
 
-  const outB = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: textB }, { textOrigin: 'typed', channel: 'dashboard', planner: forbiddenPlanner })); // TENANCY-TODO(task 7)
+  const outB = await runInstruction(db, { text: textB }, { textOrigin: 'typed', channel: 'dashboard', planner: forbiddenPlanner });
   reportOutcome(outB);
   console.log('');
   console.log('המתכנן לא נקרא — ההוראה נעצרה לפניו, ולכן ההרצה הזו לא עלתה כלום.');
@@ -277,14 +277,14 @@ async function main(): Promise<void> {
 
   const spyC = spyPlanner();
   const startedC = Date.now();
-  const outC = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: textC }, { textOrigin: 'typed', channel: 'dashboard', identityAsked: true, planner: spyC.planner })); // TENANCY-TODO(task 7)
+  const outC = await runInstruction(db, { text: textC }, { textOrigin: 'typed', channel: 'dashboard', identityAsked: true, planner: spyC.planner });
   console.log(`\n(${((Date.now() - startedC) / 1000).toFixed(1)}s)`);
   reportOutcome(outC);
   reportPrompt(spyC.seen(), spyC.calls());
 
   // ------------------------------------------------------------- THE PLANS
   banner('התוכניות שנקשרו בפועל');
-  const plans = await getPool().query<{ job_id: string; plan: unknown }>(
+  const plans = await db.query<{ job_id: string; plan: unknown }>(
     `SELECT job_id, plan FROM job_plans WHERE business_id = $1 AND job_id = ANY($2::text[])`,
     [BUSINESS, created],
   );
@@ -304,15 +304,15 @@ async function main(): Promise<void> {
  * Each failure here is reported and none stops the rest, because a cleanup
  * that gives up halfway leaves exactly the state it was written to prevent.
  */
-async function cleanup(): Promise<void> {
+async function cleanup(db: BusinessDb): Promise<void> {
   banner('ניקוי');
   for (const jobId of created) {
     try {
-      await withBusiness(BUSINESS, (db) => transition(db, jobId, { // TENANCY-TODO(task 7)
+      await transition(db, jobId, {
         to: 'failed',
         actor: 'human',
         reason: 'live contact-resolver probe: parked so nothing executes',
-      }));
+      });
     } catch (err) {
       console.error(`  לא הצלחתי לעצור את ${jobId}: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -325,10 +325,10 @@ async function cleanup(): Promise<void> {
       { kind: 'preference' as const, subjectKey: person.email, attribute: 'ערוץ מועדף' },
     ]) {
       try {
-        await withBusiness(BUSINESS, (db) => retireMemories( // TENANCY-TODO(task 7)
+        await retireMemories(
           db,
           { ...target, reason: 'live contact-resolver probe: seeded data' },
-        ));
+        );
       } catch (err) {
         console.error(`  לא הצלחתי לגרוע ${target.subjectKey}: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -337,12 +337,22 @@ async function cleanup(): Promise<void> {
   console.log('הזיכרונות שנזרעו נגרעו (גריעה רכה — השורות נשארות, מסומנות).');
 }
 
-main()
+// `main` sets exit code 1 itself on its own refusals; only a `--business`
+// refusal (2) comes back from `runForBusiness`, and 0 must not overwrite that 1.
+// Cleanup runs on the same connection, inside the business, however far
+// `main` got — and not at all on a `--business` refusal, which opened nothing.
+runForBusiness(process.argv.slice(2), (line) => console.error(line), async (db) => {
+  try {
+    await main(db);
+  } finally {
+    await cleanup(db).catch((err: unknown) => console.error(err));
+  }
+})
+  .then((code) => {
+    if (code !== 0) process.exitCode = code;
+  })
   .catch((err: unknown) => {
     console.error(err);
     process.exitCode = 1;
   })
-  .finally(async () => {
-    await cleanup().catch((err: unknown) => console.error(err));
-    await closePool();
-  });
+  .finally(() => closeCliPools());

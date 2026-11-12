@@ -17,29 +17,29 @@
  * command that raised every action class would be a far larger grant than it
  * appears to make.
  */
-import { config } from '../config.js';
 import { activeCharterVersion } from '../charter/store.js';
-import { closePool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { Plan } from '../domain/plan.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
 import { bindPlanToJob, planHashOf } from '../orchestrator/plan-store.js';
 import { setRampLevel } from '../orchestrator/ramp.js';
+import { closeCliPools, runForBusiness } from './business-arg.js';
 
 export interface SeedMailJobOptions {
   to: string;
   subject: string;
   body: string;
-  businessId?: string;
 }
 
 export async function seedMailJob(
+  db: BusinessDb,
   options: SeedMailJobOptions,
 ): Promise<{ jobId: string; planHash: string }> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
 
   // `activeCharterVersion` is positional, not an options object, and returns
   // `string | null` rather than throwing — see src/charter/store.ts.
-  const charterVersion = await withBusiness(businessId, (bdb) => activeCharterVersion(bdb)); // TENANCY-TODO(task 7)
+  const charterVersion = await activeCharterVersion(db);
   if (charterVersion === null) {
     throw new Error(
       `seedMailJob: no active charter for business ${businessId} — install one first`,
@@ -60,59 +60,65 @@ export async function seedMailJob(
     ],
   });
 
-  const job = await withBusiness(businessId, (db) => createJob(db, { // TENANCY-TODO(task 7)
+  const job = await createJob(db, {
     charterVersion,
     // The owner ran this command; nothing untrusted contributed to it.
     provenance: 'boss',
     title: `live thread: mail to ${options.to}`,
-  }));
+  });
 
   // `intake → understand → plan → execute`. There is no `intake → plan`
   // edge (LEGAL_TRANSITIONS, src/domain/job.ts) — every phase in between must
   // be walked. `actor` is a `JobActor` ('orchestrator' | 'human' | 'system' |
   // AgentId); the person running this command by hand is 'human'.
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await withBusiness(businessId, (db) => transition(db, job.jobId, { // TENANCY-TODO(task 7)
+    await transition(db, job.jobId, {
       to,
       actor: 'human',
       reason: 'seeded by job:seed',
-    }));
+    });
   }
 
-  await withBusiness(businessId, (db) => bindPlanToJob(db, job.jobId, plan)); // TENANCY-TODO(task 7)
-  await withBusiness(businessId, (db) => setRampLevel(db, 'email.initiate', 'approve_required')); // TENANCY-TODO(task 7)
+  await bindPlanToJob(db, job.jobId, plan);
+  await setRampLevel(db, 'email.initiate', 'approve_required');
 
   return { jobId: job.jobId, planHash: planHashOf(plan) };
 }
 
 /**
  * The process wrapper. Kept separate from `seedMailJob` so the test drives
- * the logic without spawning a process or reading argv.
+ * the logic without spawning a process or reading argv. `--business` is
+ * checked first: exit code 2 and nothing written on a refusal
+ * (`business-arg.ts`). Returns the exit code rather than setting it.
  */
-async function main(): Promise<void> {
-  const args = process.argv.slice(2);
-  const read = (flag: string): string | undefined => {
-    const i = args.indexOf(flag);
-    return i === -1 ? undefined : args[i + 1];
-  };
+export async function main(
+  argv: string[],
+  io: { log: (line: string) => void; error: (line: string) => void },
+): Promise<number> {
+  return runForBusiness(argv, io.error, async (db, args) => {
+    const read = (flag: string): string | undefined => {
+      const i = args.indexOf(flag);
+      return i === -1 ? undefined : args[i + 1];
+    };
 
-  const to = read('--to');
-  const subject = read('--subject') ?? 'הודעת בדיקה מהעוזרת';
-  const body = read('--body') ?? 'זו הודעת בדיקה שנשלחה על ידי החוט החי.';
+    const to = read('--to');
+    const subject = read('--subject') ?? 'הודעת בדיקה מהעוזרת';
+    const body = read('--body') ?? 'זו הודעת בדיקה שנשלחה על ידי החוט החי.';
 
-  if (to === undefined) {
-    console.error('usage: npm run job:seed -- --to <address> [--subject <s>] [--body <b>]');
-    process.exitCode = 1;
-    return;
-  }
+    if (to === undefined) {
+      io.error('usage: npm run job:seed -- --to <address> [--subject <s>] [--body <b>] --business <id>');
+      return 1;
+    }
 
-  const { jobId, planHash } = await seedMailJob({ to, subject, body });
+    const { jobId, planHash } = await seedMailJob(db, { to, subject, body });
 
-  console.log(`job ${jobId} created, in phase execute`);
-  console.log(`plan ${planHash} stored — one step, mail.send to ${to}`);
-  console.log(`ramp: email.initiate raised to approve_required for ${config.businessId}`);
-  console.log('every other action class remains at draft_only');
-  console.log('start `npm run scheduler` to run it');
+    io.log(`job ${jobId} created, in phase execute`);
+    io.log(`plan ${planHash} stored — one step, mail.send to ${to}`);
+    io.log(`ramp: email.initiate raised to approve_required for ${db.businessId}`);
+    io.log('every other action class remains at draft_only');
+    io.log('start `npm run scheduler` to run it');
+    return 0;
+  });
 }
 
 // Only run when executed directly — never on import from the test. Same
@@ -122,6 +128,9 @@ const isEntrypoint =
   import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href;
 
 if (isEntrypoint) {
-  await main();
-  await closePool();
+  process.exitCode = await main(process.argv.slice(2), {
+    log: (line) => console.log(line),
+    error: (line) => console.error(line),
+  });
+  await closeCliPools();
 }

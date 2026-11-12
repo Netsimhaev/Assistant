@@ -5,18 +5,19 @@
  * credentials, and a test suite that silently skips when a key is missing is a
  * suite that reports green for work it did not do.
  *
- *   npm run sdk:know-reader -- "סכם את הקובץ README.md"
+ *   npm run sdk:know-reader -- "סכם את הקובץ README.md" --business <id>
  */
 import { mkdir } from 'node:fs/promises';
 import { config } from '../config.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
-import { closePool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
+import { closeCliPools, runForBusiness } from '../cli/business-arg.js';
 import { runKnowReader } from './know-reader.js';
 
-const task = process.argv.slice(2).join(' ') || 'סכם בשתי שורות את הקובץ README.md.';
+async function main(db: BusinessDb, args: string[]): Promise<void> {
+  const task = args.join(' ') || 'סכם בשתי שורות את הקובץ README.md.';
 
-async function main(): Promise<void> {
   const hasCredentials =
     process.env['ANTHROPIC_API_KEY'] !== undefined ||
     process.env['ANTHROPIC_AUTH_TOKEN'] !== undefined;
@@ -28,8 +29,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
-  const bundle = active?.bundle ?? (await withBusiness(config.businessId, (bdb) => installCharter(bdb, buildCharter()))); // TENANCY-TODO(task 7)
+  const active = await loadActiveCharter(db);
+  const bundle = active?.bundle ?? (await installCharter(db, buildCharter()));
 
   // DOCUMENT_ROOT is required config now (src/config.ts) — the same
   // directory ingestDocument (src/documents/ingest.ts) stores under.
@@ -51,6 +52,7 @@ async function main(): Promise<void> {
       },
     ],
     provenance: 'unknown_external',
+    db,
     documentRoot,
     // This script runs a single ad hoc read with no orchestrator job behind
     // it, so there is no content-ingested flag to update. `null` says that
@@ -74,7 +76,10 @@ async function main(): Promise<void> {
 }
 
 try {
-  await main();
+  // `main` sets exit code 1 itself on its own refusals; only a `--business`
+  // refusal (2) comes back from here, and 0 must not overwrite that 1.
+  const code = await runForBusiness(process.argv.slice(2), (line) => console.error(line), main);
+  if (code !== 0) process.exitCode = code;
 } finally {
-  await closePool();
+  await closeCliPools();
 }

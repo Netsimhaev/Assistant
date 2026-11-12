@@ -1,7 +1,7 @@
 /**
  * Live end-to-end run of `proposeForReading` against the Agent SDK.
  *
- *   npm run sdk:propose -- <documentId> <jobId>
+ *   npm run sdk:propose -- <documentId> <jobId> --business <id>
  *
  * Two arguments, not one: `proposeForReading` (`src/orchestrator/propose.ts`)
  * derives the trust level from the job row rather than accepting it as a
@@ -16,18 +16,17 @@
  * skips silently without one reports green for work it did not do. Everything
  * this script composes is covered by tests that need neither.
  */
-import { config } from '../config.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
-import { closePool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
+import { closeCliPools, runForBusiness } from '../cli/business-arg.js';
 import { proposeForReading } from '../orchestrator/propose.js';
 
-const documentId = process.argv[2];
-const jobId = process.argv[3];
-
-async function main(): Promise<void> {
+async function main(db: BusinessDb, args: string[]): Promise<void> {
+  const documentId = args[0];
+  const jobId = args[1];
   if (documentId === undefined || jobId === undefined) {
-    console.error('שימוש: npm run sdk:propose -- <documentId> <jobId>');
+    console.error('שימוש: npm run sdk:propose -- <documentId> <jobId> --business <id>');
     process.exitCode = 1;
     return;
   }
@@ -43,10 +42,10 @@ async function main(): Promise<void> {
     return;
   }
 
-  const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
-  const bundle = active?.bundle ?? (await withBusiness(config.businessId, (bdb) => installCharter(bdb, buildCharter()))); // TENANCY-TODO(task 7)
+  const active = await loadActiveCharter(db);
+  const bundle = active?.bundle ?? (await installCharter(db, buildCharter()));
 
-  const result = await withBusiness(config.businessId, (db) => proposeForReading(db, { documentId, jobId, bundle })); // TENANCY-TODO(task 7)
+  const result = await proposeForReading(db, { documentId, jobId, bundle });
 
   console.log('--- תוצאה ---');
   if (result.status === 'no_reading') {
@@ -85,7 +84,10 @@ async function main(): Promise<void> {
 }
 
 try {
-  await main();
+  // `main` sets exit code 1 itself on its own refusals; only a `--business`
+  // refusal (2) comes back from here, and 0 must not overwrite that 1.
+  const code = await runForBusiness(process.argv.slice(2), (line) => console.error(line), main);
+  if (code !== 0) process.exitCode = code;
 } finally {
-  await closePool();
+  await closeCliPools();
 }

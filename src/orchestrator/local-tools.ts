@@ -1265,7 +1265,6 @@ const HANDLERS: Record<string, LocalHandler> = {
       // through, and only ever read by the delegating branch `answer`
       // being non-null means we cannot reach.
       parentEnvelope: await loadEnvelopeForChildJob(ctx.db, ctx.jobId),
-      businessId: ctx.db.businessId,
       // So `verifyDraft`'s own `saveVerdict` and this handler's land on the
       // SAME connection — see `VerifyDraftInput.db`.
       db: ctx.db,

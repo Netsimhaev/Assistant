@@ -35,10 +35,10 @@ describe('runKillCli', () => {
    */
   it('stops a scope, enforces it at the gate stage, and leaves an audit row naming who and why', async () => {
     const { log, lines } = collector();
-    await runKillCli(['stop', 'outbound', 'operator', 'drill'], { log, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => runKillCli(db, ['stop', 'outbound', 'operator', 'drill'], { log }));
 
-    expect((await withBusiness(BUSINESS, (bdb) => activeScopes(bdb))).map((s) => s.scope)).toEqual(['outbound']); // TENANCY-TODO(task 7)
-    const check = await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'comms.email', true)); // TENANCY-TODO(task 7)
+    expect((await withBusiness(BUSINESS, (bdb) => activeScopes(bdb))).map((s) => s.scope)).toEqual(['outbound']);
+    const check = await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'comms.email', true));
     expect(check.blocked).toBe(true);
     expect(check.scope).toBe('outbound');
 
@@ -60,12 +60,12 @@ describe('runKillCli', () => {
   it('leaves non-outbound work running under an outbound stop, and stops it under all', async () => {
     const { log } = collector();
 
-    await runKillCli(['stop', 'outbound', 'operator', 'drill'], { log, businessId: BUSINESS });
-    expect((await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'know.reader', false))).blocked).toBe(false); // TENANCY-TODO(task 7)
-    await runKillCli(['resume', 'outbound', 'operator', 'done'], { log, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => runKillCli(db, ['stop', 'outbound', 'operator', 'drill'], { log }));
+    expect((await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'know.reader', false))).blocked).toBe(false);
+    await withBusiness(BUSINESS, (db) => runKillCli(db, ['resume', 'outbound', 'operator', 'done'], { log }));
 
-    await runKillCli(['stop', 'all', 'operator', 'drill'], { log, businessId: BUSINESS });
-    expect((await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'know.reader', false))).blocked).toBe(true); // TENANCY-TODO(task 7)
+    await withBusiness(BUSINESS, (db) => runKillCli(db, ['stop', 'all', 'operator', 'drill'], { log }));
+    expect((await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'know.reader', false))).blocked).toBe(true);
   });
 
   /**
@@ -75,10 +75,10 @@ describe('runKillCli', () => {
    */
   it('stops one department only, and names its agents', async () => {
     const { log, lines } = collector();
-    await runKillCli(['stop', 'governance', 'operator', 'drill'], { log, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => runKillCli(db, ['stop', 'governance', 'operator', 'drill'], { log }));
 
-    expect((await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'gov.verify', false))).blocked).toBe(true); // TENANCY-TODO(task 7)
-    expect((await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'comms.email', true))).blocked).toBe(false); // TENANCY-TODO(task 7)
+    expect((await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'gov.verify', false))).blocked).toBe(true);
+    expect((await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'comms.email', true))).blocked).toBe(false);
 
     const text = lines.join('\n');
     expect(text).toContain('gov.verify');
@@ -89,13 +89,13 @@ describe('runKillCli', () => {
 
   it('releases a scope and records the release, leaving other scopes stopped', async () => {
     const { log, lines } = collector();
-    await runKillCli(['stop', 'outbound', 'operator', 'drill'], { log, businessId: BUSINESS });
-    await runKillCli(['stop', 'knowledge', 'operator', 'drill'], { log, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => runKillCli(db, ['stop', 'outbound', 'operator', 'drill'], { log }));
+    await withBusiness(BUSINESS, (db) => runKillCli(db, ['stop', 'knowledge', 'operator', 'drill'], { log }));
 
     lines.length = 0;
-    await runKillCli(['resume', 'outbound', 'operator', 'done'], { log, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => runKillCli(db, ['resume', 'outbound', 'operator', 'done'], { log }));
 
-    expect((await withBusiness(BUSINESS, (bdb) => activeScopes(bdb))).map((s) => s.scope)).toEqual(['knowledge']); // TENANCY-TODO(task 7)
+    expect((await withBusiness(BUSINESS, (bdb) => activeScopes(bdb))).map((s) => s.scope)).toEqual(['knowledge']);
     // The one thing an operator must not conclude from "released": that
     // everything is open again.
     expect(lines.join('\n')).toContain('knowledge');
@@ -106,13 +106,13 @@ describe('runKillCli', () => {
 
   it('reports the live state, and says so when nothing is stopped', async () => {
     const { log, lines } = collector();
-    await runKillCli(['status'], { log, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => runKillCli(db, ['status'], { log }));
     expect(lines.join('\n')).toContain('אין שום עצירה פעילה');
 
     lines.length = 0;
-    await runKillCli(['stop', 'production', 'operator', 'drill'], { log, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => runKillCli(db, ['stop', 'production', 'operator', 'drill'], { log }));
     lines.length = 0;
-    await runKillCli(['status'], { log, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => runKillCli(db, ['status'], { log }));
     const text = lines.join('\n');
     expect(text).toContain('production');
     expect(text).toContain('operator');
@@ -126,18 +126,18 @@ describe('runKillCli', () => {
    */
   it('refuses an unknown scope, an unknown action, a missing reason and a stray argument, writing nothing', async () => {
     const { log } = collector();
-    const deps = { log, businessId: BUSINESS };
+    const deps = { log };
 
-    await expect(runKillCli(['stop', 'sales', 'operator', 'drill'], deps)).rejects.toThrow('sales');
-    await expect(runKillCli(['halt', 'all', 'operator', 'drill'], deps)).rejects.toThrow('halt');
-    await expect(runKillCli(['stop', 'all', 'operator'], deps)).rejects.toThrow('שימוש');
-    await expect(runKillCli(['stop', 'all', 'operator', 'a', 'b'], deps)).rejects.toThrow('עודף');
-    await expect(runKillCli(['stop', 'all', '   ', 'drill'], deps)).rejects.toThrow('המפעיל');
-    await expect(runKillCli(['stop', 'all', 'operator', '  '], deps)).rejects.toThrow('נימוק');
-    await expect(runKillCli(['status', 'all'], deps)).rejects.toThrow('status');
-    await expect(runKillCli([], deps)).rejects.toThrow('שימוש');
+    await expect(withBusiness(BUSINESS, (db) => runKillCli(db, ['stop', 'sales', 'operator', 'drill'], deps))).rejects.toThrow('sales');
+    await expect(withBusiness(BUSINESS, (db) => runKillCli(db, ['halt', 'all', 'operator', 'drill'], deps))).rejects.toThrow('halt');
+    await expect(withBusiness(BUSINESS, (db) => runKillCli(db, ['stop', 'all', 'operator'], deps))).rejects.toThrow('שימוש');
+    await expect(withBusiness(BUSINESS, (db) => runKillCli(db, ['stop', 'all', 'operator', 'a', 'b'], deps))).rejects.toThrow('עודף');
+    await expect(withBusiness(BUSINESS, (db) => runKillCli(db, ['stop', 'all', '   ', 'drill'], deps))).rejects.toThrow('המפעיל');
+    await expect(withBusiness(BUSINESS, (db) => runKillCli(db, ['stop', 'all', 'operator', '  '], deps))).rejects.toThrow('נימוק');
+    await expect(withBusiness(BUSINESS, (db) => runKillCli(db, ['status', 'all'], deps))).rejects.toThrow('status');
+    await expect(withBusiness(BUSINESS, (db) => runKillCli(db, [], deps))).rejects.toThrow('שימוש');
 
-    expect(await withBusiness(BUSINESS, (bdb) => activeScopes(bdb))).toEqual([]); // TENANCY-TODO(task 7)
+    expect(await withBusiness(BUSINESS, (bdb) => activeScopes(bdb))).toEqual([]);
     expect(await auditReasons()).toEqual([]);
   });
 
@@ -149,7 +149,7 @@ describe('runKillCli', () => {
   it('refuses to release a scope that is not stopped', async () => {
     const { log } = collector();
     await expect(
-      runKillCli(['resume', 'all', 'operator', 'nothing to release'], { log, businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => runKillCli(db, ['resume', 'all', 'operator', 'nothing to release'], { log })),
     ).rejects.toThrow();
     expect(await auditReasons()).toEqual([]);
   });
@@ -161,10 +161,10 @@ describe('runKillCli', () => {
    */
   it('confines a stop to its own business', async () => {
     const { log } = collector();
-    await runKillCli(['stop', 'all', 'operator', 'drill'], { log, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => runKillCli(db, ['stop', 'all', 'operator', 'drill'], { log }));
 
-    expect((await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'comms.email', true))).blocked).toBe(true); // TENANCY-TODO(task 7)
-    expect((await withBusiness('other-business', (bdb) => checkKillSwitch(bdb, 'comms.email', true))).blocked).toBe(false); // TENANCY-TODO(task 7)
-    expect(await withBusiness('other-business', (bdb) => activeScopes(bdb))).toEqual([]); // TENANCY-TODO(task 7)
+    expect((await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'comms.email', true))).blocked).toBe(true);
+    expect((await withBusiness('other-business', (bdb) => checkKillSwitch(bdb, 'comms.email', true))).blocked).toBe(false);
+    expect(await withBusiness('other-business', (bdb) => activeScopes(bdb))).toEqual([]);
   });
 });

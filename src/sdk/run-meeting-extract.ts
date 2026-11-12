@@ -1,23 +1,23 @@
 /**
  * Live run of the meeting extractor against the Agent SDK:
  *
- *   npm run sdk:meeting-extract -- "תקבעי פגישה עם דני מחר בשעה 10"
+ *   npm run sdk:meeting-extract -- "תקבעי פגישה עם דני מחר בשעה 10" --business <id>
  *
  * A script and not a test (billed call; `runMeetingExtractor` refuses under
  * NODE_ENV=test). It WRITES NOTHING: it prints the gate result, and the
  * extracted request after `verifyTypedEmails`.
  */
 import { loadActiveCharter } from '../charter/store.js';
-import { config } from '../config.js';
-import { closePool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
+import { closeCliPools, runForBusiness } from '../cli/business-arg.js';
 import { isMeetingInstruction, verifyTypedEmails } from '../meetings/request.js';
 import { localParts } from '../util/local-time.js';
 import { runMeetingExtractor } from './meeting-extractor.js';
 
-async function main(): Promise<void> {
-  const text = process.argv[2];
+async function main(db: BusinessDb, args: string[]): Promise<void> {
+  const text = args[0];
   if (text === undefined || text.trim() === '') {
-    console.error('שימוש: npm run sdk:meeting-extract -- "<הוראה>"');
+    console.error('שימוש: npm run sdk:meeting-extract -- "<הוראה>" --business <id>');
     process.exitCode = 1;
     return;
   }
@@ -26,7 +26,7 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
+  const active = await loadActiveCharter(db);
   const timeZone = active?.charter.identity.timezone ?? 'Asia/Jerusalem';
   const today = localParts(new Date(), timeZone).date;
   console.log(`isMeetingInstruction: ${isMeetingInstruction(text)}  today: ${today}  tz: ${timeZone}`);
@@ -40,9 +40,12 @@ async function main(): Promise<void> {
 }
 
 try {
-  await main();
+  // `main` sets exit code 1 itself on its own refusals; only a `--business`
+  // refusal (2) comes back from here, and 0 must not overwrite that 1.
+  const code = await runForBusiness(process.argv.slice(2), (line) => console.error(line), main);
+  if (code !== 0) process.exitCode = code;
 } catch (err) {
   console.error(err instanceof Error ? err.message : String(err));
   process.exitCode = 1;
 }
-await closePool();
+await closeCliPools();

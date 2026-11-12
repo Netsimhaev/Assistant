@@ -278,7 +278,7 @@ async function auditKeyAction(params: {
       reason: params.reason,
     },
   );
-  await (params.tx !== undefined ? write(params.tx) : withBusiness(params.businessId, write)); // TENANCY-TODO(task 7)
+  await (params.tx !== undefined ? write(params.tx) : withBusiness(params.businessId, write)); // TENANCY-TODO(task 12)
 }
 
 /**
@@ -346,7 +346,7 @@ async function readNewPassphrase(deps: SecretKeyCliDeps): Promise<string> {
  * both, not a second printout.
  */
 async function create(deps: SecretKeyCliDeps, operator: string): Promise<void> {
-  const businessId = deps.businessId ?? config.businessId;
+  const businessId = deps.businessId ?? config.businessId; // TENANCY-TODO(task 12)
 
   // **Input first, before anything is written anywhere.** The passphrase is
   // pure input and costs nothing to collect early — and collecting it late
@@ -375,7 +375,7 @@ async function create(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   // naming different keys. One operator runs this tool, which is why this was
   // a low finding and not a high one, but check-then-write under a lock that
   // already exists costs nothing.
-  await withBusinessTransaction(businessId, async (tx: BusinessDb) => { // TENANCY-TODO(task 7)
+  await withBusinessTransaction(businessId, async (tx: BusinessDb) => { // TENANCY-TODO(task 12)
     await acquireAdvisoryLock(tx, ROTATION_LOCK_SCOPE);
 
     // Refuse, do not prompt (task requirement). Checked BEFORE any write:
@@ -442,7 +442,7 @@ async function create(deps: SecretKeyCliDeps, operator: string): Promise<void> {
 }
 
 async function restore(deps: SecretKeyCliDeps, operator: string): Promise<void> {
-  const businessId = deps.businessId ?? config.businessId;
+  const businessId = deps.businessId ?? config.businessId; // TENANCY-TODO(task 12)
 
   if (await pathExists(deps.keyPath)) {
     throw new Error(
@@ -533,7 +533,7 @@ interface GrantRow {
  * of them can't be opened with the key on file today.
  */
 async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
-  const businessId = deps.businessId ?? config.businessId;
+  const businessId = deps.businessId ?? config.businessId; // TENANCY-TODO(task 12)
 
   const oldKey = await loadMasterKey(deps.keyPath);
   await verifyKeyState(oldKey, { businessId });

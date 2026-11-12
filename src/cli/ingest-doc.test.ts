@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config } from '../config.js';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { runIngestCli } from './ingest-doc.js';
 
@@ -39,7 +39,7 @@ afterAll(async () => {
 describe('runIngestCli', () => {
   it('prints the document id and its status', async () => {
     const lines: string[] = [];
-    await runIngestCli([fixture('tiny.xlsx')], { log: (l) => lines.push(l), businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => runIngestCli(db, [fixture('tiny.xlsx')], { log: (l) => lines.push(l) }));
     expect(lines.join('\n')).toMatch(/DOC-[0-9A-Z]+/);
     expect(lines.join('\n')).toContain('extracted');
   });
@@ -47,45 +47,43 @@ describe('runIngestCli', () => {
   it('exits with a message when the file does not exist', async () => {
     const lines: string[] = [];
     await expect(
-      runIngestCli(['/no/such/file'], { log: (l) => lines.push(l) }),
+      withBusiness(BUSINESS, (db) => runIngestCli(db, ['/no/such/file'], { log: (l) => lines.push(l) })),
     ).rejects.toThrow();
   });
 
   it('gives a Hebrew reason for a missing file rather than the raw ENOENT text', async () => {
-    await expect(runIngestCli(['/no/such/file'], { log: () => {} })).rejects.toThrow(
+    await expect(withBusiness(BUSINESS, (db) => runIngestCli(db, ['/no/such/file'], { log: () => {} }))).rejects.toThrow(
       /הקובץ לא נמצא/,
     );
   });
 
   it('gives a Hebrew reason when the path is a directory, not a file', async () => {
     await expect(
-      runIngestCli([ROOT], { log: () => {}, businessId: BUSINESS, documentRoot: ROOT }),
+      withBusiness(BUSINESS, (db) => runIngestCli(db, [ROOT], { log: () => {}, documentRoot: ROOT })),
     ).rejects.toThrow(/אינו קובץ/);
   });
 
   it('rejects an unsupported --source value with a Hebrew message, not a stack trace', async () => {
     await expect(
-      runIngestCli([fixture('tiny.xlsx'), '--source', 'carrier-pigeon'], {
+      withBusiness(BUSINESS, (db) => runIngestCli(db, [fixture('tiny.xlsx'), '--source', 'carrier-pigeon'], {
         log: () => {},
-        businessId: BUSINESS,
         documentRoot: ROOT,
-      }),
+      })),
     ).rejects.toThrow(/--source/);
   });
 
   it('requires a path argument', async () => {
     await expect(
-      runIngestCli([], { log: () => {}, businessId: BUSINESS, documentRoot: ROOT }),
+      withBusiness(BUSINESS, (db) => runIngestCli(db, [], { log: () => {}, documentRoot: ROOT })),
     ).rejects.toThrow(/שימוש/);
   });
 
   it('prints the media type and one line per artefact, including the outline', async () => {
     const lines: string[] = [];
-    await runIngestCli([fixture('tiny.xlsx')], {
+    await withBusiness(BUSINESS, (db) => runIngestCli(db, [fixture('tiny.xlsx')], {
       log: (l) => lines.push(l),
-      businessId: BUSINESS,
       documentRoot: ROOT,
-    });
+    }));
     const out = lines.join('\n');
     expect(out).toContain('סוג מדיה:');
     expect(out).toContain('רכיב: outline');
@@ -93,11 +91,10 @@ describe('runIngestCli', () => {
 
   it('accepts --source and ingests under it', async () => {
     const lines: string[] = [];
-    await runIngestCli([fixture('tiny.docx'), '--source', 'mail'], {
+    await withBusiness(BUSINESS, (db) => runIngestCli(db, [fixture('tiny.docx'), '--source', 'mail'], {
       log: (l) => lines.push(l),
-      businessId: BUSINESS,
       documentRoot: ROOT,
-    });
+    }));
     const out = lines.join('\n');
     expect(out).toContain('extracted');
     // Asserting only 'extracted' would still pass if --source were parsed
@@ -108,11 +105,10 @@ describe('runIngestCli', () => {
 
   it('prints the Hebrew rejection reason for an unsupported type instead of throwing', async () => {
     const lines: string[] = [];
-    await runIngestCli([fixture('mystery.bin')], {
+    await withBusiness(BUSINESS, (db) => runIngestCli(db, [fixture('mystery.bin')], {
       log: (l) => lines.push(l),
-      businessId: BUSINESS,
       documentRoot: ROOT,
-    });
+    }));
     const out = lines.join('\n');
     expect(out).toContain('rejected');
     expect(out).toContain('סיבת הדחייה:');
@@ -126,7 +122,7 @@ describe('runIngestCli', () => {
       Buffer.concat([Buffer.from('%PDF-1.4\n%'), Buffer.from([0xe2, 0xe3, 0xcf, 0xd3]), Buffer.from('\n1 0 obj\n')]),
     );
     const lines: string[] = [];
-    await runIngestCli([path], { log: (l) => lines.push(l), businessId: BUSINESS, documentRoot: ROOT });
+    await withBusiness(BUSINESS, (db) => runIngestCli(db, [path], { log: (l) => lines.push(l), documentRoot: ROOT }));
     const out = lines.join('\n');
     expect(out).toContain('סטטוס: stored');
     expect(out).toMatch(/לא נקרא: הפענוח נכשל: /);

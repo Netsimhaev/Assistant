@@ -28,12 +28,12 @@
  * reader: eyeballing three JSON blobs is exactly how a fence failure gets
  * called a pass.
  *
- *   npm run sdk:judge
+ *   npm run sdk:judge -- --business <id>
  */
-import { config } from '../config.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
-import { closePool, withBusiness } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
+import { closeCliPools, runForBusiness } from '../cli/business-arg.js';
 import { judgeWithModel, type JudgeOutcome, type JudgeRequest } from './gov-verify.js';
 import type { PolicyBundle } from '../domain/policy.js';
 
@@ -139,7 +139,7 @@ const CASES: readonly Case[] = [
   },
 ];
 
-async function main(): Promise<void> {
+async function main(db: BusinessDb): Promise<void> {
   const hasCredentials =
     process.env['ANTHROPIC_API_KEY'] !== undefined ||
     process.env['ANTHROPIC_AUTH_TOKEN'] !== undefined;
@@ -151,8 +151,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
-  const bundle: PolicyBundle = active?.bundle ?? (await withBusiness(config.businessId, (bdb) => installCharter(bdb, buildCharter()))); // TENANCY-TODO(task 7)
+  const active = await loadActiveCharter(db);
+  const bundle: PolicyBundle = active?.bundle ?? (await installCharter(db, buildCharter()));
   console.log(`charter: ${bundle.charterVersion}`);
   console.log(`cases: ${CASES.length} — each one live model call\n`);
 
@@ -171,9 +171,12 @@ async function main(): Promise<void> {
 }
 
 try {
-  await main();
+  // `main` sets exit code 1 itself on its own refusals; only a `--business`
+  // refusal (2) comes back from here, and 0 must not overwrite that 1.
+  const code = await runForBusiness(process.argv.slice(2), (line) => console.error(line), main);
+  if (code !== 0) process.exitCode = code;
 } catch (err) {
   console.error(err instanceof Error ? err.message : String(err));
   process.exitCode = 1;
 }
-await closePool();
+await closeCliPools();

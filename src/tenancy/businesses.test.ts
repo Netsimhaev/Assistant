@@ -2,7 +2,7 @@ import { withBusiness } from '../db/pool.js';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePlatformPool } from '../db/platform-pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
-import { createBusiness, getBusiness, setBusinessStatus, TenancyError } from './businesses.js';
+import { BusinessIdError, createBusiness, getBusiness, setBusinessStatus, TenancyError } from './businesses.js';
 import { listActiveBusinesses } from './platform.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
 
@@ -55,6 +55,14 @@ describe('businesses registry', () => {
 
   it('refuses to change the status of an unknown business', async () => {
     await expect(setBusinessStatus('nobody-here', 'suspended')).rejects.toBeInstanceOf(TenancyError);
+  });
+
+  it('refuses a malformed id before touching the table, as a business-id error', async () => {
+    await createBusiness('alpha-shop', 'א');
+    for (const bad of ['Alpha-Shop', 'ab', 'a b c', '__proto__', '']) {
+      await expect(setBusinessStatus(bad, 'suspended')).rejects.toBeInstanceOf(BusinessIdError);
+    }
+    expect((await getBusiness('alpha-shop'))?.status).toBe('active');
   });
 
   it("job_steps rows written by transition carry the job's business_id", async () => {
