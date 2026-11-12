@@ -96,8 +96,13 @@ const SERVER_RECOVERY_BUSINESS = '';
  * which loop stalled if only one of them actually ran.
  */
 export interface RotationOutcome {
-  /** Every registered business, whose audit trail the record was meant for. */
-  businesses: readonly string[];
+  /**
+   * The registered businesses whose trails the record was written for —
+   * `null` when the audit failed before that list was known, which is the
+   * usual case: the list is what `auditKeyAction` returns once every row is
+   * written, so a failure in the middle never got it.
+   */
+  businesses: readonly string[] | null;
   previousKeyId: string | null;
   newKeyId: string;
   secretsReEncrypted: number;
@@ -140,7 +145,7 @@ export class RotationAuditUnrecordedError extends Error {
       `החלפת המפתח בוצעה במלואה ורשומת הביקורת עליה נכשלה. ההחלפה בתוקף: ` +
         `${outcome.secretsReEncrypted} סודות, ${outcome.grantsReEncrypted} הרשאות ו-` +
         `${outcome.platformSecretsReEncrypted} סודות שרת הוצפנו ` +
-        `מחדש בשרת (העסקים: ${outcome.businesses.length === 0 ? 'אין' : outcome.businesses.join(', ')}), ` +
+        `מחדש בשרת (העסקים: ${outcome.businesses === null ? '(לא ידוע)' : outcome.businesses.length === 0 ? 'אין' : outcome.businesses.join(', ')}), ` +
         `מהמפתח ${outcome.previousKeyId ?? '(לא ידוע)'} אל המפתח ${outcome.newKeyId}, ` +
         `וקובץ המפתח ועותק השחזור כבר נכתבו — אל תריץ rotate שוב. מה שחסר הוא רק ` +
         `הרישום, ויש להשלים אותו ידנית.`,
@@ -324,6 +329,11 @@ async function auditKeyAction(
   tx: Queryable,
   params: { operator: string; action: Command; reason: string },
 ): Promise<string[]> {
+  // The operator's own trace, beside the rows — and the whole trace on a
+  // server with no business yet. Printed FIRST, before any row is written, so
+  // it is there on the failure path too: an audit that throws halfway still
+  // leaves the line saying who did what. Never the key, never a secret.
+  console.error(`secret-key ${params.action} — מפעיל: ${params.operator}`);
   const businesses = await registeredBusinesses(tx);
   for (const businessId of businesses) {
     const view: BusinessDb = { businessId, inTransaction: true, query: tx.query.bind(tx) as Queryable['query'] };
@@ -343,9 +353,6 @@ async function auditKeyAction(
       reason: params.reason,
     });
   }
-  // The operator's own trace, beside the rows — and the whole trace on a
-  // server with no business yet. Never the key, never a secret.
-  console.error(`secret-key ${params.action} — מפעיל: ${params.operator}`);
   return businesses;
 }
 
@@ -766,18 +773,19 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   // — never a raw database error the operator reads as "it failed", and never
   // silence. An operator who reads this as failure runs `rotate` again, which
   // rotates a second time on top of a rotation nobody recorded.
-  let businesses: readonly string[] = [];
+  let businesses: readonly string[] | null = null;
   try {
-    await withPlatformTransaction(async (tx: Queryable) => {
-      businesses = await registeredBusinesses(tx);
-      await auditKeyAction(tx, {
+    // Assigned only once the transaction has COMMITTED: a list taken before
+    // the commit would name trails that a failed commit left without the row.
+    businesses = await withPlatformTransaction((tx: Queryable) =>
+      auditKeyAction(tx, {
         operator,
         action: 'rotate',
         reason:
           `מפתח השרת הוחלף (${newKeyId}) על ידי ${operator} — ` +
           `${rotated} סודות, ${grantsRotated} הרשאות ו-${platformRotated} סודות שרת הוצפנו מחדש`,
-      });
-    });
+      }),
+    );
   } catch (error) {
     throw new RotationAuditUnrecordedError(
       {

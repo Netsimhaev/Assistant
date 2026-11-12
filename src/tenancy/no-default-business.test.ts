@@ -39,6 +39,8 @@ const PATTERNS: readonly Pattern[] = [
   // Spelled in two halves, so this file is not itself the one marker left in `src/`.
   { name: 'TENANCY' + '-TODO', regex: new RegExp('TENANCY' + '-TODO'), sample: 'x(); // TENANCY' + '-TODO(task 12)', near: 'x(); // TODO' },
   { name: 'businessId?:', regex: /\bbusinessId\s*\?\s*:/, sample: 'options: { businessId?: string }', near: 'options: { businessId: string }' },
+  { name: 'businessId ??', regex: /\bbusinessId\s*\?\?/, sample: 'const b = options.businessId ?? fallback;', near: 'const b = options.businessId ? x : y;' },
+  { name: 'businessId: string | undefined', regex: /\bbusinessId\s*:\s*string\s*\|\s*undefined/, sample: 'function f(businessId: string | undefined) {}', near: 'function f(businessId: string | null) {}' },
   { name: 'businessId: string =', regex: /\bbusinessId\s*:\s*string\s*=(?![=>])/, sample: "function f(businessId: string = 'dev') {}", near: 'function f(businessId: string) {}' },
   {
     name: 'businessId = (parameter default)',

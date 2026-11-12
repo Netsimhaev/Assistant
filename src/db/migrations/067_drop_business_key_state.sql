@@ -20,6 +20,7 @@ ALTER TABLE server_key_state
 DO $$
 DECLARE
     business_rows integer;
+    matching_rows integer;
 BEGIN
     SELECT count(*) INTO business_rows FROM credential_key_state;
     IF business_rows = 1 THEN
@@ -31,6 +32,23 @@ BEGIN
         -- Two key states and no server row: which key is "the server's" is a
         -- guess, and dropping the table would lose both. Refused, loudly.
         RAISE EXCEPTION 'credential_key_state holds % rows and server_key_state none — pick the server key by hand before migrating', business_rows;
+    ELSIF business_rows > 1 THEN
+        -- Several business rows beside a server row: the server row is 064's
+        -- copy of ONE of them, sealed for that row's business. Left at the
+        -- column default `''` it would open for nobody once the old table is
+        -- dropped, and every key check would fail with no tool to recover. So
+        -- the business is taken from the row whose key the server row names —
+        -- exactly one, or refused: a guess here seals the wrong business.
+        SELECT count(*) INTO matching_rows
+          FROM credential_key_state c
+          JOIN server_key_state s ON s.key_id = c.key_id;
+        IF matching_rows <> 1 THEN
+            RAISE EXCEPTION 'credential_key_state holds % rows and % of them name the server key — pick the server key''s business by hand before migrating', business_rows, matching_rows;
+        END IF;
+        UPDATE server_key_state s
+           SET check_business_id = c.business_id
+          FROM credential_key_state c
+         WHERE c.key_id = s.key_id;
     END IF;
 END $$;
 

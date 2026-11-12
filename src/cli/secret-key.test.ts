@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closePool, withBusiness } from '../db/pool.js';
 import { closePlatformPool } from '../db/platform-pool.js';
 import { putSecret, storedCredentials } from '../governance/credential-store.js';
@@ -253,6 +253,65 @@ describe('a key that exists is a key that was recorded', () => {
     const { rows: state } = await testDb().query('SELECT 1 FROM server_key_state');
     expect(state).toHaveLength(1);
   });
+
+  /**
+   * The key is the server's, so a key action is recorded in EVERY registered
+   * business's own chain — one row each, under its own business id.
+   */
+  it('writes one credential_change row into each registered business chain', async () => {
+    const OTHER = 'test-business-key-audit-other';
+    await registerBusiness(OTHER);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await runSecretKeyCli(['create', OPERATOR], deps());
+      const key = await loadMasterKey(KEY_PATH);
+      await runSecretKeyCli(['rotate', OPERATOR], deps());
+      expect((await loadMasterKey(KEY_PATH)).equals(key)).toBe(false);
+    } finally {
+      errorSpy.mockRestore();
+    }
+
+    const { rows } = await testDb().query<{ business_id: string; n: string }>(
+      `SELECT business_id, count(*)::text AS n FROM audit_log
+        WHERE kind = 'credential_change' GROUP BY business_id ORDER BY business_id`,
+    );
+    // create + rotate: two rows in each chain, and in no other.
+    expect(rows).toEqual([
+      { business_id: TEST_BUSINESS, n: '2' },
+      { business_id: OTHER, n: '2' },
+    ]);
+  });
+
+  it('with no business registered writes no row, and the stderr line is the trace', async () => {
+    await testDb().query('DELETE FROM businesses');
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await runSecretKeyCli(['create', OPERATOR], deps());
+      expect(errorSpy).toHaveBeenCalledWith(`secret-key create — מפעיל: ${OPERATOR}`);
+    } finally {
+      errorSpy.mockRestore();
+    }
+
+    const { rows } = await testDb().query(`SELECT 1 FROM audit_log WHERE kind = 'credential_change'`);
+    expect(rows).toHaveLength(0);
+    const { rows: state } = await testDb().query('SELECT 1 FROM server_key_state');
+    expect(state).toHaveLength(1);
+  });
+
+  it('prints the stderr trace even when the audit write fails', async () => {
+    await testDb().query(
+      `ALTER TABLE audit_log ADD CONSTRAINT tmp_reject_credential_change_create
+         CHECK (kind <> 'credential_change') NOT VALID`,
+    );
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(runSecretKeyCli(['create', OPERATOR], deps())).rejects.toThrow();
+      expect(errorSpy).toHaveBeenCalledWith(`secret-key create — מפעיל: ${OPERATOR}`);
+    } finally {
+      errorSpy.mockRestore();
+      await testDb().query('ALTER TABLE audit_log DROP CONSTRAINT tmp_reject_credential_change_create');
+    }
+  });
 });
 
 describe('runSecretKeyCli restore', () => {
@@ -409,7 +468,8 @@ describe('a rotation that committed says so even when its record does not', () =
     //    message carries it too, because `main()` prints `err.message` and
     //    nothing else.
     expect(thrown.outcome).toEqual({
-      businesses: [TEST_BUSINESS],
+      // The audit failed before the list of trails was known.
+      businesses: null,
       previousKeyId: oldKeyId,
       newKeyId: expect.stringMatching(/^KEY-/) as unknown as string,
       secretsReEncrypted: 1,
@@ -419,6 +479,7 @@ describe('a rotation that committed says so even when its record does not', () =
     expect(thrown.message).toContain(oldKeyId as string);
     expect(thrown.message).toContain(thrown.outcome.newKeyId);
     expect(thrown.message).toContain('1');
+    expect(thrown.message).toContain('(לא ידוע)');
 
     // Never the key, never a secret — the rule an error object is no more
     // exempt from than a log line.
