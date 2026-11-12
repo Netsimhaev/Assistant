@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../config.js';
@@ -24,6 +24,13 @@ import { schedulerPass } from './scheduler.js';
 import type { Runtime } from './runtime.js';
 
 const BUSINESS = 'biz-sched-conduct';
+
+/** `<a fresh inbox root>/<businessId>` — the only shape `scanInbox` accepts (spec §5.8). */
+async function businessInbox(prefix: string, businessId: string = BUSINESS): Promise<string> {
+  const inbox = join(await mkdtemp(join(tmpdir(), prefix)), businessId);
+  await mkdir(inbox);
+  return inbox;
+}
 const PREFIX = 'TEST_CRED_';
 // Fixed clock, matching scheduler-runs-plans.test.ts: an evening wall-clock
 // run of this suite would otherwise fall inside quiet hours.
@@ -147,7 +154,7 @@ describe('schedulerPass and the conductor', () => {
   });
 
   it('scans the inbox when one is configured, into the given document root', async () => {
-    const inbox = await mkdtemp(join(tmpdir(), 'sched-inbox-'));
+    const inbox = await businessInbox('sched-inbox-');
     const documentRoot = await mkdtemp(join(tmpdir(), 'sched-root-'));
     await writeFile(join(inbox, 'note.txt'), 'שלום', 'utf8');
 
@@ -193,11 +200,11 @@ describe('schedulerPass and the conductor', () => {
     // earlier version of this test scanned a real folder and went red:
     // configuring the feature broke the suite. Since settings moved into the
     // database (spec §5.4) the inbox comes from the business's runtime, and
-    // `runtimeWith` builds one with none — `config.documentInbox` is set here
+    // `runtimeWith` builds one with none — `config.documentInboxRoot` is set here
     // too, to prove the ambient server value alone no longer turns it on.
-    const mutableConfig = config as { documentInbox: string | null };
-    const original = mutableConfig.documentInbox;
-    mutableConfig.documentInbox = await mkdtemp(join(tmpdir(), 'sched-ambient-inbox-'));
+    const mutableConfig = config as { documentInboxRoot: string | null };
+    const original = mutableConfig.documentInboxRoot;
+    mutableConfig.documentInboxRoot = await mkdtemp(join(tmpdir(), 'sched-ambient-inbox-'));
     try {
       // Deliberately no `readsPerDay: 0`. The ceiling must not be what stops
       // the conductor here — the switch must. With the ceiling left at its
@@ -209,12 +216,12 @@ describe('schedulerPass and the conductor', () => {
       expect(result.scanError).toBeNull();
       expect(result.conduct).toBeNull();
     } finally {
-      mutableConfig.documentInbox = original;
+      mutableConfig.documentInboxRoot = original;
     }
   });
 
   it("scans the business runtime's inbox when no inbox option is passed", async () => {
-    const runtimeInbox = await mkdtemp(join(tmpdir(), 'sched-runtime-inbox-'));
+    const runtimeInbox = await businessInbox('sched-runtime-inbox-');
     const result = await schedulerPass(BUSINESS, {
       readsPerDay: 0,
       runtime: { ...runtimeWith([]), inbox: runtimeInbox },
@@ -230,7 +237,7 @@ describe('schedulerPass and the conductor', () => {
     // runtime.inbox`, not a collapsing `options.inbox ?? ...` — the latter
     // treats an explicit `null` the same as "not passed" and would fall
     // through to the configured path here, actually scanning it.
-    const configuredInbox = await mkdtemp(join(tmpdir(), 'sched-configured-inbox-'));
+    const configuredInbox = await businessInbox('sched-configured-inbox-');
     const result = await schedulerPass(BUSINESS, {
       inbox: null,
       readsPerDay: 0,
@@ -272,11 +279,11 @@ describe('schedulerPass and the conductor', () => {
       return { status: 'proposed' as const, proposal: ACTING, raw: '{}' };
     };
 
-    // An explicit (empty) inbox, not the ambient `config.documentInbox`: the
+    // An explicit (empty) inbox, not the ambient `config.documentInboxRoot`: the
     // conductor runs only behind the same switch as the scan (I1), and a test
     // about the conductor must state that precondition itself rather than
     // inherit whatever `.env` happens to hold.
-    const inbox = await mkdtemp(join(tmpdir(), 'sched-conduct-inbox-'));
+    const inbox = await businessInbox('sched-conduct-inbox-');
 
     const result = await schedulerPass(conductBusiness, {
       inbox,
@@ -332,7 +339,7 @@ describe('schedulerPass and the conductor', () => {
       warnings: [],
     };
 
-    const inbox = await mkdtemp(join(tmpdir(), 'sched-notify-inbox-'));
+    const inbox = await businessInbox('sched-notify-inbox-');
     const result = await schedulerPass(notifyBusiness, {
       inbox,
       runtime,
@@ -357,7 +364,7 @@ describe('schedulerPass and the conductor', () => {
   it('a hostile file is rejected by the scan and costs nothing', async () => {
     const hostileBusiness = 'biz-sched-conduct-hostile';
     await withBusiness(hostileBusiness, (bdb) => installCharter(bdb, buildCharter()));
-    const inbox = await mkdtemp(join(tmpdir(), 'sched-hostile-inbox-'));
+    const inbox = await businessInbox('sched-hostile-inbox-', hostileBusiness);
     const documentRoot = await mkdtemp(join(tmpdir(), 'sched-hostile-root-'));
     // A `.xlsx` name over bytes that begin as a ZIP and then are not one:
     // sniffed as a spreadsheet from the bytes, refused by the archive guard
@@ -428,7 +435,9 @@ describe('schedulerPass and the conductor', () => {
     const blockerDir = await mkdtemp(join(tmpdir(), 'sched-blocker-'));
     const blockerFile = join(blockerDir, 'not-a-directory');
     await writeFile(blockerFile, 'x', 'utf8');
-    const brokenInbox = join(blockerFile, 'inbox');
+    // Named for the business, so the scan's own folder check passes and the
+    // fault it meets is the filesystem one this test is about.
+    const brokenInbox = join(blockerFile, BUSINESS);
 
     const sent: MailMessage[] = [];
     const pass = await schedulerPass(BUSINESS, {

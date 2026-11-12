@@ -48,7 +48,9 @@
  * Only a document DELIVERY job may run it (a job a
  * `document_cards.delivery_job_id` in this business names), and only for the
  * version that card shows (`deliveryVersionOf`), checked before anything
- * touches the disk. The base
+ * touches the disk. The base folder must sit inside this business's save
+ * folder on the server (`<DOCUMENT_SAVE_ROOT>/<businessId>`, spec §5.8) —
+ * checked when the setting is saved and again here, at write time. The base
  * folder's own copies are the owner's files: erasure lists them but never
  * deletes them (§9.3), which is why the result carries the absolute `path`
  * and why it is recorded on the delivery row (`recordSavedPath`, migrations 057/058).
@@ -62,7 +64,7 @@ import type { BusinessDb } from '../db/pool.js';
 import { SafeLookupKey } from '../domain/charter.js';
 import type { DocumentKind } from '../domain/document-spec.js';
 import { documentKindLabel } from '../domain/labels.js';
-import { loadDocumentSettings } from '../governance/document-settings.js';
+import { DOCUMENT_SETTINGS_HE, isInsideBusinessSaveRoot, loadDocumentSettings } from '../governance/document-settings.js';
 import { StepChannelError } from '../orchestrator/step-error.js';
 import { stripBidiControls } from '../util/bidi.js';
 import { deliveryVersionOf, loadVersionFile, readVersionBytes } from './attachments.js';
@@ -81,6 +83,7 @@ export type DocSaveInput = z.infer<typeof DocSaveInput>;
 export type SaveFailureCode =
   | 'save_not_supported'
   | 'save_no_base_folder'
+  | 'save_base_outside_business'
   | 'save_not_found'
   | 'save_hash_mismatch'
   | 'save_name_mismatch'
@@ -91,6 +94,7 @@ export type SaveFailureCode =
 export const SAVE_FAILURE_HE: Readonly<Record<SaveFailureCode, string>> = {
   save_not_supported: 'אפשר לשמור קובץ רק ממסמך שאושר — לא נשמר',
   save_no_base_folder: 'לא הוגדרה תיקיית בסיס לשמירה — אפשר להגדיר אותה בהגדרות',
+  save_base_outside_business: DOCUMENT_SETTINGS_HE.outsideBusiness,
   save_not_found: 'המסמך לשמירה לא נמצא — לא נשמר',
   save_hash_mismatch: 'המסמך השתנה מאז שאושר — לא נשמר',
   save_name_mismatch: 'שם הקובץ אינו השם שאושר — לא נשמר',
@@ -353,6 +357,12 @@ export async function runDocSave(
 
   const settings = await loadDocumentSettings(db);
   if (settings.baseFolder === null) throw refuse('save_no_base_folder');
+  // Re-checked at write time, not trusted from the setting (spec §5.8): a row
+  // written before the save root existed, or a server whose root moved, must
+  // not save into another business's folder on the same disk.
+  if (!(await isInsideBusinessSaveRoot(settings.baseFolder, db.businessId))) {
+    throw refuse('save_base_outside_business');
+  }
 
   const version = await loadVersionFile(db, input.producedVersionId);
   if (version === null) throw refuse('save_not_found');
@@ -367,6 +377,10 @@ export async function runDocSave(
 
   const target = await resolveSaveTarget(settings.baseFolder, input.folder, version.kind, input.filename);
   if (!target.ok) throw refuse('save_folder_refused', target.he);
+  // And once more on the folder actually created (a `realpath`), before the
+  // file is opened: the base re-resolved inside `resolveSaveTarget` could have
+  // been swapped since the check above.
+  if (!(await isInsideBusinessSaveRoot(target.dir, db.businessId))) throw refuse('save_base_outside_business');
 
   const saved = await saveVersionToFolder(target.dir, target.name, read.bytes, version.sha256);
   if (!saved.ok) throw refuse(saved.code, saved.he);

@@ -68,6 +68,10 @@ export interface ReadRequest {
    * Required rather than defaulted to the process cwd: defaulting would put the
    * repository root — and its `.env` — inside the reader's reach, which is the
    * exact shape of the injection this agent exists to contain.
+   *
+   * The business's folder, `<DOCUMENT_ROOT>/<businessId>` (`businessDocumentRoot`,
+   * spec §5.8) — `readDocument` builds it — never the server root that holds
+   * every business's documents. The gate hook refuses anything else.
    */
   documentRoot: string;
 }
@@ -134,6 +138,32 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadOutcome> 
   // ceiling dropped out of the brief.
   const { brief, includedOrdinals } = renderReadingBrief(request.artifacts);
 
+  const options = buildKnowReaderOptions(request, (code) => denials.push(code));
+
+  let text = '';
+  let turns = 0;
+
+  for await (const message of query({ prompt: brief, options })) {
+    if (message.type === 'assistant') {
+      turns += 1;
+      for (const block of message.message.content) {
+        if (block.type === 'text') text += block.text;
+      }
+    }
+    if (message.type === 'result' && message.subtype === 'success') {
+      text = message.result;
+    }
+  }
+
+  return interpretReaderResponse(text, includedOrdinals, denials, turns);
+}
+
+/**
+ * The SDK options a read runs under, gate hook included — split out of
+ * `runKnowReader` so what the subprocess is handed (its `cwd` above all) can
+ * be asserted without a live call. `onDenial` receives every gate denial code.
+ */
+export function buildKnowReaderOptions(request: ReadRequest, onDenial: (code: string) => void): Options {
   const binding: GateHookBinding = {
     agent: AGENT,
     bundle: request.bundle,
@@ -145,13 +175,13 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadOutcome> 
     // No ramp yet. draft_only is the value the risk engine's comment assumes.
     rampLevel: 'draft_only',
     onDecision: (event) => {
-      if (event.decision === 'deny') denials.push(event.code);
+      if (event.decision === 'deny') onDenial(event.code);
     },
     db: request.db,
     jobId: request.jobId,
   };
 
-  const options: Options = {
+  return {
     // The prompt goes in `systemPrompt`, not into an `agents` entry.
     //
     // An AgentDefinition only takes effect for a *subagent* invoked through the
@@ -177,7 +207,8 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadOutcome> 
     // attribution has to name what actually ran.
     model: KNOW_READER_MODEL,
     // A second boundary under the hook's path check, so a filesystem read is
-    // scoped by the SDK as well as by us.
+    // scoped by the SDK as well as by us. The business folder, never the
+    // server root (see `ReadRequest.documentRoot`).
     cwd: request.documentRoot,
     // Load no settings from disk.
     //
@@ -200,21 +231,4 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadOutcome> 
       PreToolUse: [{ hooks: [createGateHook(binding)] }],
     },
   };
-
-  let text = '';
-  let turns = 0;
-
-  for await (const message of query({ prompt: brief, options })) {
-    if (message.type === 'assistant') {
-      turns += 1;
-      for (const block of message.message.content) {
-        if (block.type === 'text') text += block.text;
-      }
-    }
-    if (message.type === 'result' && message.subtype === 'success') {
-      text = message.result;
-    }
-  }
-
-  return interpretReaderResponse(text, includedOrdinals, denials, turns);
 }

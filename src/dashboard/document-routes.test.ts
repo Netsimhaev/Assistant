@@ -23,6 +23,7 @@ import { buildDeliveryOptions, createDocumentCard, loadDocumentCard, typedAddres
 import { advanceStage, createProduction, loadProduction, loadVersion, saveVersion, saveVersionCheck, type ProductionDestination } from '../production/store.js';
 import type { PlanOutcome, PlanRequest } from '../sdk/planner.js';
 import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
+import { businessSaveFolder } from '../test/save-root.js';
 import { buildCharter } from '../test/fixtures.js';
 import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { createServer, type DashboardOptions } from './server.js';
@@ -490,7 +491,7 @@ describe('/documents/settings', () => {
     const baseUrl = await start();
     const cookie = await login(baseUrl);
     const csrf = await csrfOf(baseUrl, cookie, '/documents/settings');
-    const res = await post(baseUrl, cookie, '/documents/settings', { csrf, toScreen: 'on', baseFolder: uploadRoot });
+    const res = await post(baseUrl, cookie, '/documents/settings', { csrf, toScreen: 'on', baseFolder: await businessSaveFolder(B) });
     expect(res.status).toBe(303);
     const saved = await withBusiness(B, (bdb) => loadDocumentSettings(bdb));
     expect(saved).toMatchObject({ toWhatsApp: false, toEmail: false, toScreen: true });

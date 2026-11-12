@@ -5,7 +5,6 @@
  */
 import { createHash } from 'node:crypto';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
@@ -19,6 +18,7 @@ import { LEDGER_COMMAND_WORDS } from '../ledger/whatsapp-command.js';
 import { addTypedRecipient, approveDocumentCard, createDocumentCard, loadDocumentCard } from '../production/card.js';
 import { advanceStage, createProduction, saveVersion, type ProductionDestination } from '../production/store.js';
 import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
+import { businessSaveFolder } from '../test/save-root.js';
 import { buildCharter } from '../test/fixtures.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { CANCEL_WORDS, CONFIRM_WORDS, REPLY_STOPLIST } from './command-confirm.js';
@@ -130,7 +130,7 @@ describe('the WhatsApp time gate inside approveDocumentCard', () => {
     await resetDatabase();
     await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({ version: 'v-gate' })));
     // A save option needs somewhere to save to (M4); the gate under test is time.
-    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { ...DOCUMENT_SETTINGS_DEFAULTS, baseFolder: tmpdir() }));
+    await withBusiness(B, async (bdb) => saveDocumentSettings(bdb, { ...DOCUMENT_SETTINGS_DEFAULTS, baseFolder: await businessSaveFolder(B) }));
   });
   afterAll(async () => {
     await rm(join(config.documentRoot, DIR), { recursive: true, force: true });

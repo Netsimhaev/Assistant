@@ -37,6 +37,7 @@ import type { BusinessDb } from '../db/pool.js';
 import { platformSecrets } from '../tenancy/platform-credentials.js';
 import { loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 import type { RuntimeSettings } from '../tenancy/runtime-settings.js';
+import { businessFolderUnder } from '../tenancy/paths.js';
 
 /** Which vendor's code serves a binding's system. Matches `ConnectionBinding.provider`. */
 const GOOGLE_PROVIDER = 'google';
@@ -111,9 +112,10 @@ export interface Runtime {
    */
   whatsapp?: { gateway: WhatsAppGateway };
   /**
-   * The folder this business's document inbox scans, present only when the
+   * The folder this business's document inbox scans,
+   * `<DOCUMENT_INBOX_ROOT>/<businessId>` (spec §5.8), present only when the
    * business turned its inbox on (`inbox_enabled`) AND the server has an inbox
-   * folder configured (`DOCUMENT_INBOX`). Absent means the scan and the
+   * root configured (`DOCUMENT_INBOX_ROOT`). Absent means the scan and the
    * conductor do not run for this business this pass — the same "a missing
    * setting is a switch, not a fault" rule `DOCUMENT_INBOX` stated alone
    * before settings moved into the database (spec §5.4).
@@ -242,8 +244,11 @@ export interface ServerRuntime {
   /** The composed source: the encrypted store, with OAuth grants minted on top. */
   readonly credentials: CredentialSource;
   readonly dashboardBaseUrl: string;
-  /** `DOCUMENT_INBOX`, or `null` when the server has no inbox folder at all. */
-  readonly documentInbox: string | null;
+  /**
+   * `DOCUMENT_INBOX_ROOT`, or `null` when the server has no inbox root at all.
+   * Each business's folder is `<this>/<businessId>` — never this root itself.
+   */
+  readonly documentInboxRoot: string | null;
   readonly production: { available: boolean; sofficePath: string | null; chromiumPath: string | null };
   /** What the SERVER could not assemble. A business's own warnings are on its `Runtime`. */
   readonly warnings: readonly string[];
@@ -370,7 +375,7 @@ export async function buildServerRuntime(
     credentials,
     // Empty is treated as unset, the same as every other env value read here.
     dashboardBaseUrl: envValue('DASHBOARD_BASE_URL') ?? DEFAULT_DASHBOARD_BASE_URL,
-    documentInbox: envValue('DOCUMENT_INBOX'),
+    documentInboxRoot: envValue('DOCUMENT_INBOX_ROOT'),
     production: { available: missingProduction.length === 0, ...production },
     warnings,
     overrides,
@@ -646,10 +651,11 @@ export async function businessRuntime(server: ServerRuntime, db: BusinessDb): Pr
   let inbox: string | undefined;
   if (!settings.inboxEnabled) {
     warnings.push(`no document inbox: inbox_enabled is off for this business`);
-  } else if (server.documentInbox === null) {
-    warnings.push(`no document inbox: inbox_enabled is on, but DOCUMENT_INBOX is not set on this server`);
+  } else if (server.documentInboxRoot === null) {
+    warnings.push(`no document inbox: inbox_enabled is on, but DOCUMENT_INBOX_ROOT is not set on this server`);
   } else {
-    inbox = server.documentInbox;
+    // This business's own folder under the server root, never the root.
+    inbox = businessFolderUnder(server.documentInboxRoot, businessId);
   }
 
   // Additive, on top of the mail adapter above: every system whose binding

@@ -9,6 +9,7 @@ import type { BusinessDb } from '../db/pool.js';
 import { evaluateToolCall } from '../policy/engine.js';
 import { ingestsExternalContent } from '../policy/classify.js';
 import { markContentIngested } from '../orchestrator/jobs.js';
+import { isFolderOfBusiness } from '../tenancy/paths.js';
 import { isPathWithin, readPathArgument, translateToolName } from './tool-names.js';
 
 export interface GateHookBinding {
@@ -77,6 +78,12 @@ export interface GateHookBinding {
    * gate at step 4 without risk scoring, without an audit row, and without the
    * outbound controls. This check is the only thing between an agent reading
    * an attacker's document and that document telling it to read `.env`.
+   *
+   * **The business's folder, `<DOCUMENT_ROOT>/<businessId>`, never the root**
+   * (`businessDocumentRoot`, spec §5.8). On a shared server the root holds
+   * every business's documents, and a read scoped to it would let an
+   * attacker's document in one business point the reader at another's.
+   * `createGateHook` refuses a root whose last segment is not `db.businessId`.
    */
   documentRoot: string;
   /** Injectable clock, for the quiet-hours step. Real time when omitted. */
@@ -104,6 +111,15 @@ export interface GateHookBinding {
  *                    resume from it.
  */
 export function createGateHook(binding: GateHookBinding) {
+  // Refused at construction, before the SDK runs at all: a reader handed the
+  // server root, or another business's folder, is a wiring fault, and a hook
+  // that denied each read instead would look like "the document said nothing".
+  if (!isFolderOfBusiness(binding.documentRoot, binding.db.businessId)) {
+    throw new Error(
+      `createGateHook: documentRoot must be the business folder <DOCUMENT_ROOT>/${binding.db.businessId} ` +
+        '(businessDocumentRoot), not the server root or another business folder',
+    );
+  }
   return function gateHook(input: unknown): Promise<HookJSONOutput> {
     return oneAtATime(binding.db, async () => {
       try {

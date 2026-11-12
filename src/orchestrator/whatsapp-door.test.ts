@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
+import { businessSaveFolder } from '../test/save-root.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { appendAudit } from '../audit/log.js';
@@ -46,7 +47,6 @@ import { createLedgerItem, loadLedgerItem } from '../ledger/store.js';
 import type { DocxSpec } from '../domain/document-spec.js';
 import { addTypedRecipient, createDocumentCard, loadDocumentCard, SAVE_NO_BASE_FOLDER_HE } from '../production/card.js';
 import { saveDocumentSettings } from '../governance/document-settings.js';
-import { tmpdir } from 'node:os';
 import { advanceStage, createProduction, saveVersion, type ProductionDestination } from '../production/store.js';
 import {
   DOCUMENT_CARD_FIX_OPENED,
@@ -2200,7 +2200,7 @@ describe('confirming a held command over WhatsApp', () => {
 
     it('"שמרי" approves the single save option', async () => {
       const cardId = await documentCard({ mode: 'send', to: ['dana@example.com'] });
-      await withBusiness(BUSINESS, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }));
+      await withBusiness(BUSINESS, async (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: await businessSaveFolder(BUSINESS) }));
       gateway.enqueue(reply('שמרי'));
       const result = await pass();
 

@@ -1199,6 +1199,7 @@ describe('failedText', () => {
     const codes = [
       'save_not_supported',
       'save_no_base_folder',
+      'save_base_outside_business',
       'save_not_found',
       'save_hash_mismatch',
       'save_name_mismatch',

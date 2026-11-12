@@ -19,12 +19,21 @@
  * every save — the setting is the owner's choice, not a guarantee about the
  * disk tomorrow.
  *
+ * **And it must sit inside this business's save folder on the server**,
+ * `<DOCUMENT_SAVE_ROOT>/<businessId>` (spec §5.8): on a shared server every
+ * business's folders are on one disk, and without this one owner could point
+ * her saves at a folder of another business. Compared as `realpath`s, so a
+ * link inside the business folder that leads out of it is refused too. A
+ * server with no `DOCUMENT_SAVE_ROOT` accepts no base folder at all.
+ * `doc.save` re-checks this at write time (`isInsideBusinessSaveRoot`).
+ *
  * An absent row reads as the defaults, and reading never writes one.
  */
 import { constants } from 'node:fs';
 import { access as fsAccess, realpath, stat } from 'node:fs/promises';
-import { isAbsolute } from 'node:path';
+import { isAbsolute, sep } from 'node:path';
 import type { BusinessDb } from '../db/pool.js';
+import { businessSaveRoot } from '../tenancy/paths.js';
 
 export interface DocumentSettings {
   toWhatsApp: boolean;
@@ -47,7 +56,32 @@ export const DOCUMENT_SETTINGS_HE = Object.freeze({
   missing: 'תיקיית הבסיס לא נמצאה',
   notDirectory: 'תיקיית הבסיס אינה תיקייה',
   notWritable: 'אין הרשאת כתיבה לתיקיית הבסיס',
+  outsideBusiness: 'התיקייה חייבת להיות בתוך התיקייה של העסק בשרת',
+  noServerRoot: 'לא הוגדרה בשרת תיקייה לשמירת מסמכים — אי אפשר להגדיר תיקיית בסיס',
 });
+
+/**
+ * Is `folder` — resolved through `realpath` — this business's save folder or
+ * inside it? False when the server has no save root, when the business
+ * folder does not exist, or when `folder` does not resolve. Shared by the
+ * setting and by `doc.save`, so the two can never disagree on "inside".
+ */
+export async function isInsideBusinessSaveRoot(folder: string, businessId: string): Promise<boolean> {
+  const root = businessSaveRoot(businessId);
+  if (root === null) return false;
+  let realRoot: string;
+  let realFolder: string;
+  try {
+    realRoot = await realpath(root);
+    realFolder = await realpath(folder);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+    throw err;
+  }
+  const prefix = realRoot.endsWith(sep) ? realRoot : realRoot + sep;
+  return realFolder === realRoot || realFolder.startsWith(prefix);
+}
 
 interface SettingsRow {
   to_whatsapp: boolean;
@@ -93,6 +127,7 @@ function isFullyQualified(path: string): boolean {
 /** The checked, resolved base folder, or a Hebrew refusal thrown as an `Error`. */
 async function checkedBaseFolder(
   raw: string | null,
+  businessId: string,
   access: (path: string, mode: number) => Promise<void>,
 ): Promise<string | null> {
   const folder = raw?.trim() ?? '';
@@ -112,6 +147,8 @@ async function checkedBaseFolder(
   } catch {
     throw new Error(DOCUMENT_SETTINGS_HE.notWritable);
   }
+  if (businessSaveRoot(businessId) === null) throw new Error(DOCUMENT_SETTINGS_HE.noServerRoot);
+  if (!(await isInsideBusinessSaveRoot(folder, businessId))) throw new Error(DOCUMENT_SETTINGS_HE.outsideBusiness);
   return realpath(folder);
 }
 
@@ -126,7 +163,7 @@ export async function saveDocumentSettings(
   if (!(settings.toWhatsApp || settings.toEmail || settings.toScreen)) {
     throw new Error(DOCUMENT_SETTINGS_HE.noChannel);
   }
-  const baseFolder = await checkedBaseFolder(settings.baseFolder, options.access ?? fsAccess);
+  const baseFolder = await checkedBaseFolder(settings.baseFolder, db.businessId, options.access ?? fsAccess);
   await db.query(
     `INSERT INTO document_settings (business_id, to_whatsapp, to_email, to_screen, base_folder)
      VALUES ($1, $2, $3, $4, $5)

@@ -3,7 +3,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { config } from '../config.js';
 import { resetDatabase } from '../test/db.js';
+import { scratchSaveFolder } from '../test/save-root.js';
 import {
   DOCUMENT_SETTINGS_DEFAULTS,
   DOCUMENT_SETTINGS_HE,
@@ -17,7 +19,8 @@ let scratch: string;
 
 beforeEach(async () => {
   await resetDatabase();
-  scratch = await mkdtemp(join(tmpdir(), 'doc-settings-'));
+  // Inside this business's save folder on the server (spec §5.8).
+  scratch = await scratchSaveFolder(B, 'doc-settings-');
 });
 afterEach(async () => {
   await rm(scratch, { recursive: true, force: true });
@@ -99,6 +102,37 @@ describe('document settings', () => {
     ).rejects.toThrow(DOCUMENT_SETTINGS_HE.notWritable);
     expect(calls).toHaveLength(1);
     expect(await rowCount()).toBe(0);
+  });
+
+  it('refuses a link inside the business folder that leads out of it', async () => {
+    const elsewhere = await mkdtemp(join(tmpdir(), 'doc-settings-elsewhere-'));
+    try {
+      await symlink(elsewhere, join(scratch, 'out'), process.platform === 'win32' ? 'junction' : 'dir');
+      await expect(
+        withBusiness(B, (bdb) => saveDocumentSettings(bdb, { ...channels, baseFolder: join(scratch, 'out') })),
+      ).rejects.toThrow(DOCUMENT_SETTINGS_HE.outsideBusiness);
+      expect(await rowCount()).toBe(0);
+    } finally {
+      await rm(join(scratch, 'out'), { force: true, recursive: false }).catch(() => undefined);
+      await rm(elsewhere, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts no base folder at all on a server with no DOCUMENT_SAVE_ROOT', async () => {
+    const mutable = config as { documentSaveRoot: string | null };
+    const original = mutable.documentSaveRoot;
+    mutable.documentSaveRoot = null;
+    try {
+      await expect(
+        withBusiness(B, (bdb) => saveDocumentSettings(bdb, { ...channels, baseFolder: scratch })),
+      ).rejects.toThrow(DOCUMENT_SETTINGS_HE.noServerRoot);
+      expect(await rowCount()).toBe(0);
+      // Clearing the folder still works: no root is needed to have none.
+      await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { ...channels, baseFolder: null }));
+      expect(await rowCount()).toBe(1);
+    } finally {
+      mutable.documentSaveRoot = original;
+    }
   });
 
   it('a null or blank base folder clears it', async () => {

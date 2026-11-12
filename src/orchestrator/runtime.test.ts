@@ -167,7 +167,7 @@ function approvalFixture(): ApprovalRequest {
 
 describe('businessRuntime — settings from the database', () => {
   it('a business with no settings row has no notify, no WhatsApp, no inbox, and says so in warnings', async () => {
-    const runtime = await build({ env: { ...FULL, DOCUMENT_INBOX: '/srv/inbox' }, settings: null, pass: null });
+    const runtime = await build({ env: { ...FULL, DOCUMENT_INBOX_ROOT: '/srv/inbox' }, settings: null, pass: null });
     expect(runtime.notify).toBeUndefined();
     expect(runtime.whatsapp).toBeUndefined();
     expect(runtime.inbox).toBeUndefined();
@@ -238,13 +238,29 @@ describe('businessRuntime — settings from the database', () => {
   });
 
   it('builds the inbox only when the business turned it on and the server has a folder', async () => {
-    const on = await build({ env: { ...FULL, DOCUMENT_INBOX: '/srv/inbox' }, settings: { inboxEnabled: true } });
-    expect(on.inbox).toBe('/srv/inbox');
+    const on = await build({ env: { ...FULL, DOCUMENT_INBOX_ROOT: '/srv/inbox' }, settings: { inboxEnabled: true } });
+    expect(on.inbox).toBe(join('/srv/inbox', BUSINESS));
     expect(on.warnings.join(' ')).not.toMatch(/no document inbox/);
 
     const noFolder = await build({ settings: { inboxEnabled: true } });
     expect(noFolder.inbox).toBeUndefined();
-    expect(noFolder.warnings.join(' ')).toMatch(/inbox_enabled is on, but DOCUMENT_INBOX is not set/);
+    expect(noFolder.warnings.join(' ')).toMatch(/inbox_enabled is on, but DOCUMENT_INBOX_ROOT is not set/);
+  });
+
+  it("inbox scans only the business's own subfolder, and none when inbox is disabled", async () => {
+    // One server root for both; each business's runtime names its OWN folder
+    // under it, never the root and never the other's.
+    const server = await buildServerRuntime({ ...FULL, DOCUMENT_INBOX_ROOT: '/srv/inbox' });
+    await saveSettings({ inboxEnabled: true }, BUSINESS);
+    await saveSettings({ inboxEnabled: true }, OTHER);
+    expect((await runtimeFor(server, BUSINESS)).inbox).toBe(join('/srv/inbox', BUSINESS));
+    expect((await runtimeFor(server, OTHER)).inbox).toBe(join('/srv/inbox', OTHER));
+
+    // Disabled: no folder at all, even though the server has a root.
+    await saveSettings({ inboxEnabled: false }, OTHER);
+    const off = await runtimeFor(server, OTHER);
+    expect(off.inbox).toBeUndefined();
+    expect(off.warnings.join(' ')).toMatch(/inbox_enabled is off/);
   });
 });
 

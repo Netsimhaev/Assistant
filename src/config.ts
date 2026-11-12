@@ -18,13 +18,19 @@ function required(name: string): string {
 /**
  * Absent means off, never a permissive default.
  *
- * `DOCUMENT_INBOX` unset is how an installation says "do not watch a folder".
+ * `DOCUMENT_INBOX_ROOT` unset is how a server says "do not watch a folder".
  * The scheduler reports it once and carries on, exactly as `buildRuntime`
  * treats absent SMTP settings — a missing setting is a switch, not a fault.
  */
 function optional(name: string): string | null {
   const value = process.env[name];
   return value === undefined || value === '' ? null : value;
+}
+
+/** `optional`, resolved to an absolute path once (see `documentRoot` below). */
+function optionalPath(name: string): string | null {
+  const value = optional(name);
+  return value === null ? null : resolve(value);
 }
 
 export function positiveInt(name: string, fallback: number): number {
@@ -164,7 +170,20 @@ export const config = {
   // passes one via `documentRoot` overrides), so this changes nothing for
   // them.
   documentRoot: resolve(required('DOCUMENT_ROOT')),
-  documentInbox: optional('DOCUMENT_INBOX'),
+  // The server-wide inbox root (spec §5.8). A business's inbox is
+  // `<DOCUMENT_INBOX_ROOT>/<businessId>` (`src/tenancy/paths.ts`), scanned only
+  // when the business turned `inbox_enabled` on. Renames `DOCUMENT_INBOX`, which
+  // named ONE folder for the one business an installation had. Unset = no
+  // business's inbox runs. The scheduler's runtime reads the same variable from
+  // its own env (`buildServerRuntime`), so this field mirrors it for readers that
+  // hold `config` only.
+  documentInboxRoot: optional('DOCUMENT_INBOX_ROOT'),
+  // The server-wide root every business's `doc.save` base folder must sit under:
+  // `saveDocumentSettings` refuses a folder outside `<DOCUMENT_SAVE_ROOT>/<businessId>`
+  // and `doc.save` re-checks it at write time (spec §5.8). Unset = no base folder
+  // is acceptable, so no save runs — never "anywhere on the disk". Resolved once,
+  // for the same reason `documentRoot` is.
+  documentSaveRoot: optionalPath('DOCUMENT_SAVE_ROOT'),
   documentReadsPerDay: positiveInt('DOCUMENT_READS_PER_DAY', 20),
   // Document productions per local day (charter zone), counting each draft
   // call: a new production and every fix attempt (src/production/loop.ts).

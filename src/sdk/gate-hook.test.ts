@@ -7,13 +7,20 @@ import type { PolicyBundle } from '../domain/policy.js';
 import type { AgentId } from '../domain/audit.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ulid } from 'ulid';
+import { config } from '../config.js';
+import { insertOrGetDocument, markExtracted } from '../documents/store.js';
+import { readDocument } from '../documents/read.js';
+import { businessDocumentRoot } from '../tenancy/paths.js';
 import { createGateHook } from './gate-hook.js';
 import { ALWAYS_DISALLOWED_SDK_TOOLS, isPathWithin, sdkToolsFor, translateToolName } from './tool-names.js';
-import { KNOW_READER_MODEL } from './know-reader.js';
+import { buildKnowReaderOptions, KNOW_READER_MODEL, type ReadRequest } from './know-reader.js';
 import { buildReadingSystemPrompt } from './reading-prompt.js';
 
 const BUSINESS = 'test-business';
-const DOCS = join(tmpdir(), 'assistant-docs');
+const OTHER_BUSINESS = 'other-business';
+/** This business's folder under a shared root — the only shape the gate accepts (spec §5.8). */
+const DOCS = join(tmpdir(), 'assistant-docs', BUSINESS);
 /** 12:00 Asia/Jerusalem — outside the fixture's quiet hours. */
 const NOON = new Date('2026-08-18T09:00:00.000Z');
 
@@ -195,6 +202,57 @@ describe('the gate hook', () => {
 
     expect(decision).toBe('deny');
     expect(reason).toContain('path_outside_document_root');
+  });
+
+  it("a reader for business A cannot open a path under business B's folder", async () => {
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+    const read = (filePath: string) => withBusiness(BUSINESS, async (db) => {
+      const hook = createGateHook({
+        agent: 'know.reader',
+        bundle,
+        provenance: 'unknown_external',
+        db,
+        jobId: null,
+        documentRoot: businessDocumentRoot(BUSINESS),
+        counterpartyTags: [],
+        rampLevel: 'auto',
+        now: NOON,
+      });
+      const out = await hook(preToolUse('Read', { file_path: filePath }));
+      if (!('hookSpecificOutput' in out) || out.hookSpecificOutput?.hookEventName !== 'PreToolUse') {
+        throw new Error('hook did not return PreToolUse output');
+      }
+      return out.hookSpecificOutput;
+    });
+
+    // B's stored document, by the absolute path its `stored_path` resolves to —
+    // a sibling of A's folder under the one server root.
+    const theirs = await read(join(businessDocumentRoot(OTHER_BUSINESS), 'DOC-1', 'original.pdf'));
+    expect(theirs.permissionDecision).toBe('deny');
+    expect(theirs.permissionDecisionReason).toContain('path_outside_document_root');
+    // And by a climb out of A's folder, which resolves to the same place.
+    const climbed = await read(join(businessDocumentRoot(BUSINESS), '..', OTHER_BUSINESS, 'DOC-1', 'original.pdf'));
+    expect(climbed.permissionDecision).toBe('deny');
+
+    // Control: A's own document is readable, so the denials above are the scope.
+    const mine = await read(join(businessDocumentRoot(BUSINESS), 'DOC-1', 'original.pdf'));
+    expect(mine.permissionDecision).toBe('allow');
+  });
+
+  it("refuses to build a hook scoped to the server root, or to another business's folder", async () => {
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+    for (const documentRoot of [config.documentRoot, businessDocumentRoot(OTHER_BUSINESS)]) {
+      await expect(withBusiness(BUSINESS, async (db) => createGateHook({
+        agent: 'know.reader',
+        bundle,
+        provenance: 'unknown_external',
+        db,
+        jobId: null,
+        documentRoot,
+        counterpartyTags: [],
+        rampLevel: 'auto',
+      }))).rejects.toThrow(/business folder/);
+    }
   });
 
   it('hands the SDK the redacted payload rather than the one proposed', async () => {
@@ -451,6 +509,44 @@ describe('what runKnowReader hands the SDK', () => {
     expect(prompt).toContain(charter.identity.tradeName);
     // The quarantine instruction is the whole point of this agent.
     expect(prompt).toMatch(/אינו אמין/);
+  });
+
+  it('the reader subprocess cwd is the business folder', async () => {
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+    const documentId = `DOC-${ulid()}`;
+    await withBusiness(BUSINESS, (db) => insertOrGetDocument(db, {
+      documentId,
+      source: 'manual',
+      originalName: 'a.txt',
+      mediaType: 'text/plain',
+      sha256: ulid().padEnd(64, '0'),
+      byteSize: 1,
+      storedPath: `${BUSINESS}/${documentId}/original.txt`,
+    }));
+    await withBusiness(BUSINESS, (db) => markExtracted(db, documentId, [
+      { ordinal: 0, kind: 'text', partName: 'גוף', content: { blocks: [{ kind: 'paragraph', text: 'x' }] }, flags: [] },
+    ]));
+
+    // `readDocument` is what hands the reader its root; the request it builds
+    // is captured, and the SDK options are built from exactly that request.
+    let captured: ReadRequest | null = null;
+    await withBusiness(BUSINESS, (db) => readDocument(
+      db,
+      { documentId, bundle, provenance: 'unknown_external', jobId: null },
+      {
+        reader: async (request) => {
+          captured = request;
+          return { status: 'unreadable', reason: 'stub', raw: '', denials: [], turns: 0 };
+        },
+      },
+    ));
+    const request = captured as ReadRequest | null;
+    if (request === null) throw new Error('the reader was never called');
+    expect(request.documentRoot).toBe(businessDocumentRoot(BUSINESS));
+
+    const options = buildKnowReaderOptions(request, () => undefined);
+    expect(options.cwd).toBe(businessDocumentRoot(BUSINESS));
+    expect(options.cwd).not.toBe(config.documentRoot);
   });
 
   it('offers no shell and no writing tools', () => {

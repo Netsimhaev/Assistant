@@ -11,8 +11,15 @@ import { basename, extname, join } from 'node:path';
 import { ulid } from 'ulid';
 import { ingestDocument } from '../documents/ingest.js';
 import type { BusinessDb } from '../db/pool.js';
+import { isFolderOfBusiness } from '../tenancy/paths.js';
 
 export interface ScanInboxOptions {
+  /**
+   * This business's inbox folder, `<DOCUMENT_INBOX_ROOT>/<businessId>` (spec
+   * §5.8) — `businessRuntime` builds it. Never the server root, which holds
+   * every business's folder: a scan of it would ingest another business's
+   * files under this one. Refused unless its last segment is `db.businessId`.
+   */
   inbox: string;
   documentRoot?: string;
 }
@@ -135,6 +142,14 @@ function claimNameFor(name: string): string {
  */
 export async function scanInbox(db: BusinessDb, options: ScanInboxOptions): Promise<ScanResult> {
   const { inbox } = options;
+  // Before anything is created or claimed: the server root, or another
+  // business's folder, is a wiring fault and nothing in it is ours to move.
+  if (!isFolderOfBusiness(inbox, db.businessId)) {
+    throw new Error(
+      `תיבת הקליטה שנמסרה לסריקה (${inbox}) אינה התיקייה של העסק — לא נסרק דבר. ` +
+        `התיקייה של העסק היא <DOCUMENT_INBOX_ROOT>/${db.businessId}.`,
+    );
+  }
   const scope = {
     ...(options.documentRoot !== undefined ? { documentRoot: options.documentRoot } : {}),
   };

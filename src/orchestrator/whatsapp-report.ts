@@ -332,6 +332,7 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
   // doc.save (document production §9.2, production/save.ts). All final.
   save_not_supported: 'אפשר לשמור קובץ רק ממסמך שאושר',
   save_no_base_folder: 'לא הוגדרה תיקיית בסיס לשמירה',
+  save_base_outside_business: 'תיקיית הבסיס אינה בתוך התיקייה של העסק בשרת',
   save_not_found: 'המסמך לשמירה לא נמצא',
   save_hash_mismatch: 'המסמך השתנה מאז שאושר ולא נשמר',
   save_name_mismatch: 'שם הקובץ אינו השם שאושר',

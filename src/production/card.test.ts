@@ -5,6 +5,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
 import { closePool, getPool, withBusiness, withBusinessTransaction } from '../db/pool.js';
 import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
+import { businessSaveFolder } from '../test/save-root.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { CharterConnection } from '../domain/connection.js';
@@ -50,7 +51,6 @@ import {
   SAVE_RETRY_PREFIX,
 } from './card.js';
 import { documentCardAlertKey } from '../orchestrator/runtime.js';
-import { tmpdir } from 'node:os';
 import { UNAUTHORISED_ADDRESS_NOTE } from './produce-input.js';
 import { PRODUCTION_TOOLS_MISSING_REASON } from './render-error.js';
 import {
@@ -407,7 +407,7 @@ describe('approveDocumentCard', () => {
     expect(await deliveryJobs()).toBe(0);
     expect((await withBusiness(B, (db) => loadDocumentCard(db, card.cardId)))?.state).toBe('open');
     // Control: the shown plan's hash does approve (a save: it needs a base folder).
-    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }));
+    await withBusiness(B, async (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: await businessSaveFolder(B) }));
     const ok = await withBusiness(B, (db) => approveDocumentCard(db, card.cardId, card.deliveryPlans[1]!.planHash, 'dashboard'));
     expect(ok.status).toBe('approved');
     expect((await withBusiness(B, (db) => loadDocumentCard(db, card.cardId)))?.state).toBe('saved');
@@ -456,7 +456,7 @@ describe('approveDocumentCard', () => {
     expect(await deliveryJobs()).toBe(0);
 
     // Save is allowed (once there is a base folder to save into).
-    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }));
+    await withBusiness(B, async (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: await businessSaveFolder(B) }));
     const saved = await withBusiness(B, (db) => approveDocumentCard(db, card.cardId, card.deliveryPlans[0]!.planHash, 'dashboard'));
     expect(saved).toMatchObject({ status: 'approved', option: 'save' });
     expect((await withBusiness(B, (db) => loadDocumentCard(db, card.cardId)))?.state).toBe('saved');
@@ -791,7 +791,7 @@ describe('card notices are each unique, and save needs a base folder', () => {
     expect((await withBusiness(B, (db) => loadDocumentCard(db, card.cardId)))?.state).toBe('open');
 
     // Control: the same option with a base folder set is approved.
-    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }));
+    await withBusiness(B, async (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: await businessSaveFolder(B) }));
     const approved = await withBusiness(B, (db) => approveDocumentCard(db, card.cardId, save.planHash, 'dashboard'));
     expect(approved).toMatchObject({ status: 'approved', option: 'save' });
   });
@@ -799,7 +799,7 @@ describe('card notices are each unique, and save needs a base folder', () => {
   it('M4: a returned save card says the SAVE did not complete, not the send', async () => {
     const { versionId } = await readyProduction({ destination: { mode: 'save', folder: null } });
     const card = await cardFor(versionId);
-    await withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: true, toEmail: false, toScreen: true, baseFolder: tmpdir() }));
+    await withBusiness(B, async (bdb) => saveDocumentSettings(bdb, { toWhatsApp: true, toEmail: false, toScreen: true, baseFolder: await businessSaveFolder(B) }));
     await approveAndFail(card.cardId, 'save');
     const messenger = createFakeMessenger();
     expect((await withBusiness(B, (db) => reraiseFailedDeliveries(db, { messenger }))).reraised).toHaveLength(1);

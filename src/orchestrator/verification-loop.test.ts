@@ -28,7 +28,7 @@
  * store, `resumeDelegatedJobs`, `closeVerifiedJobs` — is production code.
  */
 import { config } from '../config.js';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -48,6 +48,13 @@ import { schedulerPass } from './scheduler.js';
 import type { Runtime } from './runtime.js';
 
 const BUSINESS = 'biz-verification-loop';
+
+/** `<a fresh inbox root>/<BUSINESS>` — the only shape `scanInbox` accepts (spec §5.8). */
+async function businessInbox(prefix: string): Promise<string> {
+  const inbox = join(await mkdtemp(join(tmpdir(), prefix)), BUSINESS);
+  await mkdir(inbox);
+  return inbox;
+}
 
 /** Same shape the conductor's own tests use — a reading with one finding. */
 const READING: Reading = {
@@ -145,7 +152,7 @@ describe('the verification loop, end to end through schedulerPass', () => {
       // An explicit, empty inbox: both conductor loops sit behind the same
       // switch, and `.env` here does configure a real folder. Stating it keeps
       // this test off whatever happens to be sitting in the operator's inbox.
-      const inbox = await mkdtemp(join(tmpdir(), 'verif-loop-inbox-'));
+      const inbox = await businessInbox('verif-loop-inbox-');
 
       let judgeCalls = 0;
       const judge: Judge = async (request) => {
@@ -302,7 +309,7 @@ describe('the verification loop, end to end through schedulerPass', () => {
         { path, source: 'manual' },
         { documentRoot: dir },
       ));
-      const inbox = await mkdtemp(join(tmpdir(), 'verif-seam-inbox-'));
+      const inbox = await businessInbox('verif-seam-inbox-');
 
       let judgeCalls = 0;
       const judge: Judge = async () => {

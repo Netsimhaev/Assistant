@@ -23,7 +23,7 @@ const C = 'tenant-c';
 const SERVER: ServerRuntime = {
   credentials: envCredentials({}, 'TEST_CRED_'),
   dashboardBaseUrl: 'http://127.0.0.1:3000',
-  documentInbox: null,
+  documentInboxRoot: null,
   production: { available: false, sofficePath: null, chromiumPath: null },
   warnings: [],
   overrides: {},

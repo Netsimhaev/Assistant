@@ -7,10 +7,11 @@ import { config } from '../config.js';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { XlsxSpec } from '../domain/document-spec.js';
 import { documentKindLabel } from '../domain/labels.js';
-import { saveDocumentSettings } from '../governance/document-settings.js';
+import { DOCUMENT_SETTINGS_HE, saveDocumentSettings } from '../governance/document-settings.js';
 import { runLocalTool } from '../orchestrator/local-tools.js';
 import { StepChannelError } from '../orchestrator/step-error.js';
 import { resetDatabase } from '../test/db.js';
+import { scratchSaveFolder } from '../test/save-root.js';
 import { resolveSaveTarget, saveVersionToFolder, SAVE_FAILURE_HE } from './save.js';
 import { createProduction, saveVersion } from './store.js';
 
@@ -29,7 +30,10 @@ let base: string;
 let outside: string;
 
 beforeEach(async () => {
-  scratch = await mkdtemp(join(tmpdir(), 'doc-save-'));
+  // Inside this business's save folder (`<DOCUMENT_SAVE_ROOT>/<B>`, spec §5.8),
+  // so a base folder made here is one `saveDocumentSettings` accepts. `outside`
+  // is still outside `base`, which is all the link tests need of it.
+  scratch = await scratchSaveFolder(B, 'doc-save-');
   base = join(scratch, 'base');
   outside = join(scratch, 'outside');
   await mkdir(base);
@@ -381,6 +385,50 @@ describe('doc.save handler', () => {
     // Control: the approved version saves on the same job.
     const ok = await save({ producedVersionId: approved, sha256: sha(bytes), folder: 'x', filename: CANONICAL });
     expect(ok['performed']).toBe(true);
+  });
+
+  it('save settings refuse a folder of another business', async () => {
+    const theirs = await scratchSaveFolder(OTHER, 'theirs-');
+    const nowhere = await mkdtemp(join(tmpdir(), 'not-under-the-save-root-'));
+    try {
+      for (const baseFolder of [theirs, nowhere]) {
+        await expect(
+          withBusiness(B, (bdb) => saveDocumentSettings(bdb, { toWhatsApp: false, toEmail: true, toScreen: true, baseFolder })),
+        ).rejects.toThrow(DOCUMENT_SETTINGS_HE.outsideBusiness);
+      }
+      expect(DOCUMENT_SETTINGS_HE.outsideBusiness).toBe('התיקייה חייבת להיות בתוך התיקייה של העסק בשרת');
+      const { rows } = await getPool().query('SELECT 1 FROM document_settings WHERE business_id = $1', [B]);
+      expect(rows).toEqual([]);
+      // Control: the same call with this business's own folder is accepted.
+      await withBase();
+      const saved = await getPool().query<{ base_folder: string }>('SELECT base_folder FROM document_settings WHERE business_id = $1', [B]);
+      expect(saved.rows).toEqual([{ base_folder: await realpath(base) }]);
+    } finally {
+      await rm(theirs, { recursive: true, force: true });
+      await rm(nowhere, { recursive: true, force: true });
+    }
+  });
+
+  it('doc.save refuses a stored base folder that is outside the business root', async () => {
+    const versionId = await produced();
+    await deliveryCard(versionId);
+    // Written behind `saveDocumentSettings`'s back — a row from before the
+    // save root existed, or a server whose root moved. The write-time check
+    // is what stands between it and a save into another business's folder.
+    const theirs = await scratchSaveFolder(OTHER, 'theirs-');
+    try {
+      await getPool().query(
+        `INSERT INTO document_settings (business_id, to_whatsapp, to_email, to_screen, base_folder)
+         VALUES ($1, false, true, true, $2)`,
+        [B, await realpath(theirs)],
+      );
+      const err = await refusal({ producedVersionId: versionId, sha256: sha(bytes), folder: 'x', filename: CANONICAL });
+      expect(err.code).toBe('save_base_outside_business');
+      expect(err.message).toBe('התיקייה חייבת להיות בתוך התיקייה של העסק בשרת');
+      expect(await tree(theirs)).toEqual([]);
+    } finally {
+      await rm(theirs, { recursive: true, force: true });
+    }
   });
 
   it('refuses when no base folder is configured', async () => {

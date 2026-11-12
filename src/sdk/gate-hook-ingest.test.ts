@@ -11,7 +11,8 @@ import type { AgentId } from '../domain/audit.js';
 import { createGateHook } from './gate-hook.js';
 
 const BUSINESS = 'test-business';
-const DOCS = join(tmpdir(), 'assistant-docs');
+/** This business's folder under a shared root — the only shape the gate accepts (spec §5.8). */
+const DOCS = join(tmpdir(), 'assistant-docs', BUSINESS);
 /** 12:00 Asia/Jerusalem — outside the fixture's quiet hours. */
 const NOON = new Date('2026-08-18T09:00:00.000Z');
 

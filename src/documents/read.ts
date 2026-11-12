@@ -41,7 +41,7 @@
 
 import { createHash } from 'node:crypto';
 import { ulid } from 'ulid';
-import { config } from '../config.js';
+import { businessDocumentRoot, businessFolderUnder } from '../tenancy/paths.js';
 import type { BusinessDb } from '../db/pool.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { Reading } from '../domain/reading.js';
@@ -74,6 +74,10 @@ export interface ReadDocumentInput {
 }
 
 export interface ReadDocumentOptions {
+  /**
+   * The server-wide store root (`config.documentRoot` when unset). The reader
+   * is scoped to `<this>/<businessId>`, never to the root itself.
+   */
   documentRoot?: string;
   /**
    * The one step that costs money, injectable so the composition can be tested
@@ -117,7 +121,15 @@ export async function readDocument(
   options: ReadDocumentOptions = {},
 ): Promise<ReadDocumentResult> {
   const businessId = db.businessId;
-  const documentRoot = options.documentRoot ?? config.documentRoot;
+  // The READER's root is this business's folder, never the server root (spec
+  // §5.8): `options.documentRoot` (or `config.documentRoot`) is the store root
+  // every `stored_path` is relative to, and `stored_path` already begins with
+  // the business — so the reader's scope is that root joined with this
+  // business, the same folder every one of its documents sits in.
+  const documentRoot =
+    options.documentRoot !== undefined
+      ? businessFolderUnder(options.documentRoot, businessId)
+      : businessDocumentRoot(businessId);
   const reader = options.reader ?? runKnowReader;
 
   const artifacts = await loadArtifacts(db, input.documentId);

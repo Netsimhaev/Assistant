@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getPool, withBusiness } from '../db/pool.js';
@@ -31,9 +31,12 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 });
 
 const BUSINESS = 'biz-scan';
+const OTHER = 'biz-scan-other';
 
+/** `<inbox root>/<businessId>` — the only shape `scanInbox` accepts (spec §5.8). */
 async function anInbox(): Promise<{ inbox: string; documentRoot: string }> {
-  const inbox = await mkdtemp(join(tmpdir(), 'inbox-'));
+  const inbox = join(await mkdtemp(join(tmpdir(), 'inbox-')), BUSINESS);
+  await mkdir(inbox);
   const documentRoot = await mkdtemp(join(tmpdir(), 'docroot-'));
   return { inbox, documentRoot };
 }
@@ -41,6 +44,39 @@ async function anInbox(): Promise<{ inbox: string; documentRoot: string }> {
 describe('scanInbox', () => {
   beforeEach(async () => {
     await resetDatabase();
+  });
+
+  it("scans only the business's own subfolder", async () => {
+    const root = await mkdtemp(join(tmpdir(), 'inbox-root-'));
+    const mine = join(root, BUSINESS);
+    const theirs = join(root, OTHER);
+    await mkdir(mine);
+    await mkdir(theirs);
+    await writeFile(join(mine, 'mine.txt'), 'שלי', 'utf8');
+    await writeFile(join(theirs, 'theirs.txt'), 'שלהם', 'utf8');
+    await writeFile(join(root, 'loose.txt'), 'בשורש', 'utf8');
+    const documentRoot = await mkdtemp(join(tmpdir(), 'docroot-'));
+
+    const result = await withBusiness(BUSINESS, (db) => scanInbox(db, { inbox: mine, documentRoot }));
+    expect(result.ingested).toBe(1);
+    // The other business's folder and the root itself are untouched.
+    expect(await readdir(theirs)).toEqual(['theirs.txt']);
+    expect((await readdir(root)).sort()).toEqual([BUSINESS, OTHER, 'loose.txt'].sort());
+
+    // Handed another business's folder, or the server root, the scan refuses
+    // before it creates or claims anything.
+    for (const wrong of [theirs, root]) {
+      await expect(withBusiness(BUSINESS, (db) => scanInbox(db, { inbox: wrong, documentRoot }))).rejects.toThrow(
+        /אינה התיקייה של העסק/,
+      );
+    }
+    expect(await readdir(theirs)).toEqual(['theirs.txt']);
+    expect((await readdir(root)).sort()).toEqual([BUSINESS, OTHER, 'loose.txt'].sort());
+
+    const { rows } = await getPool().query<{ business_id: string; original_name: string }>(
+      `SELECT business_id, original_name FROM documents ORDER BY original_name`,
+    );
+    expect(rows).toEqual([{ business_id: BUSINESS, original_name: 'mine.txt' }]);
   });
 
   it('ingests a file and moves it to processed', async () => {
