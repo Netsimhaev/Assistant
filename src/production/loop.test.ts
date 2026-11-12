@@ -15,12 +15,12 @@ import { join } from 'node:path';
 import mammoth from 'mammoth';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import type { DocumentSpec, DocxSpec, PdfSpec } from '../domain/document-spec.js';
 import { createJob, loadJob, transition } from '../orchestrator/jobs.js';
 import type { DraftRequest, Drafter } from '../sdk/doc-drafter.js';
 import type { DocJudge } from '../sdk/doc-judge.js';
-import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
+import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { runCheck1, type Check1Input } from './check1.js';
 import {
@@ -167,7 +167,7 @@ describe('runDocumentProductions', () => {
     expect(p?.attempt).toBe(0);
     expect(p?.work.finished).toBe(true);
 
-    const { rows } = await getPool().query('SELECT * FROM document_versions WHERE production_id = $1', [id]);
+    const { rows } = await testDb().query('SELECT * FROM document_versions WHERE production_id = $1', [id]);
     expect(rows).toHaveLength(1);
     const version = await withBusiness(TEST_BUSINESS, (db) => latestVersion(db, id));
     const bytes = await readFile(join(root, version!.storedPath));
@@ -183,7 +183,7 @@ describe('runDocumentProductions', () => {
     expect(r.finished).toEqual([{ productionId: id, versionId: version!.versionId, stage: 'ready', reason: null }]);
 
     // The audit row carries no content: no title, no instruction, no file name.
-    const audit = await getPool().query<{ reason: string; input_hash: string }>(
+    const audit = await testDb().query<{ reason: string; input_hash: string }>(
       `SELECT reason, input_hash FROM audit_log WHERE kind = 'document_production'`,
     );
     expect(audit.rows).toHaveLength(1);
@@ -206,7 +206,7 @@ describe('runDocumentProductions', () => {
     expect(drafter.calls[1]!.previous?.spec.title).toBe(BAD_TITLE);
     expect(drafter.calls[1]!.previous?.findings.some((f) => f.he.includes('המסמך ארוך מהמותר'))).toBe(true);
     expect(drafter.calls[1]!.fixInstruction).toBeUndefined();
-    const { rows } = await getPool().query<{ version_no: number }>(
+    const { rows } = await testDb().query<{ version_no: number }>(
       'SELECT version_no FROM document_versions WHERE production_id = $1 ORDER BY version_no',
       [id],
     );
@@ -257,7 +257,7 @@ describe('runDocumentProductions', () => {
     expect(resumed).toMatchObject({ ready: 1, errored: [] });
     expect(drafter.calls).toHaveLength(1);
     // Resumed: building re-used version 1 (no second version), then check1 and check2 ran.
-    const { rows } = await getPool().query('SELECT 1 FROM document_versions WHERE production_id = $1', [id]);
+    const { rows } = await testDb().query('SELECT 1 FROM document_versions WHERE production_id = $1', [id]);
     expect(rows).toHaveLength(1);
     expect(second.renderer.calls).toHaveLength(1);
   });
@@ -304,7 +304,7 @@ describe('runDocumentProductions', () => {
     // Twenty draft calls already today (local midnight 2026-11-03T22:00Z).
     for (let i = 0; i < 20; i += 1) {
       const { id } = await produce();
-      await getPool().query(
+      await testDb().query(
         `UPDATE document_productions SET stage = 'ready', work = $2, created_at = '2026-11-04T05:00:00Z' WHERE production_id = $1`,
         [id, { ...EMPTY_WORK, drafted: true, finished: true }],
       );
@@ -327,7 +327,7 @@ describe('runDocumentProductions', () => {
   it('the 20th is not refused (the cap counts calls already made)', async () => {
     for (let i = 0; i < 19; i += 1) {
       const { id } = await produce();
-      await getPool().query(
+      await testDb().query(
         `UPDATE document_productions SET stage = 'ready', work = $2, created_at = '2026-11-04T05:00:00Z' WHERE production_id = $1`,
         [id, { ...EMPTY_WORK, drafted: true, finished: true }],
       );
@@ -527,12 +527,12 @@ describe('fix round 1', () => {
 
   it('invariant breaks end failed with render_failed, never an endless errored', async () => {
     const noDraft = await produce();
-    await getPool().query(`UPDATE document_productions SET stage = 'building', work = $2 WHERE production_id = $1`, [
+    await testDb().query(`UPDATE document_productions SET stage = 'building', work = $2 WHERE production_id = $1`, [
       noDraft.id,
       { ...EMPTY_WORK, drafted: true, memoryIds: [] },
     ]);
     const noVersion = await produce();
-    await getPool().query(`UPDATE document_productions SET stage = 'check1', work = $2 WHERE production_id = $1`, [
+    await testDb().query(`UPDATE document_productions SET stage = 'check1', work = $2 WHERE production_id = $1`, [
       noVersion.id,
       { ...EMPTY_WORK, drafted: true, memoryIds: [] },
     ]);

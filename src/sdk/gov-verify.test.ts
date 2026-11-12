@@ -2,8 +2,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { PolicyBundle } from '../domain/policy.js';
@@ -96,7 +96,7 @@ const throwingJudge: Judge = async () => {
 };
 
 async function stepResultCount(jobId: string): Promise<number> {
-  const { rows } = await getPool().query<{ n: string }>(
+  const { rows } = await testDb().query<{ n: string }>(
     'SELECT count(*)::text AS n FROM job_step_results WHERE business_id = $1 AND job_id = $2',
     [BUSINESS, jobId],
   );

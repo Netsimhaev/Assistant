@@ -33,8 +33,7 @@ import { randomBytes, randomUUID, scrypt as scryptCb } from 'node:crypto';
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { appendAudit } from '../audit/log.js';
-import { config } from '../config.js';
-import { acquireAdvisoryLock, closePool, withBusiness, withBusinessTransaction, type Queryable, type BusinessDb } from '../db/pool.js';
+import { acquireAdvisoryLock, closePool, type Queryable, type BusinessDb } from '../db/pool.js';
 import { ROTATION_LOCK_SCOPE } from '../governance/credential-store.js';
 import {
   KEY_BYTES,
@@ -43,7 +42,7 @@ import {
   writeKeyState,
 } from '../governance/master-key.js';
 import { grantAad } from '../governance/oauth-grants.js';
-import { withPlatform } from '../db/platform-pool.js';
+import { closePlatformPool, withPlatform } from '../db/platform-pool.js';
 import { platformAad } from '../tenancy/platform-credentials.js';
 import { decryptSecret, encryptSecret } from '../governance/secret-cipher.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -65,6 +64,20 @@ const scrypt = promisify(scryptCb) as (
 const RECOVERY_AAD_REF = 'key-recovery';
 
 /**
+ * The business half of the recovery copy's authenticated data. The key is the
+ * server's (spec §5.9), so a copy sealed from now on names no business: `''`,
+ * a value no business id (`^[a-z0-9-]{3,63}$`) can take — the same choice
+ * `master-key.ts` makes for the key check.
+ *
+ * A copy sealed before the key moved to the server was sealed under the
+ * business the installation was configured for. That copy belongs to the key
+ * whose check row migration 067 carried over, and that row names the same
+ * business in `check_business_id` — so `restore` opens a copy under the
+ * business the server's key state names, and finds the old copies too.
+ */
+const SERVER_RECOVERY_BUSINESS = '';
+
+/**
  * What a rotation did, carried on `RotationAuditUnrecordedError` so an
  * operator can reconstruct the record by hand.
  *
@@ -83,7 +96,8 @@ const RECOVERY_AAD_REF = 'key-recovery';
  * which loop stalled if only one of them actually ran.
  */
 export interface RotationOutcome {
-  businessId: string;
+  /** Every registered business, whose audit trail the record was meant for. */
+  businesses: readonly string[];
   previousKeyId: string | null;
   newKeyId: string;
   secretsReEncrypted: number;
@@ -126,7 +140,7 @@ export class RotationAuditUnrecordedError extends Error {
       `החלפת המפתח בוצעה במלואה ורשומת הביקורת עליה נכשלה. ההחלפה בתוקף: ` +
         `${outcome.secretsReEncrypted} סודות, ${outcome.grantsReEncrypted} הרשאות ו-` +
         `${outcome.platformSecretsReEncrypted} סודות שרת הוצפנו ` +
-        `מחדש עבור "${outcome.businessId}", ` +
+        `מחדש בשרת (העסקים: ${outcome.businesses.length === 0 ? 'אין' : outcome.businesses.join(', ')}), ` +
         `מהמפתח ${outcome.previousKeyId ?? '(לא ידוע)'} אל המפתח ${outcome.newKeyId}, ` +
         `וקובץ המפתח ועותק השחזור כבר נכתבו — אל תריץ rotate שוב. מה שחסר הוא רק ` +
         `הרישום, ויש להשלים אותו ידנית.`,
@@ -154,7 +168,6 @@ export interface SecretKeyCliDeps {
   /** Where the live key file lives. Injected rather than read from an env
    * var here, so a test never touches `process.env`. */
   keyPath: string;
-  businessId?: string;
 }
 
 const COMMANDS = ['create', 'rotate', 'restore'] as const;
@@ -196,27 +209,32 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-/** Whether this installation already has an active key, independent of
+/** Whether this server already has an active key, independent of
  * whether the file at `keyPath` happens to exist. A file can be moved or
  * deleted without the database forgetting it ever sealed anything — `create`
  * must refuse on either signal, not just the one a mistyped path would hide. */
-async function keyStateExists(businessId: string, db: Queryable): Promise<boolean> {
-  const { rows } = await db.query(
-    'SELECT 1 FROM credential_key_state WHERE business_id = $1',
-    [businessId],
-  );
+async function keyStateExists(db: Queryable): Promise<boolean> {
+  const { rows } = await db.query('SELECT 1 FROM server_key_state');
   return rows.length > 0;
 }
 
-async function sealRecoveryCopy(
-  key: Buffer,
-  passphrase: string,
-  businessId: string,
-): Promise<RecoveryFile> {
+/**
+ * The business the server's key state was sealed for: `''` for every row the
+ * server writes, the old configured business for a row migration 067 carried
+ * over (see `SERVER_RECOVERY_BUSINESS`). `''` when there is no row at all.
+ */
+async function keyStateBusiness(db: Queryable): Promise<string> {
+  const { rows } = await db.query<{ check_business_id: string }>(
+    'SELECT check_business_id FROM server_key_state',
+  );
+  return rows[0]?.check_business_id ?? SERVER_RECOVERY_BUSINESS;
+}
+
+async function sealRecoveryCopy(key: Buffer, passphrase: string): Promise<RecoveryFile> {
   const salt = randomBytes(16).toString('hex');
   const derived = await scrypt(passphrase, salt, KEY_BYTES);
   const sealed = encryptSecret(key.toString('base64'), derived, {
-    businessId,
+    businessId: SERVER_RECOVERY_BUSINESS,
     ref: RECOVERY_AAD_REF,
   });
   return {
@@ -255,19 +273,61 @@ async function openRecoveryCopy(
   return key;
 }
 
-async function auditKeyAction(params: {
-  businessId: string;
-  operator: string;
-  action: Command;
-  reason: string;
-  /** Joins the caller's transaction when given, so "the key exists" and "the
-   * key was recorded" commit together. Omitted, the audit row is written on
-   * its own connection — see `rotate` for the one place that is deliberate. */
-  tx?: BusinessDb;
-}): Promise<void> {
-  const write = (bdb: BusinessDb) => appendAudit(
-    bdb,
-    {
+/**
+ * One transaction on the platform pool — `withBusinessTransaction`'s shape, on
+ * the login that reaches every business's rows and the server's own table.
+ */
+async function withPlatformTransaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
+  return withPlatform(async (tx) => {
+    await tx.query('BEGIN');
+    try {
+      const result = await fn(tx);
+      await tx.query('COMMIT');
+      return result;
+    } catch (error) {
+      await tx.query('ROLLBACK').catch(() => {
+        // A broken connection; the original error is the one worth reporting.
+      });
+      throw error;
+    }
+  });
+}
+
+/** Every registered business, in byte order — whose trails a key action is recorded in. */
+async function registeredBusinesses(tx: Queryable): Promise<string[]> {
+  const { rows } = await tx.query<{ business_id: string }>(
+    'SELECT business_id FROM businesses ORDER BY business_id COLLATE "C"',
+  );
+  return rows.map((row) => row.business_id);
+}
+
+/**
+ * Record a key action in the audit trail of EVERY registered business, on the
+ * caller's platform transaction.
+ *
+ * The key is the server's (spec §5.9), so a key action has no one owning
+ * business — but it is not nobody's business either: every business's
+ * secrets are sealed under that key, and a rotation re-seals every one of
+ * them. So each business's own chain carries the row, rather than none
+ * (the ruling for a platform SECRET, which no business's data depends on, is
+ * a trace on the row and a stderr line instead — R12). A server with no
+ * registered business yet records no row; the stderr line below is then the
+ * whole trace.
+ *
+ * `appendAudit` takes a `BusinessDb`; here it is a view of the platform
+ * transaction naming one registered business at a time — the platform login
+ * is the one that may write any business's rows, and every row joins `tx`, so
+ * "the key exists" and "the key was recorded" commit together. Returns the
+ * businesses recorded.
+ */
+async function auditKeyAction(
+  tx: Queryable,
+  params: { operator: string; action: Command; reason: string },
+): Promise<string[]> {
+  const businesses = await registeredBusinesses(tx);
+  for (const businessId of businesses) {
+    const view: BusinessDb = { businessId, inTransaction: true, query: tx.query.bind(tx) as Queryable['query'] };
+    await appendAudit(view, {
       actor: 'human',
       onBehalfOf: params.operator,
       kind: 'credential_change',
@@ -277,13 +337,16 @@ async function auditKeyAction(params: {
       provenance: 'boss',
       inputHash: canonicalHash({
         action: params.action,
-        businessId: params.businessId,
+        businessId,
         operator: params.operator,
       }),
       reason: params.reason,
-    },
-  );
-  await (params.tx !== undefined ? write(params.tx) : withBusiness(params.businessId, write)); // TENANCY-TODO(task 12)
+    });
+  }
+  // The operator's own trace, beside the rows — and the whole trace on a
+  // server with no business yet. Never the key, never a secret.
+  console.error(`secret-key ${params.action} — מפעיל: ${params.operator}`);
+  return businesses;
 }
 
 /**
@@ -351,8 +414,6 @@ async function readNewPassphrase(deps: SecretKeyCliDeps): Promise<string> {
  * both, not a second printout.
  */
 async function create(deps: SecretKeyCliDeps, operator: string): Promise<void> {
-  const businessId = deps.businessId ?? config.businessId; // TENANCY-TODO(task 12)
-
   // **Input first, before anything is written anywhere.** The passphrase is
   // pure input and costs nothing to collect early — and collecting it late
   // cost two of the three survivability layers. Read after the key file and
@@ -370,7 +431,7 @@ async function create(deps: SecretKeyCliDeps, operator: string): Promise<void> {
 
   const key = randomBytes(KEY_BYTES);
   const keyId = `KEY-${randomUUID()}`;
-  const recovery = await sealRecoveryCopy(key, passphrase, businessId);
+  const recovery = await sealRecoveryCopy(key, passphrase);
 
   // One transaction, holding `ROTATION_LOCK_SCOPE` — the identical lock
   // `putSecret` and `rotate` take. `pathExists`/`keyStateExists` are
@@ -380,7 +441,12 @@ async function create(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   // naming different keys. One operator runs this tool, which is why this was
   // a low finding and not a high one, but check-then-write under a lock that
   // already exists costs nothing.
-  await withBusinessTransaction(businessId, async (tx: BusinessDb) => { // TENANCY-TODO(task 12)
+  //
+  // On the PLATFORM pool: `server_key_state` is the server's, not any
+  // business's, and the audit rows below go into every registered business's
+  // trail — the platform login is the one that may write them all, in this
+  // one transaction.
+  await withPlatformTransaction(async (tx: Queryable) => {
     await acquireAdvisoryLock(tx, ROTATION_LOCK_SCOPE);
 
     // Refuse, do not prompt (task requirement). Checked BEFORE any write:
@@ -397,27 +463,25 @@ async function create(deps: SecretKeyCliDeps, operator: string): Promise<void> {
           `לשחזר קובץ שאבד, הרץ restore.`,
       );
     }
-    if (await keyStateExists(businessId, tx)) {
+    if (await keyStateExists(tx)) {
       throw new Error(
-        `להתקנה של "${businessId}" כבר יש מפתח פעיל רשום בבסיס הנתונים, גם אם הקובץ ` +
+        `לשרת כבר יש מפתח פעיל רשום בבסיס הנתונים, גם אם הקובץ ` +
           `בנתיב "${deps.keyPath}" חסר — יצירת מפתח חדש הייתה מייתמת כל סוד שכבר נשמר. ` +
           `הרץ restore אם הכוונה היא לשחזר קובץ שאבד.`,
       );
     }
 
-    await writeKeyState(key, keyId, { businessId, db: tx });
+    await writeKeyState(key, keyId, tx);
 
     // Inside the transaction, so "a key exists" and "a key was recorded"
     // commit together — spec §6.4 says every tool action is audited ALWAYS,
     // and an audit row written last is a row any throw above it skips. Cheap
     // here: `create` holds the audit lock for two statements, not for a whole
     // re-encryption pass (contrast `rotate` below).
-    await auditKeyAction({
-      businessId,
+    await auditKeyAction(tx, {
       operator,
       action: 'create',
-      reason: `מפתח חדש (${keyId}) נוצר עבור ${businessId} על ידי ${operator}`,
-      tx,
+      reason: `מפתח חדש לשרת (${keyId}) נוצר על ידי ${operator}`,
     });
 
     // The two file writes come last, still inside the lock. They are not
@@ -447,8 +511,6 @@ async function create(deps: SecretKeyCliDeps, operator: string): Promise<void> {
 }
 
 async function restore(deps: SecretKeyCliDeps, operator: string): Promise<void> {
-  const businessId = deps.businessId ?? config.businessId; // TENANCY-TODO(task 12)
-
   if (await pathExists(deps.keyPath)) {
     throw new Error(
       `כבר קיים קובץ מפתח בנתיב "${deps.keyPath}" — שחזור לתוכו היה עלול לדרוס מפתח ` +
@@ -476,45 +538,28 @@ async function restore(deps: SecretKeyCliDeps, operator: string): Promise<void> 
   if (passphrase.length === 0) {
     throw new Error('לא הוקלדה סיסמה — עותק השחזור לא נפתח, ושום דבר לא נכתב.');
   }
-  const key = await openRecoveryCopy(file, passphrase, businessId);
+  // On the platform pool: the key state is the server's row. Read-only up to
+  // the file write, so the copy is opened and checked before anything is written.
+  await withPlatformTransaction(async (tx: Queryable) => {
+    const key = await openRecoveryCopy(file, passphrase, await keyStateBusiness(tx));
 
-  // Belt and braces: confirm this is genuinely the key this installation's
-  // rows were sealed with before it is written back as the live key. A
-  // recovery copy could in principle be stale (kept from a key that was
-  // later rotated away) — `verifyKeyState` is the same check `buildRuntime`
-  // runs at startup, run here before anything touches disk.
-  await verifyKeyState(key, { businessId });
+    // Belt and braces: confirm this is genuinely the key this server's
+    // rows were sealed with before it is written back as the live key. A
+    // recovery copy could in principle be stale (kept from a key that was
+    // later rotated away) — `verifyKeyState` is the same check `buildRuntime`
+    // runs at startup, run here before anything touches disk.
+    await verifyKeyState(key, tx);
 
-  await writeFile(deps.keyPath, key, { mode: 0o600 });
+    await writeFile(deps.keyPath, key, { mode: 0o600 });
 
-  await auditKeyAction({
-    businessId,
-    operator,
-    action: 'restore',
-    reason: `המפתח שוחזר עבור ${businessId} מעותק השחזור על ידי ${operator}`,
+    await auditKeyAction(tx, {
+      operator,
+      action: 'restore',
+      reason: `מפתח השרת שוחזר מעותק השחזור על ידי ${operator}`,
+    });
   });
 
   deps.log('המפתח שוחזר בהצלחה מעותק השחזור.');
-}
-
-/**
- * One transaction on the platform pool — `withTransaction`'s shape, on the
- * login that reaches every business's rows and the server's own table.
- */
-async function withPlatformTransaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
-  return withPlatform(async (tx) => {
-    await tx.query('BEGIN');
-    try {
-      const result = await fn(tx);
-      await tx.query('COMMIT');
-      return result;
-    } catch (error) {
-      await tx.query('ROLLBACK').catch(() => {
-        // A broken connection; the original error is the one worth reporting.
-      });
-      throw error;
-    }
-  });
 }
 
 interface CredentialRow {
@@ -543,8 +588,9 @@ interface PlatformSecretRow {
  * would open only with the old key, some only with the new, and no single
  * key would open the installation.
  *
- * All twelve — every business, since one installation has exactly one live
- * key today (spec §2.3) — are re-encrypted **in one transaction**: a
+ * Every row of every business — the server has exactly one live key, and
+ * every business's secrets are sealed under it (spec §5.9) — is re-encrypted
+ * **in one transaction**: a
  * failure partway rolls the database back to exactly what it was before
  * rotation started, rather than leaving a mix. The same transaction takes
  * `ROTATION_LOCK_SCOPE`, the identical advisory lock `putSecret`
@@ -572,10 +618,8 @@ interface PlatformSecretRow {
  * connection and one all-or-nothing commit.
  */
 async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
-  const businessId = deps.businessId ?? config.businessId; // TENANCY-TODO(task 12)
-
   const oldKey = await loadMasterKey(deps.keyPath);
-  await verifyKeyState(oldKey, { businessId });
+  await withPlatform((db) => verifyKeyState(oldKey, db));
 
   const newKey = randomBytes(KEY_BYTES);
   const newKeyId = `KEY-${randomUUID()}`;
@@ -593,7 +637,7 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   // rotate at all — this is before the first WRITE, which is the property
   // that matters.
   const passphrase = await readNewPassphrase(deps);
-  const recovery = await sealRecoveryCopy(newKey, passphrase, businessId);
+  const recovery = await sealRecoveryCopy(newKey, passphrase);
 
   const { rotated, grantsRotated, platformRotated, previousKeyId } = await withPlatformTransaction(async (tx: Queryable) => {
     await acquireAdvisoryLock(tx, ROTATION_LOCK_SCOPE);
@@ -602,8 +646,7 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
     // retired is half of what an operator needs to reconstruct the audit row
     // by hand if the append below fails, and after the upsert it is gone.
     const { rows: stateRows } = await tx.query<{ key_id: string }>(
-      'SELECT key_id FROM credential_key_state WHERE business_id = $1',
-      [businessId],
+      'SELECT key_id FROM server_key_state',
     );
     const previous = stateRows[0]?.key_id ?? null;
 
@@ -632,7 +675,7 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
 
     // The same loop for grants. A new table that is not wired here means a key
     // rotation silently kills every connection: the row stays sealed under the
-    // old key while `credential_key_state` says otherwise, and nothing throws
+    // old key while `server_key_state` says otherwise, and nothing throws
     // until the next refresh. This is the defect class erasure was burned by
     // twice, and `connector-invariants.test.ts` is what keeps it closed.
     const { rows: grantRows } = await tx.query<GrantRow>(
@@ -679,7 +722,7 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
       );
     }
 
-    await writeKeyState(newKey, newKeyId, { businessId, db: tx });
+    await writeKeyState(newKey, newKeyId, tx);
     return {
       rotated: rows.length,
       grantsRotated: grantRows.length,
@@ -723,19 +766,22 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   // — never a raw database error the operator reads as "it failed", and never
   // silence. An operator who reads this as failure runs `rotate` again, which
   // rotates a second time on top of a rotation nobody recorded.
+  let businesses: readonly string[] = [];
   try {
-    await auditKeyAction({
-      businessId,
-      operator,
-      action: 'rotate',
-      reason:
-        `המפתח הוחלף (${newKeyId}) עבור ${businessId} על ידי ${operator} — ` +
-        `${rotated} סודות, ${grantsRotated} הרשאות ו-${platformRotated} סודות שרת הוצפנו מחדש`,
+    await withPlatformTransaction(async (tx: Queryable) => {
+      businesses = await registeredBusinesses(tx);
+      await auditKeyAction(tx, {
+        operator,
+        action: 'rotate',
+        reason:
+          `מפתח השרת הוחלף (${newKeyId}) על ידי ${operator} — ` +
+          `${rotated} סודות, ${grantsRotated} הרשאות ו-${platformRotated} סודות שרת הוצפנו מחדש`,
+      });
     });
   } catch (error) {
     throw new RotationAuditUnrecordedError(
       {
-        businessId,
+        businesses,
         previousKeyId,
         newKeyId,
         secretsReEncrypted: rotated,
@@ -799,5 +845,6 @@ if (isEntrypoint) {
     console.error(err instanceof Error ? err.message : String(err));
     process.exitCode = 1;
   }
+  await closePlatformPool();
   await closePool();
 }

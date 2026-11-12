@@ -5,7 +5,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { Plan } from '../domain/plan.js';
 import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import { createJob, loadJob } from '../orchestrator/jobs.js';
@@ -14,7 +14,7 @@ import { runDueJobs } from '../orchestrator/run-due.js';
 import { confirmedCommandCovers } from '../policy/confirmed-command.js';
 import { buildFacts } from '../policy/facts.js';
 import { refineActionClass } from '../policy/classify.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { fakeMailboxClient, installMailboxCharter, mailboxRuntime } from '../test/mailbox.js';
 import { openClientReminder, reminderBody } from './reminder.js';
@@ -29,7 +29,7 @@ let charterVersion = '';
 async function seedMeeting(over: { email?: string | null; verified?: boolean } = {}): Promise<string> {
   const job = await withBusiness(B, (db) => createJob(db, { charterVersion, provenance: 'boss', title: 'פגישה' }));
   const meetingId = `M-${job.jobId}`;
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO meetings (meeting_id, business_id, job_id, step_id, calendar_id, event_id, operation, client_name,
         client_email, client_email_verified, start_at, end_at, state)
      VALUES ($1, $2, $3, 's1', 'cal-1', 'ev-1', 'create', 'דני כהן', $4, $5, $6, $7, 'active')`,
@@ -78,7 +78,7 @@ describe('openClientReminder', () => {
       "שלום דני כהן,\nרצינו לוודא שהפגישה ביום ג' 10/11 בשעה 10:00, רחוב הרצל 1, תל אביב, מתאימה לך. " +
         `אפשר לאשר בהזמנת היומן או להשיב למייל הזה.\nמזהה תזכורת: ${meetingId}`,
     );
-    const { rows } = await getPool().query<{ reminder_job_id: string | null }>(
+    const { rows } = await testDb().query<{ reminder_job_id: string | null }>(
       'SELECT reminder_job_id FROM meetings WHERE meeting_id = $1',
       [meetingId],
     );
@@ -91,8 +91,8 @@ describe('openClientReminder', () => {
     if (!('jobId' in opened)) throw new Error('expected a job');
     const jobId = opened.jobId;
 
-    expect((await getPool().query('SELECT 1 FROM boss_instructions WHERE job_id = $1', [jobId])).rowCount).toBe(0);
-    expect((await getPool().query('SELECT 1 FROM job_authorizations WHERE job_id = $1', [jobId])).rowCount).toBe(0);
+    expect((await testDb().query('SELECT 1 FROM boss_instructions WHERE job_id = $1', [jobId])).rowCount).toBe(0);
+    expect((await testDb().query('SELECT 1 FROM job_authorizations WHERE job_id = $1', [jobId])).rowCount).toBe(0);
 
     const plan = (await withBusiness(B, (db) => loadPlanBody(db, jobId)))?.plan ?? Plan.parse(null);
     const step = plan.steps[0];
@@ -125,7 +125,7 @@ describe('openClientReminder', () => {
     expect(sent).toHaveLength(0);
     expect(sentNew).toHaveLength(0);
     expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('await_approval');
-    const cards = await getPool().query(`SELECT 1 FROM approval_requests WHERE job_id = $1 AND state = 'pending'`, [jobId]);
+    const cards = await testDb().query(`SELECT 1 FROM approval_requests WHERE job_id = $1 AND state = 'pending'`, [jobId]);
     expect(cards.rowCount).toBe(1);
   });
 
@@ -147,7 +147,7 @@ describe('openClientReminder', () => {
     await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss'));
     const noMailbox = await seedMeeting();
     expect(await withBusiness(B, (db) => openClientReminder(db, { meetingId: noMailbox }))).toEqual({ skipped: 'no_mailbox' });
-    const { rows } = await getPool().query<{ n: string }>('SELECT count(*) AS n FROM jobs WHERE business_id = $1', [B]);
+    const { rows } = await testDb().query<{ n: string }>('SELECT count(*) AS n FROM jobs WHERE business_id = $1', [B]);
     expect(Number(rows[0]?.n)).toBe(1); // only the meeting's own job
   });
 
@@ -159,10 +159,10 @@ describe('openClientReminder', () => {
       draftedForOwner:
         "שלום דני כהן,\nרצינו לוודא שהפגישה ביום ג' 10/11 בשעה 10:00, המשרד, מתאימה לך. אפשר לאשר בהזמנת היומן או להשיב למייל הזה.",
     });
-    const jobs = await getPool().query<{ n: string }>('SELECT count(*) AS n FROM jobs WHERE business_id = $1', [B]);
+    const jobs = await testDb().query<{ n: string }>('SELECT count(*) AS n FROM jobs WHERE business_id = $1', [B]);
     expect(Number(jobs.rows[0]?.n)).toBe(1); // only the meeting's own job
-    expect((await getPool().query('SELECT 1 FROM approval_requests WHERE business_id = $1', [B])).rowCount).toBe(0);
-    const { rows } = await getPool().query<{ reminder_job_id: string | null }>(
+    expect((await testDb().query('SELECT 1 FROM approval_requests WHERE business_id = $1', [B])).rowCount).toBe(0);
+    const { rows } = await testDb().query<{ reminder_job_id: string | null }>(
       'SELECT reminder_job_id FROM meetings WHERE meeting_id = $1',
       [meetingId],
     );

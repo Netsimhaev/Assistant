@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import {
   LEDGER_DEFAULTS,
   addCriticalRule,
@@ -31,7 +31,7 @@ describe('ledger settings', () => {
     expect(s).toEqual(LEDGER_DEFAULTS);
     expect(s.toEmail).toBe(true);
     expect(s.toWhatsApp).toBe(false);
-    const { rows } = await getPool().query('SELECT 1 FROM ledger_settings');
+    const { rows } = await testDb().query('SELECT 1 FROM ledger_settings');
     expect(rows).toHaveLength(0);
   });
 
@@ -39,7 +39,7 @@ describe('ledger settings', () => {
     await expect(save({ ...LEDGER_DEFAULTS, toEmail: false, toScreen: false, toWhatsApp: false })).rejects.toThrow(
       'חובה לבחור לפחות דרך תזכורת אחת',
     );
-    const { rows } = await getPool().query('SELECT 1 FROM ledger_settings');
+    const { rows } = await testDb().query('SELECT 1 FROM ledger_settings');
     expect(rows).toHaveLength(0);
   });
 
@@ -47,7 +47,7 @@ describe('ledger settings', () => {
     await expect(
       save({ ...LEDGER_DEFAULTS, modes: { ...LEDGER_DEFAULTS.modes, money_out: 'act' } }),
     ).rejects.toThrow('כסף יוצא — רק תזכורת, עד שיהיה כלי תשלום');
-    const { rows } = await getPool().query('SELECT 1 FROM ledger_settings');
+    const { rows } = await testDb().query('SELECT 1 FROM ledger_settings');
     expect(rows).toHaveLength(0);
   });
 
@@ -72,7 +72,7 @@ describe('ledger settings', () => {
     };
     await save(s);
     expect(await withBusiness(B, (db) => loadLedgerSettings(db))).toEqual(s);
-    const { rows } = await getPool().query('SELECT modes FROM ledger_settings');
+    const { rows } = await testDb().query('SELECT modes FROM ledger_settings');
     expect(Object.keys(rows[0].modes).sort()).toEqual([
       'awaiting_reply',
       'meetings',
@@ -84,7 +84,7 @@ describe('ledger settings', () => {
   });
 
   it('loads money_out as remind when the stored modes JSON lacks the key', async () => {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO ledger_settings (business_id, modes, to_whatsapp, to_email, to_screen, meeting_lead_minutes,
          meeting_lead_minutes_critical, due_lead_days_critical, nudge_after_business_days, checkin_every_days,
          checkin_every_days_critical, daily_hour, updated_by)
@@ -102,7 +102,7 @@ describe('ledger settings', () => {
     const msg = 'בפגישות ובעבודות פתוחות אין עדיין פעולה מול הצד השני — רק תזכורת';
     await expect(save({ ...LEDGER_DEFAULTS, modes: { ...LEDGER_DEFAULTS.modes, meetings: 'act' } })).rejects.toThrow(msg);
     await expect(save({ ...LEDGER_DEFAULTS, modes: { ...LEDGER_DEFAULTS.modes, projects: 'act' } })).rejects.toThrow(msg);
-    const { rows } = await getPool().query('SELECT 1 FROM ledger_settings');
+    const { rows } = await testDb().query('SELECT 1 FROM ledger_settings');
     expect(rows).toHaveLength(0);
     // The saver did run: act on a family that has a nudge is accepted.
     await save({ ...LEDGER_DEFAULTS, modes: { ...LEDGER_DEFAULTS.modes, awaiting_reply: 'act' } });
@@ -110,7 +110,7 @@ describe('ledger settings', () => {
   });
 
   it('M3: a stored act on projects loads as remind; act on warm_leads is kept', async () => {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO ledger_settings (business_id, modes, to_whatsapp, to_email, to_screen, meeting_lead_minutes,
          meeting_lead_minutes_critical, due_lead_days_critical, nudge_after_business_days, checkin_every_days,
          checkin_every_days_critical, daily_hour, updated_by)

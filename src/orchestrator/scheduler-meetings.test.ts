@@ -3,7 +3,7 @@
  * closes, and reports what it did; a throw inside it is isolated.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { installMailboxCharter } from '../test/mailbox.js';
 import { AdapterRegistry } from './adapters/registry.js';
@@ -54,7 +54,7 @@ describe('schedulerPass meetings sweep', () => {
 
     expect(pass.meetingsError).toBeNull();
     expect(pass.meetings).toMatchObject({ activated: 1, abandoned: 0, remindersOpened: 0 });
-    const { rows } = await getPool().query<{ state: string; event_id: string }>(
+    const { rows } = await testDb().query<{ state: string; event_id: string }>(
       `SELECT state, event_id FROM meetings WHERE meeting_id = 'M-1'`,
     );
     expect(rows[0]).toEqual({ state: 'active', event_id: 'ev-1' });

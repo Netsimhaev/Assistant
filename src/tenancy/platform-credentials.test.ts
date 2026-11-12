@@ -20,7 +20,7 @@ let KEY: Buffer;
 beforeEach(async () => {
   await resetDatabase();
   KEY = randomBytes(KEY_BYTES);
-  await writeKeyState(KEY, 'key-1');
+  await writeKeyState(KEY, 'key-1', testDb());
 });
 
 afterAll(async () => {

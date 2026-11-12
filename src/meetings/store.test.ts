@@ -1,13 +1,12 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import type { CalendarEvent } from '../calendar/types.js';
-import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import type { Plan } from '../domain/plan.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import type { PlannedChange } from './plan.js';
 import { recordProposedMeetings } from './store.js';
 
-const BUSINESS = config.businessId;
+const BUSINESS = TEST_BUSINESS;
 
 const EVENT: CalendarEvent = {
   calendarId: 'primary',
@@ -82,7 +81,7 @@ describe('recordProposedMeetings', () => {
     // A second call for the same job and steps writes nothing.
     await withBusiness(BUSINESS, (db) => recordProposedMeetings(db, { jobId: 'J-1', plan: PLAN, changes: CHANGES }));
 
-    const { rows } = await getPool().query<Row>(
+    const { rows } = await testDb().query<Row>(
       `SELECT step_id, operation, event_id, client_name, client_email, client_email_verified, client_phone,
               internal_note, start_at, state, response
          FROM meetings WHERE business_id = $1 AND job_id = 'J-1' ORDER BY step_id`,
@@ -120,7 +119,7 @@ describe('recordProposedMeetings', () => {
       plan: { ...PLAN, steps: [step('m1', 'r2'), step('m2', 'r3')] },
       changes: [withAttendee, noAttendee],
     }));
-    const { rows } = await getPool().query<{ step_id: string; client_email: string | null; response: string }>(
+    const { rows } = await testDb().query<{ step_id: string; client_email: string | null; response: string }>(
       `SELECT step_id, client_email, response FROM meetings WHERE business_id = $1 AND job_id = 'J-3' ORDER BY step_id`,
       [BUSINESS],
     );

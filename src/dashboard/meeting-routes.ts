@@ -103,7 +103,7 @@ async function realCredentials(db: BusinessDb, credentialKeyPath: string | undef
     const key = await loadMasterKey(credentialKeyPath);
     // On this request's connection: a second acquire while it is held is
     // hold-and-wait (Task 10 fix round 2).
-    await verifyKeyState(key, { db, businessId: db.businessId });
+    await verifyKeyState(key, db);
     return oauthCredentials({
       key,
       fallback: storedCredentials(key),

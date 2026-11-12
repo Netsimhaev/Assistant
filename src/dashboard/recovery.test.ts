@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { createTestOwner, ownerLogin } from '../test/owner.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { login, setPassword } from './auth.js';
 import { issueRecoveryCodes, redeemRecoveryCode, remainingCodes } from './recovery.js';
 
@@ -29,7 +29,7 @@ describe('issueRecoveryCodes', () => {
     const [code] = await withBusiness(BUSINESS, (db) => issueRecoveryCodes(db, { username: USERNAME, count: 1 }));
     expect(code).toBeDefined();
 
-    const { rows } = await getPool().query<{ code_hash: string; code_salt: string }>(
+    const { rows } = await testDb().query<{ code_hash: string; code_salt: string }>(
       `SELECT code_hash, code_salt FROM dashboard_recovery_codes
         WHERE business_id = $1 AND username = $2`,
       [BUSINESS, USERNAME],
@@ -127,7 +127,7 @@ describe('redeemRecoveryCode', () => {
     expect(first.ok).toBe(true);
     expect(second.ok).toBe(true);
 
-    const { rows: beforeRows } = await getPool().query<{ revoked_at: Date | null }>(
+    const { rows: beforeRows } = await testDb().query<{ revoked_at: Date | null }>(
       `SELECT revoked_at FROM dashboard_sessions WHERE business_id = $1 AND username = $2`,
       [BUSINESS, USERNAME],
     );
@@ -136,7 +136,7 @@ describe('redeemRecoveryCode', () => {
 
     await withBusiness(BUSINESS, (db) => redeemRecoveryCode(db, { login: ownerLogin(BUSINESS, USERNAME), code: codes[0]! }));
 
-    const { rows: afterRows } = await getPool().query<{ revoked_at: Date | null }>(
+    const { rows: afterRows } = await testDb().query<{ revoked_at: Date | null }>(
       `SELECT revoked_at FROM dashboard_sessions WHERE business_id = $1 AND username = $2`,
       [BUSINESS, USERNAME],
     );
@@ -149,7 +149,7 @@ describe('redeemRecoveryCode', () => {
 
     await withBusiness(BUSINESS, (db) => redeemRecoveryCode(db, { login: ownerLogin(BUSINESS, USERNAME), code: codes[0]!, sourceAddress: '203.0.113.42' }));
 
-    const { rows } = await getPool().query<{ kind: string; reason: string }>(
+    const { rows } = await testDb().query<{ kind: string; reason: string }>(
       `SELECT kind, reason FROM audit_log WHERE business_id = $1 ORDER BY seq DESC LIMIT 1`,
       [BUSINESS],
     );
@@ -164,7 +164,7 @@ describe('redeemRecoveryCode', () => {
     await withBusiness(BUSINESS, (db) => issueRecoveryCodes(db, { username: USERNAME }));
     await withBusiness(BUSINESS, (db) => redeemRecoveryCode(db, { login: ownerLogin(BUSINESS, USERNAME), code: '0'.repeat(32) }));
 
-    const { rows } = await getPool().query<{ count: string }>(
+    const { rows } = await testDb().query<{ count: string }>(
       `SELECT count(*)::text AS count FROM audit_log WHERE business_id = $1`,
       [BUSINESS],
     );
@@ -219,7 +219,7 @@ describe('redeemRecoveryCode', () => {
   // unbounded.
   it('throttles a username that has no row at all', async () => {
     const unknownBucket = async () => {
-      const { rows } = await getPool().query<{
+      const { rows } = await testDb().query<{
         recovery_failed_attempts: number;
         recovery_locked_until: Date | null;
       }>(

@@ -36,8 +36,9 @@
  * **Migration 027 added two more, and both are deliberately out of scope.**
  * `credentials` holds a business's own connection secrets — the ciphertext
  * and nonce as `bytea`, plus a ref (`OFFICE_MAIL`), a key id and the platform
- * operator who wrote the row — and `credential_key_state` holds one row
- * saying which master key is live. Not a column in either can hold a
+ * operator who wrote the row — and the key state (`server_key_state` since
+ * migration 067, `credential_key_state` before it) holds one row saying which
+ * master key is live. Not a column in either can hold a
  * counterparty's name, address or phone: there is no free text, no job id and
  * no contact identifier anywhere in them, and the secret itself is sealed
  * bytes rather than content about anyone. They are the business's own

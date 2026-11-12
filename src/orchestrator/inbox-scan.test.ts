@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { getPool, withBusiness } from '../db/pool.js';
+import { withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { scanInbox } from './inbox-scan.js';
 
@@ -73,7 +73,7 @@ describe('scanInbox', () => {
     expect(await readdir(theirs)).toEqual(['theirs.txt']);
     expect((await readdir(root)).sort()).toEqual([BUSINESS, OTHER, 'loose.txt'].sort());
 
-    const { rows } = await getPool().query<{ business_id: string; original_name: string }>(
+    const { rows } = await testDb().query<{ business_id: string; original_name: string }>(
       `SELECT business_id, original_name FROM documents ORDER BY original_name`,
     );
     expect(rows).toEqual([{ business_id: BUSINESS, original_name: 'mine.txt' }]);
@@ -89,7 +89,7 @@ describe('scanInbox', () => {
     expect(await readdir(join(inbox, 'processed'))).toEqual(['hello.txt']);
     expect(await readdir(inbox)).not.toContain('hello.txt');
 
-    const { rows } = await getPool().query<{ original_name: string }>(
+    const { rows } = await testDb().query<{ original_name: string }>(
       `SELECT original_name FROM documents WHERE business_id = $1`,
       [BUSINESS],
     );
@@ -125,7 +125,7 @@ describe('scanInbox', () => {
 
     // The verdict is on the row, with a reason the owner can read — a
     // rejection is a recorded status, never a thrown exception.
-    const { rows } = await getPool().query<{ status: string; reason: string | null }>(
+    const { rows } = await testDb().query<{ status: string; reason: string | null }>(
       `SELECT status, reason FROM documents WHERE business_id = $1`,
       [BUSINESS],
     );
@@ -149,7 +149,7 @@ describe('scanInbox', () => {
     expect(result.ingested).toBe(0);
     expect(await readdir(join(inbox, 'rejected'))).toEqual(['broken.pdf']);
     expect(await readdir(join(inbox, 'processed'))).toEqual([]);
-    const { rows } = await getPool().query<{ status: string; reason: string | null; stored_path: string }>(
+    const { rows } = await testDb().query<{ status: string; reason: string | null; stored_path: string }>(
       `SELECT status, reason, stored_path FROM documents WHERE business_id = $1`,
       [BUSINESS],
     );

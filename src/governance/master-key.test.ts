@@ -3,8 +3,10 @@ import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { registerBusiness, resetDatabase, testDb } from '../test/db.js';
+import { putSecret, storedCredentials } from './credential-store.js';
+import { encryptSecret } from './secret-cipher.js';
 import {
   KEY_BYTES,
   MasterKeyError,
@@ -13,8 +15,6 @@ import {
   verifyKeyState,
   writeKeyState,
 } from './master-key.js';
-
-const BUSINESS = 'test-business';
 
 let DIR: string;
 
@@ -109,22 +109,73 @@ describe('verifyKeyState / writeKeyState', () => {
    */
   it('accepts the key that wrote the key state', async () => {
     const keyA = randomBytes(KEY_BYTES);
-    await writeKeyState(keyA, 'key-a', { businessId: BUSINESS });
+    await writeKeyState(keyA, 'key-a', testDb());
 
-    await expect(verifyKeyState(keyA, { businessId: BUSINESS })).resolves.toBeUndefined();
+    await expect(verifyKeyState(keyA, testDb())).resolves.toBeUndefined();
   });
 
   it('refuses a different key against a stored key state', async () => {
     const keyA = randomBytes(KEY_BYTES);
     const keyB = randomBytes(KEY_BYTES);
-    await writeKeyState(keyA, 'key-a', { businessId: BUSINESS });
+    await writeKeyState(keyA, 'key-a', testDb());
 
-    await expect(verifyKeyState(keyB, { businessId: BUSINESS })).rejects.toThrow(MasterKeyError);
+    await expect(verifyKeyState(keyB, testDb())).rejects.toThrow(MasterKeyError);
+  });
+
+  /**
+   * The key state is the server's one row (spec §5.9). Before it was, each
+   * business had a row of its own, and a business with none failed the check
+   * on its own connection — so a business created after the key could not
+   * store or resolve a secret. Checked on the business's own connection, the
+   * way a dashboard request runs it.
+   */
+  it('passes the key check for a freshly created business, which then resolves its secrets', async () => {
+    const key = randomBytes(KEY_BYTES);
+    await writeKeyState(key, 'key-server', testDb());
+    const fresh = 'test-business-created-after-key';
+    await registerBusiness(fresh);
+
+    await expect(withBusiness(fresh, (db) => verifyKeyState(key, db))).resolves.toBeUndefined();
+    await withBusiness(fresh, (db) => putSecret(db, { ref: 'FRESH', value: 'fresh-secret', updatedBy: 'test' }, key));
+    expect((await storedCredentials(key).resolve('FRESH', fresh))?.value).toBe('fresh-secret');
+  });
+
+  it('writes one row for the server, however often it is written', async () => {
+    await writeKeyState(randomBytes(KEY_BYTES), 'key-1', testDb());
+    const key = randomBytes(KEY_BYTES);
+    await writeKeyState(key, 'key-2', testDb());
+
+    const { rows } = await testDb().query<{ key_id: string; check_business_id: string }>(
+      'SELECT key_id, check_business_id FROM server_key_state',
+    );
+    expect(rows).toEqual([{ key_id: 'key-2', check_business_id: '' }]);
+    await expect(verifyKeyState(key, testDb())).resolves.toBeUndefined();
+  });
+
+  /**
+   * Migration 067 carries the old business row across without re-sealing it
+   * (a migration never holds the key), so its check value is sealed for the
+   * business the installation was configured for, named in
+   * `check_business_id`. It must still verify — and only under that name.
+   */
+  it('verifies a carried-over key state under the business it was sealed for', async () => {
+    const key = randomBytes(KEY_BYTES);
+    const sealed = encryptSecret('credential-broker-key-check', key, { businessId: 'dev-business', ref: 'key-check' });
+    await testDb().query(
+      `INSERT INTO server_key_state (singleton, key_id, check_nonce, check_value, check_business_id)
+       VALUES (true, 'key-legacy', $1, $2, 'dev-business')`,
+      [sealed.nonce, sealed.ciphertext],
+    );
+    await expect(verifyKeyState(key, testDb())).resolves.toBeUndefined();
+    await expect(verifyKeyState(randomBytes(KEY_BYTES), testDb())).rejects.toThrow(MasterKeyError);
+
+    await testDb().query(`UPDATE server_key_state SET check_business_id = 'other-business'`);
+    await expect(verifyKeyState(key, testDb())).rejects.toThrow(MasterKeyError);
   });
 
   it('accepts any key when no key state has been written yet', async () => {
     const key = randomBytes(KEY_BYTES);
 
-    await expect(verifyKeyState(key, { businessId: BUSINESS })).resolves.toBeUndefined();
+    await expect(verifyKeyState(key, testDb())).resolves.toBeUndefined();
   });
 });

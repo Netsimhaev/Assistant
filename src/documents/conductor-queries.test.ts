@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import {
   documentsAwaitingRead,
   readingsToday,
@@ -47,7 +47,7 @@ describe('the conductor queries', () => {
     // docblock, ruling I2). A re-offer costs nothing: the same brief hits the
     // reading cache instead of the model.
     const documentId = await anExtractedDocument('שלום');
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_readings
          (reading_id, business_id, document_id, status, reason, content,
           provenance, model, prompt_version, brief_hash)
@@ -63,7 +63,7 @@ describe('the conductor queries', () => {
     // The completion marker: a proposal reachable through the reading, even
     // an `unproposable` one — a genuine dead end must still terminate.
     const documentId = await anExtractedDocument('שלום');
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_readings
          (reading_id, business_id, document_id, status, reason, content,
           provenance, model, prompt_version, brief_hash)
@@ -71,7 +71,7 @@ describe('the conductor queries', () => {
                'unknown_external', 'test', 'v1', 'h')`,
       [BUSINESS, documentId],
     );
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO proposals
          (proposal_id, business_id, reading_id, job_id, status, reason, content, raw,
           model, prompt_version)
@@ -88,7 +88,7 @@ describe('the conductor queries', () => {
     // `business_id` independently — a proposal that happens to reference the
     // same `reading_id` under a different business must not count.
     const documentId = await anExtractedDocument('שלום');
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_readings
          (reading_id, business_id, document_id, status, reason, content,
           provenance, model, prompt_version, brief_hash)
@@ -96,7 +96,7 @@ describe('the conductor queries', () => {
                'unknown_external', 'test', 'v1', 'h')`,
       [BUSINESS, documentId],
     );
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO proposals
          (proposal_id, business_id, reading_id, job_id, status, reason, content, raw,
           model, prompt_version)
@@ -115,7 +115,7 @@ describe('the conductor queries', () => {
     }
     expect(await withBusiness(BUSINESS, (db) => documentsAwaitingRead(db, 10))).toEqual([]);
 
-    const { rows } = await getPool().query<{ read_attempts: number; read_error: string }>(
+    const { rows } = await testDb().query<{ read_attempts: number; read_error: string }>(
       `SELECT read_attempts, read_error FROM documents WHERE document_id = $1`,
       [documentId],
     );
@@ -138,7 +138,7 @@ describe('the conductor queries', () => {
     const ownerUpload = await anExtractedDocument('הצעת מחיר שהבעלים העלה');
     const inboxFile = await anExtractedDocument('מסמך מתיקיית הקליטה');
     const foreignNamed = await anExtractedDocument('מסמך שעסק אחר נוקב בו');
-    const db = getPool();
+    const db = testDb();
     const own = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'cond-own' })));
     const foreign = await withBusiness('someone-else', (bdb) => installCharter(bdb, buildCharter({ version: 'cond-foreign' })));
     const ownJob = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: own.charterVersion, provenance: 'boss' }));
@@ -181,7 +181,7 @@ describe('the conductor queries', () => {
 
   it('counts only readings created today, for this business', async () => {
     const documentId = await anExtractedDocument('שלום');
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_readings
          (reading_id, business_id, document_id, status, reason, content,
           provenance, model, prompt_version, brief_hash, created_at)

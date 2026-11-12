@@ -27,9 +27,9 @@ import {
   GOOGLE_CLIENT_SECRET_REF,
 } from '../orchestrator/adapters/google-token-http.js';
 import { loadBindings, upsertBinding } from '../orchestrator/bindings.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { buildCharter } from '../test/fixtures.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { issueCsrfToken } from './csrf.js';
 import { createServer } from './server.js';
@@ -84,11 +84,11 @@ beforeEach(async () => {
   keyPath = join(keyDir, 'master.key');
   key = randomBytes(KEY_BYTES);
   await writeFile(keyPath, key, { mode: 0o600 });
-  // Install-wide, exactly like `oauth-grants.test.ts`'s own `beforeEach`:
-  // `writeGrant`/`putSecret` check the key state under `config.businessId`
-  // only, not `input.businessId` — one row here is enough regardless of
-  // which business this file's requests are scoped to.
-  await writeKeyState(key, 'KEY-test');
+  // Server-wide, exactly like `oauth-grants.test.ts`'s own `beforeEach`:
+  // `writeGrant`/`putSecret` check the server's one key-state row, not a row
+  // per business — one row here is enough regardless of which business this
+  // file's requests are scoped to.
+  await writeKeyState(key, 'KEY-test', testDb());
   await putPlatformSecret(GOOGLE_CLIENT_ID_REF, 'test-client-id', key, 'test');
   await putPlatformSecret(GOOGLE_CLIENT_SECRET_REF, 'test-client-secret', key, 'test');
   await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
@@ -236,7 +236,7 @@ describe('GET /oauth/:system/start', () => {
     // No state row was written for a ceremony that never actually started —
     // nothing here for a later request to "resume" into a half-configured
     // exchange.
-    const { rows } = await getPool().query('SELECT count(*)::text AS n FROM oauth_states');
+    const { rows } = await testDb().query('SELECT count(*)::text AS n FROM oauth_states');
     expect(rows[0]?.['n']).toBe('0');
   });
 
@@ -285,7 +285,7 @@ describe('GET /oauth/:system/start', () => {
 
     // Nothing happened at all: no state row minted, no grant, no binding
     // write — a refused ceremony must leave exactly the state it found.
-    const { rows } = await getPool().query('SELECT count(*)::text AS n FROM oauth_states');
+    const { rows } = await testDb().query('SELECT count(*)::text AS n FROM oauth_states');
     expect(rows[0]?.['n']).toBe('0');
     expect(await withBusiness(BUSINESS, (bdb) => readGrantBySystem(bdb, 'office-mail', key))).toBeNull();
     const bindings = await withBusiness(BUSINESS, (db) => loadBindings(db));
@@ -356,7 +356,7 @@ describe('GET /oauth/:system/start', () => {
     const body = await res.text();
     expect(body).toContain('office.calendar');
 
-    const { rows } = await getPool().query('SELECT count(*)::text AS n FROM oauth_states');
+    const { rows } = await testDb().query('SELECT count(*)::text AS n FROM oauth_states');
     expect(rows[0]?.['n']).toBe('0');
   });
 });
@@ -635,7 +635,7 @@ describe('POST /oauth/:system/revoke', () => {
     const orderedFetch = (async (url: string | URL, init?: RequestInit) => {
       const href = url.toString();
       if (href.includes('oauth2.googleapis.com/revoke')) {
-        const { rows } = await getPool().query<{ revoked_at: Date | null }>(
+        const { rows } = await testDb().query<{ revoked_at: Date | null }>(
           'SELECT revoked_at FROM oauth_grants WHERE business_id = $1 AND system = $2',
           [BUSINESS, SYSTEM],
         );
@@ -688,7 +688,7 @@ describe('POST /oauth/:system/revoke', () => {
     expect(res.status).toBe(302);
 
     // The local revoke does not need the key at all, and must still happen.
-    const { rows } = await getPool().query<{ revoked_at: Date | null }>(
+    const { rows } = await testDb().query<{ revoked_at: Date | null }>(
       'SELECT revoked_at FROM oauth_grants WHERE business_id = $1 AND system = $2',
       [BUSINESS, SYSTEM],
     );
@@ -943,13 +943,13 @@ describe('GET /connections', () => {
     // signed under a schema version this code no longer understands, the same
     // shape `loadActiveCharter` documents as its one throwing case.
     const legacyVersion = 'legacy-unreadable-1';
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO charter_versions
          (charter_version, business_id, effective_from, charter, policy_bundle, content_hash, signed_by, signed_at, signature_method)
        VALUES ($1, $2, now(), $3, $4, $5, 'legacy', now(), 'test')`,
       [legacyVersion, BUSINESS, JSON.stringify({ schemaVersion: '0.1' }), JSON.stringify({}), 'a'.repeat(64)],
     );
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO charter_active (business_id, charter_version, activated_at)
        VALUES ($1, $2, now())
        ON CONFLICT (business_id) DO UPDATE SET charter_version = EXCLUDED.charter_version, activated_at = now()`,
@@ -1046,7 +1046,7 @@ describe('mailbox ceremony', () => {
       const res = await fetch(`${baseUrl}/oauth/mailbox/start${q}`, { headers: { cookie }, redirect: 'manual' });
       expect(res.status).toBe(400);
     }
-    const { rows } = await getPool().query('SELECT count(*)::text AS n FROM oauth_states');
+    const { rows } = await testDb().query('SELECT count(*)::text AS n FROM oauth_states');
     expect(rows[0]?.['n']).toBe('0');
   });
 

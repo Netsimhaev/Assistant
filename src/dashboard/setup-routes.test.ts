@@ -4,8 +4,8 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { activeCharterVersion, installCharter } from '../charter/store.js';
 import { emailDomainProblemHe } from '../domain/charter.js';
@@ -444,7 +444,7 @@ describe('edit the rules', () => {
 
   it('opens an empty interview with a notice over an unreadable charter', async () => {
     await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'broken-1' })));
-    await getPool().query(
+    await testDb().query(
       `UPDATE charter_versions
           SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb('0'::text))
         WHERE business_id = $1`,

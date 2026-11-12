@@ -9,12 +9,12 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import type { AttendeeResponse, CalendarClient, CalendarEvent } from '../calendar/types.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { saveActionUpdateSettings } from '../governance/action-update-settings.js';
 import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import { upsertBinding } from '../orchestrator/bindings.js';
 import { createJob } from '../orchestrator/jobs.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { installMailboxCharter } from '../test/mailbox.js';
 import { syncMeetings } from './sync.js';
 
@@ -77,13 +77,13 @@ interface Seed {
 
 async function seed(s: Seed = {}): Promise<{ meetingId: string; jobId: string }> {
   const job = await withBusiness(B, (db) => createJob(db, { charterVersion, provenance: 'boss', title: 'פגישה' }));
-  await getPool().query('UPDATE jobs SET phase = $1 WHERE job_id = $2', [s.phase ?? 'execute', job.jobId]);
-  await getPool().query(
+  await testDb().query('UPDATE jobs SET phase = $1 WHERE job_id = $2', [s.phase ?? 'execute', job.jobId]);
+  await testDb().query(
     `INSERT INTO job_plans (business_id, job_id, plan_hash, plan) VALUES ($1, $2, 'h', '{}'::jsonb)`,
     [B, job.jobId],
   );
   if (s.step) {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id, status, performed)
        VALUES ($1, $2, 'h', 's1', $3, $4, true)`,
       [B, job.jobId, s.step.externalId, s.step.status],
@@ -91,7 +91,7 @@ async function seed(s: Seed = {}): Promise<{ meetingId: string; jobId: string }>
   }
   const meetingId = `M-${job.jobId}`;
   const start = s.start ?? new Date(NOW.getTime() + 48 * HOUR);
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO meetings (meeting_id, business_id, job_id, step_id, calendar_id, event_id, operation, client_name,
         client_email, client_email_verified, start_at, end_at, state, response, updated_at)
      VALUES ($1, $2, $3, 's1', 'cal-1', $4, $5, $6, $7, true, $8, $9, $10, $11, $12)`,
@@ -114,7 +114,7 @@ async function seed(s: Seed = {}): Promise<{ meetingId: string; jobId: string }>
 }
 
 async function row(meetingId: string) {
-  const { rows } = await getPool().query<{
+  const { rows } = await testDb().query<{
     state: string;
     event_id: string | null;
     response: string;
@@ -163,7 +163,7 @@ afterAll(async () => {
 describe('proposed meetings', () => {
   it('activates a proposed meeting when its step completed and converts the hold', async () => {
     const { meetingId, jobId } = await seed({ eventId: 'hold-ev', step: { status: 'completed', externalId: 'hold-ev' } });
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO meeting_holds (hold_id, business_id, job_id, calendar_id, event_id, start_at, end_at)
        VALUES ('H-1', $1, $2, 'cal-1', 'hold-ev', $3, $4)`,
       [B, jobId, NOW, new Date(NOW.getTime() + HOUR)],
@@ -178,7 +178,7 @@ describe('proposed meetings', () => {
     expect((await row(meetingId)).state).toBe('active');
     expect((await row(meetingId)).event_id).toBe('hold-ev');
     expect((await row(plain.meetingId)).event_id).toBe('new-ev');
-    const { rows } = await getPool().query<{ state: string }>(`SELECT state FROM meeting_holds WHERE hold_id = 'H-1'`);
+    const { rows } = await testDb().query<{ state: string }>(`SELECT state FROM meeting_holds WHERE hold_id = 'H-1'`);
     expect(rows[0]?.state).toBe('converted');
   });
 
@@ -202,7 +202,7 @@ describe('proposed meetings', () => {
     expect(second.uncertainAlerts).toBe(0);
     expect((await row(uncertain.meetingId)).state).toBe('proposed');
     expect(sent.map((s) => s.body)).toEqual(['ייתכן שהשינוי ביומן לרונית נשמר וייתכן שלא — כדאי לבדוק ביומן.']);
-    const audit = await getPool().query<{ reason: string }>(
+    const audit = await testDb().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE reason LIKE 'meeting_write_uncertain:%'`,
     );
     expect(audit.rows.map((r) => r.reason)).toEqual([`meeting_write_uncertain:${uncertain.meetingId}`]);
@@ -219,12 +219,12 @@ describe('proposed meetings', () => {
 
   it('resets the response to needs_action after a move', async () => {
     const old = await seed({ state: 'active', response: 'accepted', eventId: 'ev-9' });
-    await getPool().query(`UPDATE meetings SET response_at = $2, declined_notified_at = $2 WHERE meeting_id = $1`, [
+    await testDb().query(`UPDATE meetings SET response_at = $2, declined_notified_at = $2 WHERE meeting_id = $1`, [
       old.meetingId,
       NOW,
     ]);
     const moved = await seed({ operation: 'move', eventId: 'ev-9', response: 'accepted', step: { status: 'completed', externalId: 'ev-9' } });
-    await getPool().query(`UPDATE meetings SET unanswered_notified_at = $2 WHERE meeting_id = $1`, [moved.meetingId, NOW]);
+    await testDb().query(`UPDATE meetings SET unanswered_notified_at = $2 WHERE meeting_id = $1`, [moved.meetingId, NOW]);
 
     await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client: fakeCalendar(new Map([['ev-9', []]])).client }));
 
@@ -326,7 +326,7 @@ describe('responses and alerts', () => {
   });
 
   it('a calendar that cannot be reached skips polling but still activates', async () => {
-    await getPool().query(`DELETE FROM connection_bindings WHERE business_id = $1`, [B]);
+    await testDb().query(`DELETE FROM connection_bindings WHERE business_id = $1`, [B]);
     const active = await seed({ state: 'active', eventId: 'ev-x' });
     const proposed = await seed({ step: { status: 'completed', externalId: 'ev-y' }, eventId: null });
     const { client, gets } = fakeCalendar(new Map([['ev-x', [{ email: 'dani@acme.co.il', response: 'accepted' }]]]));
@@ -387,7 +387,7 @@ describe('unanswered meetings', () => {
     expect(second.remindersOpened).toBe(0);
     expect(second.unansweredAlerts).toBe(0);
     expect(sent).toHaveLength(1);
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       `SELECT count(*) AS n FROM jobs WHERE business_id = $1 AND title LIKE 'תזכורת לפגישה:%'`,
       [B],
     );
@@ -432,9 +432,9 @@ describe('unanswered meetings', () => {
       "⏳ דני כהן עדיין לא אישר את יום ג' 10:00. הנה תזכורת מוכנה לשליחה:\n" +
         "שלום דני כהן,\nרצינו לוודא שהפגישה ביום ג' 10/11 בשעה 10:00, המשרד, מתאימה לך. אפשר לאשר בהזמנת היומן או להשיב למייל הזה.",
     );
-    const jobs = await getPool().query(`SELECT 1 FROM jobs WHERE business_id = $1 AND title LIKE 'תזכורת לפגישה:%'`, [B]);
+    const jobs = await testDb().query(`SELECT 1 FROM jobs WHERE business_id = $1 AND title LIKE 'תזכורת לפגישה:%'`, [B]);
     expect(jobs.rowCount).toBe(0);
-    expect((await getPool().query('SELECT 1 FROM approval_requests WHERE business_id = $1', [B])).rowCount).toBe(0);
+    expect((await testDb().query('SELECT 1 FROM approval_requests WHERE business_id = $1', [B])).rowCount).toBe(0);
     const r = await row(meetingId);
     expect(r.reminder_claimed_at).not.toBeNull();
     expect(r.unanswered_notified_at).not.toBeNull();
@@ -451,7 +451,7 @@ describe('unanswered meetings', () => {
     expect((await row(failed.meetingId)).reminder_claimed_at).toBeNull();
 
     // A readable event, but no calendar connection at all this pass.
-    await getPool().query(`DELETE FROM connection_bindings WHERE business_id = $1`, [B]);
+    await testDb().query(`DELETE FROM connection_bindings WHERE business_id = $1`, [B]);
     const ok = await seed({ state: 'active', eventId: 'ev-2', updatedAt: new Date(NOW.getTime() - 25 * HOUR) });
     const reachable = fakeCalendar(new Map([['ev-2', [{ email: 'dani@acme.co.il', response: 'needs_action' }]]]));
     const unavailable = await withBusiness(B, (db) => syncMeetings(db, {

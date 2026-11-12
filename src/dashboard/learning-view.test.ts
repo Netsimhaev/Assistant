@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { assessRisk } from '../policy/risk.js';
@@ -202,7 +202,7 @@ function factsFor(input: unknown): ActionFacts {
 async function approvedReplyCard(): Promise<void> {
   sequence += 1;
   const jobId = `J-${sequence}`;
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO mail_messages
        (mail_id, business_id, provider_message_id, thread_id, from_address, subject,
         received_at, body_text, state, reply_job_id)
@@ -219,7 +219,7 @@ async function approvedReplyCard(): Promise<void> {
 }
 
 async function autonomyEvent(direction: 'promote' | 'demote', at: Date): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO autonomy_events (event_id, business_id, action_class, direction, from_level, to_level, reason, at)
      VALUES ($1, $2, 'email.reply', $3, 'approve_required', 'auto_notify', 'test', $4)`,
     [`AE-${ulid()}`, BUSINESS, direction, at.toISOString()],

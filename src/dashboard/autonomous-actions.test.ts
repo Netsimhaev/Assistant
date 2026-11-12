@@ -11,8 +11,8 @@
  * behaviour the system actually produces rather than a shape a test invented.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { PolicyBundle } from '../domain/policy.js';
@@ -141,7 +141,7 @@ async function seedCompletedStep(bundle: PolicyBundle, performed: boolean | null
   const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
   const binding = await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, replyPlan('dana@example.com', 'תשובה')));
   if (binding.status !== 'stored') throw new Error(`unexpected plan binding status ${binding.status}`);
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id, status, performed)
      VALUES ($1, $2, $3, 's1', 'MSG-1', 'completed', $4)`,
     [BUSINESS, job.jobId, binding.planHash, performed],
@@ -328,7 +328,7 @@ describe('listAutonomousActions', () => {
     const plainJob = await seedCompletedStep(bundle, true);
     const foreignInstructionJob = await seedCompletedStep(bundle, true);
 
-    const db = getPool();
+    const db = testDb();
     await db.query(
       `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text, text_origin)
        VALUES ('INS-mine', $1, $2, 'תשיבי לדנה', 'typed')`,

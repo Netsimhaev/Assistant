@@ -1,8 +1,8 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import type { CalendarAccess } from '../calendar/client-for.js';
 import type { CalendarClient, CalendarEvent, CalendarInfo } from '../calendar/types.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import { busyIntervals } from './free-time.js';
 import { MEETING_DEFAULTS } from './settings.js';
 import { loadCalendarRange, SNAPSHOT_MAX_EVENTS } from './snapshot.js';
@@ -65,7 +65,7 @@ describe('loadCalendarRange', () => {
   });
 
   it('counts held placeholders as busy', async () => {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO meeting_holds (hold_id, business_id, job_id, calendar_id, event_id, start_at, end_at, state)
        VALUES ('h1',$1,'j','a','ev-h','2026-11-10T08:00:00Z','2026-11-10T09:00:00Z','held'),
               ('h2',$1,'j','a','ev-r','2026-11-10T10:00:00Z','2026-11-10T11:00:00Z','released')`,

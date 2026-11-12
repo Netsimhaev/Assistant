@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { resetDatabase, testDb } from '../test/db.js';
-import { getPool, withBusiness } from '../db/pool.js';
+import { withBusiness } from '../db/pool.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { FAILED_GENERIC_TEXT, NOT_PERMITTED_TEXT } from './whatsapp-report.js';
@@ -44,7 +44,7 @@ describe('collectDigestFacts', () => {
    * include the one that broke.
    */
   it('counts a closed job and names a failed one with its Hebrew reason', async () => {
-    const db = getPool();
+    const db = testDb();
     await db.query(
       `INSERT INTO jobs (job_id, business_id, title, phase, charter_version, provenance, content_ingested, closed_at)
        VALUES ('J-ok', $1, 'שליחת הצעת מחיר', 'closed', $3, 'boss', false, $2),
@@ -79,7 +79,7 @@ describe('collectDigestFacts', () => {
    * (1, not 0 and not 2), not an accidentally-empty count.
    */
   it('does not count a job the owner refused as a completed job', async () => {
-    const db = getPool();
+    const db = testDb();
     await db.query(
       `INSERT INTO jobs (job_id, business_id, title, phase, charter_version, provenance, content_ingested, closed_at)
        VALUES ('J-denied-close', $1, 'הצעת מחיר לרונית', 'closed', $3, 'boss', false, $2),
@@ -299,7 +299,7 @@ describe('collectDigestFacts', () => {
    * sentence.
    */
   it('reports a gate denial as "not permitted yet", never as a generic failure', async () => {
-    const db = getPool();
+    const db = testDb();
     await db.query(
       `INSERT INTO jobs (job_id, business_id, title, phase, charter_version, provenance, content_ingested, closed_at)
        VALUES ('J-denied', $1, 'שליחת תזכורת', 'failed', $3, 'boss', false, $2)`,
@@ -323,7 +323,7 @@ describe('collectDigestFacts', () => {
    * answered is a question he is still waiting on, point-in-time.
    */
   it('counts an unanswered clarifying question as waiting', async () => {
-    const db = getPool();
+    const db = testDb();
     await db.query(
       `INSERT INTO jobs (job_id, business_id, title, phase, charter_version, provenance, content_ingested)
        VALUES ('J-asking', $1, 'מי זה רונית?', 'understand', $2, 'boss', false)`,
@@ -402,7 +402,7 @@ describe('collectDigestFacts', () => {
    * still-open job must still be counted as soon as it has actually sent.
    */
   it('counts a sent message by when it completed, not by when its job later closes', async () => {
-    const db = getPool();
+    const db = testDb();
     await db.query(
       `INSERT INTO jobs (job_id, business_id, title, phase, charter_version, provenance, content_ingested, closed_at)
        VALUES ('J-later-close', $1, 'תזכורת לדנה', 'closed', $3, 'boss', false, $2)`,
@@ -429,7 +429,7 @@ describe('collectDigestFacts', () => {
    * 'read'` (`document_readings_content_present`).
    */
   it('counts a document read inside the window', async () => {
-    const db = getPool();
+    const db = testDb();
     await db.query(
       `INSERT INTO documents
          (document_id, business_id, source, original_name, media_type, sha256, byte_size, stored_path, status)
@@ -473,7 +473,7 @@ describe('collectDigestFacts', () => {
    * report the EXACT total regardless of the `LIMIT`.
    */
   it('states the exact hidden count for a single source with more than twenty matches', async () => {
-    const db = getPool();
+    const db = testDb();
     const values: string[] = [];
     const params: unknown[] = [BUSINESS, new Date('2026-10-07T07:00:00+03:00'), charterVersion];
     for (let i = 0; i < 25; i += 1) {
@@ -499,7 +499,7 @@ describe('collectDigestFacts', () => {
    * source gets at least one slot before any source gets a second.
    */
   it('still names a lone rejected document even with twenty-plus failed jobs', async () => {
-    const db = getPool();
+    const db = testDb();
     const values: string[] = [];
     const params: unknown[] = [BUSINESS, new Date('2026-10-07T07:00:00+03:00'), charterVersion];
     for (let i = 0; i < 22; i += 1) {
@@ -533,7 +533,7 @@ describe('collectDigestFacts', () => {
    * UTC — so a UTC-dated rule would miss `LI-dateonly-past`.
    */
   it('counts the ledger: open, overdue in the charter zone, stuck, and closures by evidence in the window', async () => {
-    const db = getPool();
+    const db = testDb();
     const item = (id: string, status: string, due: Date | null, dateOnly: boolean, extra: Partial<{ importance: string; business: string; description: string; updatedAt: Date }> = {}) =>
       db.query(
         `INSERT INTO ledger_items
@@ -591,7 +591,7 @@ describe('collectDigestFacts', () => {
     expect(facts.ledger).toEqual({ open: 0, overdue: 0, stuck: 0, closedByEvidence: 0, topStuck: [] });
   });
   it('counts produced documents in the window, the ones sent, and the cards still waiting', async () => {
-    const db = getPool();
+    const db = testDb();
     const inWindow = new Date('2026-10-06T12:00:00+03:00');
     const before = new Date('2026-10-01T12:00:00+03:00');
     const sha = 'a'.repeat(64);

@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { activeCharterVersion, installCharter } from '../charter/store.js';
 import { createJob } from './jobs.js';
@@ -43,7 +43,7 @@ async function aJob(
 }
 
 async function itemCount(): Promise<number> {
-  const { rows } = await getPool().query<{ n: string }>('SELECT count(*)::text AS n FROM ledger_items');
+  const { rows } = await testDb().query<{ n: string }>('SELECT count(*)::text AS n FROM ledger_items');
   return Number(rows[0]?.n);
 }
 

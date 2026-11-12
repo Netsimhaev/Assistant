@@ -216,7 +216,7 @@ describe('an OAuth refresh token leaves no trace outside its own ciphertext', ()
 
   beforeEach(async () => {
     await resetDatabase();
-    await writeKeyState(KEY, 'KEY-connector-leak-scan');
+    await writeKeyState(KEY, 'KEY-connector-leak-scan', testDb());
   });
 
   afterAll(async () => {

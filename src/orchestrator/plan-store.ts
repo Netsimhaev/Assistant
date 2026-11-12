@@ -233,7 +233,7 @@ export async function completedSteps(
  * that check replaces a type barrier.** Before the business was threaded
  * through, the parameter was `pg.PoolClient` and not `Queryable`, deliberately:
  * a `Pool` satisfies `Queryable` structurally, so the narrower type was the
- * only thing that stopped `recordStepCompletion(getPool(), …)` from compiling.
+ * only thing that stopped `recordStepCompletion(<the bare pool>, …)` from compiling.
  * Every `BusinessDb` has the same type whether or not it is in a transaction,
  * so the barrier now lives in `tx.inTransaction`. What it forbids is unchanged:
  * a write on a separate connection, outside the transaction that moves the

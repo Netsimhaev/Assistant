@@ -4,8 +4,8 @@
  * implements — see that interface's own docblock (`./credentials.ts`) for why
  * `businessId` is mandatory there with no default. This module never imports
  * `config`: every business it ever touches arrives as an explicit argument
- * from its caller, so the forbidden `options.businessId ?? config.businessId`
- * pattern is unreachable here, not merely unused.
+ * from its caller, so the forbidden fallback — an optional business that
+ * defaults to a configured one — is unreachable here, not merely unused.
  *
  * `oauthCredentials` COMPOSES over an existing `CredentialSource` (the
  * `fallback`) rather than replacing it. An earlier design gave adapters a

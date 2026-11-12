@@ -5,7 +5,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { AdapterRegistry } from '../orchestrator/adapters/registry.js';
 import { envCredentials } from '../orchestrator/credentials.js';
 import type { Runtime } from '../orchestrator/runtime.js';
@@ -57,7 +57,7 @@ function emptyRuntime(emails: { subject: string; body: string }[] = []): Runtime
 }
 
 async function backdate(itemId: string): Promise<void> {
-  await getPool().query(`UPDATE ledger_items SET created_at = $2, evidence_after = $2 WHERE item_id = $1`, [
+  await testDb().query(`UPDATE ledger_items SET created_at = $2, evidence_after = $2 WHERE item_id = $1`, [
     itemId,
     new Date('2026-11-01T08:00:00Z'),
   ]);
@@ -89,7 +89,7 @@ describe('schedulerPass ledger stages', () => {
     const item = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
     await backdate(item.itemId);
     // The counterparty's reply, newer than the item's evidence_after.
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO mail_messages (mail_id, business_id, provider_message_id, thread_id, from_address, subject,
                                   received_at, body_text, created_at)
        VALUES ('M-1', $1, 'P-1', 'T', 'dana@acme.co.il', 'מענה', $2, NULL, $2)`,
@@ -108,7 +108,7 @@ describe('schedulerPass ledger stages', () => {
     // The stage after it RAN (an empty result is not null) and found nothing to remind about.
     expect(pass.ledger).not.toBeNull();
     expect(pass.ledger?.reminded).toBe(0);
-    const { rows } = await getPool().query<{ slot: string; kind: string }>(
+    const { rows } = await testDb().query<{ slot: string; kind: string }>(
       `SELECT slot, kind FROM ledger_reminders WHERE business_id = $1`,
       [B],
     );
@@ -125,7 +125,7 @@ describe('schedulerPass ledger stages', () => {
     ));
     const closing = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
     await backdate(closing.itemId);
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO mail_messages (mail_id, business_id, provider_message_id, thread_id, from_address, subject,
                                   received_at, body_text, created_at)
        VALUES ('M-1', $1, 'P-1', 'T', 'dana@acme.co.il', 'מענה', $2, NULL, $2)`,
@@ -150,7 +150,7 @@ describe('schedulerPass ledger stages', () => {
 
     expect(pass.ledgerEvidence?.closed.map((c) => c.itemId)).toEqual([closing.itemId]);
     expect(pass.ledger?.reminded).toBe(1);
-    const batches = await getPool().query<{ items: string[]; sent_at: Date | null }>(
+    const batches = await testDb().query<{ items: string[]; sent_at: Date | null }>(
       `SELECT items, sent_at FROM ledger_whatsapp_batches WHERE business_id = $1`,
       [B],
     );
@@ -163,7 +163,7 @@ describe('schedulerPass ledger stages', () => {
     expect(text).toContain("1. סגרתי 'תשובה מדנה על ההצעה'");
     expect(text).toContain("השיבי '1 פתחי'");
     expect(text).toContain('2. תזכורת: חשבונית 9 של יוסי');
-    const states = await getPool().query<{ kind: string; whatsapp_state: string | null }>(
+    const states = await testDb().query<{ kind: string; whatsapp_state: string | null }>(
       `SELECT kind, whatsapp_state FROM ledger_reminders WHERE business_id = $1 ORDER BY kind`,
       [B],
     );

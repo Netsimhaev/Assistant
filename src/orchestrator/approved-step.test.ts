@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -178,7 +178,7 @@ describe('a step resumed from an approval', () => {
     expect(outcome.approvalId).not.toBe(approvalId);
 
     // The expired one stays unspent — a claim that failed must not mark it.
-    const { rows } = await getPool().query<{ consumed_at: Date | null }>(
+    const { rows } = await testDb().query<{ consumed_at: Date | null }>(
       `SELECT consumed_at FROM approval_requests WHERE approval_id = $1`,
       [approvalId],
     );

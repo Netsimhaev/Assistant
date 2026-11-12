@@ -63,7 +63,6 @@ function isScope(value: string): value is KillScope {
 
 export interface KillCliDeps {
   log: (line: string) => void;
-  businessId?: string;
 }
 
 const USAGE =

@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
+  __appPoolForTest,
   __setAppPoolMaxForTest,
-  getPool,
   isValidBusinessId,
   transaction,
   withBusiness,
@@ -30,7 +30,7 @@ async function expectBackendGone(pid: number | undefined): Promise<void> {
 
 /** With `max: 1`, the next checkout is either the same client or a fresh one. */
 async function nextAppPid(): Promise<number | undefined> {
-  const client = await getPool().connect();
+  const client = await __appPoolForTest().connect();
   try {
     const { rows } = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
     await expect(client.query('SELECT app_business_id()')).rejects.toThrow(/no business context/);
@@ -77,7 +77,7 @@ describe('withBusiness', () => {
     ).rejects.toThrow(/division by zero/);
 
     // max: 1, so this is the very same pooled client.
-    const client = await getPool().connect();
+    const client = await __appPoolForTest().connect();
     try {
       const { rows } = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
       expect(rows[0]?.pid).toBe(pidInside);
@@ -141,11 +141,11 @@ describe('withBusiness', () => {
 
   it('refuses a malformed business id before touching the pool', async () => {
     const fn = vi.fn(async () => 'never');
-    const before = getPool().totalCount;
+    const before = __appPoolForTest().totalCount;
     await expect(withBusiness('Bad_ID', fn)).rejects.toThrow(/business id/);
     await expect(withBusinessTransaction('__proto__', fn)).rejects.toThrow(/business id/);
     expect(fn).not.toHaveBeenCalled();
-    expect(getPool().totalCount).toBe(before);
+    expect(__appPoolForTest().totalCount).toBe(before);
   });
 
   it('transaction joins an open transaction', async () => {

@@ -1,15 +1,14 @@
 import { randomBytes } from 'node:crypto';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { config } from '../config.js';
 import { closePool, withBusiness } from '../db/pool.js';
 import { writeKeyState } from '../governance/master-key.js';
 import { revokeGrant, writeGrant } from '../governance/oauth-grants.js';
 import { upsertBinding } from '../orchestrator/bindings.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { CALENDAR_SYSTEM } from './calendar.js';
 import { resolveCalendarAccess } from './client-for.js';
 
-const BUSINESS = config.businessId;
+const BUSINESS = TEST_BUSINESS;
 const REF = 'OAUTH_CALENDAR';
 
 function runtimeWith(resolve: () => Promise<{ value: string } | null>) {
@@ -52,7 +51,7 @@ describe('resolveCalendarAccess', () => {
 
   it('is needs_reauth when the grant was revoked, without resolving a credential', async () => {
     const key = randomBytes(32);
-    await writeKeyState(key, 'KEY-test');
+    await writeKeyState(key, 'KEY-test', testDb());
     await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { system: CALENDAR_SYSTEM, provider: 'google', credentialRef: REF, account: 'owner@business.example', scopes: ['https://www.googleapis.com/auth/calendar'], refreshToken: 'refresh-token-value', grantedBy: 'owner' }, key));
     await bind();
     await withBusiness(BUSINESS, (bdb) => revokeGrant(bdb, CALENDAR_SYSTEM, 'owner'));

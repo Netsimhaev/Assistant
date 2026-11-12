@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readdir, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../config.js';
-import { getPool, withBusiness } from '../db/pool.js';
+import { withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -178,7 +178,7 @@ describe('schedulerPass and the conductor', () => {
     expect(result.conduct).not.toBeNull();
     expect(result.conduct?.ceilingReached).toBe(true);
 
-    const { rows } = await getPool().query<{ document_id: string; stored_path: string }>(
+    const { rows } = await testDb().query<{ document_id: string; stored_path: string }>(
       `SELECT document_id, stored_path FROM documents WHERE business_id = $1`,
       [BUSINESS],
     );

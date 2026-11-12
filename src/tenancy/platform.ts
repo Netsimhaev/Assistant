@@ -1,4 +1,5 @@
 import { closePlatformPool, withPlatform } from '../db/platform-pool.js';
+import { verifyKeyState } from '../governance/master-key.js';
 import { normaliseLogin } from './login.js';
 
 /**
@@ -57,4 +58,40 @@ export async function resolveLogin(
     const row = rows[0];
     return row ? { businessId: row.business_id, status: row.status } : null;
   });
+}
+
+/**
+ * Delete every OAuth `state` row that can no longer matter — already
+ * consumed, or past its own TTL and therefore already refused by
+ * `consumeState`'s `expires_at` check (spec §5.7, item 4). Returns how many
+ * rows went.
+ *
+ * Here, on the platform pool, because the cleanup is server-wide by design:
+ * a consumed or expired row from business A is exactly as dead as one from
+ * business B, and each one holds a `code_verifier` in plaintext. Run on a
+ * business's own connection it would reach only that business's rows once
+ * row level security is on, and every other business's stale rows would sit
+ * until one of their owners happened to start a ceremony too. The predicate
+ * names only dead rows — nothing here can read, or remove, a live state.
+ */
+export async function cleanupOAuthStates(): Promise<number> {
+  return withPlatform(async (db) => {
+    const result = await db.query(
+      'DELETE FROM oauth_states WHERE consumed_at IS NOT NULL OR expires_at <= now()',
+    );
+    return result.rowCount ?? 0;
+  });
+}
+
+/**
+ * Check `key` against the server's key state (`verifyKeyState`), for a
+ * process that holds no connection of its own yet — the scheduler at
+ * startup. The key belongs to the server (spec §5.9), not to any business, so
+ * the check runs on the platform pool rather than inside some business's
+ * `withBusiness`. A caller that already holds a connection (a dashboard
+ * request, a CLI inside `withBusiness`) calls `verifyKeyState` on it instead
+ * and never acquires a second one.
+ */
+export async function verifyServerKeyState(key: Buffer): Promise<void> {
+  await withPlatform((db) => verifyKeyState(key, db));
 }

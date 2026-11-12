@@ -10,7 +10,7 @@ import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import type { CalendarClient, CalendarEvent, CalendarInfo } from '../calendar/types.js';
 import { calendarConnection } from '../charter/amend-calendar.js';
 import { installCharter } from '../charter/store.js';
-import { __setAppPoolMaxForTest, closePool, getPool, withBusiness } from '../db/pool.js';
+import { __setAppPoolMaxForTest, closePool, withBusiness } from '../db/pool.js';
 import { randomBytes } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -24,7 +24,7 @@ import { upsertBinding } from '../orchestrator/bindings.js';
 import type { CredentialSource } from '../orchestrator/credentials.js';
 import { loadMeetingSettings, saveMeetingSettings, MEETING_DEFAULTS } from '../meetings/settings.js';
 import { buildCharter } from '../test/fixtures.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { issueCsrfToken } from './csrf.js';
 import { createServer } from './server.js';
@@ -151,7 +151,7 @@ describe('GET /meetings/settings', () => {
    */
   it('renders with an app pool of one connection: the credential resolve reuses the request connection', async () => {
     const key = randomBytes(KEY_BYTES);
-    await writeKeyState(key, 'KEY-pool-test');
+    await writeKeyState(key, 'KEY-pool-test', testDb());
     await withBusiness(BUSINESS, (db) => putSecret(db, { ref: 'OAUTH_CALENDAR', value: 'stored-token', updatedBy: 'test' }, key));
     await bindCalendar();
     const credentials = oauthCredentials({
@@ -184,9 +184,9 @@ describe('GET /meetings/settings', () => {
     const keyPath = join(dir, 'master.key');
     await writeFile(keyPath, key, { mode: 0o600 });
     try {
-      await writeKeyState(key, 'KEY-pool-test');
+      await writeKeyState(key, 'KEY-pool-test', testDb());
       // The row `verifyKeyState` reads for this business, so the check really opens it.
-      await withBusiness(BUSINESS, (db) => writeKeyState(key, 'KEY-pool-test', { businessId: BUSINESS, db }));
+      await withBusiness(BUSINESS, (db) => writeKeyState(key, 'KEY-pool-test', db));
       await withBusiness(BUSINESS, (db) => putSecret(db, { ref: 'OAUTH_CALENDAR', value: 'stored-token', updatedBy: 'test' }, key));
       await bindCalendar();
       server = createServer({ port: 0, calendarClient: clientListing(CALENDARS), credentialKeyPath: keyPath });
@@ -451,7 +451,7 @@ async function insertMeeting(over: Record<string, unknown> = {}): Promise<string
     ...over,
   };
   const keys = Object.keys(row);
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO meetings (${keys.join(',')}) VALUES (${keys.map((_, i) => `$${i + 1}`).join(',')})`,
     keys.map((k) => row[k]),
   );
@@ -459,7 +459,7 @@ async function insertMeeting(over: Record<string, unknown> = {}): Promise<string
 }
 
 async function insertMail(from: string, subject: string, receivedAt: Date): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO mail_messages (mail_id, business_id, provider_message_id, thread_id, from_address, subject, received_at)
      VALUES ($1,$2,$1,'t',$3,$4,$5)`,
     [`mail-${Math.random().toString(36).slice(2, 10)}`, BUSINESS, from, subject, receivedAt],
@@ -500,7 +500,7 @@ describe('the meetings screen', () => {
     expect(res.status).toBe(303);
     expect(res.headers.get('location')).toBe('/meetings');
 
-    const pool = getPool();
+    const pool = testDb();
     const { rows: meetings } = await pool.query(
       `SELECT client_email, client_email_verified, client_phone, state, operation FROM meetings WHERE business_id = $1`,
       [BUSINESS],
@@ -549,7 +549,7 @@ describe('the meetings screen', () => {
       expect(html).toContain(expected);
       expect(html).toContain('בדיקה-ערך');
     }
-    const { rows } = await getPool().query(`SELECT 1 FROM boss_instructions WHERE business_id = $1`, [BUSINESS]);
+    const { rows } = await testDb().query(`SELECT 1 FROM boss_instructions WHERE business_id = $1`, [BUSINESS]);
     expect(rows).toHaveLength(0);
   });
 
@@ -599,11 +599,11 @@ describe('the meetings screen', () => {
 
     const res = await meetingsPost(baseUrl, cookie, `/meetings/${id}/mark`, { response: 'accepted' });
     expect(res.status).toBe(303);
-    const { rows } = await getPool().query(`SELECT response, response_at FROM meetings WHERE meeting_id = $1`, [id]);
+    const { rows } = await testDb().query(`SELECT response, response_at FROM meetings WHERE meeting_id = $1`, [id]);
     expect(rows[0].response).toBe('accepted');
     expect(rows[0].response_at).not.toBeNull();
 
-    const { rows: audit } = await getPool().query(
+    const { rows: audit } = await testDb().query(
       `SELECT reason, kind FROM audit_log WHERE business_id = $1 AND reason LIKE 'meeting_response_marked:%'`,
       [BUSINESS],
     );
@@ -625,9 +625,9 @@ describe('the meetings screen', () => {
     expect((await meetingsPost(baseUrl, cookie, `/meetings/${proposed}/mark`, { response: 'declined' })).status).toBe(404);
     expect((await meetingsPost(baseUrl, cookie, `/meetings/${mine}/mark`, { response: 'tentative' })).status).toBe(400);
     expect((await meetingsPost(baseUrl, cookie, `/meetings/${mine}/mark`, {})).status).toBe(400);
-    const { rows } = await getPool().query(`SELECT response FROM meetings`);
+    const { rows } = await testDb().query(`SELECT response FROM meetings`);
     expect(rows.every((r) => r.response === 'needs_action')).toBe(true);
-    const { rows: audit } = await getPool().query(`SELECT 1 FROM audit_log WHERE reason LIKE 'meeting_response_marked:%'`);
+    const { rows: audit } = await testDb().query(`SELECT 1 FROM audit_log WHERE reason LIKE 'meeting_response_marked:%'`);
     expect(audit).toHaveLength(0);
   });
 
@@ -640,10 +640,10 @@ describe('the meetings screen', () => {
 
     expect((await meetingsPost(baseUrl, cookie, '/meetings/new', formFields(), false)).status).toBe(403);
     expect((await meetingsPost(baseUrl, cookie, `/meetings/${id}/mark`, { response: 'accepted' }, false)).status).toBe(403);
-    const { rows } = await getPool().query(`SELECT response FROM meetings WHERE meeting_id = $1`, [id]);
+    const { rows } = await testDb().query(`SELECT response FROM meetings WHERE meeting_id = $1`, [id]);
     expect(rows[0].response).toBe('needs_action');
     expect(cal.created).toHaveLength(0);
-    const { rows: instr } = await getPool().query(`SELECT 1 FROM boss_instructions`);
+    const { rows: instr } = await testDb().query(`SELECT 1 FROM boss_instructions`);
     expect(instr).toHaveLength(0);
   });
 

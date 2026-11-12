@@ -4,12 +4,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { closePlatformPool } from '../db/platform-pool.js';
 import { putSecret, storedCredentials } from '../governance/credential-store.js';
 import { KEY_BYTES, MasterKeyError, loadMasterKey, verifyKeyState } from '../governance/master-key.js';
 import { encryptSecret } from '../governance/secret-cipher.js';
-import { resetDatabase, testDb } from '../test/db.js';
+import { registerBusiness, resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { RotationAuditUnrecordedError, runSecretKeyCli } from './secret-key.js';
 import type { SecretKeyCliDeps } from './secret-key.js';
 
@@ -67,6 +67,9 @@ function deps(overrides: Partial<SecretKeyCliDeps> = {}): SecretKeyCliDeps {
 
 beforeEach(async () => {
   await resetDatabase();
+  // A key action is recorded in every registered business's trail (the key
+  // is the server's, spec §5.9) — so this file's one business is registered.
+  await registerBusiness(TEST_BUSINESS);
   DIR = await mkdtemp(join(tmpdir(), 'secret-key-cli-'));
   KEY_PATH = join(DIR, 'master.key');
 });
@@ -76,6 +79,7 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
+  await closePlatformPool();
   await closePool();
 });
 
@@ -123,11 +127,11 @@ describe('runSecretKeyCli create', () => {
     await runSecretKeyCli(['create', OPERATOR], deps());
 
     const key = await loadMasterKey(KEY_PATH);
-    await expect(verifyKeyState(key, { businessId: config.businessId })).resolves.toBeUndefined();
+    await expect(verifyKeyState(key, testDb())).resolves.toBeUndefined();
 
     const wrongKey = randomBytes(32);
     await expect(
-      verifyKeyState(wrongKey, { businessId: config.businessId }),
+      verifyKeyState(wrongKey, testDb()),
     ).rejects.toThrow(MasterKeyError);
   });
 
@@ -186,7 +190,7 @@ describe('a refused passphrase changes nothing', () => {
 
     expect(await exists(KEY_PATH)).toBe(false);
     expect(await exists(`${KEY_PATH}.recovery`)).toBe(false);
-    const { rows } = await getPool().query('SELECT 1 FROM credential_key_state');
+    const { rows } = await testDb().query('SELECT 1 FROM server_key_state');
     expect(rows).toHaveLength(0);
 
     // And the operator is not stuck: with a real passphrase the very next
@@ -200,7 +204,7 @@ describe('a refused passphrase changes nothing', () => {
   it('leaves the key, the rows and the recovery copy untouched when rotate is given an empty passphrase', async () => {
     await runSecretKeyCli(['create', OPERATOR], deps());
     const key = await loadMasterKey(KEY_PATH);
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, key));
+    await withBusiness(TEST_BUSINESS, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, key));
     const recoveryBefore = await readFile(`${KEY_PATH}.recovery`, 'utf8');
 
     await expect(
@@ -213,8 +217,8 @@ describe('a refused passphrase changes nothing', () => {
     const after = await loadMasterKey(KEY_PATH);
     expect(after.equals(key)).toBe(true);
     expect(await readFile(`${KEY_PATH}.recovery`, 'utf8')).toBe(recoveryBefore);
-    await expect(verifyKeyState(key, { businessId: config.businessId })).resolves.toBeUndefined();
-    expect((await storedCredentials(key).resolve('ONE', config.businessId))?.value).toBe(
+    await expect(verifyKeyState(key, testDb())).resolves.toBeUndefined();
+    expect((await storedCredentials(key).resolve('ONE', TEST_BUSINESS))?.value).toBe(
       'first-secret',
     );
 
@@ -237,7 +241,7 @@ describe('a key that exists is a key that was recorded', () => {
   it('writes the create audit row in the same transaction as the key state', async () => {
     await runSecretKeyCli(['create', OPERATOR], deps());
 
-    const { rows } = await getPool().query<{ reason: string; on_behalf_of: string }>(
+    const { rows } = await testDb().query<{ reason: string; on_behalf_of: string }>(
       "SELECT reason, on_behalf_of FROM audit_log WHERE kind = 'credential_change'",
     );
     expect(rows).toHaveLength(1);
@@ -246,7 +250,7 @@ describe('a key that exists is a key that was recorded', () => {
 
     // The pairing, which is the actual claim: key state and audit row either
     // both exist or neither does.
-    const { rows: state } = await getPool().query('SELECT 1 FROM credential_key_state');
+    const { rows: state } = await testDb().query('SELECT 1 FROM server_key_state');
     expect(state).toHaveLength(1);
   });
 });
@@ -304,10 +308,10 @@ describe('runSecretKeyCli rotate', () => {
     await runSecretKeyCli(['create', OPERATOR], deps());
     const oldKey = await loadMasterKey(KEY_PATH);
 
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, oldKey));
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'TWO', value: 'second-secret', updatedBy: OPERATOR }, oldKey));
+    await withBusiness(TEST_BUSINESS, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, oldKey));
+    await withBusiness(TEST_BUSINESS, (bdb) => putSecret(bdb, { ref: 'TWO', value: 'second-secret', updatedBy: OPERATOR }, oldKey));
 
-    const { rows: beforeRows } = await getPool().query<{ key_id: string }>(
+    const { rows: beforeRows } = await testDb().query<{ key_id: string }>(
       'SELECT key_id FROM credentials ORDER BY ref',
     );
     const oldKeyId = beforeRows[0]?.key_id;
@@ -317,7 +321,7 @@ describe('runSecretKeyCli rotate', () => {
     const newKey = await loadMasterKey(KEY_PATH);
     expect(newKey.equals(oldKey)).toBe(false);
 
-    const { rows: afterRows } = await getPool().query<{ ref: string; key_id: string }>(
+    const { rows: afterRows } = await testDb().query<{ ref: string; key_id: string }>(
       'SELECT ref, key_id FROM credentials ORDER BY ref',
     );
     expect(afterRows).toHaveLength(2);
@@ -327,20 +331,20 @@ describe('runSecretKeyCli rotate', () => {
 
     // Every row still resolves, now under the new key, with its value
     // untouched by the round trip.
-    const one = await storedCredentials(newKey).resolve('ONE', config.businessId);
-    const two = await storedCredentials(newKey).resolve('TWO', config.businessId);
+    const one = await storedCredentials(newKey).resolve('ONE', TEST_BUSINESS);
+    const two = await storedCredentials(newKey).resolve('TWO', TEST_BUSINESS);
     expect(one?.value).toBe('first-secret');
     expect(two?.value).toBe('second-secret');
 
     // And none of them open under the old key any more — this is the
     // "leaves none under the old key" half of the claim, not just "the new
     // key also works".
-    expect(await storedCredentials(oldKey).resolve('ONE', config.businessId)).toBeNull();
-    expect(await storedCredentials(oldKey).resolve('TWO', config.businessId)).toBeNull();
+    expect(await storedCredentials(oldKey).resolve('ONE', TEST_BUSINESS)).toBeNull();
+    expect(await storedCredentials(oldKey).resolve('TWO', TEST_BUSINESS)).toBeNull();
 
     // The database's own key state agrees with the file that now sits on
     // disk — startup's `verifyKeyState` would accept it.
-    await expect(verifyKeyState(newKey, { businessId: config.businessId })).resolves.toBeUndefined();
+    await expect(verifyKeyState(newKey, testDb())).resolves.toBeUndefined();
   });
 
   it('refuses to rotate when the key file does not match the installation state', async () => {
@@ -375,10 +379,9 @@ describe('a rotation that committed says so even when its record does not', () =
   it('throws RotationAuditUnrecordedError naming the key ids and the row count, with the rotation in force', async () => {
     await runSecretKeyCli(['create', OPERATOR], deps());
     const oldKey = await loadMasterKey(KEY_PATH);
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, oldKey));
-    const { rows: before } = await getPool().query<{ key_id: string }>(
-      'SELECT key_id FROM credential_key_state WHERE business_id = $1',
-      [config.businessId],
+    await withBusiness(TEST_BUSINESS, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, oldKey));
+    const { rows: before } = await testDb().query<{ key_id: string }>(
+      'SELECT key_id FROM server_key_state',
     );
     const oldKeyId = before[0]?.key_id;
     expect(oldKeyId).toBeDefined();
@@ -406,7 +409,7 @@ describe('a rotation that committed says so even when its record does not', () =
     //    message carries it too, because `main()` prints `err.message` and
     //    nothing else.
     expect(thrown.outcome).toEqual({
-      businessId: config.businessId,
+      businesses: [TEST_BUSINESS],
       previousKeyId: oldKeyId,
       newKeyId: expect.stringMatching(/^KEY-/) as unknown as string,
       secretsReEncrypted: 1,
@@ -429,11 +432,11 @@ describe('a rotation that committed says so even when its record does not', () =
     //    and not under the retired one, key state agrees, recovery copy is a
     //    copy of the NEW key.
     expect(newKey.equals(oldKey)).toBe(false);
-    await expect(verifyKeyState(newKey, { businessId: config.businessId })).resolves.toBeUndefined();
-    expect((await storedCredentials(newKey).resolve('ONE', config.businessId))?.value).toBe(
+    await expect(verifyKeyState(newKey, testDb())).resolves.toBeUndefined();
+    expect((await storedCredentials(newKey).resolve('ONE', TEST_BUSINESS))?.value).toBe(
       'first-secret',
     );
-    expect(await storedCredentials(oldKey).resolve('ONE', config.businessId)).toBeNull();
+    expect(await storedCredentials(oldKey).resolve('ONE', TEST_BUSINESS)).toBeNull();
 
     await rm(KEY_PATH);
     await runSecretKeyCli(['restore', OPERATOR], deps());
@@ -441,7 +444,7 @@ describe('a rotation that committed says so even when its record does not', () =
 
     // And the record really is absent — otherwise this whole test could pass
     // against a rotation that quietly wrote its row after all.
-    const { rows: audit } = await getPool().query(
+    const { rows: audit } = await testDb().query(
       `SELECT 1 FROM audit_log WHERE kind = 'credential_change' AND reason LIKE '%הוחלף%'`,
     );
     expect(audit).toHaveLength(0);
@@ -488,7 +491,7 @@ describe('a new recovery passphrase must be long enough, and typed twice', () =>
 
     expect(await exists(KEY_PATH)).toBe(false);
     expect(await exists(`${KEY_PATH}.recovery`)).toBe(false);
-    const { rows } = await getPool().query('SELECT 1 FROM credential_key_state');
+    const { rows } = await testDb().query('SELECT 1 FROM server_key_state');
     expect(rows).toHaveLength(0);
   });
 
@@ -507,7 +510,7 @@ describe('a new recovery passphrase must be long enough, and typed twice', () =>
 
     expect(await exists(KEY_PATH)).toBe(false);
     expect(await exists(`${KEY_PATH}.recovery`)).toBe(false);
-    const { rows } = await getPool().query('SELECT 1 FROM credential_key_state');
+    const { rows } = await testDb().query('SELECT 1 FROM server_key_state');
     expect(rows).toHaveLength(0);
   });
 
@@ -519,7 +522,7 @@ describe('a new recovery passphrase must be long enough, and typed twice', () =>
   it('refuses a mistyped confirmation on rotate, leaving the key and the rows untouched', async () => {
     await runSecretKeyCli(['create', OPERATOR], deps());
     const key = await loadMasterKey(KEY_PATH);
-    await withBusiness(config.businessId, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, key));
+    await withBusiness(TEST_BUSINESS, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, key));
     const recoveryBefore = await readFile(`${KEY_PATH}.recovery`, 'utf8');
 
     await expect(
@@ -531,7 +534,7 @@ describe('a new recovery passphrase must be long enough, and typed twice', () =>
 
     expect((await loadMasterKey(KEY_PATH)).equals(key)).toBe(true);
     expect(await readFile(`${KEY_PATH}.recovery`, 'utf8')).toBe(recoveryBefore);
-    expect((await storedCredentials(key).resolve('ONE', config.businessId))?.value).toBe(
+    expect((await storedCredentials(key).resolve('ONE', TEST_BUSINESS))?.value).toBe(
       'first-secret',
     );
   });
@@ -552,8 +555,10 @@ describe('a new recovery passphrase must be long enough, and typed twice', () =>
     const legacy = 'old-short';
     const salt = randomBytes(16).toString('hex');
     const derived = await scrypt(legacy, salt, KEY_BYTES);
+    // The server's recovery AAD (`''`): what `create` writes today, so the
+    // only thing old about this copy is its passphrase.
     const sealed = encryptSecret(key.toString('base64'), derived, {
-      businessId: config.businessId,
+      businessId: '',
       ref: 'key-recovery',
     });
     await writeFile(
@@ -567,6 +572,35 @@ describe('a new recovery passphrase must be long enough, and typed twice', () =>
     await rm(KEY_PATH);
 
     await runSecretKeyCli(['restore', OPERATOR], deps({ readPassphrase: reads(legacy) }));
+
+    expect((await loadMasterKey(KEY_PATH)).equals(key)).toBe(true);
+  });
+
+  /**
+   * Migration 067 — a recovery copy sealed while the installation served one
+   * business was sealed under that business, and so was its key-state row,
+   * which 067 carries over with `check_business_id` naming it. `restore`
+   * opens the copy under the business the server's key state names, so the
+   * copy an operator kept from before the move still works.
+   */
+  it('restores a copy sealed before the key moved to the server', async () => {
+    const key = randomBytes(KEY_BYTES);
+    const legacyBusiness = 'dev-business';
+    const check = encryptSecret('credential-broker-key-check', key, { businessId: legacyBusiness, ref: 'key-check' });
+    await testDb().query(
+      `INSERT INTO server_key_state (singleton, key_id, check_nonce, check_value, check_business_id)
+       VALUES (true, 'KEY-legacy', $1, $2, $3)`,
+      [check.nonce, check.ciphertext, legacyBusiness],
+    );
+    const salt = randomBytes(16).toString('hex');
+    const derived = await scrypt(PASSPHRASE, salt, KEY_BYTES);
+    const sealed = encryptSecret(key.toString('base64'), derived, { businessId: legacyBusiness, ref: 'key-recovery' });
+    await writeFile(
+      `${KEY_PATH}.recovery`,
+      JSON.stringify({ salt, nonce: sealed.nonce.toString('hex'), ciphertext: sealed.ciphertext.toString('hex') }),
+    );
+
+    await runSecretKeyCli(['restore', OPERATOR], deps());
 
     expect((await loadMasterKey(KEY_PATH)).equals(key)).toBe(true);
   });

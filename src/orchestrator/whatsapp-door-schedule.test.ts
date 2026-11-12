@@ -9,7 +9,7 @@ import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import type { CalendarClient, CalendarEvent } from '../calendar/types.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import type { Plan } from '../domain/plan.js';
 import { answerScheduleQuery } from '../meetings/door.js';
 import { createFakeGateway } from '../whatsapp/fake-gateway.js';
@@ -17,7 +17,7 @@ import { createFakeMessenger } from '../whatsapp/fake-messenger.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { appendAudit } from '../audit/log.js';
 import { buildCharter } from '../test/fixtures.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { canonicalHash } from '../util/canonical.js';
 import { localParts, localToInstant } from '../util/local-time.js';
 import { upsertBinding } from './bindings.js';
@@ -94,7 +94,7 @@ async function expectedSchedule(text: string): Promise<string> {
 }
 
 async function count(sql: string): Promise<number> {
-  const { rows } = await getPool().query<{ n: string }>(sql);
+  const { rows } = await testDb().query<{ n: string }>(sql);
   return Number(rows[0]?.n);
 }
 
@@ -132,7 +132,7 @@ describe('WhatsApp door: schedule question', () => {
     expect(result.refused).toBe(0);
     expect(await count('SELECT count(*)::text AS n FROM jobs')).toBe(0);
     expect(await count('SELECT count(*)::text AS n FROM boss_instructions')).toBe(0);
-    const { rows } = await getPool().query<{ state: string; job_id: string | null }>(
+    const { rows } = await testDb().query<{ state: string; job_id: string | null }>(
       'SELECT state, job_id FROM whatsapp_messages WHERE provider_message_id = $1',
       [msg.providerMessageId],
     );
@@ -166,7 +166,7 @@ describe('WhatsApp door: schedule question', () => {
       gateway, messenger, calendar: CALENDAR,
       planner: async () => ({ status: 'planned', plan: clarifyingPlan }),
     }));
-    const parked = await getPool().query<{ job_id: string }>('SELECT job_id FROM boss_instructions');
+    const parked = await testDb().query<{ job_id: string }>('SELECT job_id FROM boss_instructions');
     expect(parked.rows).toHaveLength(1);
     const jobsBefore = await count('SELECT count(*)::text AS n FROM jobs');
 
@@ -180,9 +180,9 @@ describe('WhatsApp door: schedule question', () => {
 
     expect(texts[1]).toBe(await expectedSchedule('מה יש לי ביום שלישי'));
     expect(texts[1]).not.toContain('הוספתי את זה לבקשה הקודמת');
-    const row = await getPool().query<{ answer: string | null }>('SELECT answer FROM boss_instructions');
+    const row = await testDb().query<{ answer: string | null }>('SELECT answer FROM boss_instructions');
     expect(row.rows[0]?.answer).toBeNull();
-    const job = await getPool().query<{ phase: string }>('SELECT phase FROM jobs WHERE job_id = $1', [parked.rows[0]?.job_id]);
+    const job = await testDb().query<{ phase: string }>('SELECT phase FROM jobs WHERE job_id = $1', [parked.rows[0]?.job_id]);
     expect(['closed', 'failed', 'halted']).not.toContain(job.rows[0]?.phase);
     expect(await count('SELECT count(*)::text AS n FROM jobs')).toBe(jobsBefore);
   });

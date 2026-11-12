@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { createJob } from '../orchestrator/jobs.js';
@@ -97,7 +97,7 @@ describe('the instruction record', () => {
     await expect(
       withBusiness(BUSINESS, (bdb) => saveInstruction(bdb, { textOrigin: 'typed', jobId, text: 'שנייה' })),
     ).rejects.toThrow();
-    const { rows } = await getPool().query(`SELECT 1 FROM boss_instructions`);
+    const { rows } = await testDb().query(`SELECT 1 FROM boss_instructions`);
     expect(rows).toHaveLength(1);
   });
 });

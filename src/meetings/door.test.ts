@@ -10,7 +10,7 @@ import { CALENDAR_SYSTEM, HOLD_TITLE_PREFIX } from '../calendar/calendar.js';
 import type { CalendarClient, CalendarEvent, EventWrite } from '../calendar/types.js';
 import { calendarConnection } from '../charter/amend-calendar.js';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { loadAutonomyMode } from '../governance/autonomy-mode.js';
 import { confirmChoice, loadConfirmation } from '../governance/instruction-confirmations.js';
 import { createCalendarAdapter } from '../orchestrator/adapters/calendar.js';
@@ -26,7 +26,7 @@ import type { Runtime } from '../orchestrator/runtime.js';
 import { CONFIRMED_COMMAND_EXEMPTION_MARKER } from '../policy/confirmed-command.js';
 import type { ExtractorOutcome, MeetingExtractor } from '../sdk/meeting-extractor.js';
 import type { PlanOutcome, PlanRequest } from '../sdk/planner.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { localParts, localToInstant } from '../util/local-time.js';
 import {
@@ -265,7 +265,7 @@ function runtimeWith(client: CalendarClient): Runtime {
 }
 
 async function holds(): Promise<{ hold_id: string; job_id: string; event_id: string; state: string }[]> {
-  const { rows } = await getPool().query<{ hold_id: string; job_id: string; event_id: string; state: string }>(
+  const { rows } = await testDb().query<{ hold_id: string; job_id: string; event_id: string; state: string }>(
     'SELECT hold_id, job_id, event_id, state FROM meeting_holds WHERE business_id = $1 ORDER BY created_at',
     [BUSINESS],
   );
@@ -328,7 +328,7 @@ describe('runMeetingOperation through runInstruction', () => {
     expect(outcome.question).toContain('כלי: calendar.write');
     expect(outcome.question.indexOf('קביעה:')).toBeLessThan(outcome.question.indexOf('כלי: calendar.write'));
 
-    const { rows } = await getPool().query<{ event_id: string; internal_note: string; state: string }>(
+    const { rows } = await testDb().query<{ event_id: string; internal_note: string; state: string }>(
       'SELECT event_id, internal_note, state FROM meetings WHERE business_id = $1 AND job_id = $2',
       [BUSINESS, outcome.jobId],
     );
@@ -429,7 +429,7 @@ describe('runMeetingOperation through runInstruction', () => {
   });
 
   it('refuses when the calendar is not connected, without creating a hold', async () => {
-    await getPool().query(`DELETE FROM connection_bindings WHERE business_id = $1`, [BUSINESS]);
+    await testDb().query(`DELETE FROM connection_bindings WHERE business_id = $1`, [BUSINESS]);
     const day = workDay();
     const cal = fakeCalendar();
     const { extractor, texts } = extractorOf({ status: 'extracted', request: createRequest(day) });
@@ -440,12 +440,12 @@ describe('runMeetingOperation through runInstruction', () => {
     expect(texts).toEqual([]);
     expect(cal.calls).toEqual([]);
     expect(await holds()).toEqual([]);
-    const { rows } = await getPool().query<{ phase: string }>('SELECT phase FROM jobs WHERE business_id = $1', [BUSINESS]);
+    const { rows } = await testDb().query<{ phase: string }>('SELECT phase FROM jobs WHERE business_id = $1', [BUSINESS]);
     expect(rows.map((r) => r.phase)).toEqual(['failed']);
   });
 
   it('refuses a meeting with no settings before the billed extraction', async () => {
-    await getPool().query(`DELETE FROM meeting_settings WHERE business_id = $1`, [BUSINESS]);
+    await testDb().query(`DELETE FROM meeting_settings WHERE business_id = $1`, [BUSINESS]);
     const cal = fakeCalendar();
     const { extractor, texts } = extractorOf({ status: 'extracted', request: createRequest(workDay()) });
     const outcome = await instruct('תקבעי תור לדני כהן מחר', cal.client, extractor);
@@ -455,7 +455,7 @@ describe('runMeetingOperation through runInstruction', () => {
   });
 
   it('with no calendar, a text with only a time word is still extracted, and a non-meeting goes to the planner', async () => {
-    await getPool().query(`DELETE FROM connection_bindings WHERE business_id = $1`, [BUSINESS]);
+    await testDb().query(`DELETE FROM connection_bindings WHERE business_id = $1`, [BUSINESS]);
     const cal = fakeCalendar();
     const { extractor, texts } = extractorOf({ status: 'not_meeting' });
     let planned = 0;
@@ -471,7 +471,7 @@ describe('runMeetingOperation through runInstruction', () => {
   });
 
   it('with no calendar, a meeting read from a time word alone is refused after the extraction', async () => {
-    await getPool().query(`DELETE FROM connection_bindings WHERE business_id = $1`, [BUSINESS]);
+    await testDb().query(`DELETE FROM connection_bindings WHERE business_id = $1`, [BUSINESS]);
     const cal = fakeCalendar();
     const { extractor, texts } = extractorOf({ status: 'extracted', request: createRequest(workDay()) });
     const outcome = await instruct('תקבעי לדני כהן מחר', cal.client, extractor);
@@ -588,7 +588,7 @@ describe('runMeetingOperation through runInstruction', () => {
     const ran = await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(cal.client) }));
     expect(ran.ran).toEqual([{ jobId: outcome.jobId, status: 'done', detail: null }]);
 
-    const { rows } = await getPool().query<{ kind: string; reason: string }>(
+    const { rows } = await testDb().query<{ kind: string; reason: string }>(
       `SELECT kind, reason FROM audit_log WHERE job_id = $1 AND kind IN ('intent_to_act', 'policy_denial') ORDER BY seq`,
       [outcome.jobId],
     );
@@ -657,7 +657,7 @@ describe('runMeetingOperation — fix round 1', () => {
     if (outcome.status !== 'needs_confirmation') throw new Error(`expected a confirmation, got ${outcome.status}`);
     expect(outcome.question).toContain('תצא הזמנה אל dani@example.com (מהזיכרון — לא אומת)');
     expect(outcome.question).toContain('טלפון: 052-1234567" (מהזיכרון — לא אומת)');
-    const { rows } = await getPool().query<{ client_email_verified: boolean }>(
+    const { rows } = await testDb().query<{ client_email_verified: boolean }>(
       'SELECT client_email_verified FROM meetings WHERE business_id = $1 AND job_id = $2',
       [BUSINESS, outcome.jobId],
     );

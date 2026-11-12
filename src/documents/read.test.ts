@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { compileCharter } from '../charter/compile.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -184,7 +184,7 @@ describe('readDocument', () => {
     }));
     let flagDuringRead: boolean | null = null;
     const reader = async (request: { artifacts: readonly DocumentArtifact[] }): Promise<ReadOutcome> => {
-      const { rows } = await getPool().query<{ content_ingested: boolean }>(
+      const { rows } = await testDb().query<{ content_ingested: boolean }>(
         'SELECT content_ingested FROM jobs WHERE job_id = $1',
         [job.jobId],
       );
@@ -225,7 +225,7 @@ describe('readDocument', () => {
     // failing closed after calling the model would record conclusions for a
     // job that does not remember consuming them.
     expect(calls).toHaveLength(0);
-    const { rows } = await getPool().query(
+    const { rows } = await testDb().query(
       'SELECT 1 FROM document_readings WHERE document_id = $1',
       [documentId],
     );
@@ -259,7 +259,7 @@ describe('readDocument', () => {
     expect(second.cached).toBe(true);
     expect(calls).toHaveLength(1);
 
-    const { rows } = await getPool().query<{ content_ingested: boolean }>(
+    const { rows } = await testDb().query<{ content_ingested: boolean }>(
       'SELECT content_ingested FROM jobs WHERE job_id = $1',
       [job.jobId],
     );

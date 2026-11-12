@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { businessSaveFolder } from '../test/save-root.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
@@ -172,7 +172,7 @@ const neverCalledProvider = async (): Promise<{ text: string }> => {
 };
 
 async function stateOf(providerMessageId: string): Promise<string | null> {
-  const { rows } = await getPool().query<{ state: string }>(
+  const { rows } = await testDb().query<{ state: string }>(
     'SELECT state FROM whatsapp_messages WHERE business_id = $1 AND provider_message_id = $2',
     [BUSINESS, providerMessageId],
   );
@@ -182,7 +182,7 @@ async function stateOf(providerMessageId: string): Promise<string | null> {
 async function messageRow(
   providerMessageId: string,
 ): Promise<{ jobId: string | null; transcript: string | null; state: string } | null> {
-  const { rows } = await getPool().query<{ job_id: string | null; transcript: string | null; state: string }>(
+  const { rows } = await testDb().query<{ job_id: string | null; transcript: string | null; state: string }>(
     'SELECT job_id, transcript, state FROM whatsapp_messages WHERE business_id = $1 AND provider_message_id = $2',
     [BUSINESS, providerMessageId],
   );
@@ -192,7 +192,7 @@ async function messageRow(
 
 /** Jobs still in a non-terminal phase — not merely "a row exists". */
 async function openJobs(businessId: string): Promise<Array<{ jobId: string }>> {
-  const { rows } = await getPool().query<{ job_id: string }>(
+  const { rows } = await testDb().query<{ job_id: string }>(
     `SELECT job_id FROM jobs WHERE business_id = $1 AND phase NOT IN ('closed', 'failed', 'halted')`,
     [businessId],
   );
@@ -201,7 +201,7 @@ async function openJobs(businessId: string): Promise<Array<{ jobId: string }>> {
 
 /** Every job row regardless of phase — used where "none was ever created" matters. */
 async function allJobs(businessId: string): Promise<Array<{ jobId: string }>> {
-  const { rows } = await getPool().query<{ job_id: string }>(
+  const { rows } = await testDb().query<{ job_id: string }>(
     'SELECT job_id FROM jobs WHERE business_id = $1',
     [businessId],
   );
@@ -209,7 +209,7 @@ async function allJobs(businessId: string): Promise<Array<{ jobId: string }>> {
 }
 
 async function jobWhatsAppMessageId(jobId: string): Promise<string | null> {
-  const { rows } = await getPool().query<{ whatsapp_message_id: string | null }>(
+  const { rows } = await testDb().query<{ whatsapp_message_id: string | null }>(
     'SELECT whatsapp_message_id FROM jobs WHERE job_id = $1',
     [jobId],
   );
@@ -267,7 +267,7 @@ describe('runWhatsAppDoor', () => {
     const job = jobs[0];
     if (job === undefined) throw new Error('unreachable');
 
-    const row = await getPool().query<{ phase: string; provenance: string }>(
+    const row = await testDb().query<{ phase: string; provenance: string }>(
       'SELECT phase, provenance FROM jobs WHERE job_id = $1',
       [job.jobId],
     );
@@ -416,7 +416,7 @@ describe('runWhatsAppDoor', () => {
 
     // The answer is on the row, so the question is no longer open and the
     // next message is a new instruction again.
-    const { rows } = await getPool().query<{ answer: string | null }>(
+    const { rows } = await testDb().query<{ answer: string | null }>(
       'SELECT answer FROM boss_instructions WHERE job_id = $1',
       [parked.jobId],
     );
@@ -425,13 +425,13 @@ describe('runWhatsAppDoor', () => {
     // The parked job is superseded, naming its replacement, and its opening
     // message is claimed `'reported'` — which is what stops the report pass
     // telling the owner that the instruction he just answered "failed".
-    const jobRow = await getPool().query<{ phase: string; whatsapp_message_id: string | null }>(
+    const jobRow = await testDb().query<{ phase: string; whatsapp_message_id: string | null }>(
       'SELECT phase, whatsapp_message_id FROM jobs WHERE job_id = $1',
       [parked.jobId],
     );
     expect(jobRow.rows[0]?.phase).toBe('failed');
     const openingMessage = jobRow.rows[0]?.whatsapp_message_id;
-    const openingRow = await getPool().query<{ state: string }>(
+    const openingRow = await testDb().query<{ state: string }>(
       'SELECT state FROM whatsapp_messages WHERE id = $1',
       [openingMessage],
     );
@@ -558,12 +558,12 @@ describe('runWhatsAppDoor', () => {
     expect(confirmation).toContain('סגרתי');
     expect(confirmation).toContain('תשלחי לרונית');
 
-    const jobRow = await getPool().query<{ phase: string; whatsapp_message_id: string | null }>(
+    const jobRow = await testDb().query<{ phase: string; whatsapp_message_id: string | null }>(
       'SELECT phase, whatsapp_message_id FROM jobs WHERE job_id = $1',
       [parked.jobId],
     );
     expect(jobRow.rows[0]?.phase).toBe('closed');
-    const openingRow = await getPool().query<{ state: string }>(
+    const openingRow = await testDb().query<{ state: string }>(
       'SELECT state FROM whatsapp_messages WHERE id = $1',
       [jobRow.rows[0]?.whatsapp_message_id],
     );
@@ -616,7 +616,7 @@ describe('runWhatsAppDoor', () => {
     expect(seen[0]).toContain('זהו, רונית כהן');
     expect(messenger.sentTexts[1]).toContain('לבקשה הקודמת');
 
-    const { rows } = await getPool().query<{ answer: string | null }>(
+    const { rows } = await testDb().query<{ answer: string | null }>(
       'SELECT answer FROM boss_instructions WHERE job_id = $1',
       [parked.jobId],
     );
@@ -734,7 +734,7 @@ describe('runWhatsAppDoor', () => {
     expect(told).toContain('לבקשה הקודמת'); // which reading was chosen
     expect(told).toContain('סגרתי את הבקשה הקודמת'); // and what happened to it
 
-    const jobRow = await getPool().query<{ phase: string }>(
+    const jobRow = await testDb().query<{ phase: string }>(
       'SELECT phase FROM jobs WHERE job_id = $1',
       [parked.jobId],
     );
@@ -824,7 +824,7 @@ describe('runWhatsAppDoor', () => {
     // Nothing was taken: both questions are still open and still answerable,
     // so the refusal cost the owner nothing but a round trip.
     expect(await openJobs(BUSINESS)).toHaveLength(2);
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       `SELECT count(*)::text AS n FROM boss_instructions
         WHERE business_id = $1 AND answer IS NOT NULL`,
       [BUSINESS],
@@ -900,7 +900,7 @@ describe('runWhatsAppDoor', () => {
     expect(result.closed).toBe(1);
     expect(result.refused).toBe(0);
     expect(messenger.sentTexts[1]).not.toContain('מכסת ההוראות');
-    const jobRow = await getPool().query<{ phase: string }>(
+    const jobRow = await testDb().query<{ phase: string }>(
       'SELECT phase FROM jobs WHERE job_id = $1',
       [parked.jobId],
     );
@@ -968,13 +968,11 @@ describe('runWhatsAppDoor', () => {
    * closes both gaps at once, exactly as the review suggested: it asserts a
    * `whatsapp_instruction` row exists under the business the door was given
    * — which also pins "every outcome, including `refused`, counts" — and
-   * that none landed under `config.businessId` instead.
+   * that none landed under any other business. (There is no configured
+   * default business any more — spec §5.2 — so "any other" is the whole
+   * claim the old `config.businessId` comparison was standing in for.)
    */
   it('writes the instruction audit row under the business it was given, never the default', async () => {
-    // Sanity: if these were ever equal, the two counts below could not tell
-    // a misattributed row apart from a correctly-attributed one.
-    expect(config.businessId).not.toBe(BUSINESS);
-
     const gateway = createFakeGateway();
     const messenger = createFakeMessenger();
     gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'ג׳יבריש לא מובן' }));
@@ -985,17 +983,17 @@ describe('runWhatsAppDoor', () => {
       planner: async () => ({ status: 'unparseable', raw: 'not json', reason: 'bad model output' }),
     }));
 
-    const underGivenBusiness = await getPool().query<{ n: string }>(
+    const underGivenBusiness = await testDb().query<{ n: string }>(
       `SELECT count(*)::text AS n FROM audit_log WHERE business_id = $1 AND kind = 'whatsapp_instruction'`,
       [BUSINESS],
     );
     expect(underGivenBusiness.rows[0]?.n).toBe('1');
 
-    const underDefaultBusiness = await getPool().query<{ n: string }>(
-      `SELECT count(*)::text AS n FROM audit_log WHERE business_id = $1 AND kind = 'whatsapp_instruction'`,
-      [config.businessId],
+    const underAnyOtherBusiness = await testDb().query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM audit_log WHERE business_id <> $1 AND kind = 'whatsapp_instruction'`,
+      [BUSINESS],
     );
-    expect(underDefaultBusiness.rows[0]?.n).toBe('0');
+    expect(underAnyOtherBusiness.rows[0]?.n).toBe('0');
   });
 
   /**
@@ -1314,7 +1312,7 @@ describe('runWhatsAppDoor', () => {
     ).rejects.toThrow();
 
     // Failed before the first `recordInbound` — nothing was ever written.
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       'SELECT count(*)::text AS n FROM whatsapp_messages WHERE business_id = $1',
       [BUSINESS],
     );
@@ -1388,7 +1386,7 @@ describe('a recording is not typing', () => {
   const SPOKEN = 'תשלחי ל-dana@example.com את ההצעה';
 
   async function grants(): Promise<Array<{ recipients: string[] }>> {
-    const { rows } = await getPool().query<{ recipients: string[] }>(
+    const { rows } = await testDb().query<{ recipients: string[] }>(
       'SELECT recipients FROM job_authorizations WHERE business_id = $1',
       [BUSINESS],
     );
@@ -1396,7 +1394,7 @@ describe('a recording is not typing', () => {
   }
 
   async function storedOrigins(): Promise<string[]> {
-    const { rows } = await getPool().query<{ text_origin: string }>(
+    const { rows } = await testDb().query<{ text_origin: string }>(
       'SELECT text_origin FROM boss_instructions WHERE business_id = $1 ORDER BY created_at',
       [BUSINESS],
     );
@@ -1525,7 +1523,7 @@ describe('a side-effecting instruction over WhatsApp', () => {
   });
 
   async function instructionRowsToday(): Promise<number> {
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       `SELECT count(*)::text AS n FROM audit_log WHERE business_id = $1 AND kind = 'whatsapp_instruction'`,
       [BUSINESS],
     );
@@ -1551,7 +1549,7 @@ describe('a side-effecting instruction over WhatsApp', () => {
 
     const jobs = await openJobs(BUSINESS);
     expect(jobs).toHaveLength(1);
-    const { rows } = await getPool().query<{ phase: string; channel: string }>(
+    const { rows } = await testDb().query<{ phase: string; channel: string }>(
       `SELECT j.phase, c.channel FROM jobs j
          JOIN instruction_confirmations c ON c.job_id = j.job_id
         WHERE j.job_id = $1`,
@@ -1802,7 +1800,7 @@ describe('confirming a held command over WhatsApp', () => {
     gateway.enqueue(reply('כן'));
     await pass();
 
-    const { rows } = await getPool().query<{ job_id: string | null }>(
+    const { rows } = await testDb().query<{ job_id: string | null }>(
       `SELECT job_id FROM whatsapp_messages
         WHERE business_id = $1 AND direction = 'outbound' AND body = $2`,
       [BUSINESS, CONFIRM_EXECUTING],
@@ -2391,7 +2389,7 @@ describe('confirming a held command over WhatsApp', () => {
       expect(result.documentCardReplies).toBe(1);
       expect(lastSent()).toBe(DOCUMENT_CARD_FIX_OPENED);
       expect(await cardState(cardId)).toBe('superseded');
-      const { rows } = await getPool().query<{ instruction_text: string; text_origin: string }>(
+      const { rows } = await testDb().query<{ instruction_text: string; text_origin: string }>(
         `SELECT instruction_text, text_origin FROM document_productions WHERE business_id = $1 ORDER BY created_at DESC LIMIT 1`,
         [BUSINESS],
       );

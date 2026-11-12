@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { activeScopes, checkKillSwitch } from '../governance/killswitch.js';
 import { runKillCli } from './kill.js';
 
@@ -12,7 +12,7 @@ function collector(): { log: (line: string) => void; lines: string[] } {
 }
 
 async function auditReasons(): Promise<string[]> {
-  const { rows } = await getPool().query<{ reason: string }>(
+  const { rows } = await testDb().query<{ reason: string }>(
     "SELECT reason FROM audit_log WHERE kind = 'kill_switch' ORDER BY at ASC",
   );
   return rows.map((r) => r.reason);

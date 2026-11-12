@@ -145,11 +145,14 @@ export const config = {
    * used at run time. In tests it is `TEST_DATABASE_URL` itself, as before.
    */
   databaseMigrateUrl: testDatabaseUrl ?? required('DATABASE_MIGRATE_URL'),
-  // Required, not defaulted. This key scopes the charter, the kill switch, the
-  // spend ledger and the audit chain; a deploy that forgets it would run under
-  // someone else's name and interleave two businesses' audit chains.
-  businessId: required('BUSINESS_ID'),
-  // Required, not defaulted — same reasoning as BUSINESS_ID above. This is
+  // There is no `businessId` here, on purpose (spec §5.2): one server runs
+  // every business, and each data path takes its business explicitly —
+  // `withBusiness(businessId, …)` — from the business registry, a session or a
+  // CLI's `--business`. A configured default would be the business every
+  // forgotten argument silently fell back to.
+  //
+  // Required, not defaulted: a deploy that falls back to a default is a deploy
+  // writing somewhere nobody chose. This is
   // the one directory the reading agent (`know.reader`, gate-hook.ts's path
   // check) is scoped to, and it is where ingestDocument stores every
   // document's bytes (spec §3.5: "same root, not a second root"). A deploy

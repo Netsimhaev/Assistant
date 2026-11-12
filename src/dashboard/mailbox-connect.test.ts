@@ -22,7 +22,7 @@ import { queryAudit } from '../audit/log.js';
 import { MAILBOX_SUBPROCESSOR, buildMailboxAmendment } from '../charter/amend-mailbox.js';
 import { signCharter } from '../charter/sign.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { KEY_BYTES, writeKeyState } from '../governance/master-key.js';
 import { markNeedsReauth, readGrantBySystem } from '../governance/oauth-grants.js';
@@ -35,7 +35,7 @@ import {
 } from '../orchestrator/adapters/google-token-http.js';
 import { loadBindings } from '../orchestrator/bindings.js';
 import { buildCharter } from '../test/fixtures.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { issueCsrfToken } from './csrf.js';
 import { createServer } from './server.js';
@@ -65,7 +65,7 @@ beforeEach(async () => {
   keyPath = join(keyDir, 'master.key');
   key = randomBytes(KEY_BYTES);
   await writeFile(keyPath, key, { mode: 0o600 });
-  await writeKeyState(key, 'KEY-test');
+  await writeKeyState(key, 'KEY-test', testDb());
   for (const [ref, value] of [
     [GOOGLE_CLIENT_ID_REF, 'g-id'],
     [GOOGLE_CLIENT_SECRET_REF, 'g-secret'],
@@ -323,7 +323,7 @@ describe('POST /connections/mailbox/sign', () => {
     });
     expect(res.status).toBe(409);
     expect((await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.charterVersion).toBe(before?.charter.charterVersion);
-    const { rows } = await getPool().query('SELECT count(*)::int AS n FROM charter_versions WHERE business_id = $1', [BUSINESS]);
+    const { rows } = await testDb().query('SELECT count(*)::int AS n FROM charter_versions WHERE business_id = $1', [BUSINESS]);
     expect(rows[0]?.['n']).toBe(2);
   });
 });
@@ -342,7 +342,7 @@ describe('the OAuth ceremony for the signed mailbox', () => {
     const cookie = await login(baseUrl);
     const res = await fetch(`${baseUrl}/oauth/mailbox/start?provider=microsoft`, { headers: { cookie }, redirect: 'manual' });
     expect(res.status).toBe(400);
-    const { rows } = await getPool().query('SELECT count(*)::int AS n FROM oauth_states');
+    const { rows } = await testDb().query('SELECT count(*)::int AS n FROM oauth_states');
     expect(rows[0]?.['n']).toBe(0);
   });
 
@@ -563,14 +563,14 @@ describe('fix round 1: the way back', () => {
 async function raceInstallAgainst(post: () => Promise<Response>): Promise<{ res: Response; other: string }> {
   const otherCharter = buildCharter({ version: 'concurrent-other', connections: [OFFICE_MAIL] });
   await withBusiness(BUSINESS, (bdb) => installCharter(bdb, otherCharter, { activate: false }));
-  const client = await getPool().connect();
+  const client = await testDb().connect();
   try {
     await client.query('BEGIN');
     await client.query('SELECT charter_version FROM charter_active WHERE business_id = $1 FOR UPDATE', [BUSINESS]);
     const pending = post();
     // Wait until the POST is blocked on the row lock.
     for (let i = 0; i < 200; i += 1) {
-      const { rows } = await getPool().query<{ n: number }>(
+      const { rows } = await testDb().query<{ n: number }>(
         "SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()",
       );
       if ((rows[0]?.n ?? 0) > 0) break;

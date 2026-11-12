@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { createJob } from '../orchestrator/jobs.js';
@@ -66,7 +66,7 @@ async function liveRows(
   subjectKey: string,
   attribute: string | null = null,
 ): Promise<LiveRow[]> {
-  const { rows } = await getPool().query<{ provenance: string; body: unknown }>(
+  const { rows } = await testDb().query<{ provenance: string; body: unknown }>(
     `SELECT provenance, body FROM memories
        WHERE business_id = $1 AND kind = $2 AND subject_key = $3
          AND attribute IS NOT DISTINCT FROM $4 AND retired_at IS NULL`,
@@ -318,7 +318,7 @@ describe('the curator', () => {
       ]),
     }));
 
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE business_id = $1 AND kind = 'curation'`,
       [BUSINESS],
     );
@@ -344,7 +344,7 @@ describe('the curator', () => {
 
     expect(outcome).toMatchObject({ ran: false, written: 0, failed: true });
 
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE business_id = $1 AND kind = 'curation'`,
       [BUSINESS],
     );

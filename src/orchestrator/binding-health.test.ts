@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
@@ -107,7 +107,7 @@ interface BindingHealthRow {
 }
 
 async function loadBindingRow(system: string): Promise<BindingHealthRow> {
-  const { rows } = await getPool().query<BindingHealthRow>(
+  const { rows } = await testDb().query<BindingHealthRow>(
     'SELECT status, last_ok_at, last_error FROM connection_bindings WHERE business_id = $1 AND system = $2',
     [BUSINESS, system],
   );

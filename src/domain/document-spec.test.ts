@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import {
   Cell,
   DocumentFormat,
@@ -147,14 +147,14 @@ describe('labels are exhaustive', () => {
 
 describe('migration 053', () => {
   const insert = (w: boolean, e: boolean, s: boolean) =>
-    getPool().query(
+    testDb().query(
       `INSERT INTO document_settings (business_id, to_whatsapp, to_email, to_screen) VALUES ('b1',$1,$2,$3)`,
       [w, e, s],
     );
 
   it('document_settings accepts one channel (the code under test runs)', async () => {
     await insert(false, false, true);
-    const r = await getPool().query('SELECT count(*)::int AS n FROM document_settings');
+    const r = await testDb().query('SELECT count(*)::int AS n FROM document_settings');
     expect(r.rows[0].n).toBe(1);
   });
 
@@ -165,12 +165,12 @@ describe('migration 053', () => {
   });
 
   it('document_versions refuses a non-hex sha256 and a duplicate version number', async () => {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_productions (production_id,business_id,origin_job_id,instruction_text,text_origin,format,language,kind,destination)
        VALUES ('P1','b1','j','x','typed','xlsx','he','report','{"mode":"save","folder":"f"}')`,
     );
     const ins = (sha: string, no: number) =>
-      getPool().query(
+      testDb().query(
         `INSERT INTO document_versions (version_id,production_id,business_id,version_no,spec,stored_path,sha256,size_bytes)
          VALUES (gen_random_uuid()::text,'P1',(SELECT business_id FROM document_productions WHERE production_id='P1'),$2,'{}','p',$1,1)`,
         [sha, no],
@@ -179,7 +179,7 @@ describe('migration 053', () => {
     await ins('a'.repeat(64), 1);
     await expect(ins('b'.repeat(64), 1)).rejects.toThrow(/document_versions_unique_no/);
     await expect(
-      getPool().query(`UPDATE document_productions SET stage='bogus' WHERE production_id='P1'`),
+      testDb().query(`UPDATE document_productions SET stage='bogus' WHERE production_id='P1'`),
     ).rejects.toThrow(/document_productions_stage_known/);
   });
 });

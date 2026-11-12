@@ -14,7 +14,7 @@ import { mkdtemp, writeFile } from 'node:fs/promises';
 import { ingestDocument } from '../documents/ingest.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import type { MailTriage } from '../domain/mail-triage.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { writeKeyState } from '../governance/master-key.js';
@@ -259,7 +259,7 @@ describe('pollMailbox', () => {
       { supplier_address: 'billing@vendor.example', invoice_number: 'INV-17', amount_text: '1,200 ₪', document_id: null },
     ]);
 
-    const { rows: audit } = await getPool().query<{ actor: string; kind: string; reason: string; provenance: string; whole: string }>(
+    const { rows: audit } = await testDb().query<{ actor: string; kind: string; reason: string; provenance: string; whole: string }>(
       `SELECT actor, kind, reason, provenance, row_to_json(a)::text AS whole
          FROM audit_log a WHERE business_id = $1 AND reason LIKE 'mail_label:%'`,
       [BUSINESS],
@@ -332,13 +332,13 @@ describe('pollMailbox', () => {
 
     // The image is not a type ingest supports: never fetched.
     expect(fake.fetched).toEqual(['PM-PDF/A-1']);
-    const { rows: docs } = await getPool().query<{ document_id: string; source: string; original_name: string }>(
+    const { rows: docs } = await testDb().query<{ document_id: string; source: string; original_name: string }>(
       'SELECT document_id, source, original_name, status, stored_path FROM documents WHERE business_id = $1',
       [BUSINESS],
     );
     expect(docs).toHaveLength(1);
     expect(docs[0]).toMatchObject({ source: 'mail', original_name: 'invoice-17.pdf', status: 'extracted' });
-    const { rows: invoices } = await getPool().query<{ document_id: string | null; file_name: string | null }>(
+    const { rows: invoices } = await testDb().query<{ document_id: string | null; file_name: string | null }>(
       'SELECT document_id, file_name FROM mail_invoices WHERE business_id = $1',
       [BUSINESS],
     );
@@ -365,7 +365,7 @@ describe('pollMailbox', () => {
       })),
     );
 
-    const { rows } = await getPool().query<{ attachments: MailAttachment[] }>(
+    const { rows } = await testDb().query<{ attachments: MailAttachment[] }>(
       'SELECT attachments FROM mail_messages WHERE business_id = $1 AND provider_message_id = $2',
       [BUSINESS, 'PM-DOCS'],
     );
@@ -374,7 +374,7 @@ describe('pollMailbox', () => {
     const ids = linked.map((a) => a.documentId);
     expect(ids.every((i) => typeof i === 'string')).toBe(true);
     expect(new Set(ids).size).toBe(2);
-    const { rows: docs } = await getPool().query<{ document_id: string; status: string }>(
+    const { rows: docs } = await testDb().query<{ document_id: string; status: string }>(
       'SELECT document_id, status FROM documents WHERE business_id = $1',
       [BUSINESS],
     );
@@ -487,7 +487,7 @@ describe('pollMailbox', () => {
     expectOk(await run());
     const [row] = await mailRows();
     const replyJobId = row?.reply_job_id ?? '';
-    const { rows } = await getPool().query<{ approval_id: string }>(
+    const { rows } = await testDb().query<{ approval_id: string }>(
       'SELECT approval_id FROM approval_requests WHERE business_id = $1 AND job_id = $2',
       [BUSINESS, replyJobId],
     );
@@ -563,7 +563,7 @@ describe('pollMailbox', () => {
   it('revoked grant gives needs_reauth and does not throw', async () => {
     const { documentRoot } = await setup();
     const key = randomBytes(32);
-    await writeKeyState(key, 'KEY-test');
+    await writeKeyState(key, 'KEY-test', testDb());
     await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { system: 'mailbox', provider: 'google', credentialRef: 'OAUTH_MAILBOX', account: 'owner@business.example', scopes: ['https://www.googleapis.com/auth/gmail.modify'], refreshToken: 'refresh-token-value', grantedBy: 'owner' }, key));
     await withBusiness(BUSINESS, (bdb) => revokeGrant(bdb, 'mailbox', 'owner'));
     const neverCalled: TokenHttp = {
@@ -632,7 +632,7 @@ describe('pollMailbox', () => {
     const third = expectOk(await run());
     expect(third.status).toBe('ok');
     expect((await withBusiness(BUSINESS, (db) => getCursor(db)))?.cursor).toBe('C-1');
-    const { rows } = await getPool().query<{ state: string; error: string | null; subject: string }>(
+    const { rows } = await testDb().query<{ state: string; error: string | null; subject: string }>(
       "SELECT state, error, subject FROM mail_messages WHERE provider_message_id = 'PM-BROKEN'",
     );
     expect(rows).toEqual([{ state: 'failed', error: 'unrecordable', subject: '(לא ניתן לשמור את המייל)' }]);
@@ -666,7 +666,7 @@ describe('pollMailbox', () => {
 
     expect(fake.fetched).toEqual(['PM-AF/A-1']);
     expect(result).toMatchObject({ failed: 0, notified: 1, drafts: 1 });
-    const { rows } = await getPool().query<{ state: string; error: string | null }>("SELECT state, error FROM mail_messages WHERE provider_message_id = 'PM-AF'");
+    const { rows } = await testDb().query<{ state: string; error: string | null }>("SELECT state, error FROM mail_messages WHERE provider_message_id = 'PM-AF'");
     expect(rows).toEqual([{ state: 'triaged', error: 'attachment_failed' }]);
     const { rows: invoices } = await testDb().query('SELECT document_id FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
     expect(invoices).toEqual([{ document_id: null }]);
@@ -695,7 +695,7 @@ describe('pollMailbox', () => {
 
     expect(fake.fetched.filter((f) => f.startsWith('PM-BIG'))).toEqual([]);
     expect(fake.fetched.filter((f) => f.startsWith('PM-MANY'))).toHaveLength(10);
-    const { rows } = await getPool().query<{ error: string | null }>("SELECT error FROM mail_messages WHERE provider_message_id = 'PM-BIG'");
+    const { rows } = await testDb().query<{ error: string | null }>("SELECT error FROM mail_messages WHERE provider_message_id = 'PM-BIG'");
     expect(rows[0]?.error).toBe('attachment_too_large');
   });
 
@@ -710,7 +710,7 @@ describe('pollMailbox', () => {
     );
 
     expect(fake.fetched).toEqual(['PM-OCT/A-1']);
-    const { rows } = await getPool().query<{ status: string; media_type: string }>('SELECT status, media_type FROM documents WHERE business_id = $1', [BUSINESS]);
+    const { rows } = await testDb().query<{ status: string; media_type: string }>('SELECT status, media_type FROM documents WHERE business_id = $1', [BUSINESS]);
     expect(rows).toEqual([{ status: 'extracted', media_type: 'application/pdf' }]);
   });
 
@@ -775,7 +775,7 @@ describe('pollMailbox', () => {
     // tables an erasure deliberately keeps.
     const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: 'dana@client.example' }, { documentRoot }));
     await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
-    const { rows: columns } = await getPool().query<{ table_name: string; column_name: string }>(
+    const { rows: columns } = await testDb().query<{ table_name: string; column_name: string }>(
       `SELECT c.table_name, c.column_name
          FROM information_schema.columns c
          JOIN information_schema.tables t USING (table_schema, table_name)
@@ -786,7 +786,7 @@ describe('pollMailbox', () => {
     expect(columns.length).toBeGreaterThan(100);
     const found: string[] = [];
     for (const column of columns) {
-      const { rows } = await getPool().query<{ n: string }>(
+      const { rows } = await testDb().query<{ n: string }>(
         `SELECT count(*)::text AS n FROM "${column.table_name}" WHERE "${column.column_name}"::text LIKE $1`,
         ['%רונית_כהן%'],
       );
@@ -830,7 +830,7 @@ describe('pollMailbox', () => {
     // The triage stub moves the triage job to `failed` behind the poller's
     // back, so the poller's own `plan` transition is illegal and throws.
     const triage: Triage = async () => {
-      const { rows } = await getPool().query<{ job_id: string }>(
+      const { rows } = await testDb().query<{ job_id: string }>(
         "SELECT job_id FROM jobs WHERE business_id = $1 AND title LIKE 'מייל:%' ORDER BY created_at DESC LIMIT 1",
         [BUSINESS],
       );
@@ -889,7 +889,7 @@ describe('pollMailbox', () => {
     expect(cursor?.lastError).toBe('cursor_expired_gap');
 
     // Durable: the next clean pass overwrites `last_error`, the audit row stays.
-    const { rows: gapRows } = await getPool().query<{ reason: string; whole: string }>(
+    const { rows: gapRows } = await testDb().query<{ reason: string; whole: string }>(
       "SELECT reason, row_to_json(a)::text AS whole FROM audit_log a WHERE business_id = $1 AND reason = 'mail_cursor_gap'",
       [BUSINESS],
     );
@@ -911,7 +911,7 @@ describe('pollMailbox', () => {
     }
 
     async function storedAttachments(providerMessageId: string): Promise<MailAttachment[]> {
-      const { rows } = await getPool().query<{ attachments: MailAttachment[] }>(
+      const { rows } = await testDb().query<{ attachments: MailAttachment[] }>(
         'SELECT attachments FROM mail_messages WHERE business_id = $1 AND provider_message_id = $2',
         [BUSINESS, providerMessageId],
       );
@@ -994,7 +994,7 @@ describe('pollMailbox', () => {
       expectOk(await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot })));
 
       const docs = (await storedAttachments('PM-2I')).map((x) => x.documentId);
-      const { rows: invoices } = await getPool().query<{ document_id: string; invoice_number: string | null }>(
+      const { rows: invoices } = await testDb().query<{ document_id: string; invoice_number: string | null }>(
         'SELECT document_id, invoice_number FROM mail_invoices WHERE business_id = $1 ORDER BY file_name',
         [BUSINESS],
       );
@@ -1109,7 +1109,7 @@ describe('pollMailbox', () => {
 
       expect(triage.requests).toHaveLength(1);
       expect(result).toMatchObject({ triaged: 1, failed: 0 });
-      const { rows } = await getPool().query<{ state: string; categories: string[]; error: string | null }>(
+      const { rows } = await testDb().query<{ state: string; categories: string[]; error: string | null }>(
         'SELECT state, categories, error FROM mail_messages WHERE business_id = $1',
         [BUSINESS],
       );
@@ -1154,7 +1154,7 @@ describe('pollMailbox', () => {
       const [stored] = await storedAttachments('PM-UD');
       expect(typeof stored?.documentId).toBe('string');
       expect(stored).toMatchObject({ scanned: false });
-      const { rows } = await getPool().query<{ status: string; reason: string | null }>(
+      const { rows } = await testDb().query<{ status: string; reason: string | null }>(
         'SELECT status, reason FROM documents WHERE business_id = $1 AND document_id = $2',
         [BUSINESS, stored?.documentId],
       );
@@ -1236,7 +1236,7 @@ describe('pollMailbox', () => {
       expect(fake.fetched).toEqual(['PM-TB/A-0']);
       const seen = triage.requests[0]?.attachments ?? [];
       expect(seen.map((a) => a.notRead)).toEqual([null, 'not_ingested', 'not_ingested']);
-      const { rows } = await getPool().query<{ state: string; error: string | null }>(
+      const { rows } = await testDb().query<{ state: string; error: string | null }>(
         'SELECT state, error FROM mail_messages WHERE business_id = $1',
         [BUSINESS],
       );
@@ -1257,7 +1257,7 @@ describe('pollMailbox', () => {
 
       expect(fake.fetched).toHaveLength(3);
       expect((triage.requests[0]?.attachments ?? []).map((a) => a.notRead)).toEqual([null, null, null]);
-      const { rows } = await getPool().query<{ error: string | null }>('SELECT error FROM mail_messages WHERE business_id = $1', [BUSINESS]);
+      const { rows } = await testDb().query<{ error: string | null }>('SELECT error FROM mail_messages WHERE business_id = $1', [BUSINESS]);
       expect(rows).toEqual([{ error: null }]);
     });
   });

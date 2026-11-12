@@ -20,7 +20,7 @@
  * carries the weight in the two dial tests.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness, type BusinessDb } from '../db/pool.js';
+import { closePool, withBusiness, type BusinessDb } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -156,7 +156,7 @@ async function verdicts(actionClass: ActionClass, right: number, wrong: number):
  * holding the floor — see this file's header.
  */
 async function storedLevel(actionClass: ActionClass): Promise<string | undefined> {
-  const { rows } = await getPool().query<{ level: string }>(
+  const { rows } = await testDb().query<{ level: string }>(
     'SELECT level FROM autonomy_ramp WHERE business_id = $1 AND action_class = $2',
     [BUSINESS, actionClass],
   );
@@ -166,7 +166,7 @@ async function storedLevel(actionClass: ActionClass): Promise<string | undefined
 async function events(
   actionClass: ActionClass,
 ): Promise<{ direction: string; from_level: string; to_level: string }[]> {
-  const { rows } = await getPool().query<{
+  const { rows } = await testDb().query<{
     direction: string;
     from_level: string;
     to_level: string;
@@ -180,7 +180,7 @@ async function events(
 
 /** The `reason` on the newest event for a class — what spec §8 shows the owner. */
 async function newestReason(actionClass: ActionClass): Promise<string | undefined> {
-  const { rows } = await getPool().query<{ reason: string }>(
+  const { rows } = await testDb().query<{ reason: string }>(
     `SELECT reason FROM autonomy_events
       WHERE business_id = $1 AND action_class = $2
       ORDER BY at DESC, event_id DESC LIMIT 1`,
@@ -446,7 +446,7 @@ describe('the evaluation pass', () => {
     expect(await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'))).toBe('approve_required');
     expect(await storedLevel('email.reply')).toBe('approve_required');
     // No human touched it: the demotion came from the job record alone.
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       'SELECT count(*)::text AS n FROM autonomy_marks WHERE business_id = $1',
       [BUSINESS],
     );

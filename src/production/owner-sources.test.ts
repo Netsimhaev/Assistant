@@ -6,8 +6,8 @@
  * attached document stays `unknown_external`.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { insertOrGetDocument } from '../documents/store.js';
@@ -41,7 +41,7 @@ async function doc(businessId: string, name: string): Promise<string> {
       storedPath: `${businessId}/${documentId}/original.txt`,
     },
   ));
-  await getPool().query(`UPDATE documents SET status = 'extracted' WHERE document_id = $1`, [documentId]);
+  await testDb().query(`UPDATE documents SET status = 'extracted' WHERE document_id = $1`, [documentId]);
   return documentId;
 }
 
@@ -159,7 +159,7 @@ describe('owner-attached sources', () => {
     const production = (await withBusiness(B, (db) => loadProduction(db, productionId)))!;
     expect(sourceProvenance(production, 'DOC-a')).toBe('boss');
     expect(sourceProvenance(production, 'DOC-b')).toBe('unknown_external');
-    const { rows } = await getPool().query<{ work: { ownerSourceIds: string[] } }>(
+    const { rows } = await testDb().query<{ work: { ownerSourceIds: string[] } }>(
       'SELECT work FROM document_productions WHERE production_id = $1',
       [productionId],
     );

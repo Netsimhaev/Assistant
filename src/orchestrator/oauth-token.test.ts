@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { randomBytes } from 'node:crypto';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { writeKeyState } from '../governance/master-key.js';
 import {
   listGrants,
@@ -8,7 +8,7 @@ import {
   revokeGrant,
   writeGrant,
 } from '../governance/oauth-grants.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { createCredentialHandle } from './adapters/types.js';
 import type { CredentialHandle } from './adapters/types.js';
 import type { CredentialSource } from './credentials.js';
@@ -119,7 +119,7 @@ function clock(startMs = 0): () => number {
 describe('oauthCredentials', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await writeKeyState(KEY, 'KEY-test');
+    await writeKeyState(KEY, 'KEY-test', testDb());
   });
 
   afterAll(async () => {
@@ -214,7 +214,7 @@ describe('oauthCredentials', () => {
     await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
     const source = oauthCredentials({ key: KEY, fallback: stubSource({}), http: MISCONFIGURED_HTTP });
 
-    const before = await getPool().query<{ count: string }>(
+    const before = await testDb().query<{ count: string }>(
       `SELECT count(*)::text AS count FROM audit_log WHERE business_id = $1`,
       [BUSINESS],
     );
@@ -234,7 +234,7 @@ describe('oauthCredentials', () => {
     // No audit row was written at all — contrast with the 'rejected' test
     // above, which asserts exactly one new `credential_change` row naming
     // the provider and the system.
-    const after = await getPool().query<{ count: string }>(
+    const after = await testDb().query<{ count: string }>(
       `SELECT count(*)::text AS count FROM audit_log WHERE business_id = $1`,
       [BUSINESS],
     );
@@ -316,7 +316,7 @@ describe('oauthCredentials', () => {
       OAuthRefreshRejectedError,
     );
 
-    const { rows } = await getPool().query<{ kind: string; reason: string }>(
+    const { rows } = await testDb().query<{ kind: string; reason: string }>(
       `SELECT kind, reason FROM audit_log WHERE business_id = $1 ORDER BY seq DESC LIMIT 1`,
       [BUSINESS],
     );

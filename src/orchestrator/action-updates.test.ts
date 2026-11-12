@@ -8,7 +8,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { Plan } from '../domain/plan.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { saveActionUpdateSettings } from '../governance/action-update-settings.js';
@@ -76,7 +76,7 @@ function recordingAlert(sent: Sent[]) {
 async function rows(): Promise<
   { job_id: string; email_state: string | null; whatsapp_state: string | null; body: string }[]
 > {
-  const { rows: found } = await getPool().query<{
+  const { rows: found } = await testDb().query<{
     job_id: string;
     email_state: string | null;
     whatsapp_state: string | null;

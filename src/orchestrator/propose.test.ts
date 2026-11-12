@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { compileCharter } from '../charter/compile.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -210,7 +210,7 @@ describe('proposeForReading', () => {
     const result = await withBusiness(BUSINESS, (db) => proposeForReading(db, { documentId, jobId: job.jobId, bundle }, { proposer }));
     if (result.status !== 'proposed') throw new Error('expected proposed');
 
-    const { rows } = await getPool().query<{ proposal_id: string }>(
+    const { rows } = await testDb().query<{ proposal_id: string }>(
       'SELECT proposal_id FROM proposals WHERE proposal_id = $1',
       [result.record.proposalId],
     );

@@ -8,7 +8,7 @@
  * `runDueJobs`.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness, withBusinessTransaction } from '../db/pool.js';
+import { closePool, withBusiness, withBusinessTransaction } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -210,7 +210,7 @@ async function timeOut(jobId: string, bundle: PolicyBundle, businessId = BUSINES
   }));
   expect(outcome.status).toBe('halted');
   expect((await withBusiness(businessId, (db) => loadJob(db, jobId)))?.phase).toBe('followup');
-  const { rows } = await getPool().query<{ status: string }>(
+  const { rows } = await testDb().query<{ status: string }>(
     'SELECT status FROM job_step_results WHERE job_id = $1',
     [jobId],
   );
@@ -218,7 +218,7 @@ async function timeOut(jobId: string, bundle: PolicyBundle, businessId = BUSINES
 }
 
 async function reasksOf(oldJobId: string): Promise<Array<{ job_id: string; business_id: string }>> {
-  const { rows } = await getPool().query<{ job_id: string; business_id: string }>(
+  const { rows } = await testDb().query<{ job_id: string; business_id: string }>(
     'SELECT job_id, business_id FROM instruction_confirmations WHERE reask_of = $1',
     [oldJobId],
   );
@@ -245,7 +245,7 @@ async function linkToWhatsApp(jobId: string): Promise<string> {
 }
 
 async function whatsappLink(jobId: string): Promise<string | null> {
-  const { rows } = await getPool().query<{ whatsapp_message_id: string | null }>(
+  const { rows } = await testDb().query<{ whatsapp_message_id: string | null }>(
     'SELECT whatsapp_message_id FROM jobs WHERE job_id = $1',
     [jobId],
   );
@@ -260,7 +260,7 @@ async function backdateDecision(jobId: string): Promise<void> {
 }
 
 async function jobCount(): Promise<number> {
-  const { rows } = await getPool().query<{ n: number }>(
+  const { rows } = await testDb().query<{ n: number }>(
     'SELECT count(*)::int AS n FROM jobs WHERE business_id = $1',
     [BUSINESS],
   );
@@ -268,7 +268,7 @@ async function jobCount(): Promise<number> {
 }
 
 async function lastReason(jobId: string): Promise<string | undefined> {
-  const { rows } = await getPool().query<{ reason: string }>(
+  const { rows } = await testDb().query<{ reason: string }>(
     'SELECT reason FROM job_steps WHERE job_id = $1 ORDER BY at DESC, id DESC LIMIT 1',
     [jobId],
   );
@@ -306,7 +306,7 @@ describe('reaskFailedCommands', () => {
     expect(fresh?.provenance).toBe('boss');
     expect(fresh?.title).toBe('הצעה לזר');
     expect((await withBusiness(BUSINESS, (db) => loadStoredPlan(db, newJobId)))?.planHash).toBe(PLAN_HASH);
-    const { rows: instructions } = await getPool().query<{ text: string; text_origin: string }>(
+    const { rows: instructions } = await testDb().query<{ text: string; text_origin: string }>(
       'SELECT text, text_origin FROM boss_instructions WHERE job_id = $1',
       [newJobId],
     );
@@ -344,7 +344,7 @@ describe('reaskFailedCommands', () => {
     expect(await jobCount()).toBe(2);
     expect(await reasksOf(jobId)).toHaveLength(1);
     expect(messenger.sent).toHaveLength(1);
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       `SELECT count(*)::text AS n FROM jobs WHERE business_id = $1 AND phase = 'plan'`,
       [BUSINESS],
     );

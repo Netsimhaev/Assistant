@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { annotateAttachment, insertInvoice, linkAttachmentDocument, markOverCap, noteMailError, setCursor, settleMail } from '../mail/inbox-store.js';
 import { resetDatabase, testDb } from '../test/db.js';
@@ -83,7 +83,7 @@ async function addDocument(
   id: string,
   over: { status?: string; name?: string; media?: string; path?: string } = {},
 ): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO documents (document_id, business_id, source, original_name, media_type, sha256, byte_size, stored_path, status)
      VALUES ($1, $2, 'mail', $3, $4, $5, 5, $6, $7)`,
     [
@@ -317,7 +317,7 @@ describe('fix round 1', () => {
     const other = await storedMail(OTHER, { providerMessageId: 'L-2', attachments: [pdf('a1', 'one.pdf')] });
     await withBusiness(OTHER, (db) => linkAttachmentDocument(db, mail.mailId, 'a2', 'docZ'));
     await withBusiness(BUSINESS, (db) => linkAttachmentDocument(db, mail.mailId, 'a2', 'docZ'));
-    const { rows } = await getPool().query('SELECT mail_id, attachments FROM mail_messages');
+    const { rows } = await testDb().query('SELECT mail_id, attachments FROM mail_messages');
     const byId = new Map(rows.map((r) => [r.mail_id, r.attachments]));
     expect(byId.get(mail.mailId)).toEqual([pdf('a1', 'one.pdf'), { ...pdf('a2', 'two.pdf'), documentId: 'docZ' }]);
     expect(byId.get(other.mailId)).toEqual([pdf('a1', 'one.pdf')]);
@@ -385,7 +385,7 @@ describe('fix round 1', () => {
       }
     ));
     if (daysAgo > 0) {
-      const db = getPool();
+      const db = testDb();
       await testDb().query('ALTER TABLE audit_log DISABLE TRIGGER audit_log_no_update');
       await db.query("UPDATE audit_log SET at = now() - ($1 || ' days')::interval WHERE reason = 'mail_cursor_gap'", [String(daysAgo)]);
       await testDb().query('ALTER TABLE audit_log ENABLE TRIGGER audit_log_no_update');
@@ -619,7 +619,7 @@ describe('PDF summaries and the documents screen', () => {
     // More attachments than the screen shows: written straight to the JSON,
     // because the stored-mail path keeps ten.
     const many = Array.from({ length: DOCUMENT_LIMIT + 1 }, (_, i) => att(`l${i}`, `f${i}.pdf`, { docType: 'other' }));
-    await getPool().query(`UPDATE mail_messages SET attachments = $2::jsonb WHERE mail_id = $1`, [m.mailId, JSON.stringify(many)]);
+    await testDb().query(`UPDATE mail_messages SET attachments = $2::jsonb WHERE mail_id = $1`, [m.mailId, JSON.stringify(many)]);
     const html = await (await get(baseUrl, cookie, '/mail/documents')).text();
     expect(html).toContain(`מוצגים ${DOCUMENT_LIMIT} האחרונים`);
     expect(html.match(/<tr>/g)?.length).toBe(DOCUMENT_LIMIT + 1); // header row + the limit

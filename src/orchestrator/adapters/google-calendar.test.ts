@@ -1,12 +1,11 @@
 import { randomBytes } from 'node:crypto';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { config } from '../../config.js';
 import { installCharter } from '../../charter/store.js';
 import { closePool, withBusiness } from '../../db/pool.js';
 import type { CharterConnection } from '../../domain/connection.js';
 import { KEY_BYTES, writeKeyState } from '../../governance/master-key.js';
 import { writeGrant } from '../../governance/oauth-grants.js';
-import { resetDatabase } from '../../test/db.js';
+import { resetDatabase, testDb, TEST_BUSINESS } from '../../test/db.js';
 import { buildCharter } from '../../test/fixtures.js';
 import { loadBindings, upsertBinding } from '../bindings.js';
 import { oauthCredentials } from '../oauth-token.js';
@@ -14,7 +13,7 @@ import { createGoogleCalendarAdapter } from './google-calendar.js';
 import { createCredentialHandle } from './types.js';
 import type { AdapterCall, CredentialHandle } from './types.js';
 
-const BUSINESS = config.businessId;
+const BUSINESS = TEST_BUSINESS;
 
 const CALENDAR_CONNECTION: CharterConnection = {
   system: 'office-calendar',
@@ -230,7 +229,7 @@ describe('createGoogleCalendarAdapter', () => {
     // `serves: ['calendar.read']` connection actually cause registration)
     // is proven separately, by `runtime.test.ts`'s two registration tests.
     await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] })));
-    await writeKeyState(KEY, 'KEY-e2e', { businessId: BUSINESS });
+    await writeKeyState(KEY, 'KEY-e2e', testDb());
     await withBusiness(BUSINESS, (db) => upsertBinding(db, {
         system: 'office-calendar',
         status: 'live',

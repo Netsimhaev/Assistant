@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import {
   ACTION_UPDATE_DEFAULTS,
   loadActionUpdateSettings,
@@ -24,7 +24,7 @@ describe('action update settings', () => {
     const settings = await withBusiness(BUSINESS, (bdb) => loadActionUpdateSettings(bdb));
     expect(settings).toEqual({ toWhatsApp: false, toEmail: true, toScreen: true });
 
-    const { rows } = await getPool().query('SELECT 1 FROM action_update_settings WHERE business_id = $1', [
+    const { rows } = await testDb().query('SELECT 1 FROM action_update_settings WHERE business_id = $1', [
       BUSINESS,
     ]);
     expect(rows).toHaveLength(0);
@@ -75,7 +75,7 @@ describe('action update settings', () => {
   /** The second layer: a raw INSERT that bypasses the module still cannot write "nowhere". */
   it('refuses an all-false row at the database level', async () => {
     await expect(
-      getPool().query(
+      testDb().query(
         `INSERT INTO action_update_settings (business_id, to_whatsapp, to_email, to_screen, updated_by)
          VALUES ($1, false, false, false, 'owner')`,
         [BUSINESS],

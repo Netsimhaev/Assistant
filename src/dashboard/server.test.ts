@@ -7,8 +7,8 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { createJob, loadJob, transition } from '../orchestrator/jobs.js';
 import { recordInbound, recordOutbound } from '../whatsapp/store.js';
 import { bindPlanToJob, planHashOf } from '../orchestrator/plan-store.js';
@@ -198,7 +198,7 @@ async function seedAutonomousAction(
   const binding = await withBusiness(businessId, (db) => bindPlanToJob(db, job.jobId, plan));
   if (binding.status !== 'stored') throw new Error(`unexpected plan binding status ${binding.status}`);
 
-  await getPool().query(
+  await testDb().query(
     // `performed = true`: `listAutonomousActions` lists only steps that
     // actually performed (migration 037's column), as the real mail adapter
     // path records them.
@@ -551,7 +551,7 @@ describe('GET /conversation', () => {
    * limit) does not false-positive on the boundary itself.
    */
   async function seedMessages(businessId: string, count: number): Promise<void> {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO whatsapp_messages
          (id, business_id, direction, sender_number, sender_kind, body, provider_timestamp, state)
        SELECT 'WA-SEED-' || lpad(gs::text, 6, '0'), $1, 'inbound', '+972500000000', 'principal',
@@ -786,14 +786,14 @@ describe('GET /instruct, POST /instruct', () => {
 
     expect(res.status).toBe(400);
     expect(await res.text()).toContain('ארוכה מ-4000 תווים');
-    const { rows } = await getPool().query(`SELECT 1 FROM boss_instructions`);
+    const { rows } = await testDb().query(`SELECT 1 FROM boss_instructions`);
     expect(rows).toHaveLength(0);
     // M3: an empty `boss_instructions` is also true if the cap is deleted and
     // `saveInstruction` throws instead — `runInstruction` catches that throw,
     // fails the job it already opened, and returns a refusal that reads
     // differently but still leaves this table empty. What the cap uniquely
     // buys is that no job is opened at all, so that is what is asserted.
-    const jobs = await getPool().query(`SELECT 1 FROM jobs WHERE business_id = $1`, [BUSINESS]);
+    const jobs = await testDb().query(`SELECT 1 FROM jobs WHERE business_id = $1`, [BUSINESS]);
     expect(jobs.rows).toHaveLength(0);
   });
 
@@ -1429,7 +1429,7 @@ describe('POST /instruct/:jobId/answer', () => {
 
     // The same scope string and the same key derivation the route uses.
     const scope = `instruct-answer:${BUSINESS}:${jobId}`;
-    const holder = await getPool().connect();
+    const holder = await testDb().connect();
     let response: Response;
     try {
       const taken = await holder.query<{ locked: boolean }>(
@@ -1460,7 +1460,7 @@ describe('POST /instruct/:jobId/answer', () => {
     // `claimAnswer` and `createJob` and both of these go red.
     const stored = await withBusiness(BUSINESS, (bdb) => loadInstructionForJob(bdb, jobId));
     expect(stored?.answer).toBeNull();
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       'SELECT count(*)::text AS n FROM jobs WHERE business_id = $1',
       [BUSINESS],
     );
@@ -1791,7 +1791,7 @@ describe('the gov.verify verdict on a card', () => {
       const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
       // Bypasses `saveVerdict`'s TS type on purpose — a row written before
       // `fenceForgeryDetected` existed carries no such key at all.
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, $3::jsonb)`,
         [
           BUSINESS,
@@ -1822,7 +1822,7 @@ describe('the gov.verify verdict on a card', () => {
     // `criteria: []` violates `Verdict`'s own `.min(1)` — a row `saveVerdict`
     // itself could never produce, exactly the "corrupted or pre-migration
     // row" shape this guard exists for.
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, $3::jsonb)`,
       [BUSINESS, job.jobId, JSON.stringify({ criteria: [] })],
     );
@@ -2621,7 +2621,7 @@ describe('changing the password', () => {
 describe('the address a recovery redemption is audited from', () => {
   /** The reason line of the incident entry `redeemRecoveryCode` writes. */
   async function redemptionAudit(businessId: string): Promise<string> {
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM audit_log
         WHERE business_id = $1 AND reason LIKE 'recovery code redeemed%'
         ORDER BY seq DESC LIMIT 1`,
@@ -2997,7 +2997,7 @@ describe('GET /autonomy — the learning level and the update channels', () => {
   it('still shows the dial and the channels when no charter can be read', async () => {
     // A charter that exists but does not parse: the gate lets it through (it
     // is not absent), and the learning level cannot be computed from it.
-    await getPool().query(
+    await testDb().query(
       `UPDATE charter_versions
           SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb('0'::text))
         WHERE business_id = $1`,
@@ -3060,7 +3060,7 @@ describe('GET /autonomy — the learning level and the update channels', () => {
     expect(body).toContain('חובה לבחור לפחות דרך עדכון אחת');
     // The boxes as he left them, not the old choice silently restored.
     expect(body).not.toContain('name="toEmail" checked');
-    const { rows } = await getPool().query('SELECT 1 FROM action_update_settings WHERE business_id = $1', [BUSINESS]);
+    const { rows } = await testDb().query('SELECT 1 FROM action_update_settings WHERE business_id = $1', [BUSINESS]);
     expect(rows).toHaveLength(0);
   });
 
@@ -3075,14 +3075,14 @@ describe('GET /autonomy — the learning level and the update channels', () => {
       redirect: 'manual',
     });
     expect(res.status).toBe(403);
-    const { rows } = await getPool().query('SELECT 1 FROM action_update_settings WHERE business_id = $1', [BUSINESS]);
+    const { rows } = await testDb().query('SELECT 1 FROM action_update_settings WHERE business_id = $1', [BUSINESS]);
     expect(rows).toHaveLength(0);
   });
 });
 
 describe('GET /autonomy/actions — "חדש" on the screen channel', () => {
   async function updateRow(businessId: string, jobId: string, stepId: string): Promise<void> {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO action_updates (update_id, business_id, job_id, step_id, action_class, body)
        VALUES ($1, $2, $3, $4, 'email.reply', 'עדכון')`,
       [`AU-${ulid()}`, businessId, jobId, stepId],
@@ -3090,7 +3090,7 @@ describe('GET /autonomy/actions — "חדש" on the screen channel', () => {
   }
 
   async function seenAt(businessId: string, jobId: string): Promise<Date | null> {
-    const { rows } = await getPool().query<{ seen_at: Date | null }>(
+    const { rows } = await testDb().query<{ seen_at: Date | null }>(
       'SELECT seen_at FROM action_updates WHERE business_id = $1 AND job_id = $2',
       [businessId, jobId],
     );
@@ -3177,7 +3177,7 @@ describe('POST /autonomy/actions/:jobId/:stepId/mark', () => {
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');
 
-    const { rows } = await getPool().query('SELECT * FROM autonomy_marks WHERE business_id = $1', [BUSINESS]);
+    const { rows } = await testDb().query('SELECT * FROM autonomy_marks WHERE business_id = $1', [BUSINESS]);
     expect(rows).toHaveLength(0);
   });
 
@@ -3194,7 +3194,7 @@ describe('POST /autonomy/actions/:jobId/:stepId/mark', () => {
     });
     expect(res.status).toBe(403);
 
-    const { rows } = await getPool().query('SELECT * FROM autonomy_marks WHERE business_id = $1', [BUSINESS]);
+    const { rows } = await testDb().query('SELECT * FROM autonomy_marks WHERE business_id = $1', [BUSINESS]);
     expect(rows).toHaveLength(0);
   });
 
@@ -3215,7 +3215,7 @@ describe('POST /autonomy/actions/:jobId/:stepId/mark', () => {
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/autonomy/actions');
 
-    const { rows } = await getPool().query<{
+    const { rows } = await testDb().query<{
       job_id: string;
       step_id: string;
       action_class: string;
@@ -3235,7 +3235,7 @@ describe('POST /autonomy/actions/:jobId/:stepId/mark', () => {
 
     // The mark does not undo or touch the step it describes (spec §8.4) —
     // the underlying completion row is untouched.
-    const { rows: stepRows } = await getPool().query(
+    const { rows: stepRows } = await testDb().query(
       'SELECT status, external_id FROM job_step_results WHERE business_id = $1 AND job_id = $2',
       [BUSINESS, jobId],
     );
@@ -3257,7 +3257,7 @@ describe('POST /autonomy/actions/:jobId/:stepId/mark', () => {
     });
     expect(res.status).toBe(400);
 
-    const { rows } = await getPool().query('SELECT * FROM autonomy_marks WHERE business_id = $1', [BUSINESS]);
+    const { rows } = await testDb().query('SELECT * FROM autonomy_marks WHERE business_id = $1', [BUSINESS]);
     expect(rows).toHaveLength(0);
   });
 });
@@ -3404,7 +3404,7 @@ describe('digest screen', () => {
    * is kept for the unreadable case below and pinned at the view level.
    */
   it('sends the owner to the setup interview when no charter has been signed yet', async () => {
-    await getPool().query('DELETE FROM charter_active WHERE business_id = $1', [BUSINESS]);
+    await testDb().query('DELETE FROM charter_active WHERE business_id = $1', [BUSINESS]);
     const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -3424,7 +3424,7 @@ describe('digest screen', () => {
   it('renders 200 with a message distinct from "none yet" when the signed charter cannot be read', async () => {
     const baseUrl = await startServer();
     await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
-    await getPool().query(
+    await testDb().query(
       `UPDATE charter_versions
           SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb($2::text))
         WHERE business_id = $1`,
@@ -3612,7 +3612,7 @@ describe('boss-command confirmation on the dashboard', () => {
   }
 
   async function executeMoves(jobId: string): Promise<number> {
-    const { rows } = await getPool().query(
+    const { rows } = await testDb().query(
       "SELECT 1 FROM job_steps WHERE job_id = $1 AND to_phase = 'execute'",
       [jobId],
     );

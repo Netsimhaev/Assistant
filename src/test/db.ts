@@ -30,7 +30,7 @@ export async function ensureSchema(): Promise<void> {
  * The migrator (table-owner) pool, for test seeding and assertions that need
  * ownership: TRUNCATE, DDL, `ALTER TABLE ... DISABLE TRIGGER`, temporary
  * test triggers. The app role must never own tables, so these cannot run on
- * `getPool()`.
+ * the app pool (which `withBusiness` alone hands out).
  */
 export function testDb(): pg.Pool {
   return getMigratorPool();
@@ -95,7 +95,6 @@ export async function resetDatabase(): Promise<void> {
       oauth_grants,
       oauth_states,
       credentials,
-      credential_key_state,
       server_key_state,
       platform_credentials,
       business_runtime_settings,

@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness, type BusinessDb } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness, type BusinessDb } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import {
   LedgerItemNotFoundError,
   createLedgerItem,
@@ -91,7 +91,7 @@ describe('ledger store', () => {
 
   it('reopen moves evidence_after forward', async () => {
     const item = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
-    await getPool().query(
+    await testDb().query(
       `UPDATE ledger_items SET evidence_after = now() - interval '2 days' WHERE item_id = $1`,
       [item.itemId],
     );

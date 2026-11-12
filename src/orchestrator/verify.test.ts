@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness, withBusinessTransaction } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness, withBusinessTransaction } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
@@ -112,7 +112,7 @@ describe('closeVerifiedJobs', () => {
 
     await withBusiness(BUSINESS, (db) => closeVerifiedJobs(db));
 
-    const { rows } = await getPool().query<{ from_phase: string; to_phase: string; reason: string }>(
+    const { rows } = await testDb().query<{ from_phase: string; to_phase: string; reason: string }>(
       `SELECT from_phase, to_phase, reason FROM job_steps
         WHERE job_id = $1 AND to_phase IN ('remember', 'closed')
         ORDER BY at`,
@@ -302,7 +302,7 @@ describe('closeVerifiedJobs', () => {
 });
 
 async function readPerformed(jobId: string, planHash: string): Promise<boolean | null> {
-  const { rows } = await getPool().query<{ performed: boolean | null }>(
+  const { rows } = await testDb().query<{ performed: boolean | null }>(
     'SELECT performed FROM job_step_results WHERE job_id = $1 AND plan_hash = $2 AND step_id = $3',
     [jobId, planHash, 's1'],
   );

@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -465,7 +465,7 @@ describe('the mail field on SchedulerPassResult', () => {
     const pass = await schedulerPass(BUSINESS, { now: NOON, inbox: null, runtime: inert() });
     expect(pass.mailRetention).toEqual({ scrubbed: 1 });
     expect(pass.mailRetentionError).toBeNull();
-    const { rows } = await getPool().query<{ body_text: string | null }>(
+    const { rows } = await testDb().query<{ body_text: string | null }>(
       'SELECT body_text FROM mail_messages WHERE mail_id = $1',
       ['M-old'],
     );

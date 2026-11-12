@@ -14,10 +14,10 @@ import { installCharter } from '../charter/store.js';
 import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { issueCsrfToken } from '../dashboard/csrf.js';
 import { createServer } from '../dashboard/server.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { CALENDAR_NOT_CONNECTED_REPLY } from '../meetings/door.js';
 import { buildCharter } from '../test/fixtures.js';
-import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
+import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import { localParts, localToInstant } from '../util/local-time.js';
 import { upsertBinding } from './bindings.js';
 import type { CredentialSource } from './credentials.js';
@@ -55,7 +55,7 @@ async function bindCalendar(): Promise<void> {
 }
 
 async function count(table: 'jobs' | 'boss_instructions'): Promise<number> {
-  const { rows } = await getPool().query<{ n: string }>(`SELECT count(*)::text AS n FROM ${table}`);
+  const { rows } = await testDb().query<{ n: string }>(`SELECT count(*)::text AS n FROM ${table}`);
   return Number(rows[0]?.n);
 }
 
@@ -181,9 +181,9 @@ describe('both doors pass the calendar', () => {
     const html = await res.text();
     expect(html).toContain('לקוח מתשובה');
     expect(html).toContain('לאיזו רונית?'); // the parked question is still on the page, still answerable
-    const { rows } = await getPool().query<{ answer: string | null }>('SELECT answer FROM boss_instructions');
+    const { rows } = await testDb().query<{ answer: string | null }>('SELECT answer FROM boss_instructions');
     expect(rows[0]?.answer).toBeNull();
-    const job = await getPool().query<{ phase: string }>('SELECT phase FROM jobs WHERE job_id = $1', [parkedOutcome.jobId]);
+    const job = await testDb().query<{ phase: string }>('SELECT phase FROM jobs WHERE job_id = $1', [parkedOutcome.jobId]);
     expect(['closed', 'failed', 'halted']).not.toContain(job.rows[0]?.phase);
     expect(await count('jobs')).toBe(jobsBefore);
   });

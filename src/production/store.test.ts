@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import type { DocxSpec } from '../domain/document-spec.js';
-import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
+import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import {
   advanceStage,
   claimProduction,
@@ -67,13 +67,13 @@ describe('production store', () => {
     expect(first?.productionId).toBe(id);
     expect(first?.leasedBy).toBe('a');
     expect(await withBusiness(B, (db) => claimProduction(db, 'b', 60_000))).toBeNull();
-    await getPool().query(`UPDATE document_productions SET lease_until = now() - interval '1 second'`);
+    await testDb().query(`UPDATE document_productions SET lease_until = now() - interval '1 second'`);
     expect((await withBusiness(B, (db) => claimProduction(db, 'b', 60_000)))?.leasedBy).toBe('b');
   });
 
   it('never claims a terminal production, nor one of another business', async () => {
     const id = await withBusiness(B, (db) => createProduction(db, input()));
-    await getPool().query(`UPDATE document_productions SET stage = 'ready' WHERE production_id = $1`, [id]);
+    await testDb().query(`UPDATE document_productions SET stage = 'ready' WHERE production_id = $1`, [id]);
     await withBusiness('other-business', (db) => createProduction(db, input()));
     expect(await withBusiness(B, (db) => claimProduction(db, 'a', 60_000))).toBeNull();
     // Control: a queued one of this business is claimed.
@@ -110,7 +110,7 @@ describe('production store', () => {
     const latest = await withBusiness(TEST_BUSINESS, (db) => latestVersion(db, id));
     expect(latest?.versionId).toBe(v2);
     expect(latest?.spec).toEqual(spec);
-    const { rows } = await getPool().query<{ version_id: string; superseded: boolean }>(
+    const { rows } = await testDb().query<{ version_id: string; superseded: boolean }>(
       `SELECT version_id, superseded_at IS NOT NULL AS superseded FROM document_versions WHERE production_id = $1 ORDER BY version_no`,
       [id],
     );
@@ -128,20 +128,20 @@ describe('production store', () => {
     const b = await withBusiness(B, (db) => createProduction(db, input()));
     const yesterday = await withBusiness(B, (db) => createProduction(db, input()));
     await withBusiness(B, (db) => createProduction(db, input())); // queued, never drafted: not counted
-    await getPool().query(`UPDATE document_productions SET work = $2, attempt = 2 WHERE production_id = $1`, [a, drafted]);
-    await getPool().query(`UPDATE document_productions SET work = $2 WHERE production_id = $1`, [b, drafted]);
-    await getPool().query(
+    await testDb().query(`UPDATE document_productions SET work = $2, attempt = 2 WHERE production_id = $1`, [a, drafted]);
+    await testDb().query(`UPDATE document_productions SET work = $2 WHERE production_id = $1`, [b, drafted]);
+    await testDb().query(
       `UPDATE document_productions SET work = $2, attempt = 1, created_at = '2026-11-03T21:59:00Z' WHERE production_id = $1`,
       [yesterday, drafted],
     );
-    await getPool().query(`UPDATE document_productions SET created_at = '2026-11-03T22:30:00Z' WHERE production_id <> $1`, [yesterday]);
+    await testDb().query(`UPDATE document_productions SET created_at = '2026-11-03T22:30:00Z' WHERE production_id <> $1`, [yesterday]);
     expect(await withBusiness(B, (db) => productionsToday(db, TZ, now))).toBe(4); // a: 1+2, b: 1
   });
 
   it('an unreadable working record fails closed (throws), never reads as empty', async () => {
     const id = await withBusiness(B, (db) => createProduction(db, input()));
     expect((await withBusiness(B, (db) => loadProduction(db, id)))?.work).toEqual(EMPTY_WORK);
-    await getPool().query(`UPDATE document_productions SET work = '{"drafted":"yes"}' WHERE production_id = $1`, [id]);
+    await testDb().query(`UPDATE document_productions SET work = '{"drafted":"yes"}' WHERE production_id = $1`, [id]);
     await expect(withBusiness(B, (db) => loadProduction(db, id))).rejects.toThrow(/unreadable work record/);
   });
 
@@ -149,7 +149,7 @@ describe('production store', () => {
     const id = await withBusiness(B, (db) => createProduction(db, input()));
     const f = [{ check: 'spec' as const, code: 'cap_exceeded', where: 'document', he: 'x' }];
     expect(await withBusiness(TEST_BUSINESS, (db) => advanceStage(db, id, 'queued', 'fixing', { findings: f }))).toBe(true);
-    const { rows } = await getPool().query<{ findings: unknown; work: unknown }>(
+    const { rows } = await testDb().query<{ findings: unknown; work: unknown }>(
       'SELECT findings, work FROM document_productions WHERE production_id = $1',
       [id],
     );

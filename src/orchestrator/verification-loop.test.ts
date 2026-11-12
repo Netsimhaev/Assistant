@@ -32,8 +32,8 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { ingestDocument } from '../documents/ingest.js';
@@ -113,7 +113,7 @@ interface Envelope {
 }
 
 async function envelopes(): Promise<Envelope[]> {
-  const { rows } = await getPool().query<Envelope>(
+  const { rows } = await testDb().query<Envelope>(
     `SELECT envelope_id, kind, parent_job_id, child_job_id FROM agent_envelopes
       WHERE business_id = $1 ORDER BY created_at ASC, envelope_id ASC`,
     [BUSINESS],
@@ -364,7 +364,7 @@ describe('the verification loop, end to end through schedulerPass', () => {
  * legally be in.
  */
 async function documentJobId(): Promise<string> {
-  const { rows } = await getPool().query<{ job_id: string }>(
+  const { rows } = await testDb().query<{ job_id: string }>(
     `SELECT job_id FROM jobs WHERE business_id = $1 AND phase = 'await_approval'`,
     [BUSINESS],
   );

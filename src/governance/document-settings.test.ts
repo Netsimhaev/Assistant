@@ -2,9 +2,9 @@ import { mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { config } from '../config.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { scratchSaveFolder } from '../test/save-root.js';
 import {
   DOCUMENT_SETTINGS_DEFAULTS,
@@ -32,7 +32,7 @@ afterAll(async () => {
 const channels = { toWhatsApp: false, toEmail: true, toScreen: true };
 
 async function rowCount(): Promise<number> {
-  const { rows } = await getPool().query('SELECT 1 FROM document_settings WHERE business_id = $1', [B]);
+  const { rows } = await testDb().query('SELECT 1 FROM document_settings WHERE business_id = $1', [B]);
   return rows.length;
 }
 
@@ -62,7 +62,7 @@ describe('document settings', () => {
 
   it('the CHECK is the second layer: an all-false row cannot be written from SQL', async () => {
     await expect(
-      getPool().query(
+      testDb().query(
         `INSERT INTO document_settings (business_id, to_whatsapp, to_email, to_screen) VALUES ($1, false, false, false)`,
         [B],
       ),

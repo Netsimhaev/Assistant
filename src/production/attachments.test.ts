@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import type { DocxSpec } from '../domain/document-spec.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import {
   canonicalAttachmentName,
   resolveAttachments,
@@ -81,7 +81,7 @@ describe('resolveAttachments', () => {
     const otherRoot = await mkdtemp(join(tmpdir(), 'attach-root-'));
     try {
       await mkdir(join(otherRoot, DIR), { recursive: true });
-      const { rows } = await getPool().query<{ stored_path: string }>(
+      const { rows } = await testDb().query<{ stored_path: string }>(
         'SELECT stored_path FROM document_versions WHERE version_id = $1',
         [ref.producedVersionId],
       );
@@ -136,7 +136,7 @@ describe('resolveAttachments', () => {
     // Control: unchanged, it resolves (so the refusal below is the hash check).
     expect((await withBusiness(B, (db) => resolveAttachments(db, [ref], config.documentRoot))).ok).toBe(true);
     // Same length, different bytes — the size check cannot catch it, only the hash.
-    const { rows } = await getPool().query<{ stored_path: string }>(
+    const { rows } = await testDb().query<{ stored_path: string }>(
       'SELECT stored_path FROM document_versions WHERE version_id = $1',
       [ref.producedVersionId],
     );
@@ -176,7 +176,7 @@ describe('resolveAttachments', () => {
 
   it('a stored path escaping the document root → attachment_not_found, the file is never read', async () => {
     const ref = await produced(Buffer.from('inside'));
-    await getPool().query('UPDATE document_versions SET stored_path = $1 WHERE version_id = $2', [
+    await testDb().query('UPDATE document_versions SET stored_path = $1 WHERE version_id = $2', [
       '../outside.docx',
       ref.producedVersionId,
     ]);

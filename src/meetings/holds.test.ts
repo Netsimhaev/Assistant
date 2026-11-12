@@ -1,17 +1,16 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
-import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { upsertBinding } from '../orchestrator/bindings.js';
 import { createJob } from '../orchestrator/jobs.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { CALENDAR_SYSTEM, HOLD_TITLE_PREFIX } from '../calendar/calendar.js';
 import type { CalendarAccess } from '../calendar/client-for.js';
 import type { CalendarClient, CalendarEvent, EventWrite } from '../calendar/types.js';
 import { createHold, markHoldConverted, releaseHold, sweepHolds } from './holds.js';
 
-const BUSINESS = config.businessId;
+const BUSINESS = TEST_BUSINESS;
 const SIGNAL = new AbortController().signal;
 
 interface Call {
@@ -79,7 +78,7 @@ let charterVersion = '';
 
 async function newJob(phase = 'plan'): Promise<string> {
   const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion, provenance: 'boss', title: 't' }));
-  await getPool().query('UPDATE jobs SET phase = $1 WHERE job_id = $2', [phase, job.jobId]);
+  await testDb().query('UPDATE jobs SET phase = $1 WHERE job_id = $2', [phase, job.jobId]);
   return job.jobId;
 }
 
@@ -98,12 +97,12 @@ async function hold(client: CalendarClient, jobId: string, name = 'דנה לוי
 }
 
 async function state(holdId: string): Promise<string> {
-  const { rows } = await getPool().query<{ state: string }>('SELECT state FROM meeting_holds WHERE hold_id = $1', [holdId]);
+  const { rows } = await testDb().query<{ state: string }>('SELECT state FROM meeting_holds WHERE hold_id = $1', [holdId]);
   return rows[0]?.state ?? 'missing';
 }
 
 async function addConfirmation(jobId: string, st: string): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO instruction_confirmations (business_id, job_id, options, presented_text, channel, state, chosen_plan_hash)
      VALUES ($1, $2, '[]'::jsonb, 'q', 'whatsapp', $3, $4)`,
     [BUSINESS, jobId, st, st === 'confirmed' ? 'h' : null],
@@ -134,7 +133,7 @@ describe('holds', () => {
     expect(calls[0]?.args[3]).toBe(`hold:${h.holdId}`);
     expect(await state(h.holdId)).toBe('held');
 
-    const { rows } = await getPool().query<Record<string, unknown>>(
+    const { rows } = await testDb().query<Record<string, unknown>>(
       "SELECT * FROM audit_log WHERE reason = 'calendar_hold:created'",
     );
     expect(rows).toHaveLength(1);
@@ -242,7 +241,7 @@ describe('holds', () => {
       }, { by: 'test' }));
     const { client } = fake();
     const age = async (id: string): Promise<void> => {
-      await getPool().query("UPDATE meeting_holds SET created_at = now() - interval '2 hours' WHERE hold_id = $1", [id]);
+      await testDb().query("UPDATE meeting_holds SET created_at = now() - interval '2 hours' WHERE hold_id = $1", [id]);
     };
     const closed = await hold(client, await newJob('closed'));
     const orphan = await hold(client, await newJob('plan')); // no confirmation row
@@ -258,7 +257,7 @@ describe('holds', () => {
     const cancelled = await hold(client, cancelledJob);
     // Past the short grace a job with no pending question loses its hold.
     for (const h of [orphan, cancelled]) {
-      await getPool().query("UPDATE meeting_holds SET created_at = now() - interval '6 minutes' WHERE hold_id = $1", [h.holdId]);
+      await testDb().query("UPDATE meeting_holds SET created_at = now() - interval '6 minutes' WHERE hold_id = $1", [h.holdId]);
     }
     const keep: string[] = [];
     for (const phase of ['execute', 'verify', 'remember', 'followup', 'await_approval', 'plan']) {

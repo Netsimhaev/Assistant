@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -63,7 +63,7 @@ function baseRequest(
 }
 
 async function countJobs(): Promise<number> {
-  const { rows } = await getPool().query<{ n: string }>(
+  const { rows } = await testDb().query<{ n: string }>(
     'SELECT count(*)::text AS n FROM jobs WHERE business_id = $1',
     [BUSINESS],
   );
@@ -172,7 +172,7 @@ describe('requestHelp', () => {
     // `attachChildJob` — Task 7 depends on this column entirely
     // (`resumeDelegatedJobs` finds a closed child's parent through it) and
     // nothing was asserting it landed.
-    const { rows } = await getPool().query<{ child_job_id: string | null }>(
+    const { rows } = await testDb().query<{ child_job_id: string | null }>(
       'SELECT child_job_id FROM agent_envelopes WHERE business_id = $1 AND envelope_id = $2',
       [BUSINESS, result.envelopeId],
     );
@@ -641,7 +641,7 @@ describe('requestHelp', () => {
     const openedA = await withBusiness(TEST_BUSINESS, (db) => requestHelp(db, baseRequest(jobA, bundle, { parentEnvelope: ancestorForA })));
     expect(openedA.status).toBe('opened');
 
-    const before = await getPool().query<{ n: string }>(
+    const before = await testDb().query<{ n: string }>(
       'SELECT count(*)::text AS n FROM agent_envelopes WHERE business_id = $1',
       [BUSINESS],
     );
@@ -653,7 +653,7 @@ describe('requestHelp', () => {
 
     // No envelope was written for B's refused request — the two ancestors
     // plus A's one real envelope, unchanged.
-    const after = await getPool().query<{ n: string }>(
+    const after = await testDb().query<{ n: string }>(
       'SELECT count(*)::text AS n FROM agent_envelopes WHERE business_id = $1',
       [BUSINESS],
     );
@@ -687,7 +687,7 @@ describe('requestHelp', () => {
     expect(result.status).toBe('opened');
     if (result.status !== 'opened') throw new Error('expected opened');
 
-    const { rows } = await getPool().query<{ envelope_id: string | null; reason: string }>(
+    const { rows } = await testDb().query<{ envelope_id: string | null; reason: string }>(
       `SELECT envelope_id, reason FROM audit_log WHERE business_id = $1 AND kind = 'delegation'`,
       [BUSINESS],
     );

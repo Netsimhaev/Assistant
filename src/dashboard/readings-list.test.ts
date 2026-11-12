@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { createJob } from '../orchestrator/jobs.js';
@@ -16,7 +16,7 @@ const OTHER_BUSINESS = 'biz-readings-other';
  * test needing two collided on insert.
  */
 async function seedDocument(businessId: string, documentId: string): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO documents
        (document_id, business_id, source, original_name, media_type, byte_size,
         sha256, stored_path, status)
@@ -28,7 +28,7 @@ async function seedDocument(businessId: string, documentId: string): Promise<voi
 
 /** A `read` reading, with its content — the ordinary, successful case. */
 async function seedReading(businessId: string, documentId: string, readingId: string): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO document_readings
        (reading_id, business_id, document_id, status, reason, content,
         provenance, model, prompt_version, brief_hash)
@@ -49,7 +49,7 @@ async function seedUnreadableReading(
   readingId: string,
   reason: string,
 ): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO document_readings
        (reading_id, business_id, document_id, status, reason, content,
         provenance, model, prompt_version, brief_hash)
@@ -71,7 +71,7 @@ async function seedProposal(params: {
   /** The proposal's `action`. `null` (the default) is a stance with nothing to approve. */
   action?: unknown;
 }): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO proposals
        (proposal_id, business_id, reading_id, job_id, status, reason, content, raw,
         model, prompt_version, created_at)
@@ -105,7 +105,7 @@ async function seedApproval(params: {
   jobId: string;
   createdAt?: string;
 }): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO approval_requests
        (approval_id, business_id, job_id, action_class, summary, detail,
         risk, proposed_tool, proposed_input, input_hash, expires_at, created_at)

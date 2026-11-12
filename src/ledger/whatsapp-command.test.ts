@@ -4,8 +4,8 @@
  * the numbered batch the owner actually received.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, type BusinessDb, type Queryable, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, type BusinessDb, type Queryable, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { recordInbound } from '../whatsapp/store.js';
 import { CANCEL_WORDS, CONFIRM_WORDS, REPLY_STOPLIST } from '../orchestrator/command-confirm.js';
@@ -220,9 +220,9 @@ describe('applyLedgerCommand', () => {
       query: (async (text: string, params?: unknown[]) => {
         if (!raced && typeof text === 'string' && text.trimStart().startsWith('UPDATE ledger_items')) {
           raced = true;
-          await getPool().query(`UPDATE ledger_items SET status = 'cancelled' WHERE item_id = $1`, [id]);
+          await testDb().query(`UPDATE ledger_items SET status = 'cancelled' WHERE item_id = $1`, [id]);
         }
-        return getPool().query(text, params);
+        return testDb().query(text, params);
       }) as Queryable['query'],
     };
     expect(await applyLedgerCommand(db, id, { kind: 'done', n: null }, { ...APPLY })).toBe('lost_race');
@@ -240,7 +240,7 @@ describe('applyLedgerCommand', () => {
   it('reopen moves an evidence-closed item to open and evidence_after forward', async () => {
     const id = await item();
     const past = new Date('2026-01-01T00:00:00Z');
-    await getPool().query(`UPDATE ledger_items SET evidence_after = $2 WHERE item_id = $1`, [id, past]);
+    await testDb().query(`UPDATE ledger_items SET evidence_after = $2 WHERE item_id = $1`, [id, past]);
     await withBusiness(B, (db) => moveLedgerStatus(db, id, ['open'], 'closed_by_evidence', { kind: 'closed_by_evidence', by: 'system' }));
     expect(await withBusiness(B, (db) => applyLedgerCommand(db, id, { kind: 'reopen', n: null }, APPLY))).toBe('applied');
     const after = await load(id);
@@ -271,7 +271,7 @@ describe('applyLedgerCommand', () => {
 
   it('snooze resets nudge_count and reopens a stuck item', async () => {
     const id = await item({ dueAt: new Date('2026-11-01T06:00:00Z'), dueIsDateOnly: true });
-    await getPool().query(`UPDATE ledger_items SET nudge_count = 3 WHERE item_id = $1`, [id]);
+    await testDb().query(`UPDATE ledger_items SET nudge_count = 3 WHERE item_id = $1`, [id]);
     await withBusiness(B, (db) => moveLedgerStatus(db, id, ['open'], 'stuck', { kind: 'stuck', by: 'system' }));
 
     expect(
@@ -353,7 +353,7 @@ describe('handleLedgerWhatsApp', () => {
 
   async function batch(items: string[], sentAt: Date | null): Promise<void> {
     seq += 1;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO ledger_whatsapp_batches (batch_id, business_id, items, sent_at) VALUES ($1, $2, $3, $4)`,
       [`LB-T${seq}`, B, items, sentAt],
     );
@@ -391,7 +391,7 @@ describe('handleLedgerWhatsApp', () => {
   }
 
   async function messageState(id: string): Promise<string | undefined> {
-    const { rows } = await getPool().query<{ state: string }>(`SELECT state FROM whatsapp_messages WHERE id = $1`, [id]);
+    const { rows } = await testDb().query<{ state: string }>(`SELECT state FROM whatsapp_messages WHERE id = $1`, [id]);
     return rows[0]?.state;
   }
 

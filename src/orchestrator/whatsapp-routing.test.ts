@@ -16,11 +16,11 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import type { Plan } from '../domain/plan.js';
 import { pendingQuestions, type InstructionRecord } from '../governance/instructions.js';
 import type { PlanOutcome } from '../sdk/planner.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { createFakeGateway } from '../whatsapp/fake-gateway.js';
 import { createFakeMessenger } from '../whatsapp/fake-messenger.js';
@@ -295,7 +295,7 @@ describe('claimAsAnswer', () => {
     expect(await withBusiness(BUSINESS, (db) => claimAsAnswer(db, open, 'רונית לוי'))).toBe(false);
 
     // The first answer stands; the loser overwrote nothing.
-    const { rows } = await getPool().query<{ answer: string | null }>(
+    const { rows } = await testDb().query<{ answer: string | null }>(
       'SELECT answer FROM boss_instructions WHERE instruction_id = $1',
       [open.instructionId],
     );
@@ -332,7 +332,7 @@ describe('retireOpenInstruction', () => {
       reason: REASON_CLOSED_BY_OWNER,
     }));
 
-    const jobRow = await getPool().query<{ phase: string; whatsapp_message_id: string | null }>(
+    const jobRow = await testDb().query<{ phase: string; whatsapp_message_id: string | null }>(
       'SELECT phase, whatsapp_message_id FROM jobs WHERE job_id = $1',
       [open.jobId],
     );
@@ -340,7 +340,7 @@ describe('retireOpenInstruction', () => {
     const messageId = jobRow.rows[0]?.whatsapp_message_id;
     expect(messageId).not.toBeNull();
 
-    const msgRow = await getPool().query<{ state: string }>(
+    const msgRow = await testDb().query<{ state: string }>(
       'SELECT state FROM whatsapp_messages WHERE id = $1',
       [messageId],
     );

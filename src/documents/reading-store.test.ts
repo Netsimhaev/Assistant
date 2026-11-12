@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import type { Reading } from '../domain/reading.js';
 import { insertOrGetDocument } from './store.js';
 import {
@@ -169,7 +169,7 @@ describe('loadLatestReading', () => {
     // reading specifically, by id. Reversing the ORDER BY must fail this.
     const documentId = await aDocument();
     const first = await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId)));
-    await getPool().query(
+    await testDb().query(
       `UPDATE document_readings SET created_at = now() - interval '1 hour' WHERE reading_id = $1`,
       [first.record.readingId],
     );
@@ -209,8 +209,8 @@ describe('the readings table', () => {
   it('drops a document\'s readings when the document is deleted', async () => {
     const documentId = await aDocument();
     await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId)));
-    await getPool().query('DELETE FROM documents WHERE document_id = $1', [documentId]);
-    const { rows } = await getPool().query(
+    await testDb().query('DELETE FROM documents WHERE document_id = $1', [documentId]);
+    const { rows } = await testDb().query(
       'SELECT 1 FROM document_readings WHERE document_id = $1',
       [documentId],
     );

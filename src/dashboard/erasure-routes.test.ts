@@ -20,7 +20,7 @@ import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -121,7 +121,7 @@ async function seedRonit(): Promise<{ jobId: string }> {
 }
 
 async function memoryCount(): Promise<number> {
-  const { rows } = await getPool().query<{ n: string }>(
+  const { rows } = await testDb().query<{ n: string }>(
     'SELECT count(*)::text AS n FROM memories WHERE business_id = $1',
     [BUSINESS],
   );
@@ -285,12 +285,12 @@ describe('the erasure routes', () => {
     expect(html).toContain('action="/erase/confirm"');
 
     // Never to the planner: no job, and no instruction row.
-    const jobs = await getPool().query(
+    const jobs = await testDb().query(
       'SELECT 1 FROM jobs WHERE business_id = $1 AND title IS NULL',
       [BUSINESS],
     );
     expect(jobs.rows).toHaveLength(0);
-    const instructions = await getPool().query('SELECT 1 FROM boss_instructions');
+    const instructions = await testDb().query('SELECT 1 FROM boss_instructions');
     expect(instructions.rows).toHaveLength(0);
 
     // And read-only: a preview destroys nothing.
@@ -462,7 +462,7 @@ describe('the erasure routes', () => {
     // empty entry form.
     expect(html).toContain(jobId);
     expect(html).toContain('שמור את זה');
-    const rows = await getPool().query('SELECT 1 FROM kept_items WHERE business_id = $1', [BUSINESS]);
+    const rows = await testDb().query('SELECT 1 FROM kept_items WHERE business_id = $1', [BUSINESS]);
     expect(rows.rows).toHaveLength(0);
   });
 
@@ -487,7 +487,7 @@ describe('the erasure routes', () => {
 
     expect(res.status).toBe(200);
     expect(await res.text()).toContain('בטל שמירה');
-    const rows = await getPool().query<{ item_id: string }>(
+    const rows = await testDb().query<{ item_id: string }>(
       'SELECT item_id FROM kept_items WHERE business_id = $1',
       [BUSINESS],
     );
@@ -563,7 +563,7 @@ describe('the erasure routes', () => {
     });
 
     expect(res.status).toBe(403);
-    const rows = await getPool().query('SELECT 1 FROM kept_items WHERE business_id = $1', [BUSINESS]);
+    const rows = await testDb().query('SELECT 1 FROM kept_items WHERE business_id = $1', [BUSINESS]);
     expect(rows.rows).toHaveLength(0);
   });
 
@@ -717,7 +717,7 @@ describe('what the owner authorised', () => {
   it('refuses when a different ledger row took the place of the one in the preview', async () => {
     const baseUrl = await startServer();
     const { jobId } = await seedRonit();
-    const db = getPool();
+    const db = testDb();
     await db.query(
       `INSERT INTO ledger_items (item_id, business_id, family, description, origin_job_id)
        VALUES ('LI-first', $1, 'money_in', $2, $3)`,
@@ -822,7 +822,7 @@ describe('the two ways a confirm ends other than cleanly', () => {
       await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, { headers: { cookie } })
     ).text();
 
-    const blocker = await getPool().connect();
+    const blocker = await testDb().connect();
     let pending: Promise<Response>;
     try {
       await blocker.query('BEGIN');
@@ -976,7 +976,7 @@ describe('the smaller things the screen owes the owner', () => {
     });
 
     expect(await res.text()).toContain('צריך את זה לביקורת המס');
-    const rows = await getPool().query<{ note: string | null }>(
+    const rows = await testDb().query<{ note: string | null }>(
       'SELECT note FROM kept_items WHERE business_id = $1 AND item_id = $2',
       [BUSINESS, jobId],
     );
@@ -1036,7 +1036,7 @@ describe('calendar events in the plan fingerprint', () => {
   it('refuses when a different calendar event took the place of the one in the preview', async () => {
     const baseUrl = await startServer();
     const { jobId } = await seedRonit();
-    const db = getPool();
+    const db = testDb();
     await db.query(
       `INSERT INTO meetings (meeting_id, business_id, job_id, step_id, calendar_id, event_id, operation, client_name)
        VALUES ('MT-fp', $1, $2, 's1', 'cal-1', 'ev-first', 'create', 'לקוח')`,

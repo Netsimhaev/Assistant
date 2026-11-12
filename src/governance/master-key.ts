@@ -9,8 +9,7 @@
  * carefully than the model prompts.
  */
 import { readFile, stat } from 'node:fs/promises';
-import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js'; // TENANCY-TODO(task 12)
+import type { Queryable } from '../db/pool.js';
 import { decryptSecret, encryptSecret, type Sealed } from './secret-cipher.js';
 
 export const KEY_BYTES = 32;
@@ -42,9 +41,25 @@ export class MasterKeyError extends Error {}
 const KEY_CHECK_REF = 'key-check';
 const KEY_CHECK_PLAINTEXT = 'credential-broker-key-check';
 
+/**
+ * The business half of the key check's authenticated data, for every row the
+ * server writes. The key is the server's, not any business's (spec §5.9), and
+ * `''` is a value no business id (`^[a-z0-9-]{3,63}$`) can take — so the check
+ * value can never share its authenticated data with a business's own
+ * `key-check`-shaped AAD, even in principle.
+ *
+ * A row carried over from before the key moved to the server (migration 067)
+ * was sealed under the business the installation was configured for, and
+ * names it in `check_business_id`; `verifyKeyState` opens each row under the
+ * business it names. The next `create`/`rotate` replaces it with one sealed
+ * under this value.
+ */
+const SERVER_KEY_CHECK_BUSINESS = '';
+
 interface KeyStateRow {
   check_nonce: Buffer;
   check_value: Buffer;
+  check_business_id: string;
 }
 
 async function readKeyBytes(path: string): Promise<Buffer> {
@@ -107,30 +122,27 @@ export async function loadMasterKey(path: string): Promise<Buffer> {
 }
 
 /**
- * Seal the key-check plaintext with `key` and store it as the installation's
- * one row. `businessId` defaults to the configured business — unlike every read
- * path for a real secret, this is bookkeeping rather than an authorisation
- * decision: the key is per-installation, the table holds exactly one row,
- * and there is no customer whose secret a default here could hand to another.
+ * Seal the key-check plaintext with `key` and store it as the server's one
+ * row (`server_key_state`, spec §5.9). `db` is required: the caller says which
+ * connection — the platform pool from the key CLI, a test's own — and there is
+ * no business to default to, because the key is not any business's.
  */
-export async function writeKeyState(
-  key: Buffer,
-  keyId: string,
-  options: { businessId?: string; db?: Queryable } = {},
-): Promise<void> {
-  const businessId = options.businessId ?? config.businessId; // TENANCY-TODO(task 12)
-  const db = options.db ?? getPool(); // TENANCY-TODO(task 12)
-  const sealed = encryptSecret(KEY_CHECK_PLAINTEXT, key, { businessId, ref: KEY_CHECK_REF });
+export async function writeKeyState(key: Buffer, keyId: string, db: Queryable): Promise<void> {
+  const sealed = encryptSecret(KEY_CHECK_PLAINTEXT, key, {
+    businessId: SERVER_KEY_CHECK_BUSINESS,
+    ref: KEY_CHECK_REF,
+  });
 
   await db.query(
-    `INSERT INTO credential_key_state (business_id, key_id, check_nonce, check_value)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (business_id) DO UPDATE
+    `INSERT INTO server_key_state (singleton, key_id, check_nonce, check_value, check_business_id)
+     VALUES (true, $1, $2, $3, $4)
+     ON CONFLICT (singleton) DO UPDATE
        SET key_id = EXCLUDED.key_id,
            check_nonce = EXCLUDED.check_nonce,
            check_value = EXCLUDED.check_value,
+           check_business_id = EXCLUDED.check_business_id,
            created_at = now()`,
-    [businessId, keyId, sealed.nonce, sealed.ciphertext],
+    [keyId, sealed.nonce, sealed.ciphertext, SERVER_KEY_CHECK_BUSINESS],
   );
 }
 
@@ -145,23 +157,23 @@ export async function writeKeyState(
  * open under `key` throws: the check value is not a secret, so what it
  * proves by opening (or failing to) is only "the key in the file is the key
  * that sealed the rows this installation already has."
+ *
+ * The row is the SERVER's (spec §5.9), so every business passes or fails the
+ * same check — a business created yesterday, with no key state of its own,
+ * is checked against the one key the server holds. `db` is required and is
+ * used as given: a dashboard request passes its own request connection, and
+ * this function must never acquire a second one beside it (pool.ts's
+ * hold-and-wait note).
  */
-export async function verifyKeyState(
-  key: Buffer,
-  options: { businessId?: string; db?: Queryable } = {},
-): Promise<void> {
-  const businessId = options.businessId ?? config.businessId; // TENANCY-TODO(task 12)
-  const db = options.db ?? getPool(); // TENANCY-TODO(task 12)
-
+export async function verifyKeyState(key: Buffer, db: Queryable): Promise<void> {
   const { rows } = await db.query<KeyStateRow>(
-    'SELECT check_nonce, check_value FROM credential_key_state WHERE business_id = $1',
-    [businessId],
+    'SELECT check_nonce, check_value, check_business_id FROM server_key_state',
   );
   const row = rows[0];
   if (!row) return;
 
   const sealed: Sealed = { ciphertext: row.check_value, nonce: row.check_nonce };
-  const opened = decryptSecret(sealed, key, { businessId, ref: KEY_CHECK_REF });
+  const opened = decryptSecret(sealed, key, { businessId: row.check_business_id, ref: KEY_CHECK_REF });
   if (opened === null) {
     throw new MasterKeyError(
       'המפתח שסופק אינו תואם למפתח שהצפין את הסודות של ההתקנה הזו — העלייה מסורבת',

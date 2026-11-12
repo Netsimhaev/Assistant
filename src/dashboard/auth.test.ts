@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { createTestOwner, ownerLogin } from '../test/owner.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import {
   hashPassword,
   login,
@@ -76,7 +76,7 @@ describe('login', () => {
       expect(result).toEqual({ ok: false, code: 'bad_credentials' });
     }
 
-    const { rows } = await getPool().query<{ failed_attempts: number; locked_until: Date | null }>(
+    const { rows } = await testDb().query<{ failed_attempts: number; locked_until: Date | null }>(
       // One row for the whole server since migration 066.
       `SELECT failed_attempts, locked_until FROM dashboard_unknown_user_throttle`,
     );

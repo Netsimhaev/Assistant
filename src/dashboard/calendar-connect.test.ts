@@ -23,7 +23,7 @@ import { GOOGLE_CLIENT_ID_REF, GOOGLE_CLIENT_SECRET_REF } from '../orchestrator/
 import { upsertBinding } from '../orchestrator/bindings.js';
 import { writeGrant } from '../governance/oauth-grants.js';
 import { buildCharter } from '../test/fixtures.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { issueCsrfToken } from './csrf.js';
 import { CALENDAR_AUTHORISATION_TEXT } from './calendar-connect.js';
@@ -62,7 +62,7 @@ beforeEach(async () => {
   keyPath = join(keyDir, 'master.key');
   key = randomBytes(KEY_BYTES);
   await writeFile(keyPath, key, { mode: 0o600 });
-  await writeKeyState(key, 'KEY-test');
+  await writeKeyState(key, 'KEY-test', testDb());
   await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
   await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [OFFICE_CALENDAR] })));
 });

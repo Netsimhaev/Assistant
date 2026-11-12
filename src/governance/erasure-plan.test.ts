@@ -4,8 +4,8 @@ import { mkdir, mkdtemp, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { ulid } from 'ulid';
 import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
@@ -34,12 +34,12 @@ async function bareJob(title: string): Promise<string> {
 /** A job that mentions the anchor in its authorisation and its plan. */
 async function jobAbout(identifier: string, title: string): Promise<string> {
   const jobId = await bareJob(title);
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
      VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
     [BUSINESS, jobId, identifier],
   );
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
      VALUES ($1, $2, 'h1', $3::jsonb)`,
     [BUSINESS, jobId, JSON.stringify({ goal: 'send', steps: [{ input: { to: [identifier] } }] })],
@@ -76,7 +76,7 @@ describe('buildErasurePlan', () => {
   describe('finds a contact through every place the anchor can appear', () => {
     it('via job_authorizations.recipients', async () => {
       const jobId = await bareJob('via-authorization');
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
          VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
         [BUSINESS, jobId, RONIT],
@@ -89,7 +89,7 @@ describe('buildErasurePlan', () => {
 
     it('via job_plans.plan', async () => {
       const jobId = await bareJob('via-plan');
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
          VALUES ($1, $2, 'h1', $3::jsonb)`,
         [BUSINESS, jobId, JSON.stringify({ goal: 'send', steps: [{ input: { to: [RONIT] } }] })],
@@ -102,7 +102,7 @@ describe('buildErasurePlan', () => {
 
     it('via boss_instructions.text', async () => {
       const jobId = await bareJob('via-instruction');
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text, text_origin)
          VALUES ($1, $2, $3, $4, 'typed')`,
         [`INS-${ulid()}`, BUSINESS, jobId, `תשלחי תזכורת ל-${RONIT}`],
@@ -115,7 +115,7 @@ describe('buildErasurePlan', () => {
 
     it('via approval_requests (proposed input, summary and detail)', async () => {
       const jobId = await bareJob('via-approval');
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO approval_requests
            (approval_id, business_id, job_id, action_class, summary, detail, risk,
             proposed_tool, proposed_input, input_hash, expires_at)
@@ -145,7 +145,7 @@ describe('buildErasurePlan', () => {
       // behind it (Task 10) — the one shape `job_plans.plan` cannot discover
       // by itself, per `AGENT_ENVELOPES_ERASED_PREDICATE`'s docblock.
       const jobId = await bareJob('via-envelope');
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO agent_envelopes
            (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
             kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
@@ -182,7 +182,7 @@ describe('buildErasurePlan', () => {
     it('discovers a contact through agent_envelopes.payload even when the identifier contains a LIKE wildcard', async () => {
       const jobId = await bareJob('via-envelope-wildcard');
       const identifier = 'zz_env-wild@nowhere.example';
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO agent_envelopes
            (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
             kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
@@ -205,7 +205,7 @@ describe('buildErasurePlan', () => {
     // directly-invoked delegation, one table over.
     it('via verification_verdicts.verdict', async () => {
       const jobId = await bareJob('via-verdict');
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, $3::jsonb)`,
         [
           BUSINESS,
@@ -238,7 +238,7 @@ describe('buildErasurePlan', () => {
     it('discovers a contact through verification_verdicts.verdict even when the identifier contains a LIKE wildcard', async () => {
       const jobId = await bareJob('via-verdict-wildcard');
       const identifier = 'zz_verdict-wild@nowhere.example';
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, $3::jsonb)`,
         [
           BUSINESS,
@@ -288,7 +288,7 @@ describe('buildErasurePlan', () => {
   it('finds a digest whose body mentions the contact, and counts it for deletion', async () => {
     await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'digest-found' })));
     const digestId = `DG-${ulid()}`;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
        VALUES ($1, $2, 'daily', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', $3, true)`,
       [digestId, BUSINESS, `תדריך יומי · ממתין לך: שליחה ל-${RONIT} נכשלה`],
@@ -298,7 +298,7 @@ describe('buildErasurePlan', () => {
     // would still report count 1, because this would otherwise be the only
     // row in the table. With it, a selective match stays at 1 and an
     // unselective one reports 2.
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
        VALUES ($1, $2, 'daily', '2026-01-02T00:00:00Z', '2026-01-03T00:00:00Z', $3, true)`,
       [`DG-${ulid()}`, BUSINESS, 'תדריך יומי · הכל תקין, אין חריגות'],
@@ -321,7 +321,7 @@ describe('buildErasurePlan', () => {
   it('discovers a digest by its body alone, with no job or document linking to it', async () => {
     await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'digest-discovery' })));
     const digestId = `DG-${ulid()}`;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
        VALUES ($1, $2, 'weekly', '2026-01-01T00:00:00Z', '2026-01-08T00:00:00Z', $3, true)`,
       [digestId, BUSINESS, `תדריך שבועי · מסמך מ-${RONIT} נדחה`],
@@ -329,7 +329,7 @@ describe('buildErasurePlan', () => {
     // A second digest naming an unrelated contact, so an unselective match
     // (every digest in the business, not just this one) would be caught by
     // the exact-array assertion below rather than passing by coincidence.
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
        VALUES ($1, $2, 'weekly', '2026-01-08T00:00:00Z', '2026-01-15T00:00:00Z', $3, true)`,
       [`DG-${ulid()}`, BUSINESS, 'תדריך שבועי · מסמך מ-avi@gamma-lift.example נדחה'],
@@ -358,7 +358,7 @@ describe('buildErasurePlan', () => {
     await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'digest-window' })));
     const insideId = `DG-${ulid()}`;
     const outsideId = `DG-${ulid()}`;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content, created_at)
        VALUES ($1, $2, 'daily', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'תדריך יומי · הכל תקין', true, $3)`,
       [insideId, BUSINESS, '2026-03-10T12:00:00Z'],
@@ -366,7 +366,7 @@ describe('buildErasurePlan', () => {
     // One second before the window's lower bound — the exact edge a `>`
     // mistake (instead of `>=`) would wrongly admit, and the exact edge a
     // decoy at some unrelated far-away date would not test at all.
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content, created_at)
        VALUES ($1, $2, 'daily', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'תדריך יומי · הכל תקין', true, $3)`,
       [outsideId, BUSINESS, '2026-03-10T11:59:59Z'],
@@ -389,12 +389,12 @@ describe('buildErasurePlan', () => {
    */
   it('discovers an interview draft by a name in its answers, and counts it for deletion', async () => {
     const name = `${RONIT} בע"מ`;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO charter_interview_drafts (draft_id, business_id, answers)
        VALUES ('DR-ronit', $1, $2::jsonb)`,
       [BUSINESS, JSON.stringify({ counterparties: { known: [], doNotContact: [{ label: name, phone: '+972541234567' }] } })],
     );
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO charter_interview_drafts (draft_id, business_id, answers)
        VALUES ('DR-other', 'other-business', $1::jsonb)`,
       [JSON.stringify({ counterparties: { known: [], doNotContact: [{ label: name, phone: '+972541234567' }] } })],
@@ -415,7 +415,7 @@ describe('buildErasurePlan', () => {
    * real-world event happened at, and no document reference of any kind.
    */
   it('reaches no interview draft from a window or a document anchor', async () => {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO charter_interview_drafts (draft_id, business_id, answers) VALUES ('DR-any', $1, '{}')`,
       [BUSINESS],
     );
@@ -431,7 +431,7 @@ describe('buildErasurePlan', () => {
       db,
       { jobId, kind: 'entity', subjectKey: RONIT, body: { name: 'רונית' } },
     ));
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO agent_envelopes
          (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
           kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
@@ -441,7 +441,7 @@ describe('buildErasurePlan', () => {
                '{}'::jsonb, 1, $4, $5)`,
       [BUSINESS, `ENV-${ulid()}`, JSON.stringify({ lookFor: RONIT }), `idem-${ulid()}`, jobId],
     );
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, '{}'::jsonb)`,
       [BUSINESS, jobId],
     );
@@ -506,7 +506,7 @@ describe('buildErasurePlan', () => {
     const QUOTED = 'אלפא בע"מ';
 
     it('the premise holds: the escaped text form does not match', async () => {
-      const { rows } = await getPool().query<{ m: boolean }>(
+      const { rows } = await testDb().query<{ m: boolean }>(
         `SELECT $1::jsonb::text ILIKE $2 AS m`,
         [JSON.stringify({ body: `לכבוד ${QUOTED}\nשלום` }), `%${QUOTED}%`],
       );
@@ -515,7 +515,7 @@ describe('buildErasurePlan', () => {
 
     it('via job_plans.plan', async () => {
       const jobId = await bareJob('quoted-plan');
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
          VALUES ($1, $2, 'h1', $3::jsonb)`,
         [BUSINESS, jobId, JSON.stringify({ goal: 'send', steps: [{ input: { body: `לכבוד ${QUOTED}\nשלום` } }] })],
@@ -528,7 +528,7 @@ describe('buildErasurePlan', () => {
 
     it('via approval_requests.proposed_input', async () => {
       const jobId = await bareJob('quoted-approval');
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO approval_requests
            (approval_id, business_id, job_id, action_class, summary, detail, risk,
             proposed_tool, proposed_input, input_hash, expires_at)
@@ -548,7 +548,7 @@ describe('buildErasurePlan', () => {
     });
 
     it('an orphan approval card (no job) is counted for deletion', async () => {
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO approval_requests
            (approval_id, business_id, job_id, action_class, summary, detail, risk,
             proposed_tool, proposed_input, input_hash, expires_at)
@@ -569,7 +569,7 @@ describe('buildErasurePlan', () => {
 
     it('via agent_envelopes.payload', async () => {
       const jobId = await bareJob('quoted-envelope');
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO agent_envelopes
            (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
             kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
@@ -587,7 +587,7 @@ describe('buildErasurePlan', () => {
 
     it('via verification_verdicts.verdict', async () => {
       const jobId = await bareJob('quoted-verdict');
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, $3::jsonb)`,
         [BUSINESS, jobId, JSON.stringify({ note: `נבדק מול ${QUOTED}` })],
       );
@@ -599,7 +599,7 @@ describe('buildErasurePlan', () => {
 
     it('still treats a wildcard inside a JSON string value as a literal', async () => {
       const jobId = await bareJob('quoted-wild');
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
          VALUES ($1, $2, 'h1', $3::jsonb)`,
         [BUSINESS, jobId, JSON.stringify({ steps: [{ input: { to: 'axb@nowhere.example' } }] })],
@@ -771,7 +771,7 @@ describe('the task ledger', () => {
   }
 
   async function anItem(seed: ItemSeed): Promise<string> {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO ledger_items
          (item_id, business_id, family, description, counterparty_name, counterparty_email,
           counterparty_domain, reference, stages, proposed_stages, nudge_job_id, origin_job_id,
@@ -797,7 +797,7 @@ describe('the task ledger', () => {
   }
 
   async function anEvent(itemId: string, eventId: string, note: string | null, jobId: string | null = null): Promise<void> {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO ledger_events (event_id, business_id, item_id, kind, job_id, note, by_whom)
        VALUES ($1, $2, $3, 'updated', $4, $5, 'owner')`,
       [eventId, BUSINESS, itemId, jobId, note],
@@ -805,7 +805,7 @@ describe('the task ledger', () => {
   }
 
   async function aReminder(itemId: string, reminderId: string, body: string): Promise<void> {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO ledger_reminders (reminder_id, business_id, item_id, slot, kind, body)
        VALUES ($1, $2, $3, $4, 'due', $5)`,
       [reminderId, BUSINESS, itemId, `slot-${reminderId}`, body],
@@ -847,7 +847,7 @@ describe('the task ledger', () => {
 
     // The premise: the JSONB text form escapes the quote, so a plain text
     // match alone cannot find it.
-    const premise = await getPool().query(`SELECT 1 FROM ledger_items WHERE stages::text ILIKE $1`, [`%${NAME}%`]);
+    const premise = await testDb().query(`SELECT 1 FROM ledger_items WHERE stages::text ILIKE $1`, [`%${NAME}%`]);
     expect(premise.rows).toHaveLength(0);
 
     const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: NAME }));
@@ -906,7 +906,7 @@ describe('the task ledger', () => {
   });
 
   it('finds a counterparty critical rule by its match, and never a family rule', async () => {
-    const db = getPool();
+    const db = testDb();
     await db.query(
       `INSERT INTO ledger_critical_rules (rule_id, business_id, kind, match, created_by)
        VALUES ('LC-ronit', $1, 'counterparty', $2, 'owner'),
@@ -934,7 +934,7 @@ describe('the task ledger', () => {
     await aReminder('LI-x', 'LR-x', 'תזכורת');
     await anItem({ itemId: 'LI-keep', originJobId: keepOrigin, description: 'שורה של מישהו אחר' });
     await anEvent('LI-keep', 'LE-keep', 'נוצר');
-    const db = getPool();
+    const db = testDb();
     await db.query(
       `INSERT INTO ledger_whatsapp_batches (batch_id, business_id, items)
        VALUES ('LW-only', $1, ARRAY['LI-x']),
@@ -1024,7 +1024,7 @@ describe('document production', () => {
   }
 
   async function aProduction(seed: ProductionSeed): Promise<void> {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_productions
          (production_id, business_id, origin_job_id, instruction_text, text_origin, format, language,
           kind, destination, source_document_ids, stage, findings, work, created_at)
@@ -1056,7 +1056,7 @@ describe('document production', () => {
     await mkdir(join(root, 'produced', BUSINESS, productionId), { recursive: true });
     if (opts.storedPath === undefined) await writeFile(join(root, storedPath), 'docx-bytes');
     await writeFile(join(root, previewPath), 'png-bytes');
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_versions (version_id, production_id, business_id, version_no, spec, stored_path, sha256, size_bytes, check1, check2)
        VALUES ($1, $2, (SELECT business_id FROM document_productions WHERE production_id = $2), 1, $3::jsonb, $4, repeat('a', 64), 10, $5::jsonb, $6::jsonb)`,
       [
@@ -1069,7 +1069,7 @@ describe('document production', () => {
       ],
     );
     const cardId = `CARD-${versionId}`;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_cards (card_id, business_id, version_id, delivery_plans)
        VALUES ($1, $2, $3, $4::jsonb)`,
       [cardId, BUSINESS, versionId, JSON.stringify(opts.deliveryPlans ?? [])],
@@ -1078,7 +1078,7 @@ describe('document production', () => {
   }
 
   async function aDelivery(cardId: string, versionId: string, jobId: string, savedPaths: string[] = []): Promise<void> {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_deliveries (job_id, business_id, card_id, version_id, saved_paths)
        VALUES ($1, $2, $3, $4, $5::text[])`,
       [jobId, BUSINESS, cardId, versionId, savedPaths],
@@ -1126,7 +1126,7 @@ describe('document production', () => {
       expect(executed.get(`${table}:delete`), table).toBe(1);
     }
     expect(outcome.filesRemoved).toBe(2);
-    const db = getPool();
+    const db = testDb();
     const left = await db.query<{ production_id: string }>('SELECT production_id FROM document_productions');
     expect(left.rows.map((r) => r.production_id)).toEqual(['PR-decoy']);
     const versions = await db.query<{ version_id: string }>('SELECT version_id FROM document_versions');
@@ -1189,7 +1189,7 @@ describe('document production', () => {
     expect(plan.productionIds).toEqual(['PR-live']);
     expect(plan.refusals.map((r) => r.kind)).toEqual(['live_job']);
     await expect(withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan))).rejects.toThrow();
-    expect((await getPool().query('SELECT 1 FROM document_productions')).rows).toHaveLength(1);
+    expect((await testDb().query('SELECT 1 FROM document_productions')).rows).toHaveLength(1);
   });
 
   it('the preview lists a saved base-folder copy and erasure leaves it', async () => {
@@ -1219,7 +1219,7 @@ describe('document production', () => {
     expect((await stat(saved)).isFile()).toBe(true);
     expect((await stat(second)).isFile()).toBe(true);
     // The row that recorded the path went with its job.
-    expect((await getPool().query('SELECT 1 FROM document_deliveries')).rows).toHaveLength(0);
+    expect((await testDb().query('SELECT 1 FROM document_deliveries')).rows).toHaveLength(0);
   });
 
   it('finds a production by a saved copy path alone', async () => {
@@ -1245,12 +1245,12 @@ describe('document production', () => {
     expect(plan.refusals).toEqual([]);
     expect(plan.productionIds).toEqual(['PR-flip']);
 
-    await getPool().query(
+    await testDb().query(
       `UPDATE document_productions SET stage = 'fixing', work = jsonb_set(work, '{finished}', 'false') WHERE production_id = 'PR-flip'`,
     );
 
     await expect(withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan))).rejects.toBeInstanceOf(ErasureRefusedError);
-    const db = getPool();
+    const db = testDb();
     expect((await db.query('SELECT 1 FROM document_productions')).rows).toHaveLength(1);
     expect((await db.query('SELECT 1 FROM document_versions')).rows).toHaveLength(1);
     expect((await db.query('SELECT 1 FROM document_cards')).rows).toHaveLength(1);
@@ -1267,13 +1267,13 @@ describe('document production', () => {
 
     // The owner approves the card between the preview and the confirm.
     const delivery = await bareJob('race-delivery');
-    await getPool().query(`UPDATE document_cards SET state = 'approved', delivery_job_id = $1 WHERE card_id = $2`, [
+    await testDb().query(`UPDATE document_cards SET state = 'approved', delivery_job_id = $1 WHERE card_id = $2`, [
       delivery,
       v.cardId,
     ]);
 
     await expect(withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan))).rejects.toBeInstanceOf(ErasureRefusedError);
-    expect((await getPool().query('SELECT 1 FROM document_cards')).rows).toHaveLength(1);
+    expect((await testDb().query('SELECT 1 FROM document_cards')).rows).toHaveLength(1);
     expect((await stat(v.file)).isFile()).toBe(true);
   });
 
@@ -1282,7 +1282,7 @@ describe('document production', () => {
     const delivery = await bareJob('held-delivery');
     await aProduction({ productionId: 'PR-held', originJobId: origin, instructionText: `מסמך ל-${RONIT}` });
     const v = await aVersion('PR-held', 'VER-held');
-    await getPool().query(`UPDATE document_cards SET state = 'approved', delivery_job_id = $1 WHERE card_id = $2`, [
+    await testDb().query(`UPDATE document_cards SET state = 'approved', delivery_job_id = $1 WHERE card_id = $2`, [
       delivery,
       v.cardId,
     ]);
@@ -1290,7 +1290,7 @@ describe('document production', () => {
     const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }, { documentRoot: root }));
     expect(plan.jobIds).toContain(delivery);
     await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
-    expect((await getPool().query('SELECT 1 FROM document_cards')).rows).toHaveLength(0);
+    expect((await testDb().query('SELECT 1 FROM document_cards')).rows).toHaveLength(0);
   });
 
   it('never queues a produced path outside produced/<business>/<production>/ for unlinking', async () => {
@@ -1300,7 +1300,7 @@ describe('document production', () => {
     const other = join('produced', BUSINESS, 'PR-someone-else', 'x.docx');
     await aVersion('PR-esc', 'VER-esc1', { storedPath: outside });
     const badPreview = join('produced', BUSINESS, 'PR-esc', '..', '..', 'p.png');
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_versions (version_id, production_id, business_id, version_no, spec, stored_path, sha256, size_bytes, check2)
        VALUES ('VER-esc2', 'PR-esc', (SELECT business_id FROM document_productions WHERE production_id = 'PR-esc'), 2, '{}'::jsonb, $1, repeat('a', 64), 10, $2::jsonb)`,
       [other, JSON.stringify({ previewPath: badPreview })],
@@ -1348,7 +1348,7 @@ describe('calendar scheduling', () => {
       createdAt?: string;
     },
   ): Promise<void> {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO meetings
          (meeting_id, business_id, job_id, step_id, calendar_id, event_id, operation,
           client_name, internal_note, start_at, reminder_job_id, created_at)
@@ -1370,7 +1370,7 @@ describe('calendar scheduling', () => {
   }
 
   async function aHold(holdId: string, jobId: string, eventId: string, state = 'held'): Promise<void> {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO meeting_holds (hold_id, business_id, job_id, calendar_id, event_id, start_at, end_at, state)
        VALUES ($1, $2, $3, 'cal-1', $4, '2026-12-01T09:00:00Z', '2026-12-01T10:00:00Z', $5)`,
       [holdId, BUSINESS, jobId, eventId, state],
@@ -1391,7 +1391,7 @@ describe('calendar scheduling', () => {
     expect(plan.items.find((i) => i.table === 'meetings')?.count).toBe(1);
 
     await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
-    const left = await getPool().query('SELECT meeting_id FROM meetings');
+    const left = await testDb().query('SELECT meeting_id FROM meetings');
     expect(left.rows).toEqual([{ meeting_id: 'MT-2' }]);
   });
 
@@ -1427,7 +1427,7 @@ describe('calendar scheduling', () => {
     expect(plan.items.find((i) => i.table === 'meeting_holds')?.count).toBe(1);
 
     await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
-    const left = await getPool().query('SELECT hold_id FROM meeting_holds');
+    const left = await testDb().query('SELECT hold_id FROM meeting_holds');
     expect(left.rows).toEqual([{ hold_id: 'H-2' }]);
   });
 
@@ -1476,7 +1476,7 @@ describe('calendar scheduling', () => {
     expect(plan.calendarEventsKept).toEqual([]);
 
     await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
-    const left = await getPool().query('SELECT meeting_id FROM meetings');
+    const left = await testDb().query('SELECT meeting_id FROM meetings');
     expect(left.rows).toEqual([{ meeting_id: 'MT-kept' }]);
   });
 
@@ -1521,7 +1521,7 @@ describe('calendar scheduling', () => {
     const origin = await jobAbout(RONIT, 'ledger-origin');
     const nudge = await bareJob('nudge-job');
     const reminder = await bareJob('late-reminder');
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO ledger_items (item_id, business_id, family, description, origin_job_id, nudge_job_id)
        VALUES ('LI-late', $1, 'money_in', $2, $3, $4)`,
       [BUSINESS, `לגבות מ-${RONIT}`, origin, nudge],

@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness, withBusinessTransaction } from '../db/pool.js';
+import { closePool, withBusiness, withBusinessTransaction } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -118,7 +118,7 @@ async function linkToWhatsApp(jobId: string): Promise<{ messageId: string }> {
 }
 
 async function messageState(messageId: string): Promise<string> {
-  const { rows } = await getPool().query<{ state: string }>(
+  const { rows } = await testDb().query<{ state: string }>(
     'SELECT state FROM whatsapp_messages WHERE id = $1',
     [messageId],
   );
@@ -467,7 +467,7 @@ describe('reportWhatsAppJobs', () => {
     expect(first.status).toBe('halted');
     expect((await reload(job.jobId)).phase).toBe('await_approval');
 
-    const { rows } = await getPool().query<{ approval_id: string }>(
+    const { rows } = await testDb().query<{ approval_id: string }>(
       'SELECT approval_id FROM approval_requests WHERE job_id = $1',
       [job.jobId],
     );
@@ -574,7 +574,7 @@ describe('reportWhatsAppJobs', () => {
     }));
     expect(run.status).toBe('halted');
 
-    const { rows } = await getPool().query<{ approval_id: string }>(
+    const { rows } = await testDb().query<{ approval_id: string }>(
       'SELECT approval_id FROM approval_requests WHERE job_id = $1',
       [job.jobId],
     );
@@ -647,7 +647,7 @@ describe('reportWhatsAppJobs', () => {
     }));
     expect(run.status).toBe('halted');
 
-    const { rows } = await getPool().query<{ approval_id: string }>(
+    const { rows } = await testDb().query<{ approval_id: string }>(
       'SELECT approval_id FROM approval_requests WHERE job_id = $1',
       [job.jobId],
     );
@@ -728,7 +728,7 @@ describe('reportWhatsAppJobs', () => {
     expect(run.status).toBe('halted');
     expect((await reload(job.jobId)).phase).toBe('await_approval');
 
-    const { rows } = await getPool().query<{ approval_id: string }>(
+    const { rows } = await testDb().query<{ approval_id: string }>(
       'SELECT approval_id FROM approval_requests WHERE job_id = $1',
       [job.jobId],
     );
@@ -899,7 +899,7 @@ describe('reportWhatsAppJobs', () => {
     expect(verdict.outcome).not.toBe('not_implemented');
 
     // The raw row, checked AFTER — corroborating evidence, not the proof.
-    const { rows } = await getPool().query<{ status: string; performed: boolean | null }>(
+    const { rows } = await testDb().query<{ status: string; performed: boolean | null }>(
       'SELECT status, performed FROM job_step_results WHERE job_id = $1',
       [job.jobId],
     );

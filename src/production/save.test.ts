@@ -4,13 +4,13 @@ import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import type { XlsxSpec } from '../domain/document-spec.js';
 import { documentKindLabel } from '../domain/labels.js';
 import { DOCUMENT_SETTINGS_HE, saveDocumentSettings } from '../governance/document-settings.js';
 import { runLocalTool } from '../orchestrator/local-tools.js';
 import { StepChannelError } from '../orchestrator/step-error.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { scratchSaveFolder } from '../test/save-root.js';
 import { resolveSaveTarget, saveVersionToFolder, SAVE_FAILURE_HE } from './save.js';
 import { createProduction, saveVersion } from './store.js';
@@ -256,7 +256,7 @@ describe('doc.save handler', () => {
   }
 
   async function deliveryCard(versionId: string, businessId = B): Promise<void> {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_cards (card_id, business_id, version_id, state, delivery_job_id)
        VALUES ($1, $2, $3, 'approved', $4)`,
       [`DC-${versionId}`, businessId, versionId, JOB],
@@ -303,7 +303,7 @@ describe('doc.save handler', () => {
   it('records where the copy landed on the delivery row, for the erasure preview (C7)', async () => {
     const versionId = await produced();
     await deliveryCard(versionId);
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_deliveries (job_id, business_id, card_id, version_id) VALUES ($1, $2, $3, $4)`,
       [JOB, B, `DC-${versionId}`, versionId],
     );
@@ -315,7 +315,7 @@ describe('doc.save handler', () => {
     await writeFile(join(dir, CANONICAL), 'taken');
     const result = await save({ producedVersionId: versionId, sha256: sha(bytes), folder: 'לקוחות', filename: CANONICAL });
     expect(result['path']).toBe(join(dir, 'רווחיות מרץ (2).xlsx'));
-    const { rows } = await getPool().query<{ saved_paths: string[] }>(
+    const { rows } = await testDb().query<{ saved_paths: string[] }>(
       'SELECT saved_paths FROM document_deliveries WHERE job_id = $1',
       [JOB],
     );
@@ -325,7 +325,7 @@ describe('doc.save handler', () => {
     // the first: the owner must be told about every copy on his disk.
     const again = await save({ producedVersionId: versionId, sha256: sha(bytes), folder: 'לקוחות', filename: CANONICAL });
     expect(again['path']).toBe(join(dir, 'רווחיות מרץ (3).xlsx'));
-    const after = await getPool().query<{ saved_paths: string[] }>(
+    const after = await testDb().query<{ saved_paths: string[] }>(
       'SELECT saved_paths FROM document_deliveries WHERE job_id = $1',
       [JOB],
     );
@@ -397,11 +397,11 @@ describe('doc.save handler', () => {
         ).rejects.toThrow(DOCUMENT_SETTINGS_HE.outsideBusiness);
       }
       expect(DOCUMENT_SETTINGS_HE.outsideBusiness).toBe('התיקייה חייבת להיות בתוך התיקייה של העסק בשרת');
-      const { rows } = await getPool().query('SELECT 1 FROM document_settings WHERE business_id = $1', [B]);
+      const { rows } = await testDb().query('SELECT 1 FROM document_settings WHERE business_id = $1', [B]);
       expect(rows).toEqual([]);
       // Control: the same call with this business's own folder is accepted.
       await withBase();
-      const saved = await getPool().query<{ base_folder: string }>('SELECT base_folder FROM document_settings WHERE business_id = $1', [B]);
+      const saved = await testDb().query<{ base_folder: string }>('SELECT base_folder FROM document_settings WHERE business_id = $1', [B]);
       expect(saved.rows).toEqual([{ base_folder: await realpath(base) }]);
     } finally {
       await rm(theirs, { recursive: true, force: true });
@@ -417,7 +417,7 @@ describe('doc.save handler', () => {
     // is what stands between it and a save into another business's folder.
     const theirs = await scratchSaveFolder(OTHER, 'theirs-');
     try {
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO document_settings (business_id, to_whatsapp, to_email, to_screen, base_folder)
          VALUES ($1, false, true, true, $2)`,
         [B, await realpath(theirs)],

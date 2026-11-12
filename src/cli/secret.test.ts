@@ -3,10 +3,9 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { writeKeyState } from '../governance/master-key.js';
-import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
+import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import { main, runSecretCli, type SecretCliDeps } from './secret.js';
 import { resolveStoredSecret } from '../governance/credential-store.js';
 import { resolvePlatformSecret } from '../tenancy/platform-credentials.js';
@@ -44,12 +43,11 @@ beforeEach(async () => {
   PREVIOUS_KEY_PATH = process.env['CREDENTIAL_KEY_PATH'];
   process.env['CREDENTIAL_KEY_PATH'] = keyPath;
 
-  // The key state is per-installation and holds one row under
-  // `config.businessId` — the same default `putSecret` reads it under, and
-  // the same one `credential-store.test.ts` uses.
+  // The key state is the server's one row (spec §5.9) — the same row
+  // `putSecret` reads, and the same one `credential-store.test.ts` writes.
   const { readFile } = await import('node:fs/promises');
   const key = await readFile(keyPath);
-  await writeKeyState(key, KEY_ID);
+  await writeKeyState(key, KEY_ID, testDb());
 });
 
 afterEach(async () => {
@@ -84,7 +82,7 @@ afterAll(async () => {
  * catching.
  */
 async function allAuditText(): Promise<string> {
-  const db = getPool();
+  const db = testDb();
   const { rows: columns } = await db.query<{ column_name: string }>(
     `SELECT column_name FROM information_schema.columns
       WHERE table_schema = 'public' AND table_name = 'audit_log'
@@ -110,7 +108,7 @@ describe('runSecretCli', () => {
 
     await run(['put', REF, OPERATOR], { log, readSecret: reads(SECRET) });
 
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       'SELECT count(*)::text AS n FROM credentials WHERE business_id = $1 AND ref = $2',
       [BUSINESS, REF],
     );
@@ -139,7 +137,7 @@ describe('runSecretCli', () => {
       run(['put', REF, OPERATOR, SECRET], { log, readSecret: reads('unused') }),
     ).rejects.toThrow();
 
-    const { rows } = await getPool().query<{ n: string }>('SELECT count(*)::text AS n FROM credentials');
+    const { rows } = await testDb().query<{ n: string }>('SELECT count(*)::text AS n FROM credentials');
     expect(rows[0]?.n).toBe('0');
   });
 
@@ -185,7 +183,7 @@ describe('runSecretCli', () => {
    * only when there is good news to record.
    */
   it('audits a test resolve that fails to resolve, not only one that succeeds', async () => {
-    const before = await getPool().query<{ n: string }>(
+    const before = await testDb().query<{ n: string }>(
       `SELECT count(*)::text AS n FROM audit_log WHERE kind = 'credential_change'`,
     );
 
@@ -194,7 +192,7 @@ describe('runSecretCli', () => {
       readSecret: reads('unused'),
     });
 
-    const after = await getPool().query<{ n: string }>(
+    const after = await testDb().query<{ n: string }>(
       `SELECT count(*)::text AS n FROM audit_log WHERE kind = 'credential_change'`,
     );
     expect(Number(after.rows[0]?.n)).toBe(Number(before.rows[0]?.n) + 1);
@@ -211,11 +209,11 @@ describe('runSecretCli', () => {
   it("stores the secret under the connection's business, not the configured default", async () => {
     const OTHER_BUSINESS = 'other-business';
     expect(OTHER_BUSINESS).not.toBe(BUSINESS);
-    expect(OTHER_BUSINESS).not.toBe(config.businessId);
+    expect(OTHER_BUSINESS).not.toBe(TEST_BUSINESS);
 
     await run(['put', REF, OPERATOR], { log: () => {}, readSecret: reads(SECRET) }, OTHER_BUSINESS);
 
-    const { rows } = await getPool().query<{ business_id: string; n: string }>(
+    const { rows } = await testDb().query<{ business_id: string; n: string }>(
       `SELECT business_id, count(*)::text AS n FROM credentials WHERE ref = $1 GROUP BY business_id`,
       [REF],
     );
@@ -225,7 +223,7 @@ describe('runSecretCli', () => {
   it('writes an audit row naming the business, the ref and the operator', async () => {
     await run(['put', REF, OPERATOR], { log: () => {}, readSecret: reads(SECRET) });
 
-    const { rows } = await getPool().query<{ reason: string; on_behalf_of: string | null; business_id: string; kind: string }>(
+    const { rows } = await testDb().query<{ reason: string; on_behalf_of: string | null; business_id: string; kind: string }>(
       `SELECT reason, on_behalf_of, business_id, kind FROM audit_log WHERE kind = 'credential_change'`,
     );
     expect(rows).toHaveLength(1);
@@ -281,7 +279,7 @@ describe('runSecretCli', () => {
 
       expect(lines.some((l) => l.includes(REF))).toBe(true);
 
-      const { rows } = await getPool().query<{ n: string }>(
+      const { rows } = await testDb().query<{ n: string }>(
         `SELECT count(*)::text AS n FROM audit_log WHERE kind = 'credential_change' AND reason LIKE '%רשימת%'`,
       );
       expect(rows[0]?.n).toBe('1');
@@ -295,7 +293,7 @@ describe('runSecretCli', () => {
       const { log } = collector();
       await run(['remove', REF, OPERATOR], { log, readSecret: reads('unused') });
 
-      const { rows } = await getPool().query<{ n: string }>(
+      const { rows } = await testDb().query<{ n: string }>(
         'SELECT count(*)::text AS n FROM credentials WHERE business_id = $1 AND ref = $2',
         [BUSINESS, REF],
       );
@@ -306,7 +304,7 @@ describe('runSecretCli', () => {
       const { log } = collector();
       await run(['remove', 'NEVER_STORED', OPERATOR], { log, readSecret: reads('unused') });
 
-      const { rows } = await getPool().query<{ n: string }>(
+      const { rows } = await testDb().query<{ n: string }>(
         `SELECT count(*)::text AS n FROM audit_log WHERE kind = 'credential_change'`,
       );
       expect(rows[0]?.n).toBe('1');
@@ -350,7 +348,7 @@ describe('secret --platform', () => {
     const argvValue = io(PLATFORM_VALUE);
     expect(await main(['--platform', 'put', PLATFORM_REF, OPERATOR, PLATFORM_VALUE], argvValue)).toBe(1);
     expect(argvValue.err.join('\n')).not.toContain(PLATFORM_VALUE);
-    const { rows } = await getPool().query('SELECT 1 FROM platform_credentials');
+    const { rows } = await testDb().query('SELECT 1 FROM platform_credentials');
     expect(rows).toHaveLength(0);
   });
 
@@ -359,7 +357,7 @@ describe('secret --platform', () => {
     expect(await main(['--platform', 'put', PLATFORM_REF, OPERATOR], put)).toBe(0);
     expect(put.err).toEqual([`secret --platform put ${PLATFORM_REF} — מפעיל: ${OPERATOR}`]);
 
-    const { rows } = await getPool().query<{ updated_by: string }>('SELECT updated_by FROM platform_credentials');
+    const { rows } = await testDb().query<{ updated_by: string }>('SELECT updated_by FROM platform_credentials');
     expect(rows[0]?.updated_by).toBe(OPERATOR);
 
     const list = io('');
@@ -383,7 +381,7 @@ describe('secret --platform', () => {
     } finally {
       process.env['CREDENTIAL_KEY_PATH'] = original;
     }
-    const { rows } = await getPool().query('SELECT 1 FROM platform_credentials');
+    const { rows } = await testDb().query('SELECT 1 FROM platform_credentials');
     expect(rows).toHaveLength(1);
   });
 });

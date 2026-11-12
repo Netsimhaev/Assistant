@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -68,7 +68,7 @@ describe('runInstruction', () => {
     expect(result.status).toBe('needs_confirmation');
     if (result.status !== 'needs_confirmation') throw new Error('unreachable');
 
-    const jobs = await getPool().query<{ provenance: string; phase: string }>(
+    const jobs = await testDb().query<{ provenance: string; phase: string }>(
       `SELECT provenance, phase FROM jobs WHERE job_id = $1`,
       [result.jobId],
     );
@@ -102,7 +102,7 @@ describe('runInstruction', () => {
     // row is what this test reads; the outcome no longer carries `granted`.
     if (result.status !== 'needs_confirmation') throw new Error('unreachable');
 
-    const { rows } = await getPool().query<{ action_class: string; recipients: string[] }>(
+    const { rows } = await testDb().query<{ action_class: string; recipients: string[] }>(
       `SELECT action_class, recipients FROM job_authorizations WHERE job_id = $1`,
       [result.jobId],
     );
@@ -132,7 +132,7 @@ describe('runInstruction', () => {
     // (`not.toBe('execute')` would also be satisfied by `undefined` if no row
     // existed at all — assert the actual phase, not the absence of one value.)
     expect(await withBusiness(BUSINESS, (db) => loadPlanBody(db, result.jobId))).toBeNull();
-    const jobs = await getPool().query<{ phase: string }>(
+    const jobs = await testDb().query<{ phase: string }>(
       `SELECT phase FROM jobs WHERE job_id = $1`,
       [result.jobId],
     );
@@ -163,7 +163,7 @@ describe('runInstruction', () => {
     // A refusal that leaves the job anywhere but `failed` is a job nothing in
     // production ever revisits. Deleting the `→ failed` transition would
     // still leave this test green without this assertion.
-    const jobs = await getPool().query<{ phase: string }>(`SELECT phase FROM jobs`);
+    const jobs = await testDb().query<{ phase: string }>(`SELECT phase FROM jobs`);
     expect(jobs.rows[0]?.phase).toBe('failed');
   });
 
@@ -182,7 +182,7 @@ describe('runInstruction', () => {
     // Same reasoning as the unparseable-plan test above: without this, the
     // `→ failed` transition on the DAG-rejection path could be deleted and
     // this test would not notice.
-    const jobs = await getPool().query<{ phase: string }>(`SELECT phase FROM jobs`);
+    const jobs = await testDb().query<{ phase: string }>(`SELECT phase FROM jobs`);
     expect(jobs.rows[0]?.phase).toBe('failed');
   });
 
@@ -261,7 +261,7 @@ describe('runInstruction', () => {
     expect(rows).toHaveLength(0);
 
     // The plan is still bound and parked — only the shortcut was withheld.
-    const jobs = await getPool().query<{ phase: string }>(`SELECT phase FROM jobs WHERE job_id = $1`, [
+    const jobs = await testDb().query<{ phase: string }>(`SELECT phase FROM jobs WHERE job_id = $1`, [
       result.jobId,
     ]);
     expect(jobs.rows[0]?.phase).toBe('plan');
@@ -296,7 +296,7 @@ describe('runInstruction', () => {
     // reading the two call sites side by side.
     if (result.status !== 'needs_confirmation') throw new Error('unreachable');
 
-    const { rows } = await getPool().query<{ action_class: string; recipients: string[] }>(
+    const { rows } = await testDb().query<{ action_class: string; recipients: string[] }>(
       `SELECT action_class, recipients FROM job_authorizations WHERE job_id = $1`,
       [result.jobId],
     );
@@ -340,7 +340,7 @@ describe('runInstruction', () => {
       }));
 
     expect(result.status).toBe('refused');
-    const jobs = await getPool().query<{ phase: string }>(`SELECT phase FROM jobs`);
+    const jobs = await testDb().query<{ phase: string }>(`SELECT phase FROM jobs`);
     expect(jobs.rows[0]?.phase).toBe('failed');
   });
 
@@ -376,7 +376,7 @@ describe('runInstruction', () => {
     expect(auths.rows).toHaveLength(0);
     const plans = await testDb().query(`SELECT 1 FROM job_plans`);
     expect(plans.rows).toHaveLength(0);
-    const jobs = await getPool().query<{ phase: string }>(`SELECT phase FROM jobs`);
+    const jobs = await testDb().query<{ phase: string }>(`SELECT phase FROM jobs`);
     expect(jobs.rows[0]?.phase).toBe('failed');
   });
 
@@ -482,7 +482,7 @@ describe('runInstruction', () => {
 
     // Nothing bound — the same resting place the planner's own question uses.
     expect(await withBusiness(BUSINESS, (db) => loadPlanBody(db, outcome.jobId))).toBeNull();
-    const jobs = await getPool().query<{ phase: string }>(`SELECT phase FROM jobs WHERE job_id = $1`, [
+    const jobs = await testDb().query<{ phase: string }>(`SELECT phase FROM jobs WHERE job_id = $1`, [
       outcome.jobId,
     ]);
     expect(jobs.rows[0]?.phase).toBe('understand');
@@ -887,7 +887,7 @@ describe('an instruction whose text came from a recording', () => {
   });
 
   async function authorisationRows(jobId: string): Promise<Array<{ recipients: string[] }>> {
-    const { rows } = await getPool().query<{ recipients: string[] }>(
+    const { rows } = await testDb().query<{ recipients: string[] }>(
       `SELECT recipients FROM job_authorizations WHERE job_id = $1`,
       [jobId],
     );
@@ -916,7 +916,7 @@ describe('an instruction whose text came from a recording', () => {
 
     // The ACTION is still planned and bound exactly as a typed one is. Only
     // who may be contacted changed.
-    const jobs = await getPool().query<{ phase: string }>(
+    const jobs = await testDb().query<{ phase: string }>(
       `SELECT phase FROM jobs WHERE job_id = $1`,
       [result.jobId],
     );
@@ -967,7 +967,7 @@ describe('an instruction whose text came from a recording', () => {
       }));
 
     expect(result.status).toBe('needs_confirmation');
-    const rows = await getPool().query<{ action_class: string; recipients: string[] }>(
+    const rows = await testDb().query<{ action_class: string; recipients: string[] }>(
       `SELECT action_class, recipients FROM job_authorizations`,
     );
     expect(rows.rows).toEqual([
@@ -1057,7 +1057,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
   }
 
   async function phaseOf(jobId: string): Promise<string | undefined> {
-    const { rows } = await getPool().query<{ phase: string }>(
+    const { rows } = await testDb().query<{ phase: string }>(
       'SELECT phase FROM jobs WHERE job_id = $1',
       [jobId],
     );
@@ -1329,7 +1329,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
         }));
 
       expect(result).toEqual({ status: 'refused', reason: 'לא הצלחתי לשמור את שאלת האישור.' });
-      const jobs = await getPool().query<{ phase: string }>(
+      const jobs = await testDb().query<{ phase: string }>(
         `SELECT phase FROM jobs WHERE title = 'תשלחי ל-dana@example.com את ההצעה'`,
       );
       // Never left parked in `plan` with no question anyone can answer.
@@ -1398,7 +1398,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
       }));
 
     expect(result.status).toBe('refused');
-    const jobs = await getPool().query<{ job_id: string; phase: string }>(
+    const jobs = await testDb().query<{ job_id: string; phase: string }>(
       `SELECT job_id, phase FROM jobs WHERE title = 'תשלחי לרונית את ההצעה'`,
     );
     expect(jobs.rows[0]?.phase).toBe('failed');
@@ -1495,7 +1495,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     }
 
     async function ledgerRows(): Promise<number> {
-      const { rows } = await getPool().query<{ n: number }>(`SELECT count(*)::int AS n FROM ledger_items`);
+      const { rows } = await testDb().query<{ n: number }>(`SELECT count(*)::int AS n FROM ledger_items`);
       return rows[0]?.n ?? -1;
     }
 
@@ -1513,7 +1513,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
         expect(result.reason).toMatch(/פנקס/);
       }
       expect(await ledgerRows()).toBe(before);
-      const { rows } = await getPool().query<{ phase: string }>(`SELECT phase FROM jobs WHERE title = 'תרשמי'`);
+      const { rows } = await testDb().query<{ phase: string }>(`SELECT phase FROM jobs WHERE title = 'תרשמי'`);
       expect(rows.map((r) => r.phase)).toEqual(['failed', 'failed', 'failed', 'failed']);
       // Control: a valid add of the same shape is planned.
       const ok = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תרשמי' }, {
@@ -1557,7 +1557,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
       expect(result.ledgerEcho).toContain('ארשום:');
       expect(result.ledgerEcho).not.toContain('כתובת לא מאומתת');
       await withBusiness(BUSINESS, (db) => runDueJobs(db));
-      const { rows } = await getPool().query<{ v: boolean }>(
+      const { rows } = await testDb().query<{ v: boolean }>(
         `SELECT counterparty_email_verified AS v FROM ledger_items WHERE counterparty_email = 'dana@acme.example'`,
       );
       expect(rows).toEqual([{ v: true }]);
@@ -1573,7 +1573,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
       expect(result.status).toBe('needs_confirmation');
       if (result.status !== 'needs_confirmation') throw new Error('unreachable');
       expect(result.question).toContain('ארשום: ממתינים לצד שני · תשובה מדנה');
-      const { rows } = await getPool().query<{ presented_text: string }>(
+      const { rows } = await testDb().query<{ presented_text: string }>(
         `SELECT presented_text FROM instruction_confirmations WHERE job_id = $1`,
         [result.jobId],
       );

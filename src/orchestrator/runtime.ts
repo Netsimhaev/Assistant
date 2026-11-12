@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { loadActiveCharter } from '../charter/store.js';
 import { storedCredentials } from '../governance/credential-store.js';
-import { loadMasterKey, MasterKeyError, verifyKeyState } from '../governance/master-key.js';
+import { loadMasterKey, MasterKeyError } from '../governance/master-key.js';
 import { createEmailNotifier } from '../governance/notify.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
 import { createSmtpTransport } from '../mail/transport.js';
@@ -35,6 +35,7 @@ import { PRODUCTION_TOOLS_MISSING_REASON } from '../production/render-error.js';
 import { withBusiness } from '../db/pool.js';
 import type { BusinessDb } from '../db/pool.js';
 import { platformSecrets } from '../tenancy/platform-credentials.js';
+import { verifyServerKeyState } from '../tenancy/platform.js';
 import { loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 import type { RuntimeSettings } from '../tenancy/runtime-settings.js';
 import { businessFolderUnder } from '../tenancy/paths.js';
@@ -318,7 +319,9 @@ export async function buildServerRuntime(
     );
   }
   const key = await loadMasterKey(keyPath);
-  await verifyKeyState(key);
+  // The server's key state, on the platform pool: this process holds no
+  // connection yet, and the key is no business's (spec §5.9).
+  await verifyServerKeyState(key);
   // COMPOSED, not the bare store: a ref that resolves through
   // `storedCredentials` still resolves the same way (the mail adapter is
   // untouched); a ref that names a stored OAuth grant instead mints a live

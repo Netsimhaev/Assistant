@@ -102,13 +102,12 @@ describe('createBossMessenger', () => {
    * only ever targets the one `businessId` passed to `createBossMessenger`,
    * so no plausible mutation inside this module flips which business a row
    * lands under — this test would pass even against an implementation that
-   * silently dropped `businessId` and fell back to configuration. The test
-   * that actually guards against that mutation is the FIRST test in this
-   * file: `config.businessId` is `dev-business` in this project's test
-   * environment while every test here uses `test-business`, so a
-   * `recordOutbound`/`settleMessage` call that dropped `{ businessId }`
-   * would make that test's own `conversation({ businessId: BUSINESS })`
-   * come back empty instead of with one row. This test stays for
+   * silently dropped `businessId` and fell back to configuration. There is
+   * no configured business any more (spec §5.2), and the compiler plus
+   * `src/tenancy/no-default-business.test.ts` are what keep a call from
+   * dropping `{ businessId }` now — the FIRST test in this file, which used
+   * to catch that mutation through a configured `dev-business`, still
+   * guards the round trip. This test stays for
    * documentation, and for the narrower, real case of someone removing the
    * business filter from `conversation` itself in `store.ts`.
    */

@@ -278,7 +278,7 @@ export async function main(
       const key = await loadMasterKey(path);
       // A key file that is not the one this installation sealed with would
       // write rows that open for nobody — refused before anything is touched.
-      await verifyKeyState(key);
+      await verifyKeyState(key, db);
       const report = await importEnv(db, env, key);
       for (const line of renderImportReport(db.businessId, report)) io.log(line);
     });

@@ -3,7 +3,7 @@ import { access, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ulid } from 'ulid';
-import { closePool, getPool, transaction, withBusiness } from '../db/pool.js';
+import { closePool, transaction, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -27,7 +27,7 @@ async function seed(): Promise<{ jobId: string }> {
     provenance: 'boss',
     title: `מייל אל ${RONIT}`,
   }));
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
      VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
     [BUSINESS, job.jobId, RONIT],
@@ -55,7 +55,7 @@ async function insertDocument(
   storedPath: string,
   sha: string = 'a'.repeat(64),
 ): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO documents (document_id, business_id, source, original_name, media_type, sha256, byte_size, stored_path, status)
      VALUES ($1, $2, 'manual', 'doc.txt', 'text/plain', $4, 12, $3, 'extracted')`,
     [documentId, BUSINESS, storedPath, sha],
@@ -63,7 +63,7 @@ async function insertDocument(
 }
 
 async function insertReading(readingId: string, documentId: string, briefHash: string): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO document_readings
        (reading_id, business_id, document_id, status, content, provenance, model, prompt_version, brief_hash)
      VALUES ($1, $2, $3, 'read', '{}', 'boss', 'test-model', 'v1', $4)`,
@@ -72,7 +72,7 @@ async function insertReading(readingId: string, documentId: string, briefHash: s
 }
 
 async function insertProposal(proposalId: string, readingId: string, jobId: string | null): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO proposals (proposal_id, business_id, reading_id, status, content, model, prompt_version, raw, job_id)
      VALUES ($1, $2, $3, 'proposed', '{}', 'test-model', 'v1', '', $4)`,
     [proposalId, BUSINESS, readingId, jobId],
@@ -135,7 +135,7 @@ describe('executeErasure', () => {
       withBusiness(BUSINESS, (bdb) => transaction(bdb, (tx) => executeErasure(tx, plan))),
     ).rejects.toThrow(/outside a transaction/);
 
-    const memories = await getPool().query('SELECT 1 FROM memories WHERE business_id=$1', [BUSINESS]);
+    const memories = await testDb().query('SELECT 1 FROM memories WHERE business_id=$1', [BUSINESS]);
     expect(memories.rows).toHaveLength(1);
   });
 
@@ -145,14 +145,14 @@ describe('executeErasure', () => {
 
     await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
-    const memories = await getPool().query('SELECT 1 FROM memories WHERE business_id=$1', [BUSINESS]);
+    const memories = await testDb().query('SELECT 1 FROM memories WHERE business_id=$1', [BUSINESS]);
     expect(memories.rows).toHaveLength(0);
 
-    const auth = await getPool().query('SELECT 1 FROM job_authorizations WHERE job_id=$1', [jobId]);
+    const auth = await testDb().query('SELECT 1 FROM job_authorizations WHERE job_id=$1', [jobId]);
     expect(auth.rows).toHaveLength(0);
 
     // The job survives, emptied — audit rows point at it.
-    const job = await getPool().query<{ title: string | null }>(
+    const job = await testDb().query<{ title: string | null }>(
       'SELECT title FROM jobs WHERE job_id=$1',
       [jobId],
     );
@@ -219,7 +219,7 @@ describe('executeErasure', () => {
     );
 
     // And nothing was touched on the way to refusing.
-    const memories = await getPool().query('SELECT 1 FROM memories WHERE business_id=$1', [BUSINESS]);
+    const memories = await testDb().query('SELECT 1 FROM memories WHERE business_id=$1', [BUSINESS]);
     expect(memories.rows).toHaveLength(1);
   });
 
@@ -238,7 +238,7 @@ describe('executeErasure', () => {
     const total = outcome.deleted.reduce((sum, item) => sum + item.count, 0);
     expect(total).toBeGreaterThan(0);
 
-    const { rows } = await getPool().query<{ kind: string; reason: string }>(
+    const { rows } = await testDb().query<{ kind: string; reason: string }>(
       `SELECT kind, reason FROM audit_log WHERE business_id=$1 AND kind='erasure'`,
       [BUSINESS],
     );
@@ -266,14 +266,14 @@ describe('executeErasure', () => {
     await insertDocument(documentId, `nowhere/${documentId}.txt`);
 
     const readingId = `READ-${ulid()}`;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_readings
          (reading_id, business_id, document_id, status, content, provenance, model, prompt_version, brief_hash)
        VALUES ($1, $2, $3, 'read', '{}', 'boss', 'test-model', 'v1', 'hash-c1')`,
       [readingId, BUSINESS, documentId],
     );
     const proposalId = `PROP-${ulid()}`;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO proposals (proposal_id, business_id, reading_id, status, content, model, prompt_version, raw, job_id)
        VALUES ($1, $2, $3, 'proposed', '{}', 'test-model', 'v1', '', $4)`,
       [proposalId, BUSINESS, readingId, jobId],
@@ -288,14 +288,14 @@ describe('executeErasure', () => {
     const deletedProposals = outcome.deleted.find((item) => item.table === 'proposals');
     expect(deletedProposals?.count).toBe(1);
 
-    const remaining = await getPool().query('SELECT 1 FROM proposals WHERE proposal_id=$1', [proposalId]);
+    const remaining = await testDb().query('SELECT 1 FROM proposals WHERE proposal_id=$1', [proposalId]);
     expect(remaining.rows).toHaveLength(0);
   });
 
   /**
    * I1: atomicity is the single most important property of this file, and it
    * is otherwise untested — replacing the transaction with plain
-   * `getPool().query` calls would leave every other test in this file green.
+   * `testDb().query` calls would leave every other test in this file green.
    * Built by hand with a deliberately empty `refusals`: `buildErasurePlan`
    * would itself refuse a signed document, so the only way to exercise the
    * executor's OWN atomicity guarantee, independent of the planner's, is to
@@ -304,7 +304,7 @@ describe('executeErasure', () => {
    * migration 020), not the planner.
    *
    * Confirmed by hand against an autocommit version of `executeErasure`
-   * (`client.query` replaced by `getPool().query`, `BEGIN`/`COMMIT`/
+   * (`client.query` replaced by `testDb().query`, `BEGIN`/`COMMIT`/
    * `ROLLBACK` removed): the memory delete commits on its own before the
    * `documents` delete fails, and this test fails because the memory row is
    * gone.
@@ -351,10 +351,10 @@ describe('executeErasure', () => {
 
     await expect(withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan))).rejects.toThrow();
 
-    const memories = await getPool().query('SELECT 1 FROM memories WHERE memory_id=$1', [memory.memoryId]);
+    const memories = await testDb().query('SELECT 1 FROM memories WHERE memory_id=$1', [memory.memoryId]);
     expect(memories.rows).toHaveLength(1);
 
-    const doc = await getPool().query('SELECT 1 FROM documents WHERE document_id=$1', [documentId]);
+    const doc = await testDb().query('SELECT 1 FROM documents WHERE document_id=$1', [documentId]);
     expect(doc.rows).toHaveLength(1);
   });
 
@@ -389,26 +389,26 @@ describe('executeErasure', () => {
 
     const documentId = `DOC-${ulid()}`;
     await insertDocument(documentId, `nowhere/${documentId}.txt`);
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_artifacts (business_id, document_id, ordinal, kind, content)
        VALUES ($1, $2, 0, 'text', '{}')`,
       [BUSINESS, documentId],
     );
     const readingId = `READ-${ulid()}`;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_readings
          (reading_id, business_id, document_id, status, content, provenance, model, prompt_version, brief_hash)
        VALUES ($1, $2, $3, 'read', '{}', 'boss', 'test-model', 'v1', 'hash-i2')`,
       [readingId, BUSINESS, documentId],
     );
     const proposalId = `PROP-${ulid()}`;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO proposals (proposal_id, business_id, reading_id, status, content, model, prompt_version, raw, job_id)
        VALUES ($1, $2, $3, 'proposed', '{}', 'test-model', 'v1', '', $4)`,
       [proposalId, BUSINESS, readingId, jobId],
     );
     const unsignedApproval = `AP-${ulid()}`;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO approval_requests
          (approval_id, business_id, job_id, action_class, summary, detail, risk,
           proposed_tool, proposed_input, input_hash, expires_at)
@@ -420,7 +420,7 @@ describe('executeErasure', () => {
     // document, one this plan does not name, so the signed-document refusal
     // is not what is being exercised here.
     const signedApproval = `AP-${ulid()}`;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO approval_requests
          (approval_id, business_id, job_id, action_class, summary, detail, risk,
           proposed_tool, proposed_input, input_hash, expires_at)
@@ -445,23 +445,23 @@ describe('executeErasure', () => {
         signedBy: 'owner',
       }
     ));
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text, text_origin)
        VALUES ($1, $2, $3, 'x', 'typed')`,
       [`INS-${ulid()}`, BUSINESS, jobId],
     );
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
        VALUES ($1, $2, 'h1', '{}'::jsonb)`,
       [BUSINESS, jobId],
     );
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
        VALUES ($1, $2, 'email.reply', ARRAY['x@example.com'])`,
       [BUSINESS, jobId],
     );
     const envelopeId = `ENV-${ulid()}`;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO agent_envelopes
          (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
           kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
@@ -475,17 +475,17 @@ describe('executeErasure', () => {
     // pointer to the very envelope row this erasure is about to delete. See
     // `JOBS_SCRUBBED_PREDICATE`'s docblock for why leaving this uncleared
     // kills a parked parent on the next scheduler pass.
-    await getPool().query('UPDATE jobs SET awaiting_envelope_id = $2 WHERE job_id = $1', [
+    await testDb().query('UPDATE jobs SET awaiting_envelope_id = $2 WHERE job_id = $1', [
       jobId,
       envelopeId,
     ]);
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO verification_verdicts (business_id, job_id, verdict)
        VALUES ($1, $2, '{}'::jsonb)`,
       [BUSINESS, jobId],
     );
     await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'understand', actor: 'orchestrator', reason: 'seed reason' }));
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id)
        VALUES ($1, $2, 'h1', 's1', 'ext-123')`,
       [BUSINESS, jobId],
@@ -495,13 +495,13 @@ describe('executeErasure', () => {
       { jobId, kind: 'entity', subjectKey: 'i2-subject', body: {} },
     ));
     const digestId = `DG-${ulid()}`;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
        VALUES ($1, $2, 'daily', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'x', true)`,
       [digestId, BUSINESS],
     );
     const draftId = `DR-${ulid()}`;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO charter_interview_drafts (draft_id, business_id, answers) VALUES ($1, $2, '{}')`,
       [draftId, BUSINESS],
     );
@@ -568,10 +568,10 @@ describe('executeErasure', () => {
       ['charter_interview_drafts', 'draft_id', draftId],
     ];
     for (const [table, column, value] of deletedChecks) {
-      const { rows } = await getPool().query(`SELECT 1 FROM ${table} WHERE ${column} = $1`, [value]);
+      const { rows } = await testDb().query(`SELECT 1 FROM ${table} WHERE ${column} = $1`, [value]);
       expect(rows, table).toHaveLength(0);
     }
-    const approvals = await getPool().query<{ approval_id: string; summary: string }>(
+    const approvals = await testDb().query<{ approval_id: string; summary: string }>(
       'SELECT approval_id, summary FROM approval_requests WHERE job_id=$1',
       [jobId],
     );
@@ -579,11 +579,11 @@ describe('executeErasure', () => {
     expect(approvals.rows.map((r) => r.approval_id)).toEqual([signedApproval]);
     expect(approvals.rows.map((r) => r.approval_id)).not.toContain(unsignedApproval);
     expect(approvals.rows[0]?.summary).not.toContain(SIGNED_SECRET);
-    const instructions = await getPool().query('SELECT 1 FROM boss_instructions WHERE job_id=$1', [jobId]);
+    const instructions = await testDb().query('SELECT 1 FROM boss_instructions WHERE job_id=$1', [jobId]);
     expect(instructions.rows).toHaveLength(0);
 
     // Scrubbed rows survive, emptied.
-    const jobRow = await getPool().query<{ title: string | null; awaiting_envelope_id: string | null }>(
+    const jobRow = await testDb().query<{ title: string | null; awaiting_envelope_id: string | null }>(
       'SELECT title, awaiting_envelope_id FROM jobs WHERE job_id=$1',
       [jobId],
     );
@@ -593,11 +593,11 @@ describe('executeErasure', () => {
     // see JOBS_SCRUBBED_PREDICATE's docblock (fix round 1, item 2).
     expect(jobRow.rows[0]?.awaiting_envelope_id).toBeNull();
 
-    const stepRows = await getPool().query<{ reason: string }>('SELECT reason FROM job_steps WHERE job_id=$1', [jobId]);
+    const stepRows = await testDb().query<{ reason: string }>('SELECT reason FROM job_steps WHERE job_id=$1', [jobId]);
     expect(stepRows.rows.length).toBeGreaterThan(0);
     for (const row of stepRows.rows) expect(row.reason).toBe('נמחק בהוראת הבעלים');
 
-    const resultRow = await getPool().query<{ external_id: string | null }>(
+    const resultRow = await testDb().query<{ external_id: string | null }>(
       'SELECT external_id FROM job_step_results WHERE job_id=$1 AND step_id=$2',
       [jobId, 's1'],
     );
@@ -621,14 +621,14 @@ describe('executeErasure', () => {
   it('moves a parked parent to failed when its own delegation envelope is erased', async () => {
     const jobId = await bareJob('parked-parent');
     const identifier = 'parked@nowhere.example';
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
        VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
       [BUSINESS, jobId, identifier],
     );
 
     const envelopeId = `ENV-${ulid()}`;
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO agent_envelopes
          (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
           kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
@@ -670,7 +670,7 @@ describe('executeErasure', () => {
       count: 1,
     });
 
-    const jobRow = await getPool().query<{
+    const jobRow = await testDb().query<{
       phase: string;
       closed_at: Date | null;
       awaiting_envelope_id: string | null;
@@ -681,7 +681,7 @@ describe('executeErasure', () => {
 
     // A reason exists, names no contact, and it is not the generic scrub
     // text — it is written after the job_steps reason-scrub runs.
-    const steps = await getPool().query<{ reason: string }>(
+    const steps = await testDb().query<{ reason: string }>(
       `SELECT reason FROM job_steps WHERE job_id=$1 AND from_phase='followup' AND to_phase='failed'`,
       [jobId],
     );
@@ -701,7 +701,7 @@ describe('executeErasure', () => {
     const total = outcome.deleted
       .filter((item) => item.action !== 'fail')
       .reduce((sum, item) => sum + item.count, 0);
-    const { rows: auditRows } = await getPool().query<{ reason: string }>(
+    const { rows: auditRows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE business_id=$1 AND kind='erasure'`,
       [BUSINESS],
     );
@@ -731,9 +731,9 @@ describe('executeErasure', () => {
 
     await expect(withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan))).rejects.toBeInstanceOf(ErasureRefusedError);
 
-    const memories = await getPool().query('SELECT 1 FROM memories WHERE business_id=$1', [BUSINESS]);
+    const memories = await testDb().query('SELECT 1 FROM memories WHERE business_id=$1', [BUSINESS]);
     expect(memories.rows).toHaveLength(1);
-    const auth = await getPool().query('SELECT 1 FROM job_authorizations WHERE job_id=$1', [jobId]);
+    const auth = await testDb().query('SELECT 1 FROM job_authorizations WHERE job_id=$1', [jobId]);
     expect(auth.rows).toHaveLength(1);
   });
 
@@ -762,7 +762,7 @@ describe('executeErasure', () => {
    */
   it('a contact anchor that reaches a shared reading counts every proposal on it, not just its own job’s', async () => {
     const jobA = await bareJob('shared-reading-a');
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
        VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
       [BUSINESS, jobA, RONIT],
@@ -790,7 +790,7 @@ describe('executeErasure', () => {
     const deletedProposals = outcome.deleted.find((item) => item.table === 'proposals');
     expect(deletedProposals?.count).toBe(2);
 
-    const remaining = await getPool().query('SELECT 1 FROM proposals WHERE reading_id=$1', [readingId]);
+    const remaining = await testDb().query('SELECT 1 FROM proposals WHERE reading_id=$1', [readingId]);
     expect(remaining.rows).toHaveLength(0);
   });
 
@@ -818,8 +818,8 @@ describe('executeErasure', () => {
     // reading, not the window boundary arithmetic.
     const jobATime = new Date('2026-01-01T00:00:00.000Z');
     const jobBTime = new Date('2026-01-01T01:00:00.000Z');
-    await getPool().query('UPDATE jobs SET created_at=$2 WHERE job_id=$1', [jobA, jobATime.toISOString()]);
-    await getPool().query('UPDATE jobs SET created_at=$2 WHERE job_id=$1', [jobB, jobBTime.toISOString()]);
+    await testDb().query('UPDATE jobs SET created_at=$2 WHERE job_id=$1', [jobA, jobATime.toISOString()]);
+    await testDb().query('UPDATE jobs SET created_at=$2 WHERE job_id=$1', [jobB, jobBTime.toISOString()]);
 
     const fromIso = new Date(jobATime.getTime() - 1000).toISOString();
     const toIso = new Date(jobATime.getTime() + 1000).toISOString();
@@ -836,7 +836,7 @@ describe('executeErasure', () => {
     const deletedProposals = outcome.deleted.find((item) => item.table === 'proposals');
     expect(deletedProposals?.count).toBe(2);
 
-    const remaining = await getPool().query('SELECT 1 FROM proposals WHERE reading_id=$1', [readingId]);
+    const remaining = await testDb().query('SELECT 1 FROM proposals WHERE reading_id=$1', [readingId]);
     expect(remaining.rows).toHaveLength(0);
   });
 
@@ -870,7 +870,7 @@ describe('executeErasure', () => {
     /** An approval card with no job behind it, carrying the anchor verbatim. */
     async function orphanApproval(identifier: string): Promise<string> {
       const approvalId = `AP-${ulid()}`;
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO approval_requests
            (approval_id, business_id, job_id, action_class, summary, detail, risk,
             proposed_tool, proposed_input, input_hash, expires_at)
@@ -903,7 +903,7 @@ describe('executeErasure', () => {
 
       await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
-      const survivors = await getPool().query<{ approval_id: string }>(
+      const survivors = await testDb().query<{ approval_id: string }>(
         'SELECT approval_id FROM approval_requests WHERE business_id=$1',
         [BUSINESS],
       );
@@ -942,7 +942,7 @@ describe('executeErasure', () => {
 
       await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
-      const survivors = await getPool().query<{ approval_id: string }>(
+      const survivors = await testDb().query<{ approval_id: string }>(
         'SELECT approval_id FROM approval_requests WHERE business_id=$1',
         [BUSINESS],
       );
@@ -953,7 +953,7 @@ describe('executeErasure', () => {
     it('an orphan approval_requests row created inside a window is listed and deleted', async () => {
       const inside = await orphanApproval(RONIT);
       const outside = await orphanApproval('avi@gamma-lift.example');
-      await getPool().query(
+      await testDb().query(
         `UPDATE approval_requests SET created_at = now() - interval '30 days' WHERE approval_id = $1`,
         [outside],
       );
@@ -968,7 +968,7 @@ describe('executeErasure', () => {
 
       await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
-      const survivors = await getPool().query<{ approval_id: string }>(
+      const survivors = await testDb().query<{ approval_id: string }>(
         'SELECT approval_id FROM approval_requests WHERE business_id=$1',
         [BUSINESS],
       );
@@ -989,12 +989,12 @@ describe('executeErasure', () => {
      */
     it('leaves a card whose job is outside the window, even though the card is inside it', async () => {
       const jobId = await bareJob('older-than-the-window');
-      await getPool().query(
+      await testDb().query(
         `UPDATE jobs SET created_at = now() - interval '30 days' WHERE job_id = $1`,
         [jobId],
       );
       const approvalId = `AP-${ulid()}`;
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO approval_requests
            (approval_id, business_id, job_id, action_class, summary, detail, risk,
             proposed_tool, proposed_input, input_hash, expires_at)
@@ -1013,7 +1013,7 @@ describe('executeErasure', () => {
 
       await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
-      const survivors = await getPool().query('SELECT 1 FROM approval_requests WHERE approval_id=$1', [
+      const survivors = await testDb().query('SELECT 1 FROM approval_requests WHERE approval_id=$1', [
         approvalId,
       ]);
       expect(survivors.rows).toHaveLength(1);
@@ -1033,7 +1033,7 @@ describe('executeErasure', () => {
 
       await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
-      const rows = await getPool().query('SELECT 1 FROM proposals WHERE proposal_id=$1', [
+      const rows = await testDb().query('SELECT 1 FROM proposals WHERE proposal_id=$1', [
         orphanProposal,
       ]);
       expect(rows.rows).toHaveLength(0);
@@ -1057,7 +1057,7 @@ describe('executeErasure', () => {
   describe('an approval a signature points at', () => {
     async function approvalFor(jobId: string | null, identifier: string): Promise<string> {
       const approvalId = `AP-${ulid()}`;
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO approval_requests
            (approval_id, business_id, job_id, action_class, summary, detail, risk,
             proposed_tool, proposed_input, input_hash, expires_at, edited_input,
@@ -1113,7 +1113,7 @@ describe('executeErasure', () => {
 
       await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
-      const rows = await getPool().query<{
+      const rows = await testDb().query<{
         approval_id: string;
         summary: string;
         detail: string;
@@ -1151,7 +1151,7 @@ describe('executeErasure', () => {
       }
 
       // The signature itself survives, still pointing at a row that exists.
-      const signature = await getPool().query('SELECT 1 FROM signatures WHERE approval_id = $1', [
+      const signature = await testDb().query('SELECT 1 FROM signatures WHERE approval_id = $1', [
         signedApproval,
       ]);
       expect(signature.rows).toHaveLength(1);
@@ -1176,7 +1176,7 @@ describe('executeErasure', () => {
     const jobId = await bareJob('signed-mid-flight');
     const documentId = `DOC-${ulid()}`;
     await insertDocument(documentId, `nowhere/${documentId}.txt`);
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO document_artifacts (business_id, document_id, ordinal, kind, content)
        VALUES ($1, $2, 0, 'text', '{}')`,
       [BUSINESS, documentId],
@@ -1227,11 +1227,11 @@ describe('executeErasure', () => {
 
     // And nothing was destroyed: the rollback held, on a row the statement
     // order had already deleted before reaching `documents`.
-    const artifacts = await getPool().query('SELECT 1 FROM document_artifacts WHERE document_id=$1', [
+    const artifacts = await testDb().query('SELECT 1 FROM document_artifacts WHERE document_id=$1', [
       documentId,
     ]);
     expect(artifacts.rows).toHaveLength(1);
-    const documents = await getPool().query('SELECT 1 FROM documents WHERE document_id=$1', [
+    const documents = await testDb().query('SELECT 1 FROM documents WHERE document_id=$1', [
       documentId,
     ]);
     expect(documents.rows).toHaveLength(1);
@@ -1274,14 +1274,14 @@ describe('executeErasure', () => {
       // and the rows are actually gone — the failure is only in the log.
       const total = typedError.outcome.deleted.reduce((sum, item) => sum + item.count, 0);
       expect(total).toBeGreaterThan(0);
-      const memories = await getPool().query('SELECT 1 FROM memories WHERE business_id=$1', [BUSINESS]);
+      const memories = await testDb().query('SELECT 1 FROM memories WHERE business_id=$1', [BUSINESS]);
       expect(memories.rows).toHaveLength(0);
-      const auth = await getPool().query('SELECT 1 FROM job_authorizations WHERE job_id=$1', [jobId]);
+      const auth = await testDb().query('SELECT 1 FROM job_authorizations WHERE job_id=$1', [jobId]);
       expect(auth.rows).toHaveLength(0);
 
       // And genuinely no audit row: the append failed for real, not a retry
       // swallowing the error.
-      const rows = await getPool().query(`SELECT 1 FROM audit_log WHERE business_id=$1 AND kind='erasure'`, [BUSINESS]);
+      const rows = await testDb().query(`SELECT 1 FROM audit_log WHERE business_id=$1 AND kind='erasure'`, [BUSINESS]);
       expect(rows.rows).toHaveLength(0);
     });
   });

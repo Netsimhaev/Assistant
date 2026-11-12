@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -253,7 +253,7 @@ describe('runDueJobs', () => {
     expect(second.unbound).toEqual([]);
 
     // And the reason is on the record, not only in the returned bucket.
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM job_steps WHERE job_id = $1 AND to_phase = 'failed'`,
       [jobId],
     );
@@ -306,7 +306,7 @@ describe('runDueJobs', () => {
     expect(second.ran).toEqual([]);
 
     // And the rejection code is on the record, not only in the bucket.
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM job_steps WHERE job_id = $1 AND to_phase = 'failed'`,
       [jobId],
     );

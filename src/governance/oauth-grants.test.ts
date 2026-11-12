@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { randomBytes } from 'node:crypto';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { decryptSecret } from './secret-cipher.js';
 import { writeKeyState } from './master-key.js';
 import {
@@ -32,13 +32,13 @@ const GRANT = {
 describe('the OAuth grant store', () => {
   beforeEach(async () => {
     await resetDatabase();
-    // Install-wide, exactly like `credential-store.test.ts`'s own
-    // `beforeEach`: `writeGrant`/`recordRefresh` now check the key state
-    // under `config.businessId` only (fix round 1, Important 3), matching
-    // `liveKeyId`, which has never taken a business at all. One row is
+    // Server-wide, exactly like `credential-store.test.ts`'s own
+    // `beforeEach`: `writeGrant`/`recordRefresh` check the server's one
+    // key-state row (spec §5.9), matching `liveKeyId`, which has never taken
+    // a business at all. One row is
     // therefore enough for every business this file uses -- BUSINESS and
     // OTHER included -- and a per-business row would just be unread.
-    await writeKeyState(KEY, 'KEY-test');
+    await writeKeyState(KEY, 'KEY-test', testDb());
   });
 
   afterAll(async () => {
@@ -54,7 +54,7 @@ describe('the OAuth grant store', () => {
     expect(read?.scopes).toEqual([...GRANT.scopes]);
 
     // The positive half is above. Now: the value appears in no other column.
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       `SELECT count(*)::text AS n FROM oauth_grants
         WHERE business_id = $1
           AND (provider LIKE $2 OR credential_ref LIKE $2 OR account LIKE $2
@@ -74,7 +74,7 @@ describe('the OAuth grant store', () => {
 
   it('cannot be opened as if it were a secret', async () => {
     await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, KEY));
-    const { rows } = await getPool().query<{ ciphertext: Buffer; nonce: Buffer }>(
+    const { rows } = await testDb().query<{ ciphertext: Buffer; nonce: Buffer }>(
       'SELECT ciphertext, nonce FROM oauth_grants WHERE business_id = $1 AND system = $2',
       [BUSINESS, GRANT.system],
     );

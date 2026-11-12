@@ -115,7 +115,7 @@ export interface AdapterCall {
    * The business whose job this step belongs to — `job.businessId`, the same
    * value `runPlan` already passes to `CredentialSource.resolve`.
    *
-   * Required, never defaulted to `config.businessId`, for the reason that
+   * Required, never defaulted to a configured business, for the reason that
    * resolve takes it: an omitted business silently read as "the configured
    * one" is how one business acts on another's data. The mailbox adapter
    * reads it to resolve an instruction reply's thread from THIS business's

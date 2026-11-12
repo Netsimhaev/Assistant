@@ -3,8 +3,8 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
-import { closePool, getPool, withBusiness, withBusinessTransaction } from '../db/pool.js';
-import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
+import { closePool, withBusiness, withBusinessTransaction } from '../db/pool.js';
+import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import { businessSaveFolder } from '../test/save-root.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -113,7 +113,7 @@ async function ownerJob(
 }
 
 async function productionCount(): Promise<number> {
-  const { rows } = await getPool().query<{ n: string }>('SELECT COUNT(*)::text AS n FROM document_productions');
+  const { rows } = await testDb().query<{ n: string }>('SELECT COUNT(*)::text AS n FROM document_productions');
   return Number(rows[0]?.n ?? 0);
 }
 
@@ -203,7 +203,7 @@ async function liveMail(): Promise<void> {
 }
 
 async function deliveryJobs(): Promise<number> {
-  const { rows } = await getPool().query<{ n: string }>(
+  const { rows } = await testDb().query<{ n: string }>(
     `SELECT COUNT(*)::text AS n FROM jobs WHERE business_id = $1 AND title LIKE 'מסירת מסמך%'`,
     [B],
   );
@@ -351,7 +351,7 @@ describe('approveDocumentCard', () => {
     expect(sent[0]?.attachments?.[0]?.filename).toBe('הצעה.docx');
     expect(sent[0]?.attachments?.[0]?.bytes.equals(bytes)).toBe(true);
     // It ran on the owner's confirmation, not on any autonomy.
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'intent_to_act'`,
       [outcome.jobId],
     );
@@ -399,7 +399,7 @@ describe('approveDocumentCard', () => {
       status: 'card_stale',
     });
     // A plan smuggled into the stored card but not what the server builds is stale too.
-    await getPool().query(
+    await testDb().query(
       `UPDATE document_cards SET delivery_plans = delivery_plans || $2::jsonb WHERE card_id = $1`,
       [card.cardId, JSON.stringify([{ option: 'send', label: 'x', planHash: 'smuggled', plan: stale }])],
     );
@@ -448,7 +448,7 @@ describe('approveDocumentCard', () => {
     const version = await withBusiness(B, (db) => loadVersion(db, versionId));
     const send = buildDeliveryOptions({ ...production!, stage: 'ready' }, version!, 'ready')[0]!;
     expect(send.option).toBe('send');
-    await getPool().query(
+    await testDb().query(
       `UPDATE document_cards SET delivery_plans = delivery_plans || $2::jsonb WHERE card_id = $1`,
       [card.cardId, JSON.stringify([send])],
     );
@@ -547,7 +547,7 @@ describe('createDocumentCard and its notices', () => {
 
   it('a card too long for one WhatsApp message sends the file with a dashboard-only caption, and is not WhatsApp-approvable', async () => {
     const { productionId, versionId } = await readyProduction();
-    await getPool().query(
+    await testDb().query(
       `UPDATE document_productions SET work = jsonb_set(work, '{notes}', $2::jsonb) WHERE production_id = $1`,
       [productionId, JSON.stringify(['א'.repeat(4_500)])],
     );
@@ -608,7 +608,7 @@ describe('exclusions', () => {
     const outcome = await withBusiness(B, (db) => approveDocumentCard(db, card.cardId, card.deliveryPlans[0]!.planHash, 'dashboard'));
     if (outcome.status !== 'approved') throw new Error(outcome.status);
     const stored = await withBusiness(B, (db) => loadStoredPlan(db, outcome.jobId));
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO confirmed_step_claims (business_id, job_id, step_id, plan_hash) VALUES ($1, $2, 'deliver', $3)`,
       [B, outcome.jobId, stored!.planHash],
     );
@@ -646,7 +646,7 @@ describe('exclusions', () => {
 
     // Control: the very same job, with its delivery record gone, IS a re-ask
     // candidate — the delivery marker is what kept it out.
-    await getPool().query('DELETE FROM document_deliveries WHERE job_id = $1', [jobId]);
+    await testDb().query('DELETE FROM document_deliveries WHERE job_id = $1', [jobId]);
     const control = await withBusiness(B, (db) => reaskFailedCommands(db));
     expect(control.reasked.map((r) => r.oldJobId)).toEqual([jobId]);
   });
@@ -659,7 +659,7 @@ describe('exclusions', () => {
     if (again.status !== 'approved') throw new Error(again.status);
     // The card now names only the NEW job; the old one keeps its own record.
     expect((await withBusiness(B, (db) => loadDocumentCard(db, cardId)))?.deliveryJobId).toBe(again.jobId);
-    const { rows } = await getPool().query<{ job_id: string }>(
+    const { rows } = await testDb().query<{ job_id: string }>(
       'SELECT job_id FROM document_deliveries WHERE card_id = $1',
       [cardId],
     );
@@ -682,7 +682,7 @@ describe('exclusions', () => {
         channel: 'dashboard',
       }));
     expect(await withBusiness(B, (bdb) => confirmChoice(bdb, job.jobId, hash, 'p'))).toBe(true);
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO confirmed_step_claims (business_id, job_id, step_id, plan_hash) VALUES ($1, $2, 's1', $3)`,
       [B, job.jobId, hash],
     );
@@ -699,7 +699,7 @@ describe('exclusions', () => {
     }));
     expect((await withBusiness(B, (db) => reaskFailedCommands(db))).reasked).toEqual([]);
     // Control: without the production row it would be re-asked.
-    await getPool().query('DELETE FROM document_productions WHERE origin_job_id = $1', [job.jobId]);
+    await testDb().query('DELETE FROM document_productions WHERE origin_job_id = $1', [job.jobId]);
     expect((await withBusiness(B, (db) => reaskFailedCommands(db))).reasked.map((r) => r.oldJobId)).toEqual([job.jobId]);
   });
 
@@ -715,7 +715,7 @@ describe('exclusions', () => {
     expect(skipped.skipped).toBe('not_qualified');
     // Control: the same plan on a job with no delivery record passes the
     // qualification (its mail.send step is outbound).
-    await getPool().query('DELETE FROM document_deliveries WHERE job_id = $1', [outcome.jobId]);
+    await testDb().query('DELETE FROM document_deliveries WHERE job_id = $1', [outcome.jobId]);
     const control = await withBusiness(B, (db) => curateJob(db, outcome.jobId, { curator: curator as never }));
     expect(control.skipped).not.toBe('not_qualified');
   });
@@ -810,7 +810,7 @@ describe('card notices are each unique, and save needs a base folder', () => {
   });
 
   async function breakCharter(): Promise<void> {
-    await getPool().query(
+    await testDb().query(
       `UPDATE charter_versions SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb('0'::text))
         WHERE business_id = $1`,
       [B],
@@ -858,10 +858,10 @@ describe('card states (M6)', () => {
     const card = await cardFor(versionId);
     // The CHECK refuses the dropped state...
     await expect(
-      getPool().query(`UPDATE document_cards SET state = 'fix_requested' WHERE card_id = $1`, [card.cardId]),
+      testDb().query(`UPDATE document_cards SET state = 'fix_requested' WHERE card_id = $1`, [card.cardId]),
     ).rejects.toThrow(/document_cards_state_known/);
     // ...and still admits every kept one (the update ran against a real row).
-    const { rowCount } = await getPool().query(`UPDATE document_cards SET state = 'superseded' WHERE card_id = $1`, [
+    const { rowCount } = await testDb().query(`UPDATE document_cards SET state = 'superseded' WHERE card_id = $1`, [
       card.cardId,
     ]);
     expect(rowCount).toBe(1);

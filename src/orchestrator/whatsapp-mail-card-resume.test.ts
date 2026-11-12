@@ -17,8 +17,8 @@ vi.mock('./resume.js', async (importOriginal) => {
   };
 });
 
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { QUESTION_TRIAGE, installMailboxCharter, storedMail, stubDrafter } from '../test/mailbox.js';
 import { createFakeGateway } from '../whatsapp/fake-gateway.js';
 import { createBossMessenger } from '../whatsapp/messenger.js';
@@ -57,12 +57,12 @@ describe('approve-by-WhatsApp when the resume fails', () => {
 
     expect(result.mailCardReplies).toBe(1);
     expect(gateway.sent.at(-1)?.body).toBe(DECIDED_RESUME_FAILED);
-    const { rows } = await getPool().query<{ state: string }>(
+    const { rows } = await testDb().query<{ state: string }>(
       "SELECT state FROM approval_requests WHERE business_id = $1 AND job_id = $2",
       [BUSINESS, raised.replyJobId],
     );
     expect(rows.map((r) => r.state)).toEqual(['approved']);
-    const { rows: inbound } = await getPool().query<{ state: string }>(
+    const { rows: inbound } = await testDb().query<{ state: string }>(
       "SELECT state FROM whatsapp_messages WHERE business_id = $1 AND provider_message_id = 'wamid.resume-1'",
       [BUSINESS],
     );

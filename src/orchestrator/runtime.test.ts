@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
-import { config } from '../config.js';
 import { closePool, withBusiness } from '../db/pool.js';
 import { closePlatformPool } from '../db/platform-pool.js';
 import type { CharterConnection } from '../domain/connection.js';
@@ -16,7 +15,7 @@ import { saveRuntimeSettings } from '../tenancy/runtime-settings.js';
 import type { RuntimeSettingsPatch } from '../tenancy/runtime-settings.js';
 import { upsertBinding } from './bindings.js';
 import { DEFAULT_CREDENTIAL_ENV_PREFIX } from './credentials.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { createFakeGateway } from '../whatsapp/fake-gateway.js';
 import {
@@ -29,7 +28,7 @@ import {
 import type { Runtime, ServerRuntime, ServerRuntimeOverrides } from './runtime.js';
 
 /** The key state is written under the configured business, so tests use it. */
-const BUSINESS = config.businessId;
+const BUSINESS = TEST_BUSINESS;
 const OTHER = 'test-runtime-other';
 
 const CALENDAR_CONNECTION: CharterConnection = {
@@ -71,7 +70,7 @@ beforeEach(async () => {
   KEY = randomBytes(KEY_BYTES);
   const keyPath = join(DIR, 'master.key');
   await writeFile(keyPath, KEY, { mode: 0o600 });
-  await writeKeyState(KEY, 'key-1');
+  await writeKeyState(KEY, 'key-1', testDb());
   FULL = { ...SERVER_ENV, CREDENTIAL_KEY_PATH: keyPath };
 });
 

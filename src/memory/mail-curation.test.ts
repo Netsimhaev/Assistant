@@ -3,7 +3,7 @@
  * assistant about, and the daily count is kept apart from document curation.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { settleMail } from '../mail/inbox-store.js';
 import { createJob } from '../orchestrator/jobs.js';
@@ -11,7 +11,7 @@ import { pollMailbox } from '../orchestrator/mail-poll.js';
 import type { MailTriage } from '../domain/mail-triage.js';
 import type { MailboxClient } from '../mail/providers/types.js';
 import type { Triage } from '../sdk/mail-triage.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { incomingMail, installMailboxCharter, mailboxRuntime, stubDrafter, storedMail } from '../test/mailbox.js';
 import { setCursor } from '../mail/inbox-store.js';
 import { buildCurationBrief } from './curation-brief.js';
@@ -199,7 +199,7 @@ describe('curation from mail', () => {
     // The mail run counts on the mail side only, prefixed in the audit row.
     expect(await withBusiness(BUSINESS, (db) => curationRunsToday(db, { scope: 'mail' }))).toBe(1);
     expect(await withBusiness(BUSINESS, (db) => curationRunsToday(db))).toBe(20);
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE business_id = $1 AND kind = 'curation' AND reason LIKE 'mail:%'`,
       [BUSINESS],
     );
@@ -230,7 +230,7 @@ describe('curation from mail', () => {
     });
     expect(calls).toBe(1);
     expect(result).toMatchObject({ triaged: 1, failed: 0 });
-    const { rows } = await getPool().query<{ state: string; error: string | null }>(
+    const { rows } = await testDb().query<{ state: string; error: string | null }>(
       'SELECT state, error FROM mail_messages WHERE business_id = $1',
       [BUSINESS],
     );
@@ -280,7 +280,7 @@ describe('curation from mail', () => {
 
   it('mail scope never retires: an existing non-boss preference survives, the claim lands as a chunk', async () => {
     const jobId = await seedMailJob();
-    const { rows: versions } = await getPool().query<{ charter_version: string }>(
+    const { rows: versions } = await testDb().query<{ charter_version: string }>(
       'SELECT charter_version FROM jobs WHERE job_id = $1',
       [jobId],
     );
@@ -303,7 +303,7 @@ describe('curation from mail', () => {
       }),
     }));
     expect(outcome).toMatchObject({ written: 2, failed: false });
-    const { rows } = await getPool().query<{ kind: string; retired_at: Date | null; body: unknown }>(
+    const { rows } = await testDb().query<{ kind: string; retired_at: Date | null; body: unknown }>(
       'SELECT kind, retired_at, body FROM memories WHERE business_id = $1 AND subject_key = $2',
       [BUSINESS, SENDER],
     );

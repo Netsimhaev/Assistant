@@ -39,9 +39,10 @@ export interface CredentialSource {
   /**
    * `businessId` is REQUIRED and has no default anywhere in this path.
    *
-   * Everywhere else in this codebase the business is
-   * `options.businessId ?? config.businessId`. Here that pattern is
-   * forbidden: an omitted business would read silently as "the one in the
+   * This was the first path where the old pattern — an optional business
+   * falling back to the one in the configuration — was forbidden, and since
+   * the server runs every business (spec §5.2) it is forbidden everywhere:
+   * an omitted business would read silently as "the one in the
    * configuration", which is precisely the mechanism by which one customer
    * reads another's secret. Required means an omission is a compile error
    * rather than a wrong lookup at run time.

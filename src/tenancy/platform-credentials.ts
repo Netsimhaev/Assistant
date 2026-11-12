@@ -92,7 +92,7 @@ export async function putPlatformSecret(
       // and writing the sealed row are two statements, and a rotation between
       // them would seal this row under a key it is not labelled with.
       await acquireAdvisoryLock(db, ROTATION_LOCK_SCOPE);
-      await verifyKeyState(key, { db });
+      await verifyKeyState(key, db);
       const keyId = await liveKeyId(db);
       const sealed = encryptSecret(value, key, platformAad(ref));
       await db.query(
@@ -142,7 +142,7 @@ export async function resolvePlatformSecret(ref: string, key: Buffer): Promise<s
 export async function removePlatformSecret(ref: string, key: Buffer): Promise<boolean> {
   assertLegalRef(ref);
   return withPlatform(async (db) => {
-    await verifyKeyState(key, { db });
+    await verifyKeyState(key, db);
     const result = await db.query('DELETE FROM platform_credentials WHERE ref = $1', [ref]);
     return (result.rowCount ?? 0) > 0;
   });

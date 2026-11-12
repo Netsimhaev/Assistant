@@ -15,7 +15,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { buildCalendarAmendment } from '../charter/amend-calendar.js';
 import { signCharter } from '../charter/sign.js';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import type { CalendarProvider } from '../calendar/calendar.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { KEY_BYTES, writeKeyState } from '../governance/master-key.js';
@@ -23,7 +23,7 @@ import { readGrantBySystem } from '../governance/oauth-grants.js';
 import { GOOGLE_CLIENT_ID_REF, GOOGLE_CLIENT_SECRET_REF } from '../orchestrator/adapters/google-token-http.js';
 import { loadBindings } from '../orchestrator/bindings.js';
 import { buildCharter } from '../test/fixtures.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { createServer } from './server.js';
 import { putPlatformSecret } from '../tenancy/platform-credentials.js';
@@ -52,7 +52,7 @@ beforeEach(async () => {
   keyPath = join(keyDir, 'master.key');
   key = randomBytes(KEY_BYTES);
   await writeFile(keyPath, key, { mode: 0o600 });
-  await writeKeyState(key, 'KEY-test');
+  await writeKeyState(key, 'KEY-test', testDb());
   for (const [ref, value] of [
     [GOOGLE_CLIENT_ID_REF, 'g-id'],
     [GOOGLE_CLIENT_SECRET_REF, 'g-secret'],
@@ -128,7 +128,7 @@ describe('calendar OAuth ceremony and the signed provider', () => {
       redirect: 'manual',
     });
     expect(res.status).toBe(400);
-    const { rows } = await getPool().query('SELECT count(*)::int AS n FROM oauth_states');
+    const { rows } = await testDb().query('SELECT count(*)::int AS n FROM oauth_states');
     expect(rows[0]?.['n']).toBe(0);
     expect(calls).toEqual([]);
 

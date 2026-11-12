@@ -8,7 +8,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import type { LedgerItem } from '../domain/ledger.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -85,7 +85,7 @@ interface ReminderRow {
 }
 
 async function reminders(): Promise<ReminderRow[]> {
-  const { rows } = await getPool().query<ReminderRow>(
+  const { rows } = await testDb().query<ReminderRow>(
     `SELECT reminder_id, item_id, kind, body, email_state, whatsapp_state, seen_at
        FROM ledger_reminders WHERE business_id = $1 ORDER BY created_at, reminder_id`,
     [B],
@@ -94,7 +94,7 @@ async function reminders(): Promise<ReminderRow[]> {
 }
 
 async function batches(): Promise<{ batch_id: string; items: string[]; sent_at: Date | null }[]> {
-  const { rows } = await getPool().query<{ batch_id: string; items: string[]; sent_at: Date | null }>(
+  const { rows } = await testDb().query<{ batch_id: string; items: string[]; sent_at: Date | null }>(
     `SELECT batch_id, items, sent_at FROM ledger_whatsapp_batches WHERE business_id = $1 ORDER BY created_at`,
     [B],
   );
@@ -276,7 +276,7 @@ describe('runLedgerPass', () => {
       { by: 'boss' },
     ));
     // Created Sunday 2026-11-01 10:00 local. Sun–Thu week, 3 business days → Wed 11-04 08:00 local.
-    await getPool().query(`UPDATE ledger_items SET created_at = $2 WHERE item_id = $1`, [
+    await testDb().query(`UPDATE ledger_items SET created_at = $2 WHERE item_id = $1`, [
       item.itemId,
       new Date('2026-11-01T08:00:00Z'),
     ]);
@@ -306,7 +306,7 @@ describe('runLedgerPass', () => {
       base({ family: 'awaiting_reply', description: 'act', dueAt: null, amountMinor: null }),
       { by: 'boss' },
     ));
-    await getPool().query(`UPDATE ledger_items SET created_at = $2 WHERE item_id = $1`, [
+    await testDb().query(`UPDATE ledger_items SET created_at = $2 WHERE item_id = $1`, [
       actItem.itemId,
       new Date('2026-11-01T08:00:00Z'),
     ]);
@@ -332,7 +332,7 @@ describe('runLedgerPass', () => {
   });
 
   it('a pass with no active charter returns the empty result', async () => {
-    await getPool().query(`DELETE FROM charter_active WHERE business_id = $1`, [B]);
+    await testDb().query(`DELETE FROM charter_active WHERE business_id = $1`, [B]);
     await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
     const sent: Sent[] = [];
     const result = await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, sendAlert: recordingAlert(sent) }));

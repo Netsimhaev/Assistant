@@ -11,7 +11,7 @@
  * just as well for a job nothing ever ran.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import {
   DRAFT_BODY as BODY,
@@ -74,7 +74,7 @@ function storedMail(overrides: Partial<IncomingMail> = {}): Promise<StoredMail> 
 }
 
 async function mailRow(mailId: string): Promise<{ error: string | null; reply_job_id: string | null }> {
-  const { rows } = await getPool().query<{ error: string | null; reply_job_id: string | null }>(
+  const { rows } = await testDb().query<{ error: string | null; reply_job_id: string | null }>(
     'SELECT error, reply_job_id FROM mail_messages WHERE mail_id = $1',
     [mailId],
   );
@@ -84,7 +84,7 @@ async function mailRow(mailId: string): Promise<{ error: string | null; reply_jo
 }
 
 async function approvalCount(): Promise<number> {
-  const { rows } = await getPool().query<{ n: string }>(
+  const { rows } = await testDb().query<{ n: string }>(
     'SELECT count(*)::text AS n FROM approval_requests WHERE business_id = $1',
     [BUSINESS],
   );
@@ -235,7 +235,7 @@ describe('raiseMailReply', () => {
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     expect(links).toEqual([`https://dash.example/a/${raised.approvalId}`]);
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, raised.replyJobId)))?.phase).toBe('await_approval');
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'incident'`,
       [raised.replyJobId],
     );
@@ -273,7 +273,7 @@ describe('raiseMailReply', () => {
     await expect(
       withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail: { ...mail, mailId: 'M-missing' }, triage: TRIAGE, bundle, drafter: stubDrafter() })),
     ).rejects.toThrow(/linkReplyJob/);
-    const { rows } = await getPool().query<{ state: string; job_id: string }>(
+    const { rows } = await testDb().query<{ state: string; job_id: string }>(
       'SELECT state, job_id FROM approval_requests WHERE business_id = $1',
       [BUSINESS],
     );
@@ -330,7 +330,7 @@ describe('approve sends, under mode off', () => {
     await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
 
     expect(sent).toHaveLength(0);
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'policy_denial'`,
       [raised.replyJobId],
     );
@@ -413,7 +413,7 @@ describe('the stage-8 exemption is a mailbox-reply-job exemption (R20)', () => {
     await approve(approvalId);
     const { client, sent } = fakeClient();
     await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
-    const { rows } = await getPool().query<{ consumed_at: Date | null }>(
+    const { rows } = await testDb().query<{ consumed_at: Date | null }>(
       'SELECT consumed_at FROM approval_requests WHERE approval_id = $1',
       [approvalId],
     );
@@ -425,7 +425,7 @@ describe('the stage-8 exemption is a mailbox-reply-job exemption (R20)', () => {
 
     expect(sent).toHaveLength(0);
     expect(consumed).toBeNull();
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'policy_denial'`,
       [jobId],
     );
@@ -484,7 +484,7 @@ describe('a new message goes out through the mailbox too, under the gate (R21)',
     // email.initiate is approve_required in the charter: a card, nothing sent.
     expect(sentNew).toHaveLength(0);
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('await_approval');
-    const { rows } = await getPool().query<{ approval_id: string }>(
+    const { rows } = await testDb().query<{ approval_id: string }>(
       `SELECT approval_id FROM approval_requests WHERE job_id = $1 AND state = 'pending'`,
       [jobId],
     );
@@ -505,7 +505,7 @@ describe('a new message goes out through the mailbox too, under the gate (R21)',
     await withBusiness(BUSINESS, (db) => runDueJobs(db, { runtime: runtimeWith(client), now: NOON }));
 
     expect(sentNew).toHaveLength(0);
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'policy_denial'`,
       [jobId],
     );
@@ -544,7 +544,7 @@ describe('an instruction-door reply goes out threaded through the mailbox', () =
   }
 
   async function pendingCardFor(jobId: string): Promise<string> {
-    const { rows } = await getPool().query<{ approval_id: string }>(
+    const { rows } = await testDb().query<{ approval_id: string }>(
       `SELECT approval_id FROM approval_requests WHERE job_id = $1 AND state = 'pending'`,
       [jobId],
     );
@@ -595,7 +595,7 @@ describe('an instruction-door reply goes out threaded through the mailbox', () =
     expect(sent).toHaveLength(0);
     expect(sentNew).toHaveLength(0);
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM job_steps WHERE job_id = $1 AND to_phase = 'failed'`,
       [jobId],
     );
@@ -616,7 +616,7 @@ describe('reraiseAfterFailedSend', () => {
   }
 
   async function pendingCards(): Promise<Array<{ approval_id: string; job_id: string; detail: string }>> {
-    const { rows } = await getPool().query<{ approval_id: string; job_id: string; detail: string }>(
+    const { rows } = await testDb().query<{ approval_id: string; job_id: string; detail: string }>(
       `SELECT approval_id, job_id, detail FROM approval_requests
         WHERE business_id = $1 AND state = 'pending' ORDER BY created_at`,
       [BUSINESS],
@@ -884,7 +884,7 @@ describe('a reply the assistant has LEARNED goes without a card (owner ruling H1
   }
 
   async function actionUpdateCount(): Promise<number> {
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       'SELECT count(*)::text AS n FROM action_updates WHERE business_id = $1',
       [BUSINESS],
     );
@@ -908,7 +908,7 @@ describe('a reply the assistant has LEARNED goes without a card (owner ruling H1
     expect(sent).toHaveLength(1);
     expect(await approvalCount()).toBe(0);
     expect(await actionUpdateCount()).toBe(1);
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'intent_to_act'`,
       [raised.replyJobId],
     );
@@ -939,7 +939,7 @@ describe('a reply the assistant has LEARNED goes without a card (owner ruling H1
   });
 
   async function learnedCards(): Promise<Array<{ approval_id: string; job_id: string; detail: string }>> {
-    const { rows } = await getPool().query<{ approval_id: string; job_id: string; detail: string }>(
+    const { rows } = await testDb().query<{ approval_id: string; job_id: string; detail: string }>(
       `SELECT approval_id, job_id, detail FROM approval_requests
         WHERE business_id = $1 AND state = 'pending' ORDER BY created_at`,
       [BUSINESS],

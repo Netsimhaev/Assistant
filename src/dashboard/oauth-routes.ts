@@ -259,7 +259,7 @@ async function loadKeyForRequest(db: BusinessDb, credentialKeyPath: string | und
   }
   const key = await loadMasterKey(credentialKeyPath);
   // On the request's own connection, never a second one (Task 10 fix round 2).
-  await verifyKeyState(key, { db, businessId: db.businessId });
+  await verifyKeyState(key, db);
   return key;
 }
 

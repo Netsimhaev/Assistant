@@ -4,8 +4,8 @@
  * and every poll have an index.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from './pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from './pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { createState } from '../governance/oauth-state.js';
 
 const BUSINESS = 'test-business';
@@ -29,7 +29,7 @@ describe('oauth_states.provider is a closed set', () => {
         }),
       );
     }
-    const { rows } = await getPool().query<{ n: string }>('SELECT count(*)::text AS n FROM oauth_states');
+    const { rows } = await testDb().query<{ n: string }>('SELECT count(*)::text AS n FROM oauth_states');
     expect(rows[0]?.n).toBe('3');
   });
 
@@ -42,7 +42,7 @@ describe('oauth_states.provider is a closed set', () => {
 
 describe('mail_messages lookup indexes', () => {
   async function indexDef(name: string): Promise<string | undefined> {
-    const { rows } = await getPool().query<{ indexdef: string }>(
+    const { rows } = await testDb().query<{ indexdef: string }>(
       `SELECT indexdef FROM pg_indexes WHERE tablename = 'mail_messages' AND indexname = $1`,
       [name],
     );

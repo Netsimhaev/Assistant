@@ -6,10 +6,10 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { createLedgerItem, listLedgerEvents, loadLedgerItem, type NewLedgerItem } from '../ledger/store.js';
 import { listCriticalRules, loadLedgerSettings } from '../ledger/settings.js';
 import { localParts, localToInstant } from '../util/local-time.js';
@@ -124,7 +124,7 @@ describe('GET /ledger', () => {
   it('lists open items with the stuck list first', async () => {
     await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ description: 'פריט רגיל פתוח' }), { by: 'boss' }));
     const stuck = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ description: 'פריט תקוע דחוף' }), { by: 'boss' }));
-    await getPool().query(`UPDATE ledger_items SET status = 'stuck' WHERE item_id = $1`, [stuck.itemId]);
+    await testDb().query(`UPDATE ledger_items SET status = 'stuck' WHERE item_id = $1`, [stuck.itemId]);
     const base = await start();
     const cookie = await login(base);
     const res = await get(base, cookie, '/ledger');
@@ -162,7 +162,7 @@ describe('GET /ledger', () => {
   it('an unknown filter reads as open', async () => {
     await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ description: 'פתוח' }), { by: 'boss' }));
     const done = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ description: 'סגור לגמרי' }), { by: 'boss' }));
-    await getPool().query(`UPDATE ledger_items SET status = 'done' WHERE item_id = $1`, [done.itemId]);
+    await testDb().query(`UPDATE ledger_items SET status = 'done' WHERE item_id = $1`, [done.itemId]);
     const base = await start();
     const cookie = await login(base);
     const html = await (await get(base, cookie, '/ledger?filter=bogus')).text();
@@ -174,7 +174,7 @@ describe('GET /ledger', () => {
 
   it('marks unseen reminders as seen', async () => {
     const it1 = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item(), { by: 'boss' }));
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO ledger_reminders (reminder_id, business_id, item_id, slot, kind, body)
        VALUES ('LR-1', $1, $2, 's1', 'due', 'x')`,
       [BUSINESS, it1.itemId],
@@ -182,20 +182,20 @@ describe('GET /ledger', () => {
     const base = await start();
     const cookie = await login(base);
     await get(base, cookie, '/ledger');
-    const { rows } = await getPool().query(`SELECT seen_at FROM ledger_reminders WHERE reminder_id = 'LR-1'`);
+    const { rows } = await testDb().query(`SELECT seen_at FROM ledger_reminders WHERE reminder_id = 'LR-1'`);
     expect(rows[0]?.seen_at).not.toBeNull();
   });
 
   describe('the follow-up line (F-I3)', () => {
     async function event(itemId: string, id: string, kind: string, at: string, jobId: string | null = null) {
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO ledger_events (event_id, business_id, item_id, kind, job_id, by_whom, at)
          VALUES ($1, $2, $3, $4, $5, 'system', $6)`,
         [id, BUSINESS, itemId, kind, jobId, at],
       );
     }
     async function reminder(itemId: string, id: string, slot: string, body: string, at: string) {
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO ledger_reminders (reminder_id, business_id, item_id, slot, kind, body, created_at)
          VALUES ($1, $2, $3, $4, 'nudge', $5, $6)`,
         [id, BUSINESS, itemId, slot, body, at],
@@ -207,7 +207,7 @@ describe('GET /ledger', () => {
       const it1 = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ family: 'warm_leads' }), { by: 'boss' }));
       // The opened job's claim row: no channel state (the old, wrong "draft" signal).
       await reminder(it1.itemId, 'LR-open', 'n1', 'שלום דנה, רק מזכירה', '2026-11-01T08:00:00Z');
-      await getPool().query(`UPDATE ledger_items SET nudge_job_id = 'J-flight' WHERE item_id = $1`, [it1.itemId]);
+      await testDb().query(`UPDATE ledger_items SET nudge_job_id = 'J-flight' WHERE item_id = $1`, [it1.itemId]);
       const base = await start();
       const cookie = await login(base);
       const html = await (await get(base, cookie, '/ledger')).text();

@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -68,7 +68,7 @@ async function failChild(jobId: string): Promise<void> {
 }
 
 async function latestResultPayload(): Promise<{ outcome: string; note: string }> {
-  const { rows } = await getPool().query<{ payload: { outcome: string; note: string } }>(
+  const { rows } = await testDb().query<{ payload: { outcome: string; note: string } }>(
     `SELECT payload FROM agent_envelopes
       WHERE business_id = $1 AND kind = 'result'
       ORDER BY created_at DESC LIMIT 1`,

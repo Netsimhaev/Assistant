@@ -3,8 +3,8 @@
  * the owner is always told who the sender was.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { closeLedgerByEvidence } from './evidence.js';
 import { renderEvidenceNotice } from './render.js';
@@ -49,7 +49,7 @@ async function addMail(o: {
 }): Promise<string> {
   seq += 1;
   const id = `M-${seq}`;
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO mail_messages (mail_id, business_id, provider_message_id, thread_id, from_address, subject,
                                 received_at, body_text, created_at)
      VALUES ($1, $2, $3, 'T', $4, $5, $6, $7, $6)`,
@@ -59,7 +59,7 @@ async function addMail(o: {
 }
 
 async function setEvidenceAfter(itemId: string, at: Date): Promise<void> {
-  await getPool().query(`UPDATE ledger_items SET evidence_after = $2 WHERE item_id = $1`, [itemId, at]);
+  await testDb().query(`UPDATE ledger_items SET evidence_after = $2 WHERE item_id = $1`, [itemId, at]);
 }
 
 const T0 = new Date('2026-11-01T08:00:00Z');
@@ -108,10 +108,10 @@ describe('closeLedgerByEvidence', () => {
     expect(events.at(-1)).toMatchObject({ kind: 'closed_by_evidence', mailId, byWhom: 'evidence' });
     // Email goes now; WhatsApp is NOT sent here (I5): the notice is handed to
     // the ledger pass, which puts it first in the pass's single batch.
-    const { rows } = await getPool().query(`SELECT slot, email_state, whatsapp_state FROM ledger_reminders`);
+    const { rows } = await testDb().query(`SELECT slot, email_state, whatsapp_state FROM ledger_reminders`);
     expect(rows).toEqual([{ slot: `evidence:${mailId}`, email_state: 'sent', whatsapp_state: null }]);
     expect(r.texts).toHaveLength(0);
-    const batch = await getPool().query(`SELECT 1 FROM ledger_whatsapp_batches`);
+    const batch = await testDb().query(`SELECT 1 FROM ledger_whatsapp_batches`);
     expect(batch.rowCount).toBe(0);
     expect(res.notices).toHaveLength(1);
     expect(res.notices[0]).toMatchObject({ itemId: item.itemId, from: 'Dana@Acme.co.il' });
@@ -180,7 +180,7 @@ describe('closeLedgerByEvidence', () => {
     expect(res.closed).toEqual([]);
     expect(await statusOf(unverified.itemId)).toBe('open');
 
-    await getPool().query(`UPDATE ledger_items SET counterparty_email_verified = true WHERE item_id = $1`, [
+    await testDb().query(`UPDATE ledger_items SET counterparty_email_verified = true WHERE item_id = $1`, [
       unverified.itemId,
     ]);
     const again = await withBusiness(B, (db) => closeLedgerByEvidence(db));
@@ -229,7 +229,7 @@ describe('closeLedgerByEvidence', () => {
     if (notice === undefined) throw new Error('expected a notice');
     // The number is the notice's real position in the batch it lands in.
     expect(renderEvidenceNotice(notice, 'whatsapp', 3)).toBe(expectedWa);
-    const { rows } = await getPool().query(`SELECT body FROM ledger_reminders`);
+    const { rows } = await testDb().query(`SELECT body FROM ledger_reminders`);
     expect(rows[0].body).toContain('dana@acme.co.il');
   });
 
@@ -253,7 +253,7 @@ describe('closeLedgerByEvidence', () => {
     expect(second.skipped).toBe(0); // rejected by evidence_after, not by the claim fallback
     expect(second.considered).toBe(1); // the item was examined and the old mail rejected
     expect(await statusOf(item.itemId)).toBe('open');
-    const { rows } = await getPool().query(`SELECT count(*)::int AS n FROM ledger_reminders`);
+    const { rows } = await testDb().query(`SELECT count(*)::int AS n FROM ledger_reminders`);
     expect(rows[0].n).toBe(1);
   });
 
@@ -300,7 +300,7 @@ describe('closeLedgerByEvidence', () => {
     expect(res.skipped).toBe(1);
     expect(r.emails).toHaveLength(0);
     expect(r.texts).toHaveLength(0);
-    const { rows } = await getPool().query(`SELECT count(*)::int AS n FROM ledger_reminders`);
+    const { rows } = await testDb().query(`SELECT count(*)::int AS n FROM ledger_reminders`);
     expect(rows[0].n).toBe(0);
   });
 });

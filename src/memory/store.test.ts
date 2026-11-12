@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { createJob } from '../orchestrator/jobs.js';
@@ -137,7 +137,7 @@ describe('the memory store', () => {
     // The old belief is still on the record — that is what "retire, never
     // delete" buys, and a business asked to explain last quarter's decision
     // needs it.
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       `SELECT count(*)::text AS n FROM memories
         WHERE business_id=$1 AND subject_key='c_812' AND retired_at IS NOT NULL`,
       [BUSINESS],

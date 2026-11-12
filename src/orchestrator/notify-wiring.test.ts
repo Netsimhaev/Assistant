@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
@@ -202,7 +202,7 @@ describe('approval notification wiring', () => {
     // The store is the source: nothing in this test sets SMTP_PASS, and the
     // registry below never touches `envCredentials`.
     const key = randomBytes(32);
-    await writeKeyState(key, 'key-1');
+    await writeKeyState(key, 'key-1', testDb());
     await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: 'OFFICE_MAIL', value: 'סוד-מהמאגר', updatedBy: 'test' }, key));
 
     const captured: string[] = [];
@@ -292,7 +292,7 @@ describe('approval notification wiring', () => {
     const job = await jobInExecute(bundle);
 
     const key = randomBytes(32);
-    await writeKeyState(key, 'key-1');
+    await writeKeyState(key, 'key-1', testDb());
     // Two refs, two rows: the binding's and the notifier's. The notifier must
     // resolve its own, which is what makes `captured` below evidence about
     // NOTIFY_MAIL specifically rather than about whatever else is stored.
@@ -348,7 +348,7 @@ describe('approval notification wiring', () => {
     expect(result.status).toBe('halted');
     expect(captured).toEqual([secret]);
 
-    const rows = await getPool().query<{ reason: string; input_hash: string }>(
+    const rows = await testDb().query<{ reason: string; input_hash: string }>(
       `SELECT reason, input_hash FROM audit_log
         WHERE business_id = $1 AND kind = 'incident' AND reason LIKE 'approval_notify_failed%'`,
       [BUSINESS],

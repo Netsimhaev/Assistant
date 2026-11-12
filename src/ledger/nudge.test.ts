@@ -13,7 +13,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { Plan } from '../domain/plan.js';
 import { decide } from '../governance/approvals.js';
 import { buildErasurePlan } from '../governance/erasure-plan.js';
@@ -26,7 +26,7 @@ import { closeVerifiedJobs } from '../orchestrator/verify.js';
 import { confirmedCommandCovers } from '../policy/confirmed-command.js';
 import { buildFacts } from '../policy/facts.js';
 import { runNudgeDrafter, type NudgeDrafter, type NudgeDraftRequest } from '../sdk/nudge-drafter.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { fakeMailboxClient, installMailboxCharter, mailboxRuntime } from '../test/mailbox.js';
 import { observeNudges, openNudge, SEND_FAILED_REASON } from './nudge.js';
@@ -89,7 +89,7 @@ async function actMode(): Promise<void> {
 }
 
 async function nudgeJobId(itemId: string): Promise<string> {
-  const { rows } = await getPool().query<{ nudge_job_id: string | null }>(
+  const { rows } = await testDb().query<{ nudge_job_id: string | null }>(
     `SELECT nudge_job_id FROM ledger_items WHERE item_id = $1`,
     [itemId],
   );
@@ -99,12 +99,12 @@ async function nudgeJobId(itemId: string): Promise<string> {
 }
 
 async function jobCount(): Promise<number> {
-  const { rows } = await getPool().query<{ n: string }>(`SELECT count(*) AS n FROM jobs WHERE business_id = $1`, [B]);
+  const { rows } = await testDb().query<{ n: string }>(`SELECT count(*) AS n FROM jobs WHERE business_id = $1`, [B]);
   return Number(rows[0]?.n ?? 0);
 }
 
 async function nudgeReminders(itemId: string): Promise<{ slot: string; body: string; email_state: string | null }[]> {
-  const { rows } = await getPool().query<{ slot: string; body: string; email_state: string | null }>(
+  const { rows } = await testDb().query<{ slot: string; body: string; email_state: string | null }>(
     `SELECT slot, body, email_state FROM ledger_reminders
       WHERE business_id = $1 AND item_id = $2 AND kind = 'nudge' ORDER BY created_at, reminder_id`,
     [B, itemId],
@@ -113,7 +113,7 @@ async function nudgeReminders(itemId: string): Promise<{ slot: string; body: str
 }
 
 async function auditRows(jobId: string): Promise<{ kind: string; reason: string }[]> {
-  const { rows } = await getPool().query<{ kind: string; reason: string }>(
+  const { rows } = await testDb().query<{ kind: string; reason: string }>(
     `SELECT kind, reason FROM audit_log WHERE job_id = $1 ORDER BY seq`,
     [jobId],
   );
@@ -155,7 +155,7 @@ describe('act mode: the nudge goes through the gate', () => {
     expect(sent).toHaveLength(0);
     expect(sentNew).toHaveLength(0);
     expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('await_approval');
-    const cards = await getPool().query(`SELECT 1 FROM approval_requests WHERE job_id = $1 AND state = 'pending'`, [jobId]);
+    const cards = await testDb().query(`SELECT 1 FROM approval_requests WHERE job_id = $1 AND state = 'pending'`, [jobId]);
     expect(cards.rowCount).toBe(1);
     // The job reached the gate: stage 5 wrote its intent.
     expect((await auditRows(jobId)).some((r) => r.kind === 'intent_to_act')).toBe(true);
@@ -175,7 +175,7 @@ describe('act mode: the nudge goes through the gate', () => {
     const { client, sentNew } = fakeMailboxClient();
     await withBusiness(B, (db) => runDueJobs(db, { runtime: mailboxRuntime(client), now: NOW }));
 
-    const { rows } = await getPool().query<{ approval_id: string }>(
+    const { rows } = await testDb().query<{ approval_id: string }>(
       `SELECT approval_id FROM approval_requests WHERE job_id = $1 AND state = 'pending'`,
       [jobId],
     );
@@ -199,7 +199,7 @@ describe('act mode: the nudge goes through the gate', () => {
     const again = await withBusiness(B, (db) => observeNudges(db));
     expect(again.sent).toEqual([]);
     expect((await withBusiness(B, (db) => loadLedgerItem(db, item.itemId)))?.nudgeCount).toBe(1);
-    const { rows: cleared } = await getPool().query(`SELECT nudge_job_id FROM ledger_items WHERE item_id = $1`, [
+    const { rows: cleared } = await testDb().query(`SELECT nudge_job_id FROM ledger_items WHERE item_id = $1`, [
       item.itemId,
     ]);
     expect(cleared[0]).toEqual({ nudge_job_id: null });
@@ -256,7 +256,7 @@ describe('act mode: the nudge goes through the gate', () => {
     await withBusiness(B, (db) => runDueJobs(db, { runtime: mailboxRuntime(client), now: NOW }));
     expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
 
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO job_steps (job_id, business_id, from_phase, to_phase, actor, reason, at)
        VALUES ($1, 'other-business', 'execute', 'failed', 'orchestrator', 'channel_unavailable: foreign', now() + interval '1 hour')`,
       [jobId],
@@ -288,7 +288,7 @@ describe('act mode: the nudge goes through the gate', () => {
 
 describe('a nudge whose item moved on, or whose opening crashed', () => {
   async function pendingCard(jobId: string): Promise<string> {
-    const { rows } = await getPool().query<{ approval_id: string }>(
+    const { rows } = await testDb().query<{ approval_id: string }>(
       `SELECT approval_id FROM approval_requests WHERE job_id = $1 AND state = 'pending'`,
       [jobId],
     );
@@ -321,7 +321,7 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
     const observed = await withBusiness(B, (db) => observeNudges(db, { now: NOW }));
     expect(observed.sent).toEqual([]);
     expect(observed.fallback).toEqual([]);
-    const { rows } = await getPool().query<{ state: string }>(
+    const { rows } = await testDb().query<{ state: string }>(
       `SELECT state FROM approval_requests WHERE approval_id = $1`,
       [approvalId],
     );
@@ -331,7 +331,7 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
     ).rejects.toThrow();
     expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('closed');
     expect((await withBusiness(B, (db) => loadLedgerItem(db, item.itemId)))?.nudgeCount).toBe(0); // never counted
-    const { rows: link } = await getPool().query(`SELECT nudge_job_id FROM ledger_items WHERE item_id = $1`, [
+    const { rows: link } = await testDb().query(`SELECT nudge_job_id FROM ledger_items WHERE item_id = $1`, [
       item.itemId,
     ]);
     expect(link[0]).toEqual({ nudge_job_id: null });
@@ -355,7 +355,7 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
     await withBusiness(B, (db) => runDueJobs(db, { runtime: mailboxRuntime(client), now: NOW }));
     const approvalId = await pendingCard(jobId);
     await withBusiness(B, (db) => observeNudges(db, { now: NOW }));
-    const { rows } = await getPool().query<{ state: string }>(
+    const { rows } = await testDb().query<{ state: string }>(
       `SELECT state FROM approval_requests WHERE approval_id = $1`,
       [approvalId],
     );
@@ -369,7 +369,7 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
     await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, drafter: stubDrafter().fn, sendAlert: recordingAlert([]) }));
     const jobId = await nudgeJobId(item.itemId);
     // Simulate the crash between linking and plan→execute.
-    await getPool().query(`UPDATE jobs SET phase = 'plan', created_at = $2 WHERE job_id = $1`, [
+    await testDb().query(`UPDATE jobs SET phase = 'plan', created_at = $2 WHERE job_id = $1`, [
       jobId,
       new Date(NOW.getTime() - 10 * 60 * 1000),
     ]);
@@ -377,7 +377,7 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
     expect(young.fallback).toEqual([]);
     expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('plan');
 
-    await getPool().query(`UPDATE jobs SET created_at = $2 WHERE job_id = $1`, [
+    await testDb().query(`UPDATE jobs SET created_at = $2 WHERE job_id = $1`, [
       jobId,
       new Date(NOW.getTime() - 16 * 60 * 1000),
     ]);
@@ -386,7 +386,7 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
     expect(observed.fallback.map((f) => f.itemId)).toEqual([item.itemId]);
     expect(observed.fallback[0]?.draft).toBe(DRAFT);
     expect(observed.reminders).toHaveLength(1);
-    const { rows: link } = await getPool().query(`SELECT nudge_job_id FROM ledger_items WHERE item_id = $1`, [
+    const { rows: link } = await testDb().query(`SELECT nudge_job_id FROM ledger_items WHERE item_id = $1`, [
       item.itemId,
     ]);
     expect(link[0]).toEqual({ nudge_job_id: null });
@@ -454,7 +454,7 @@ describe('when no nudge job is opened', () => {
   it('cap moves the item to stuck and tells the owner', async () => {
     await actMode();
     const item = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
-    await getPool().query(`UPDATE ledger_items SET nudge_count = 2 WHERE item_id = $1`, [item.itemId]);
+    await testDb().query(`UPDATE ledger_items SET nudge_count = 2 WHERE item_id = $1`, [item.itemId]);
     const drafter = stubDrafter();
     const sent: Sent[] = [];
     const result = await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, drafter: drafter.fn, sendAlert: recordingAlert(sent) }));
@@ -472,7 +472,7 @@ describe('when no nudge job is opened', () => {
     const other = await withBusiness(B, (db) => createLedgerItem(db, base({ description: 'אחר' }), { by: 'boss' }));
     const item = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
     // One nudge already went out today (10:00 local), on another item.
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO ledger_events (event_id, business_id, item_id, kind, by_whom, at)
        VALUES ('LE-x', $1, $2, 'nudged', 'system', '2026-11-03T07:00:00Z')`,
       [B, other.itemId],
@@ -490,7 +490,7 @@ describe('when no nudge job is opened', () => {
       expect(await jobCount()).toBe(0);
 
       // A nudge yesterday (local) does not count against today.
-      await getPool().query(`UPDATE ledger_events SET at = '2026-11-02T21:59:00Z' WHERE event_id = 'LE-x'`);
+      await testDb().query(`UPDATE ledger_events SET at = '2026-11-02T21:59:00Z' WHERE event_id = 'LE-x'`);
       const next = await withBusiness(B, (db) => openNudge(db, item, NUDGE_SLOT, { active, drafter: drafter.fn, now: NOW }));
       expect(next.outcome).toBe('opened');
     } finally {
@@ -506,9 +506,9 @@ describe('the nudge job carries no exemption', () => {
     await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, drafter: stubDrafter().fn, sendAlert: recordingAlert([]) }));
     const jobId = await nudgeJobId(item.itemId);
 
-    const bi = await getPool().query(`SELECT 1 FROM boss_instructions WHERE job_id = $1`, [jobId]);
+    const bi = await testDb().query(`SELECT 1 FROM boss_instructions WHERE job_id = $1`, [jobId]);
     expect(bi.rowCount).toBe(0);
-    const auth = await getPool().query(`SELECT 1 FROM job_authorizations WHERE job_id = $1`, [jobId]);
+    const auth = await testDb().query(`SELECT 1 FROM job_authorizations WHERE job_id = $1`, [jobId]);
     expect(auth.rowCount).toBe(0);
 
     const stored = await withBusiness(B, (db) => loadPlanBody(db, jobId));

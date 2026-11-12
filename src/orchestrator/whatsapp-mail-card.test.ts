@@ -8,7 +8,7 @@
  * wrong reason.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import {
   NOON,
@@ -119,7 +119,7 @@ function door(h: Harness, planner: (r: PlanRequest) => Promise<PlanOutcome> = ne
 }
 
 async function approvalsFor(jobId: string) {
-  const { rows } = await getPool().query<{
+  const { rows } = await testDb().query<{
     approval_id: string;
     state: string;
     decided_channel: string | null;

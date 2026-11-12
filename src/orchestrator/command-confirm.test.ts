@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -167,7 +167,7 @@ function inertRuntime(): Runtime {
 }
 
 async function reasonsTo(jobId: string, to: string): Promise<string[]> {
-  const { rows } = await getPool().query<{ reason: string }>(
+  const { rows } = await testDb().query<{ reason: string }>(
     'SELECT reason FROM job_steps WHERE job_id = $1 AND to_phase = $2',
     [jobId, to],
   );
@@ -534,7 +534,7 @@ describe('applyConfirmation', () => {
     expect(outcome).toBe('executing');
     expect(await phaseOf(jobId)).toBe('execute');
     expect((await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, jobId)))?.state).toBe('confirmed');
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       "SELECT reason FROM job_steps WHERE job_id = $1 AND to_phase = 'execute'",
       [jobId],
     );
@@ -658,7 +658,7 @@ describe('applyConfirmation', () => {
       'already_decided',
     );
     expect(await transitionsTo(jobId, 'closed')).toBe(1);
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       "SELECT reason FROM job_steps WHERE job_id = $1 AND to_phase = 'closed'",
       [jobId],
     );
@@ -689,7 +689,7 @@ describe('scheduler expiry', () => {
     expect(result.settledConfirmations).toEqual({ settled: [{ jobId: stale, to: 'closed' }], skipped: [], errored: [] });
     expect(result.expiredConfirmationsError).toBeNull();
     expect(await phaseOf(stale)).toBe('closed');
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       "SELECT reason FROM job_steps WHERE job_id = $1 AND to_phase = 'closed'",
       [stale],
     );

@@ -44,12 +44,11 @@ function buildPool(connectionString: string, max: number): pg.Pool {
 
 /**
  * The APPLICATION pool: logs in as a member of `assistant_app` — NOBYPASSRLS,
- * owner of nothing. `withBusiness` checks out from this same pool.
- *
- * Kept for now; Task 12 deletes it from production code, at which point every
- * query goes through `withBusiness`.
+ * owner of nothing. Private to this module, on purpose: every query reaches it
+ * through `withBusiness` (or, for the one server-wide throttle, `withNoBusiness`),
+ * never as a bare pool that carries no business (spec §5.2).
  */
-export function getPool(): pg.Pool {
+function appPool(): pg.Pool {
   pool ??= buildPool(config.databaseUrl, appPoolMax);
   return pool;
 }
@@ -83,6 +82,16 @@ export async function __setAppPoolMaxForTest(max: number): Promise<void> {
   pool = undefined;
   appPoolMax = max;
   await old?.end();
+}
+
+/**
+ * Test-only: the bare app pool, for the tests that must check out the very
+ * client `withBusiness` just released (`max: 1`) or count its connections.
+ * Throws outside tests — production code has no unscoped app connection.
+ */
+export function __appPoolForTest(): pg.Pool {
+  if (!config.isTest) throw new Error('__appPoolForTest is test-only');
+  return appPool();
 }
 
 export type Queryable = Pick<pg.PoolClient, 'query'>;
@@ -159,7 +168,7 @@ export async function withBusiness<T>(
   fn: (db: BusinessDb) => Promise<T>,
 ): Promise<T> {
   assertBusinessId(businessId);
-  const client = await getPool().connect();
+  const client = await appPool().connect();
   let destroy = false;
   try {
     try {
@@ -198,7 +207,7 @@ export async function withBusiness<T>(
  * rule as `withBusiness` — anything but idle is destroyed.
  */
 export async function withNoBusiness<T>(fn: (db: Queryable) => Promise<T>): Promise<T> {
-  const client = await getPool().connect();
+  const client = await appPool().connect();
   let destroy = false;
   try {
     try {
@@ -244,33 +253,6 @@ export async function withBusinessTransaction<T>(
   fn: (tx: BusinessDb) => Promise<T>,
 ): Promise<T> {
   return withBusiness(businessId, (db) => transaction(db, fn));
-}
-
-/**
- * Run `fn` inside a transaction, rolling back on any throw.
- *
- * Every write that must be atomic with its audit entry goes through here —
- * "the memory write and its audit record land in the same transaction" is the
- * property that makes the trail trustworthy (docs/06-memory.md).
- */
-export async function withTransaction<T>(
-  fn: (tx: pg.PoolClient) => Promise<T>,
-): Promise<T> {
-  const client = await getPool().connect();
-  try {
-    await client.query('BEGIN');
-    const result = await fn(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => {
-      // Rollback failure means the connection is already broken; the original
-      // error is the one worth propagating.
-    });
-    throw error;
-  } finally {
-    client.release();
-  }
 }
 
 /**

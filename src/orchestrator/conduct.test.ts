@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { getPool, withBusiness } from '../db/pool.js';
+import { withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -140,7 +140,7 @@ describe('conductPendingDocuments', () => {
     }));
 
     expect(result.carded).toBe(1);
-    const { rows } = await getPool().query<{ approval_id: string }>(
+    const { rows } = await testDb().query<{ approval_id: string }>(
       `SELECT approval_id FROM approval_requests`,
     );
     const approvalId = rows[0]?.approval_id;
@@ -177,7 +177,7 @@ describe('conductPendingDocuments', () => {
     // failed send is load-bearing.
     expect(result.carded).toBe(1);
     expect(result.failed).toBe(0);
-    const jobs = await getPool().query<{ phase: string }>(
+    const jobs = await testDb().query<{ phase: string }>(
       `SELECT phase FROM jobs WHERE business_id = $1`,
       [BUSINESS],
     );
@@ -185,7 +185,7 @@ describe('conductPendingDocuments', () => {
 
     // And the failure is on the audit chain under the same code the gate
     // writes, not swallowed.
-    const audit = await getPool().query<{ reason: string; kind: string }>(
+    const audit = await testDb().query<{ reason: string; kind: string }>(
       `SELECT reason, kind FROM audit_log WHERE business_id = $1 AND kind = 'incident'`,
       [BUSINESS],
     );
@@ -203,12 +203,12 @@ describe('conductPendingDocuments', () => {
     }));
 
     expect(result.carded).toBe(1);
-    const { rows } = await getPool().query<{ state: string; job_id: string }>(
+    const { rows } = await testDb().query<{ state: string; job_id: string }>(
       `SELECT state, job_id FROM approval_requests`,
     );
     expect(rows[0]?.state).toBe('pending');
 
-    const jobs = await getPool().query<{ provenance: string; phase: string }>(
+    const jobs = await testDb().query<{ provenance: string; phase: string }>(
       `SELECT provenance, phase FROM jobs WHERE business_id = $1`,
       [BUSINESS],
     );
@@ -243,12 +243,12 @@ describe('conductPendingDocuments', () => {
     }));
     expect(result.carded).toBe(1);
 
-    const jobs = await getPool().query<{ job_id: string }>(
+    const jobs = await testDb().query<{ job_id: string }>(
       `SELECT job_id FROM jobs WHERE business_id = $1`, [BUSINESS]);
     const jobId = jobs.rows[0]?.job_id;
     expect(jobId).toBeTruthy();
 
-    const plans = await getPool().query<{ plan: unknown }>(
+    const plans = await testDb().query<{ plan: unknown }>(
       `SELECT plan FROM job_plans WHERE business_id = $1 AND job_id = $2`, [BUSINESS, jobId]);
     expect(plans.rows).toHaveLength(1);
 
@@ -285,7 +285,7 @@ describe('conductPendingDocuments', () => {
     // transition, so without this assertion the test held whether or not
     // that transition ran at all — the third instance of that pattern in
     // this plan. The job must actually close, not sit in `plan` forever.
-    const jobs = await getPool().query<{ phase: string }>(
+    const jobs = await testDb().query<{ phase: string }>(
       `SELECT phase FROM jobs WHERE business_id = $1`,
       [BUSINESS],
     );
@@ -306,7 +306,7 @@ describe('conductPendingDocuments', () => {
 
     expect(result.ceilingReached).toBe(true);
     expect(d.calls.reads, 'the second document must not be read').toBe(1);
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       `SELECT count(*)::text AS n FROM document_readings WHERE business_id = $1`,
       [BUSINESS],
     );
@@ -314,7 +314,7 @@ describe('conductPendingDocuments', () => {
 
     // M6: the test's own title is "leaves the rest for tomorrow" — assert
     // that, not just that the first document's reading count stopped at one.
-    const docs = await getPool().query<{ read_attempts: number }>(
+    const docs = await testDb().query<{ read_attempts: number }>(
       `SELECT read_attempts FROM documents WHERE business_id = $1 ORDER BY created_at ASC`,
       [BUSINESS],
     );
@@ -350,7 +350,7 @@ describe('conductPendingDocuments', () => {
 
     expect(result.failed).toBe(1);
     expect(result.carded, 'the second document must still get its card').toBe(1);
-    const { rows } = await getPool().query<{ read_attempts: number; read_error: string }>(
+    const { rows } = await testDb().query<{ read_attempts: number; read_error: string }>(
       `SELECT read_attempts, read_error FROM documents WHERE read_attempts > 0`,
     );
     expect(rows[0]?.read_attempts).toBe(1);
@@ -363,7 +363,7 @@ describe('conductPendingDocuments', () => {
     // `closeVerifiedJobs` selects `verify`/`remember` — so a job left there
     // is not resting, it is leaked forever. The first job must be closed out
     // to `failed`; the second must still reach its card.
-    const jobs = await getPool().query<{ phase: string }>(
+    const jobs = await testDb().query<{ phase: string }>(
       `SELECT phase FROM jobs WHERE business_id = $1 ORDER BY created_at ASC`,
       [BUSINESS],
     );
@@ -449,7 +449,7 @@ describe('conductPendingDocuments', () => {
     // silently indistinguishable from "never attempted".
     expect(result.verificationFailed).toBe(1);
 
-    const jobs = await getPool().query<{ title: string | null; phase: string }>(
+    const jobs = await testDb().query<{ title: string | null; phase: string }>(
       `SELECT title, phase FROM jobs WHERE business_id = $1 ORDER BY created_at ASC`,
       [BUSINESS],
     );
@@ -534,7 +534,7 @@ describe('conductPendingDocuments', () => {
     // Not a failure — the delegation opened cleanly.
     expect(result.verificationFailed).toBe(0);
 
-    const jobs = await getPool().query<{ title: string | null; phase: string }>(
+    const jobs = await testDb().query<{ title: string | null; phase: string }>(
       `SELECT title, phase FROM jobs WHERE business_id = $1 ORDER BY created_at ASC`,
       [BUSINESS],
     );
@@ -580,7 +580,7 @@ describe('conductPendingDocuments', () => {
     expect(result.carded).toBe(1);
     expect(result.verificationFailed).toBe(0);
 
-    const jobs = await getPool().query<{ title: string | null; phase: string }>(
+    const jobs = await testDb().query<{ title: string | null; phase: string }>(
       `SELECT title, phase FROM jobs WHERE business_id = $1 ORDER BY created_at ASC`,
       [BUSINESS],
     );
@@ -608,7 +608,7 @@ describe('conductPendingDocuments', () => {
     expect(result.carded).toBe(1);
     expect(result.verificationFailed).toBe(0);
 
-    const jobs = await getPool().query<{ job_id: string; title: string | null }>(
+    const jobs = await testDb().query<{ job_id: string; title: string | null }>(
       `SELECT job_id, title FROM jobs WHERE business_id = $1 ORDER BY created_at ASC`,
       [BUSINESS],
     );
@@ -640,7 +640,7 @@ describe('conductPendingDocuments', () => {
     }));
     expect(result.carded).toBe(1);
 
-    const jobs = await getPool().query<{ job_id: string; title: string | null }>(
+    const jobs = await testDb().query<{ job_id: string; title: string | null }>(
       `SELECT job_id, title FROM jobs WHERE business_id = $1 ORDER BY created_at ASC`,
       [BUSINESS],
     );
@@ -669,7 +669,7 @@ describe('conductPendingDocuments', () => {
     }));
     expect(result.carded).toBe(1);
 
-    const jobs = await getPool().query<{ job_id: string }>(
+    const jobs = await testDb().query<{ job_id: string }>(
       `SELECT job_id FROM jobs WHERE business_id = $1 ORDER BY created_at ASC`,
       [BUSINESS],
     );

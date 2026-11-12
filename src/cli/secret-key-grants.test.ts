@@ -13,8 +13,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { putSecret, storedCredentials } from '../governance/credential-store.js';
 import { KEY_BYTES, loadMasterKey, writeKeyState } from '../governance/master-key.js';
 import {
@@ -25,7 +24,7 @@ import {
 } from '../governance/oauth-grants.js';
 import type { WriteGrantInput } from '../governance/oauth-grants.js';
 import { decryptSecret, encryptSecret } from '../governance/secret-cipher.js';
-import { resetDatabase, testDb } from '../test/db.js';
+import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { platformAad, putPlatformSecret, resolvePlatformSecret } from '../tenancy/platform-credentials.js';
 import { closePlatformPool } from '../db/platform-pool.js';
 import { runSecretKeyCli } from './secret-key.js';
@@ -33,7 +32,7 @@ import type { SecretKeyCliDeps } from './secret-key.js';
 
 const OPERATOR = 'operator@example.com';
 const PASSPHRASE = 'correct horse battery staple';
-const BUSINESS = config.businessId;
+const BUSINESS = TEST_BUSINESS;
 
 let DIR: string;
 let KEY_PATH: string;
@@ -81,7 +80,7 @@ describe('rotate re-encrypts oauth_grants', () => {
   it('re-encrypts OAuth grants too, so rotation does not kill every connection', async () => {
     const OLD_KEY = randomBytes(KEY_BYTES);
     await writeFile(KEY_PATH, OLD_KEY, { mode: 0o600 });
-    await writeKeyState(OLD_KEY, 'KEY-old', { businessId: BUSINESS });
+    await writeKeyState(OLD_KEY, 'KEY-old', testDb());
     await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, OLD_KEY));
 
     await runRotate();
@@ -108,7 +107,7 @@ describe('rotate re-encrypts oauth_grants', () => {
   it('re-encrypts a revoked grant too, so the evidence it existed does not go dark', async () => {
     const OLD_KEY = randomBytes(KEY_BYTES);
     await writeFile(KEY_PATH, OLD_KEY, { mode: 0o600 });
-    await writeKeyState(OLD_KEY, 'KEY-old', { businessId: BUSINESS });
+    await writeKeyState(OLD_KEY, 'KEY-old', testDb());
     await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, OLD_KEY));
 
     const revoked = await withBusiness(BUSINESS, (bdb) => revokeGrant(bdb, GRANT.system, OPERATOR));
@@ -126,7 +125,7 @@ describe('rotate re-encrypts oauth_grants', () => {
     // The public read paths still refuse a revoked row after rotation — that
     // is unchanged and correct. What must have changed is the key the row
     // opens under, checked the same way `rotate` itself checks each row.
-    const { rows } = await getPool().query<{ ciphertext: Buffer; nonce: Buffer }>(
+    const { rows } = await testDb().query<{ ciphertext: Buffer; nonce: Buffer }>(
       'SELECT ciphertext, nonce FROM oauth_grants WHERE business_id = $1 AND system = $2',
       [BUSINESS, GRANT.system],
     );
@@ -153,7 +152,7 @@ describe('rotate re-encrypts oauth_grants', () => {
   it('aborts the whole rotation, leaving credentials and grants untouched, when a grant fails to decrypt', async () => {
     const OLD_KEY = randomBytes(KEY_BYTES);
     await writeFile(KEY_PATH, OLD_KEY, { mode: 0o600 });
-    await writeKeyState(OLD_KEY, 'KEY-old', { businessId: BUSINESS });
+    await writeKeyState(OLD_KEY, 'KEY-old', testDb());
     await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, OLD_KEY));
     await withBusiness(BUSINESS, (bdb) => writeGrant(bdb, { ...GRANT }, OLD_KEY));
 
@@ -165,7 +164,7 @@ describe('rotate re-encrypts oauth_grants', () => {
       wrongKey,
       grantAad(BUSINESS, 'other-system'),
     );
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO oauth_grants
          (business_id, system, provider, credential_ref, account, scopes,
           ciphertext, nonce, key_id, granted_by)
@@ -211,7 +210,7 @@ describe('rotate re-encrypts platform_credentials', () => {
   it('re-seals the server secrets too, so resolvePlatformSecret answers under the new key', async () => {
     const OLD_KEY = randomBytes(KEY_BYTES);
     await writeFile(KEY_PATH, OLD_KEY, { mode: 0o600 });
-    await writeKeyState(OLD_KEY, 'KEY-old', { businessId: BUSINESS });
+    await writeKeyState(OLD_KEY, 'KEY-old', testDb());
     await putPlatformSecret('GOOGLE_OAUTH_CLIENT_SECRET', 'platform-client-secret', OLD_KEY, OPERATOR);
 
     await runRotate();
@@ -225,7 +224,7 @@ describe('rotate re-encrypts platform_credentials', () => {
   it('aborts the whole rotation, leaving every table untouched, when a platform secret fails to open', async () => {
     const OLD_KEY = randomBytes(KEY_BYTES);
     await writeFile(KEY_PATH, OLD_KEY, { mode: 0o600 });
-    await writeKeyState(OLD_KEY, 'KEY-old', { businessId: BUSINESS });
+    await writeKeyState(OLD_KEY, 'KEY-old', testDb());
     await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, OLD_KEY));
     await putPlatformSecret('GOOGLE_OAUTH_CLIENT_ID', 'good-client-id', OLD_KEY, OPERATOR);
     // A platform row sealed under a key this installation never held.
@@ -242,5 +241,67 @@ describe('rotate re-encrypts platform_credentials', () => {
     expect((await loadMasterKey(KEY_PATH)).equals(OLD_KEY)).toBe(true);
     expect((await storedCredentials(OLD_KEY).resolve('ONE', BUSINESS))?.value).toBe('first-secret');
     expect(await resolvePlatformSecret('GOOGLE_OAUTH_CLIENT_ID', OLD_KEY)).toBe('good-client-id');
+  });
+});
+
+describe('rotate covers every business on the server', () => {
+  const OTHER = 'test-business-rotate-other';
+
+  /**
+   * The master key belongs to the server (spec §5.9), so one rotation moves
+   * every business's rows — not only the business an installation used to
+   * be configured for — and the server's own secrets with them. Two
+   * businesses, each with a secret and a grant, plus a platform secret: all
+   * five open under the new key and none under the old.
+   */
+  it('rotation re-encrypts every business\'s secrets and platform secrets in one transaction', async () => {
+    const OLD_KEY = randomBytes(KEY_BYTES);
+    await writeFile(KEY_PATH, OLD_KEY, { mode: 0o600 });
+    await writeKeyState(OLD_KEY, 'KEY-old', testDb());
+    for (const business of [BUSINESS, OTHER]) {
+      await withBusiness(business, (bdb) => putSecret(bdb, { ref: 'ONE', value: `secret-of-${business}`, updatedBy: OPERATOR }, OLD_KEY));
+      await withBusiness(business, (bdb) => writeGrant(bdb, { ...GRANT, refreshToken: `token-of-${business}` }, OLD_KEY));
+    }
+    await putPlatformSecret('GOOGLE_OAUTH_CLIENT_SECRET', 'platform-client-secret', OLD_KEY, OPERATOR);
+
+    await runRotate();
+
+    const newKey = await loadMasterKey(KEY_PATH);
+    expect(newKey.equals(OLD_KEY)).toBe(false);
+    for (const business of [BUSINESS, OTHER]) {
+      expect((await storedCredentials(newKey).resolve('ONE', business))?.value).toBe(`secret-of-${business}`);
+      expect(await storedCredentials(OLD_KEY).resolve('ONE', business)).toBeNull();
+      expect((await withBusiness(business, (bdb) => readGrantBySystem(bdb, GRANT.system, newKey)))?.refreshToken).toBe(
+        `token-of-${business}`,
+      );
+    }
+    expect(await resolvePlatformSecret('GOOGLE_OAUTH_CLIENT_SECRET', newKey)).toBe('platform-client-secret');
+    // The server's key state moved with them: one row, naming the new key.
+    const { rows } = await testDb().query<{ key_id: string }>('SELECT key_id FROM server_key_state');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.key_id).not.toBe('KEY-old');
+  });
+
+  it('a row of another business that will not open leaves every business untouched', async () => {
+    const OLD_KEY = randomBytes(KEY_BYTES);
+    await writeFile(KEY_PATH, OLD_KEY, { mode: 0o600 });
+    await writeKeyState(OLD_KEY, 'KEY-old', testDb());
+    await withBusiness(BUSINESS, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, OLD_KEY));
+    await putPlatformSecret('GOOGLE_OAUTH_CLIENT_ID', 'good-client-id', OLD_KEY, OPERATOR);
+    // The other business's secret, sealed under a key the server never held.
+    const corrupted = encryptSecret('unreadable', randomBytes(KEY_BYTES), { businessId: OTHER, ref: 'BROKEN' });
+    await testDb().query(
+      `INSERT INTO credentials (business_id, ref, ciphertext, nonce, key_id, updated_by)
+       VALUES ($1, 'BROKEN', $2, $3, 'KEY-old', 'test')`,
+      [OTHER, corrupted.ciphertext, corrupted.nonce],
+    );
+
+    await expect(runRotate()).rejects.toThrow(/BROKEN/);
+
+    expect((await loadMasterKey(KEY_PATH)).equals(OLD_KEY)).toBe(true);
+    expect((await storedCredentials(OLD_KEY).resolve('ONE', BUSINESS))?.value).toBe('first-secret');
+    expect(await resolvePlatformSecret('GOOGLE_OAUTH_CLIENT_ID', OLD_KEY)).toBe('good-client-id');
+    const { rows } = await testDb().query<{ key_id: string }>('SELECT key_id FROM server_key_state');
+    expect(rows.map((row) => row.key_id)).toEqual(['KEY-old']);
   });
 });

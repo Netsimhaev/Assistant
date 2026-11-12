@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import {
   claimMail, getCursor, insertInvoice, listInvoices, mailReadsToday, recordIncoming, searchMail,
   setCursor, settleMail, staleClaimsToReceived, type IncomingMail,
@@ -78,7 +78,7 @@ describe('inbox store', () => {
     // Rows with no document are not bound by it.
     expect(await withBusiness(BUSINESS, (db) => insertInvoice(db, { ...inv, documentId: null }))).not.toBeNull();
     expect(await withBusiness(BUSINESS, (db) => insertInvoice(db, { ...inv, documentId: null }))).not.toBeNull();
-    const { rows } = await getPool().query('SELECT invoice_number FROM mail_invoices WHERE business_id = $1 AND document_id = $2', [BUSINESS, 'DOC-1']);
+    const { rows } = await testDb().query('SELECT invoice_number FROM mail_invoices WHERE business_id = $1 AND document_id = $2', [BUSINESS, 'DOC-1']);
     expect(rows).toEqual([{ invoice_number: '1' }]);
   });
 
@@ -99,7 +99,7 @@ describe('inbox store', () => {
     await withBusiness(BUSINESS, (db) => recordIncoming(db, mail({ providerMessageId: 'c' })));
     await withBusiness(BUSINESS, (db) => settleMail(db, a.mailId, { state: 'triaged' }));
     await withBusiness(BUSINESS, (db) => settleMail(db, b.mailId, { state: 'triaged' }));
-    await getPool().query(`UPDATE mail_messages SET triaged_at = now() - interval '2 days' WHERE mail_id = $1`, [b.mailId]);
+    await testDb().query(`UPDATE mail_messages SET triaged_at = now() - interval '2 days' WHERE mail_id = $1`, [b.mailId]);
     expect(await withBusiness(BUSINESS, (db) => mailReadsToday(db))).toBe(1);
   });
   it('recordIncoming strips NUL from every text field, so a hostile mail cannot stall the poll', async () => {
@@ -126,14 +126,14 @@ describe('inbox store', () => {
     if (a === null || b === null) throw new Error('setup');
     expect(await withBusiness(BUSINESS, (db) => claimMail(db, a.mailId))).toBe(true);
     expect(await withBusiness(BUSINESS, (db) => claimMail(db, b.mailId))).toBe(true);
-    const { rows } = await getPool().query<{ claimed_at: Date | null }>(
+    const { rows } = await testDb().query<{ claimed_at: Date | null }>(
       'SELECT claimed_at FROM mail_messages WHERE mail_id = $1', [b.mailId],
     );
     expect(rows[0]?.claimed_at).not.toBeNull();
-    await getPool().query("UPDATE mail_messages SET claimed_at = now() - interval '31 minutes' WHERE mail_id = $1", [a.mailId]);
+    await testDb().query("UPDATE mail_messages SET claimed_at = now() - interval '31 minutes' WHERE mail_id = $1", [a.mailId]);
 
     expect(await withBusiness(BUSINESS, (db) => staleClaimsToReceived(db, 30))).toBe(1);
-    const { rows: states } = await getPool().query<{ provider_message_id: string; state: string }>(
+    const { rows: states } = await testDb().query<{ provider_message_id: string; state: string }>(
       'SELECT provider_message_id, state FROM mail_messages ORDER BY provider_message_id',
     );
     expect(states).toEqual([

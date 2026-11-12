@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { CharterConnection } from '../domain/connection.js';
@@ -20,7 +20,7 @@ const BUSINESS = 'test-business';
  * `ramp-floor.test.ts`'s job; this reads what was actually written.
  */
 async function storedLevel(actionClass: string, businessId: string): Promise<string | undefined> {
-  const { rows } = await getPool().query<{ level: string }>(
+  const { rows } = await testDb().query<{ level: string }>(
     'SELECT level FROM autonomy_ramp WHERE business_id = $1 AND action_class = $2',
     [businessId, actionClass],
   );

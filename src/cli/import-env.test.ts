@@ -12,9 +12,8 @@ import { MICROSOFT_CLIENT_ID_REF } from '../orchestrator/adapters/microsoft-toke
 import { GREEN_API_TOKEN_REF, NOTIFY_SMTP_PASS_REF } from '../orchestrator/runtime.js';
 import { putPlatformSecret, resolvePlatformSecret } from '../tenancy/platform-credentials.js';
 import { loadRuntimeSettings } from '../tenancy/runtime-settings.js';
-import { registerBusiness, resetDatabase } from '../test/db.js';
+import { registerBusiness, resetDatabase, testDb } from '../test/db.js';
 import { IMPORT_OPERATOR, main } from './import-env.js';
-import { testDb } from '../test/db.js';
 
 const BUSINESS = 'test-import-env';
 let DIR: string;
@@ -45,7 +44,7 @@ beforeEach(async () => {
   KEY = randomBytes(KEY_BYTES);
   KEY_PATH = join(DIR, 'master.key');
   await writeFile(KEY_PATH, KEY, { mode: 0o600 });
-  await writeKeyState(KEY, 'key-1');
+  await writeKeyState(KEY, 'key-1', testDb());
 });
 
 afterEach(async () => {

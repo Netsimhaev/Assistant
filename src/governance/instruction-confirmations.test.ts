@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import type { Plan } from '../domain/plan.js';
 import { planHashOf } from '../orchestrator/plan-store.js';
 import {
@@ -45,7 +45,7 @@ const OPTION_A: ConfirmationOption = { label: 'דנה כהן', planHash: HASH_A,
 const OPTION_B: ConfirmationOption = { label: 'דנה לוי', planHash: HASH_B, plan: PLAN_B, contactSource: 'unverified' };
 
 async function presentedMinutesAgo(jobId: string, minutes: number): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `UPDATE instruction_confirmations SET presented_at = now() - make_interval(mins => $2) WHERE job_id = $1`,
     [jobId, minutes],
   );
@@ -56,7 +56,7 @@ async function seed(jobId: string, businessId = BUSINESS, options = [OPTION_A, O
 }
 
 async function stateOf(jobId: string, businessId: string): Promise<string | undefined> {
-  const { rows } = await getPool().query<{ state: string }>(
+  const { rows } = await testDb().query<{ state: string }>(
     'SELECT state FROM instruction_confirmations WHERE business_id = $1 AND job_id = $2',
     [businessId, jobId],
   );
@@ -131,7 +131,7 @@ describe('instruction confirmations', () => {
     await seed('OLD-CONFIRMED');
     await seed('OLD-OTHER', OTHER);
     expect(await withBusiness(BUSINESS, (bdb) => confirmChoice(bdb, 'OLD-CONFIRMED', HASH_A, 'owner'))).toBe(true);
-    await getPool().query(
+    await testDb().query(
       `UPDATE instruction_confirmations SET presented_at = now() - interval '2 hours'
         WHERE job_id IN ('OLD', 'OLD-CONFIRMED', 'OLD-OTHER')`,
     );
@@ -238,7 +238,7 @@ describe('instruction confirmations', () => {
   it('the database refuses a confirmed row without a chosen hash', async () => {
     await seed('J1');
     await expect(
-      getPool().query(`UPDATE instruction_confirmations SET state = 'confirmed' WHERE job_id = 'J1'`),
+      testDb().query(`UPDATE instruction_confirmations SET state = 'confirmed' WHERE job_id = 'J1'`),
     ).rejects.toThrow(/chosen_iff_confirmed/);
   });
 });

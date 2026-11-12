@@ -31,7 +31,6 @@
  * same value, so the cipher's binding is the only thing standing behind a
  * `WHERE` clause that is wrong in some way we have not thought of.
  */
-import { config } from '../config.js';
 import { acquireAdvisoryLock, transaction, withBusiness } from '../db/pool.js';
 import type { BusinessDb, Queryable } from '../db/pool.js';
 import { createCredentialHandle } from '../orchestrator/adapters/types.js';
@@ -72,7 +71,7 @@ export interface SecretSummary {
 
 /**
  * The business is not a field here: it is the `BusinessDb` `putSecret`
- * takes, required, with no fallback to `config.businessId` — the same rule
+ * takes, required, with no fallback to a configured business — the same rule
  * the read path states at length in `credentials.ts`. A secret written under
  * the wrong business is a secret another customer's `resolve` can reach, and
  * one source for it means the connection and the AAD cannot disagree.
@@ -129,28 +128,25 @@ function assertLegalRef(ref: string): void {
 }
 
 /**
- * The key id the installation's rows are being sealed under, read from
- * `credential_key_state` rather than accepted from the caller.
+ * The key id the server's rows are being sealed under, read from
+ * `server_key_state` rather than accepted from the caller.
  *
  * A caller that supplies its own key id can write a row labelled with one key
  * and sealed with another — a row that opens for nobody, discovered only when
  * a customer's send fails. There is no parameter for it anywhere in this
  * module.
  *
- * `businessId` here is the installation's own (`config.businessId`), not the
- * secret's: the key is per-installation and this table holds one row, so it
- * is bookkeeping rather than an authorisation decision. The read path above
- * is where an omitted business would hand one customer another's secret, and
- * that path has no default at all.
+ * There is no business in this read at all: the key is the server's (spec
+ * §5.9) and the table holds exactly one row, so it is bookkeeping rather than
+ * an authorisation decision. The read path above is where an omitted business
+ * would hand one customer another's secret, and that path has no default at
+ * all.
  *
  * Exported for `oauth-grants.ts`, which seals rows under the same live key id
  * and must not read the key-state table a second way.
  */
 export async function liveKeyId(db: Queryable): Promise<string> {
-  const { rows } = await db.query<{ key_id: string }>(
-    'SELECT key_id FROM credential_key_state WHERE business_id = $1',
-    [config.businessId], // TENANCY-TODO(task 12)
-  );
+  const { rows } = await db.query<{ key_id: string }>('SELECT key_id FROM server_key_state');
   const row = rows[0];
   if (row === undefined) {
     throw new CredentialStoreError(
@@ -264,7 +260,7 @@ export async function putSecret(
 
   const write = async (db: BusinessDb): Promise<void> => {
     await acquireAdvisoryLock(db, ROTATION_LOCK_SCOPE);
-    await verifyKeyState(key, { db });
+    await verifyKeyState(key, db);
     const keyId = await liveKeyId(db);
 
     const sealed = encryptSecret(input.value, key, {

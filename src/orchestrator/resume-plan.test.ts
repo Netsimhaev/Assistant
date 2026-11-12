@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -393,7 +393,7 @@ describe('a resumed plan does not re-run what already ran', () => {
     expect(first.steps[0]?.externalId).toBe('MSG-1');
 
     // Written down, not merely returned: `verify` reads it after the resume.
-    const { rows } = await getPool().query<{ step_id: string; external_id: string | null }>(
+    const { rows } = await testDb().query<{ step_id: string; external_id: string | null }>(
       'SELECT step_id, external_id FROM job_step_results WHERE job_id = $1',
       [job.jobId],
     );
@@ -624,7 +624,7 @@ describe('re-planning is refused only over work that happened', () => {
     expect(sent).toHaveLength(1);
 
     // The job is bound to the new plan now, not the abandoned one.
-    const { rows } = await getPool().query<{ plan_hash: string }>(
+    const { rows } = await testDb().query<{ plan_hash: string }>(
       'SELECT plan_hash FROM job_plans WHERE job_id = $1',
       [job.jobId],
     );
@@ -893,7 +893,7 @@ describe('a dispatched call whose outcome nobody knows is not "nothing ran"', ()
     // `performed` is `null`, not `false` — ruling 4 (task 8, fix round 1): a
     // timeout carries no claim either way, and `false` here would be a value
     // nobody actually read off anything.
-    const { rows } = await getPool().query<{
+    const { rows } = await testDb().query<{
       status: string;
       external_id: string | null;
       performed: boolean | null;
@@ -936,7 +936,7 @@ describe('a dispatched call whose outcome nobody knows is not "nothing ran"', ()
     // The unknown row was promoted rather than left to re-run forever —
     // `performed` along with `status`, from `null` to the real boolean the
     // successful resume actually knows (ruling 5).
-    const { rows } = await getPool().query<{
+    const { rows } = await testDb().query<{
       status: string;
       external_id: string | null;
       performed: boolean | null;

@@ -1,8 +1,8 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
@@ -151,7 +151,7 @@ describe('what an erasure leaves behind', () => {
       provenance: 'boss',
       title: `מייל אל ${PROBE}`,
     }));
-    const db = getPool();
+    const db = testDb();
 
     await db.query(
       `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
@@ -761,7 +761,7 @@ describe('what an erasure leaves behind', () => {
       provenance: 'boss',
       title: 'משימה רגילה שלא קשורה לאיש',
     }));
-    const db = getPool();
+    const db = testDb();
     await db.query(
       `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
        VALUES ($1, $2, 'hp-update-only', $3::jsonb)`,
@@ -805,7 +805,7 @@ describe('what an erasure leaves behind', () => {
   it('reaches a confirmation whose name appears only in the question or only JSON-escaped in an option', async () => {
     const NAME = 'אלפא בע"מ';
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'confirmation-only' })));
-    const db = getPool();
+    const db = testDb();
     const textJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -897,7 +897,7 @@ describe('what an erasure leaves behind', () => {
       title: 'משימה רגילה שלא קשורה לאיש',
     }));
 
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO autonomy_marks (mark_id, business_id, job_id, step_id, action_class, note, marked_by)
        VALUES ('AM-note-only', $1, $2, 's1', 'email.reply', $3, 'owner@example.com')`,
       [BUSINESS, job.jobId, `לא היה צריך להעתיק את ${PROBE} בטעות`],
@@ -906,7 +906,7 @@ describe('what an erasure leaves behind', () => {
     const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PROBE }));
     await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
-    const { rows } = await getPool().query(
+    const { rows } = await testDb().query(
       'SELECT 1 FROM autonomy_marks WHERE business_id = $1 AND mark_id = $2',
       [BUSINESS, 'AM-note-only'],
     );
@@ -934,7 +934,7 @@ describe('what an erasure leaves behind', () => {
    */
   it('reaches a gov.verify job whose bound plan names the document, on a document anchor', async () => {
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'doc-anchor' })));
-    const db = getPool();
+    const db = testDb();
     const documentId = `DOC-anchor-${Date.now()}`;
 
     await db.query(
@@ -1050,7 +1050,7 @@ describe('what an erasure leaves behind', () => {
         provenance: 'boss',
         title,
       }));
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
          VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
         [BUSINESS, job.jobId, identifier],
@@ -1059,7 +1059,7 @@ describe('what an erasure leaves behind', () => {
         db,
         { jobId: job.jobId, kind: 'entity', subjectKey: identifier, body: { email: identifier } },
       ));
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO whatsapp_messages
            (id, business_id, provider_message_id, direction, sender_number,
             sender_kind, body, provider_timestamp, state, job_id)
@@ -1075,19 +1075,19 @@ describe('what an erasure leaves behind', () => {
     const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PROBE }));
     await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
-    const memories = await getPool().query<{ subject_key: string }>(
+    const memories = await testDb().query<{ subject_key: string }>(
       'SELECT subject_key FROM memories WHERE business_id=$1',
       [BUSINESS],
     );
     expect(memories.rows.map((r) => r.subject_key)).toEqual(['keeper@nowhere.example']);
 
-    const auth = await getPool().query('SELECT 1 FROM job_authorizations WHERE job_id=$1', [keptJob]);
+    const auth = await testDb().query('SELECT 1 FROM job_authorizations WHERE job_id=$1', [keptJob]);
     expect(auth.rows).toHaveLength(1);
 
-    const probeMessage = await getPool().query('SELECT 1 FROM whatsapp_messages WHERE job_id=$1', [probeJob]);
+    const probeMessage = await testDb().query('SELECT 1 FROM whatsapp_messages WHERE job_id=$1', [probeJob]);
     expect(probeMessage.rows).toHaveLength(0);
 
-    const keptMessage = await getPool().query('SELECT 1 FROM whatsapp_messages WHERE job_id=$1', [keptJob]);
+    const keptMessage = await testDb().query('SELECT 1 FROM whatsapp_messages WHERE job_id=$1', [keptJob]);
     expect(keptMessage.rows).toHaveLength(1);
   });
 
@@ -1108,12 +1108,12 @@ describe('what an erasure leaves behind', () => {
       provenance: 'boss',
       title: 'kept-job-with-whatsapp',
     }));
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
        VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
       [BUSINESS, job.jobId, PROBE],
     );
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO whatsapp_messages
          (id, business_id, provider_message_id, direction, sender_number,
           sender_kind, body, provider_timestamp, state, job_id)
@@ -1127,7 +1127,7 @@ describe('what an erasure leaves behind', () => {
 
     await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
-    const rows = await getPool().query('SELECT 1 FROM whatsapp_messages WHERE job_id=$1', [job.jobId]);
+    const rows = await testDb().query('SELECT 1 FROM whatsapp_messages WHERE job_id=$1', [job.jobId]);
     expect(rows.rows).toHaveLength(1);
   });
 
@@ -1166,7 +1166,7 @@ describe('what an erasure leaves behind', () => {
     // (if there were one) would be silent too — but there is no
     // `boss_instructions` row here at all, matching a job whose WhatsApp
     // thread was never run through the instruction door.
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO whatsapp_messages
          (id, business_id, provider_message_id, direction, sender_number,
           sender_kind, body, provider_timestamp, state, job_id)
@@ -1176,7 +1176,7 @@ describe('what an erasure leaves behind', () => {
     );
     // The SECOND message on the same job — the one that actually names the
     // contact, and the only place it is named anywhere in this job.
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO whatsapp_messages
          (id, business_id, provider_message_id, direction, sender_number,
           sender_kind, body, transcript, provider_timestamp, state, job_id)
@@ -1190,7 +1190,7 @@ describe('what an erasure leaves behind', () => {
 
     await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
-    const rows = await getPool().query('SELECT 1 FROM whatsapp_messages WHERE job_id=$1', [job.jobId]);
+    const rows = await testDb().query('SELECT 1 FROM whatsapp_messages WHERE job_id=$1', [job.jobId]);
     expect(rows.rows).toHaveLength(0);
   });
 
@@ -1208,7 +1208,7 @@ describe('what an erasure leaves behind', () => {
     // sent) — same as the `jobs` window search above it. `created_at` has a
     // `DEFAULT now()`, so both rows get it set explicitly here rather than
     // relying on insertion order to land one inside the window and one out.
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO whatsapp_messages
          (id, business_id, provider_message_id, direction, sender_number,
           sender_kind, body, provider_timestamp, state, job_id, created_at)
@@ -1216,7 +1216,7 @@ describe('what an erasure leaves behind', () => {
                '2026-01-01T12:00:00.000Z', 'received', NULL, '2026-01-01T12:00:00.000Z')`,
       [BUSINESS, PROBE, `הודעה מ-${PROBE} בחלון`],
     );
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO whatsapp_messages
          (id, business_id, provider_message_id, direction, sender_number,
           sender_kind, body, provider_timestamp, state, job_id, created_at)
@@ -1228,7 +1228,7 @@ describe('what an erasure leaves behind', () => {
     const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'window', fromIso: '2026-01-01T00:00:00.000Z', toIso: '2026-01-02T00:00:00.000Z' }));
     await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
 
-    const remaining = await getPool().query<{ id: string }>(
+    const remaining = await testDb().query<{ id: string }>(
       'SELECT id FROM whatsapp_messages WHERE business_id=$1',
       [BUSINESS],
     );
@@ -1248,7 +1248,7 @@ describe('what an erasure leaves behind', () => {
    */
   it('contact erasure deletes the mail and its reply job', async () => {
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'mail' })));
-    const db = getPool();
+    const db = testDb();
     const NAME = 'רונית_כהן';
     const SENDER = 'ronit@client.example';
     const mk = async (title: string): Promise<string> =>
@@ -1357,13 +1357,13 @@ describe('what an erasure leaves behind', () => {
       ['M-in', '2026-01-01T12:00:00.000Z'],
       ['M-out', '2026-03-01T12:00:00.000Z'],
     ] as const) {
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO mail_messages
            (mail_id, business_id, provider_message_id, thread_id, from_address, subject, received_at, body_text)
          VALUES ($1, $2, $3, 't', 'a@b.example', 's', $4, 'גוף')`,
         [mailId, BUSINESS, `pm-${mailId}`, at],
       );
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO mail_invoices (invoice_id, business_id, mail_id, supplier_address, received_at)
          VALUES ($1, $2, $3, 'a@b.example', $4)`,
         [`INV-${mailId}`, BUSINESS, mailId, at],
@@ -1375,9 +1375,9 @@ describe('what an erasure leaves behind', () => {
     expect(outcome.deleted.find((i) => i.table === 'mail_invoices')?.count).toBe(1);
     expect(outcome.deleted.find((i) => i.table === 'mail_messages')?.count).toBe(1);
 
-    const mails = await getPool().query<{ mail_id: string }>('SELECT mail_id FROM mail_messages');
+    const mails = await testDb().query<{ mail_id: string }>('SELECT mail_id FROM mail_messages');
     expect(mails.rows.map((r) => r.mail_id)).toEqual(['M-out']);
-    const invoices = await getPool().query<{ invoice_id: string }>('SELECT invoice_id FROM mail_invoices');
+    const invoices = await testDb().query<{ invoice_id: string }>('SELECT invoice_id FROM mail_invoices');
     expect(invoices.rows.map((r) => r.invoice_id)).toEqual(['INV-M-out']);
   });
 
@@ -1387,7 +1387,7 @@ describe('what an erasure leaves behind', () => {
    */
   it('removes the invoice of an erased document and keeps the mail', async () => {
     await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'mail-doc' })));
-    const db = getPool();
+    const db = testDb();
     const documentId = `DOC-inv-${Date.now()}`;
     await db.query(
       `INSERT INTO documents

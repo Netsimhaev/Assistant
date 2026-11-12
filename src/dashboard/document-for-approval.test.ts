@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { assessRisk } from '../policy/risk.js';
@@ -227,7 +227,7 @@ describe('documentForApproval', () => {
     const { readingId } = await aDocumentAndReading(BUSINESS);
     const job = await aJob(BUSINESS, bundle, 'כוונה שאינה בסכמה');
     const proposal = await aProposal(BUSINESS, readingId, job.jobId);
-    await getPool().query(
+    await testDb().query(
       `UPDATE proposals
           SET content = jsonb_set(content, '{action,intent}', '"sign_everything"')
         WHERE proposal_id = $1`,
@@ -311,7 +311,7 @@ describe('documentForApproval', () => {
     const olderProposal = await aProposal(BUSINESS, older.readingId, job.jobId);
     // Backdate it so ordering does not depend on wall-clock resolution
     // between two inserts issued microseconds apart.
-    await getPool().query(
+    await testDb().query(
       `UPDATE proposals SET created_at = now() - interval '1 hour' WHERE proposal_id = $1`,
       [olderProposal.proposalId],
     );
@@ -342,7 +342,7 @@ describe('documentForApproval', () => {
     const proposalB = await aProposal(BUSINESS, b.readingId, job.jobId);
     // Force an exact tie — one explicit, shared timestamp for both rows,
     // not "however close together the two inserts landed".
-    await getPool().query(
+    await testDb().query(
       `UPDATE proposals SET created_at = now() WHERE proposal_id IN ($1, $2)`,
       [proposalA.proposalId, proposalB.proposalId],
     );

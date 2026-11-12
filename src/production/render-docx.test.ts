@@ -3,8 +3,8 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import JSZip from 'jszip';
 import mammoth from 'mammoth';
 import { createDbImageLoader, renderDocx, type ImageLoader } from './render-docx.js';
@@ -234,7 +234,7 @@ describe('createDbImageLoader', () => {
   const rel = (n: string) => `__docx-loader-test-${process.pid}/${n}`;
 
   async function seed(id: string, business: string, storedPath: string, mediaType = 'image/png') {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO documents (document_id, business_id, source, original_name, media_type, byte_size,
                               sha256, stored_path, status)
        VALUES ($1, $2, 'manual', 'x.png', $3, 10, rpad(md5($1), 64, '0'), $4, 'extracted')`,

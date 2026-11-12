@@ -66,7 +66,7 @@ describe('logErrored', () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
-      logErrored(cleanResult());
+      logErrored(cleanResult(), null);
       expect(logSpy).not.toHaveBeenCalled();
       expect(errorSpy).not.toHaveBeenCalled();
     } finally {
@@ -82,7 +82,7 @@ describe('logErrored', () => {
         ...cleanResult(),
         expiredConfirmationsError: 'boom',
         settledConfirmations: { settled: [], skipped: [], errored: [{ jobId: 'J-1', error: 'bang' }] },
-      });
+      }, null);
       expect(errorSpy).toHaveBeenCalledWith('confirmation expiry failed: boom');
       expect(errorSpy).toHaveBeenCalledWith('confirmation for job J-1 could not be settled: bang');
     } finally {
@@ -109,7 +109,7 @@ describe('logErrored', () => {
           failed: 0,
           gap: true,
         },
-      });
+      }, null);
       const all = [...logSpy.mock.calls, ...errorSpy.mock.calls].map((c) => String(c[0])).join('\n');
       expect(all).toContain('mailbox cursor expired');
       expect(all).toContain('3 mail(s) from people had no WhatsApp channel');
@@ -132,7 +132,7 @@ describe('logErrored', () => {
         whatsappDoor: { polled: 3, instructed: 1, recordedOnly: 0, refused: 2, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, documentCardReplies: 0, confirmErrored: [], malformedSenderCount: 0 },
         whatsappReport: { reported: 0, deferred: 2, errored: ['job-a', 'job-b'] },
       };
-      logErrored(result);
+      logErrored(result, null);
 
       const logged = logSpy.mock.calls.map((call) => String(call[0])).join('\n');
       const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');
@@ -153,7 +153,7 @@ describe('logErrored', () => {
   it('says "both loops skipped" only when the door never ran', () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
-      logErrored({ ...cleanResult(), whatsappError: 'stale charter' });
+      logErrored({ ...cleanResult(), whatsappError: 'stale charter' }, null);
       const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');
       expect(errored).toContain('WhatsApp loops skipped this pass');
       expect(errored).not.toContain('WhatsApp report failed');
@@ -172,7 +172,7 @@ describe('logErrored', () => {
           confirmationReplies: 0, ledgerReplies: 0, documentCardReplies: 0, confirmErrored: [{ jobId: 'job-c', error: 'bound to nothing' }],
           malformedSenderCount: 0,
         },
-      });
+      }, null);
       const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');
       expect(errored).toContain('WhatsApp confirmation for job job-c could not be applied: bound to nothing');
     } finally {
@@ -187,7 +187,7 @@ describe('logErrored', () => {
         ...cleanResult(),
         whatsappDoor: { polled: 0, instructed: 0, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, documentCardReplies: 0, confirmErrored: [], malformedSenderCount: 0 },
         whatsappError: 'reportCandidates query rejected',
-      });
+      }, null);
       const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');
       expect(errored).toContain('WhatsApp report failed after the door ran this pass');
       expect(errored).not.toContain('WhatsApp loops skipped this pass');
@@ -212,7 +212,7 @@ describe('logErrored', () => {
       logErrored({
         ...cleanResult(),
         digest: { produced: [], screenOnly: 0, errored: 'charter stored under an older schema' },
-      });
+      }, null);
       const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');
       expect(errored).toContain('digest failed: charter stored under an older schema');
     } finally {
@@ -227,7 +227,7 @@ describe('logErrored', () => {
         ...cleanResult(),
         actionUpdates: { written: 3, emailFailed: 1, whatsappFailed: 2, skippedNotConnected: 1 },
         actionUpdatesError: 'connection reset',
-      });
+      }, null);
       const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');
       expect(errored).toContain('action updates failed: connection reset');
       expect(errored).toContain('1 email and 2 WhatsApp send(s) failed');
@@ -242,7 +242,7 @@ describe('logErrored', () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
-      logErrored({ ...cleanResult(), digest: null });
+      logErrored({ ...cleanResult(), digest: null }, null);
       expect(logSpy).not.toHaveBeenCalled();
       expect(errorSpy).not.toHaveBeenCalled();
     } finally {
@@ -262,10 +262,10 @@ describe('logErrored: document production', () => {
     resetProductionNoticeForTests();
     const s = spy();
     try {
-      logErrored(cleanResult());
+      logErrored(cleanResult(), null);
       expect(s.log).not.toHaveBeenCalled();
-      logErrored({ ...cleanResult(), documentProductions: null });
-      logErrored({ ...cleanResult(), documentProductions: null });
+      logErrored({ ...cleanResult(), documentProductions: null }, null);
+      logErrored({ ...cleanResult(), documentProductions: null }, null);
       expect(s.log).toHaveBeenCalledTimes(1);
       expect(s.log).toHaveBeenCalledWith(expect.stringMatching(/^document production did not run: /));
       expect(s.error).not.toHaveBeenCalled();
@@ -278,7 +278,7 @@ describe('logErrored: document production', () => {
   it('a thrown loop prints its error, not "did not run"', () => {
     const s = spy();
     try {
-      logErrored({ ...cleanResult(), documentProductions: null, documentProductionsError: 'boom' });
+      logErrored({ ...cleanResult(), documentProductions: null, documentProductionsError: 'boom' }, null);
       expect(s.error).toHaveBeenCalledWith('document production failed: boom');
       expect(s.log).not.toHaveBeenCalled();
     } finally {
@@ -301,7 +301,7 @@ describe('logErrored: document production', () => {
           errored: [{ productionId: 'DP-1', error: 'bang' }],
           originJobMissing: ['DP-2'],
         },
-      });
+      }, null);
       expect(s.log).toHaveBeenCalledWith(
         'document production: 5 stage move(s), 1 ready, 0 stopped at checks, 1 failed, 0 skipped',
       );

@@ -1,9 +1,8 @@
 import { randomBytes } from 'node:crypto';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { canonicalJson } from '../util/canonical.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import type { BusinessDb } from '../db/pool.js';
 import { MasterKeyError, writeKeyState } from './master-key.js';
 import {
@@ -27,9 +26,9 @@ let KEY: Buffer;
 beforeEach(async () => {
   await resetDatabase();
   KEY = randomBytes(32);
-  // The key state is per-installation and holds one row, so it is written
-  // under `config.businessId` — the same default `putSecret` reads it under.
-  await writeKeyState(KEY, KEY_ID);
+  // The key state is the server's one row (spec §5.9) — the same row
+  // `putSecret` reads, whichever business it writes for.
+  await writeKeyState(KEY, KEY_ID, testDb());
 });
 
 afterAll(async () => {
@@ -126,12 +125,12 @@ describe('storedCredentials', () => {
     // Sealed for BIZ_A, now sitting in BIZ_B's row — the hand-copied row of
     // spec §4.4. Nothing about the bytes changes; only which business the
     // query will find them under.
-    await getPool().query('UPDATE credentials SET business_id = $1 WHERE business_id = $2', [
+    await testDb().query('UPDATE credentials SET business_id = $1 WHERE business_id = $2', [
       BIZ_B,
       BIZ_A,
     ]);
 
-    const present = await getPool().query<{ n: string }>(
+    const present = await testDb().query<{ n: string }>(
       'SELECT count(*)::text AS n FROM credentials WHERE business_id = $1 AND ref = $2',
       [BIZ_B, REF],
     );
@@ -144,7 +143,7 @@ describe('storedCredentials', () => {
     await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: 'first', updatedBy: OPERATOR }, KEY));
     await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: 'second', updatedBy: 'someone-else' }, KEY));
 
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       'SELECT count(*)::text AS n FROM credentials WHERE business_id = $1 AND ref = $2',
       [BIZ_A, REF],
     );
@@ -222,7 +221,7 @@ describe('putSecret', () => {
       ).rejects.toThrow(CredentialStoreError);
     }
 
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       'SELECT count(*)::text AS n FROM credentials',
     );
     expect(rows[0]?.n).toBe('0');
@@ -231,7 +230,7 @@ describe('putSecret', () => {
   it('labels the row with the installation key id rather than one the caller chose', async () => {
     await withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY));
 
-    const { rows } = await getPool().query<{ key_id: string }>(
+    const { rows } = await testDb().query<{ key_id: string }>(
       'SELECT key_id FROM credentials WHERE business_id = $1 AND ref = $2',
       [BIZ_A, REF],
     );
@@ -243,16 +242,14 @@ describe('putSecret', () => {
       withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, randomBytes(32))),
     ).rejects.toThrow(MasterKeyError);
 
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       'SELECT count(*)::text AS n FROM credentials',
     );
     expect(rows[0]?.n).toBe('0');
   });
 
   it('refuses to write before a key exists, rather than labelling the row with nothing', async () => {
-    await getPool().query('DELETE FROM credential_key_state WHERE business_id = $1', [
-      config.businessId,
-    ]);
+    await testDb().query('DELETE FROM server_key_state');
 
     await expect(
       withBusiness(BIZ_A, (bdb) => putSecret(bdb, { ref: REF, value: SECRET, updatedBy: OPERATOR }, KEY)),
@@ -264,7 +261,7 @@ describe('putSecret', () => {
 
     // Every text column of the row, read back as text. The secret must not be
     // in any of them, and the ciphertext must not be the plaintext either.
-    const { rows } = await getPool().query<{
+    const { rows } = await testDb().query<{
       business_id: string;
       ref: string;
       updated_by: string;

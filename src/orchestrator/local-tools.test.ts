@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { config } from '../config.js';
 import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -604,7 +604,7 @@ describe('the local tool executor', () => {
       // too, not just `jobs.awaiting_envelope_id` — the original park
       // (`delegate.ts`) sets both, and omitting it here left the id
       // surviving only in the Hebrew reason string.
-      const { rows: stepRows } = await getPool().query<{ envelope_id: string | null }>(
+      const { rows: stepRows } = await testDb().query<{ envelope_id: string | null }>(
         'SELECT envelope_id FROM job_steps WHERE job_id = $1 ORDER BY id DESC LIMIT 1',
         [jobId],
       );

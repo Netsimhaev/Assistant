@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import type { DocxSpec } from '../domain/document-spec.js';
 import type { Plan } from '../domain/plan.js';
 import { DOCUMENT_SETTINGS_HE, loadDocumentSettings } from '../governance/document-settings.js';
@@ -22,7 +22,7 @@ import { attachedDocumentsForJob } from '../governance/instructions.js';
 import { buildDeliveryOptions, createDocumentCard, loadDocumentCard, typedAddressProblem } from '../production/card.js';
 import { advanceStage, createProduction, loadProduction, loadVersion, saveVersion, saveVersionCheck, type ProductionDestination } from '../production/store.js';
 import type { PlanOutcome, PlanRequest } from '../sdk/planner.js';
-import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
+import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import { businessSaveFolder } from '../test/save-root.js';
 import { buildCharter } from '../test/fixtures.js';
 import { createTestOwner, ownerLogin } from '../test/owner.js';
@@ -106,7 +106,7 @@ async function post(baseUrl: string, cookie: string, path: string, fields: Recor
 }
 
 async function deliveryJobs(): Promise<number> {
-  const { rows } = await getPool().query<{ n: string }>('SELECT count(*)::text AS n FROM document_deliveries');
+  const { rows } = await testDb().query<{ n: string }>('SELECT count(*)::text AS n FROM document_deliveries');
   return Number(rows[0]?.n ?? 0);
 }
 
@@ -215,7 +215,7 @@ describe('upload on /instruct', () => {
     });
     expect(res.status).toBeLessThan(400);
 
-    const { rows } = await getPool().query<{ document_id: string; original_name: string; stored_path: string; source: string }>(
+    const { rows } = await testDb().query<{ document_id: string; original_name: string; stored_path: string; source: string }>(
       'SELECT document_id, original_name, stored_path, source FROM documents WHERE business_id = $1',
       [B],
     );
@@ -228,7 +228,7 @@ describe('upload on /instruct', () => {
     expect(doc.source).toBe('instruction');
     expect(seen[0]?.attachedDocuments).toEqual([{ documentId: doc.document_id, name }]);
 
-    const job = await getPool().query<{ job_id: string }>('SELECT job_id FROM boss_instructions WHERE business_id = $1', [B]);
+    const job = await testDb().query<{ job_id: string }>('SELECT job_id FROM boss_instructions WHERE business_id = $1', [B]);
     expect(await withBusiness(B, (bdb) => attachedDocumentsForJob(bdb, job.rows[0]!.job_id))).toEqual([doc.document_id]);
   });
 
@@ -248,7 +248,7 @@ describe('upload on /instruct', () => {
     );
     const res = await fetch(`${baseUrl}/instruct`, { method: 'POST', headers: { cookie, 'content-type': type }, body, redirect: 'manual' });
     expect(res.status).toBe(400);
-    const { rows } = await getPool().query<{ reason: string | null; status: string }>(
+    const { rows } = await testDb().query<{ reason: string | null; status: string }>(
       'SELECT reason, status FROM documents WHERE business_id = $1',
       [B],
     );
@@ -256,7 +256,7 @@ describe('upload on /instruct', () => {
     const html = await res.text();
     expect(html).toContain(rows[0]!.reason!.slice(0, 10));
     expect(called).toBe(0);
-    const { rows: jobs } = await getPool().query('SELECT 1 FROM boss_instructions WHERE business_id = $1', [B]);
+    const { rows: jobs } = await testDb().query('SELECT 1 FROM boss_instructions WHERE business_id = $1', [B]);
     expect(jobs).toHaveLength(0);
   });
 
@@ -278,7 +278,7 @@ describe('upload on /instruct', () => {
       const res = await fetch(`${baseUrl}/instruct`, { method: 'POST', headers: { cookie, 'content-type': type }, body, redirect: 'manual' });
       expect(res.status).toBe(400);
       expect(await res.text()).toContain(reason);
-      const { rows } = await getPool().query('SELECT 1 FROM documents WHERE business_id = $1', [B]);
+      const { rows } = await testDb().query('SELECT 1 FROM documents WHERE business_id = $1', [B]);
       expect(rows).toHaveLength(0);
       expect(called).toBe(0);
     });
@@ -290,7 +290,7 @@ describe('upload on /instruct', () => {
     const { body, type } = multipart({ csrf: 'forged', text: 'x' }, { name: 'a.txt', bytes: Buffer.from('a') });
     const res = await fetch(`${baseUrl}/instruct`, { method: 'POST', headers: { cookie, 'content-type': type }, body, redirect: 'manual' });
     expect(res.status).toBe(403);
-    const { rows } = await getPool().query('SELECT 1 FROM documents');
+    const { rows } = await testDb().query('SELECT 1 FROM documents');
     expect(rows).toHaveLength(0);
   });
 });
@@ -454,7 +454,7 @@ describe('/documents', () => {
     const res = await post(baseUrl, cookie, `/documents/${a.cardId}/fix`, { text: 'להוסיף מע"מ', csrf });
     expect(res.status).toBe(303);
     expect((await withBusiness(B, (db) => loadDocumentCard(db, a.cardId)))?.state).toBe('superseded');
-    const { rows } = await getPool().query<{ n: string }>('SELECT count(*)::text AS n FROM document_productions');
+    const { rows } = await testDb().query<{ n: string }>('SELECT count(*)::text AS n FROM document_productions');
     expect(rows[0]?.n).toBe('2');
   });
 
@@ -555,13 +555,13 @@ describe('fix round 1 minors', () => {
       expect(status, `declared=${declared}`).toBe(413);
       expect(text).toContain('הקובץ גדול');
     }
-    const { rows } = await getPool().query('SELECT 1 FROM documents');
+    const { rows } = await testDb().query('SELECT 1 FROM documents');
     expect(rows).toHaveLength(0);
   });
 
   it('an unreadable charter refuses the document screens instead of guessing a zone and currency', async () => {
     const a = await card();
-    await getPool().query(
+    await testDb().query(
       `UPDATE charter_versions SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb('0'::text))
         WHERE business_id = $1`,
       [B],

@@ -32,10 +32,12 @@ import type { TenantPassReport } from './tenants.js';
  * a terminal disposition for those (an attempt counter, a dead-letter phase)
  * is still a policy call for its own change.
  */
-export function logErrored(result: SchedulerPassResult, businessId?: string): void {
+export function logErrored(result: SchedulerPassResult, businessId: string | null): void {
   // Every line names the business it is about once the scheduler runs more
-  // than one (spec §5.3). Shadowing `console` keeps each line below as it was.
-  const prefix = businessId === undefined ? '' : `[${businessId}] `;
+  // than one (spec §5.3). `null` — said, not omitted — is a pass reported on
+  // its own (the tests of this module). Shadowing `console` keeps each line
+  // below as it was.
+  const prefix = businessId === null ? '' : `[${businessId}] `;
   const console = {
     log: (message: string): void => globalThis.console.log(`${prefix}${message}`),
     error: (message: string): void => globalThis.console.error(`${prefix}${message}`),

@@ -18,7 +18,7 @@
  * that baseline with the confirmation left pending.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -135,7 +135,7 @@ describe('a confirmed boss command through the scheduler runner', () => {
     expect(result.ran).toHaveLength(1);
     expect(result.ran[0]?.status).not.toBe('done');
     expect(sent).toEqual([]);
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'policy_denial'`,
       [jobId],
     );
@@ -172,7 +172,7 @@ describe('a confirmed boss command through the scheduler runner', () => {
     expect(again.ran).toHaveLength(1);
     expect(again.ran[0]?.status).not.toBe('done');
     expect(sent).toHaveLength(1);
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM job_steps WHERE job_id = $1 ORDER BY at DESC LIMIT 1`,
       [jobId],
     );

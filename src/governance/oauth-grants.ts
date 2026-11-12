@@ -5,7 +5,7 @@
  * One row per `(business_id, system)` — one Google Calendar grant per
  * business, not per binding. The refresh token is sealed under the same
  * master key as `credentials` (`credential-store.ts`), read through the
- * same `credential_key_state` bookkeeping (`liveKeyId`, exported from that
+ * same `server_key_state` bookkeeping (`liveKeyId`, exported from that
  * module for exactly this reuse). That buys a shared key-id LABEL, and —
  * as of the task that wired it — a shared rotation loop too: `rotate`
  * (`src/cli/secret-key.ts`) re-encrypts `credentials` and `oauth_grants` in
@@ -30,8 +30,8 @@
  * never match. That is a structural guarantee, not a naming convention: no
  * blocklist has to be kept in sync for it to hold.
  *
- * The business is required everywhere here, with no fallback to
- * `config.businessId` — the same rule `CredentialSource.resolve`
+ * The business is required everywhere here, with no fallback to a
+ * configured business — the same rule `CredentialSource.resolve`
  * (`src/orchestrator/credentials.ts`) states at length. It is the
  * `BusinessDb` every function takes (`db.businessId`), so the connection and
  * the business can never disagree. An omitted business would read silently
@@ -150,7 +150,7 @@ function toSummary(row: SummaryRow): OAuthGrantSummary {
  * produces a refusal rather than a row labelled with the live key id and
  * sealed with a different one; same `liveKeyId` read, from the exported
  * function in `credential-store.ts` rather than a second query against
- * `credential_key_state`, so there is exactly one place that decides which
+ * `server_key_state`, so there is exactly one place that decides which
  * key id a freshly sealed row is labelled with; same `transaction(db, …)`
  * shape — it joins a caller's open transaction, or opens its own.
  *
@@ -164,12 +164,12 @@ export async function writeGrant(
 ): Promise<void> {
   const write = async (db: BusinessDb): Promise<void> => {
     await acquireAdvisoryLock(db, ROTATION_LOCK_SCOPE);
-    // Install-wide, exactly like `putSecret` — not `{ businessId: db.businessId, db }`.
-    // The key is per-installation (see `liveKeyId`'s own docblock); checking
+    // Server-wide, exactly like `putSecret`.
+    // The key is the server's (see `liveKeyId`'s own docblock); checking
     // it against one row while `liveKeyId` reads another is the very
     // opens-for-nobody hazard both docblocks describe, just with the mismatch
     // moved one level up.
-    await verifyKeyState(key, { db });
+    await verifyKeyState(key, db);
     const keyId = await liveKeyId(db);
     const sealed = encryptSecret(input.refreshToken, key, grantAad(db.businessId, input.system));
 
@@ -326,10 +326,10 @@ export async function listGrants(db: BusinessDb): Promise<OAuthGrantSummary[]> {
  * nothing can ever read again. Without the `rowCount` check, that same
  * "no such row" would be silently indistinguishable from success.
  *
- * Key check is install-wide (`verifyKeyState(key, { db })`, no `businessId`)
+ * Key check is server-wide (`verifyKeyState(key, db)`, no `businessId`)
  * — exactly `putSecret`'s call, and for the same reason `writeGrant`'s does:
- * it must ask the same question `liveKeyId` answers, not a different row of
- * `credential_key_state`.
+ * it must ask the same question `liveKeyId` answers, of the same one row of
+ * `server_key_state`.
  */
 export async function recordRefresh(
   db: BusinessDb,
@@ -354,7 +354,7 @@ export async function recordRefresh(
       return;
     }
     await acquireAdvisoryLock(db, ROTATION_LOCK_SCOPE);
-    await verifyKeyState(key, { db });
+    await verifyKeyState(key, db);
     const keyId = await liveKeyId(db);
     const sealed = encryptSecret(rotatedRefreshToken, key, grantAad(businessId, system));
     const result = await db.query(

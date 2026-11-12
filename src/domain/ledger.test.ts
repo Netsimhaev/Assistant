@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { LedgerFamily, LedgerStatus, isLedgerOverdue } from './ledger.js';
 import { localToInstant } from '../util/local-time.js';
 import { ledgerFamilyLabel, ledgerStatusLabel } from './labels.js';
@@ -14,7 +14,7 @@ afterAll(async () => {
 });
 
 function insertSettings(whatsapp: boolean, email: boolean, screen: boolean, modes: object) {
-  return getPool().query(
+  return testDb().query(
     `INSERT INTO ledger_settings
        (business_id, modes, to_whatsapp, to_email, to_screen, meeting_lead_minutes,
         meeting_lead_minutes_critical, due_lead_days_critical, nudge_after_business_days,
@@ -49,7 +49,7 @@ describe('migration 052 constraints', () => {
 
   it('accepts a valid settings row (the code under test runs)', async () => {
     await insertSettings(true, false, false, okModes);
-    const r = await getPool().query('SELECT count(*)::int AS n FROM ledger_settings');
+    const r = await testDb().query('SELECT count(*)::int AS n FROM ledger_settings');
     expect(r.rows[0].n).toBe(1);
   });
 

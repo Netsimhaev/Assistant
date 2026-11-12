@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import {
   claimForReport, claimMessage, conversation, recordInbound, recordOutbound, settleMessage,
   unclaimedInbound,
@@ -116,7 +116,7 @@ describe('claimForReport', () => {
   afterAll(async () => { await closePool(); });
 
   async function stateOf(id: string): Promise<string> {
-    const { rows } = await getPool().query<{ state: string }>(
+    const { rows } = await testDb().query<{ state: string }>(
       'SELECT state FROM whatsapp_messages WHERE id = $1',
       [id],
     );

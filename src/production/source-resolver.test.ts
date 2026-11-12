@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { resolveSourceDocuments } from './source-resolver.js';
 
 const B = 'test-business';
@@ -13,7 +13,7 @@ async function doc(
 ): Promise<string> {
   seq += 1;
   const id = `DOC-${String(seq).padStart(4, '0')}`;
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO documents (document_id, business_id, source, original_name, media_type, sha256, byte_size,
                             stored_path, status, created_at)
      VALUES ($1, $2, 'manual', $3, 'application/pdf', $4, 10, $5, $6, $7)`,
@@ -37,7 +37,7 @@ async function mailWith(
   business = B,
 ): Promise<void> {
   seq += 1;
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO mail_messages (mail_id, business_id, provider_message_id, thread_id, from_address, from_name,
                                 subject, received_at, attachments, state)
      VALUES ($1, $2, $3, 't', $4, $5, 's', '2026-10-02T08:00:00Z', $6::jsonb, 'triaged')`,

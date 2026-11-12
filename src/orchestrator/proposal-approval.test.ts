@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { getPool, withBusiness } from '../db/pool.js';
+import { withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -39,7 +39,7 @@ describe('raiseProposalApproval', () => {
     const approvalId = await withBusiness(BUSINESS, (db) => raiseProposalApproval(db, { jobId: null, proposal: aProposal(), bundle }));
 
     expect(approvalId).not.toBeNull();
-    const { rows } = await getPool().query<{ state: string; summary: string; detail: string }>(
+    const { rows } = await testDb().query<{ state: string; summary: string; detail: string }>(
       `SELECT state, summary, detail FROM approval_requests WHERE approval_id = $1`,
       [approvalId],
     );
@@ -50,7 +50,7 @@ describe('raiseProposalApproval', () => {
   it('says plainly that approving will not make it happen', async () => {
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const approvalId = await withBusiness(BUSINESS, (db) => raiseProposalApproval(db, { jobId: null, proposal: aProposal(), bundle }));
-    const { rows } = await getPool().query<{ detail: string }>(
+    const { rows } = await testDb().query<{ detail: string }>(
       `SELECT detail FROM approval_requests WHERE approval_id = $1`,
       [approvalId],
     );
@@ -88,7 +88,7 @@ describe('raiseProposalApproval', () => {
   it('stamps the approval\'s risk with external provenance', async () => {
     const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const approvalId = await withBusiness(BUSINESS, (db) => raiseProposalApproval(db, { jobId: null, proposal: aProposal(), bundle }));
-    const { rows } = await getPool().query<{ risk: { dimensions: { provenance: { level: string; chainDepth: number } } } }>(
+    const { rows } = await testDb().query<{ risk: { dimensions: { provenance: { level: string; chainDepth: number } } } }>(
       `SELECT risk FROM approval_requests WHERE approval_id = $1`,
       [approvalId],
     );

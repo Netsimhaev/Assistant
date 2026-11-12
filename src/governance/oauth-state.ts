@@ -28,7 +28,8 @@
  * third round-trip through an untrusted client.
  */
 import { randomBytes } from 'node:crypto';
-import type { BusinessDb, Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
+import { cleanupOAuthStates } from '../tenancy/platform.js';
 
 /**
  * How long an unconsumed state stays valid. Long enough to actually complete
@@ -62,7 +63,7 @@ export async function createState(
   // PERMANENT row holding a `code_verifier` in plaintext, consumed or not.
   // See `pruneStaleStates`'s own docblock for why here rather than a
   // scheduler pass.
-  await pruneStaleStates(db);
+  await pruneStaleStates();
   const state = randomBytes(32).toString('base64url');
   const expiresAt = new Date(Date.now() + STATE_TTL_MS).toISOString();
   await db.query(
@@ -90,16 +91,20 @@ export async function createState(
  * enough to both start ceremonies and prune after itself, with no second
  * process required to agree on when.
  *
- * **Unscoped by business id, deliberately.** This is housekeeping on rows
- * that are ALREADY DEAD (consumed, or past `expires_at`) — not a lookup
- * `consumeState`'s own `WHERE business_id = $2` already guards against
- * reading cross-tenant. A consumed or expired row from business A is exactly
- * as safe to delete as one from business B; scoping this query would only
- * leave every OTHER business's stale rows sitting untouched until one of
- * their own owners happens to start a ceremony too.
+ * **Unscoped by business id, deliberately — and therefore not on `db`.** This
+ * is housekeeping on rows that are ALREADY DEAD (consumed, or past
+ * `expires_at`) — not a lookup `consumeState`'s own `WHERE business_id = $2`
+ * already guards against reading cross-tenant. A consumed or expired row from
+ * business A is exactly as safe to delete as one from business B; scoping this
+ * query would only leave every OTHER business's stale rows sitting untouched
+ * until one of their own owners happens to start a ceremony too. A
+ * cross-business delete is one of the declared platform operations (spec
+ * §5.7), so it is `cleanupOAuthStates` in `src/tenancy/platform.ts`, on the
+ * platform pool — a different pool from the request's, so the request's one
+ * app connection is not joined by a second from the same pool.
  */
-async function pruneStaleStates(db: Queryable): Promise<void> {
-  await db.query(`DELETE FROM oauth_states WHERE consumed_at IS NOT NULL OR expires_at <= now()`);
+async function pruneStaleStates(): Promise<void> {
+  await cleanupOAuthStates();
 }
 
 export interface ConsumedState {

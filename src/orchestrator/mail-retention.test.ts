@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { MAIL_BODY_RETENTION_DAYS, scrubOldMailBodies } from './mail-retention.js';
 
@@ -47,7 +47,7 @@ describe('scrubOldMailBodies', () => {
     const result = await withBusiness(BUSINESS, (db) => scrubOldMailBodies(db, { now: NOW }));
     expect(result).toEqual({ scrubbed: 1 });
 
-    const { rows } = await getPool().query<{
+    const { rows } = await testDb().query<{
       mail_id: string;
       body_text: string | null;
       body_scrubbed_at: Date | null;
@@ -84,7 +84,7 @@ describe('scrubOldMailBodies', () => {
 
     await withBusiness(BUSINESS, (db) => scrubOldMailBodies(db, { now: NOW }));
 
-    const { rows } = await getPool().query<{ reason: string; kind: string; input_hash: string }>(
+    const { rows } = await testDb().query<{ reason: string; kind: string; input_hash: string }>(
       `SELECT reason, kind, input_hash FROM audit_log WHERE business_id = $1`,
       [BUSINESS],
     );
