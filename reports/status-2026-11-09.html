@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<meta charset="utf-8">
+<title>דוח מצב פרויקט</title>
+<style>
+  @page { size: A4; margin: 14mm 12mm; }
+  * { box-sizing: border-box; }
+  body { font-family: "Segoe UI", Arial, sans-serif; color: #1f2937; font-size: 11pt; line-height: 1.5; margin: 0; }
+  /* בהדפסה השוליים באים מ-@page; על המסך הם חייבים להיכתב במפורש, אחרת הטקסט נצמד לקצה */
+  @media screen { body { padding: 14mm 12mm; max-width: 210mm; } }
+  h1 { font-size: 20pt; margin: 0 0 2px; }
+  h2 { font-size: 13pt; margin: 22px 0 8px; padding-bottom: 4px; border-bottom: 2px solid #e5e7eb; }
+  .sub { color: #6b7280; font-size: 10pt; margin-bottom: 14px; }
+  .headline { background: #f9fafb; border-right: 4px solid #4b5563; padding: 10px 12px; margin: 12px 0 18px; }
+
+  /* סרגל השלבים */
+  .phases { display: flex; gap: 6px; margin: 10px 0 4px; }
+  .ph { flex: 1; padding: 8px 6px; border-radius: 5px; text-align: center; font-size: 9.5pt; border: 1px solid; }
+
+  table { width: 100%; border-collapse: collapse; margin: 8px 0 4px; }
+  th { background: #f3f4f6; font-size: 9.5pt; text-align: right; padding: 7px 9px; border: 1px solid #e5e7eb; }
+  td { padding: 7px 9px; border: 1px solid #e5e7eb; vertical-align: top; font-size: 10pt; }
+  td.st { width: 92px; white-space: nowrap; font-weight: 600; }
+  .note { color: #6b7280; font-size: 9pt; }
+
+  /* שלושת המצבים — הצבע הוא המידע, ולכן גם הטקסט אומר אותו */
+  .green  { background: #d1fae5; border-color: #6ee7b7; color: #065f46; }
+  .yellow { background: #fef3c7; border-color: #fcd34d; color: #92400e; }
+  .red    { background: #fee2e2; border-color: #fca5a5; color: #991b1b; }
+  .gray   { background: #f3f4f6; border-color: #d1d5db; color: #4b5563; }
+
+  .legend { display: flex; gap: 14px; font-size: 9pt; margin: 6px 0 0; }
+  .legend span { padding: 3px 8px; border-radius: 4px; border: 1px solid; }
+  ol, ul { margin: 6px 0; padding-inline-start: 20px; }
+  li { margin-bottom: 5px; }
+  tr, li { break-inside: avoid; }
+  h2 { break-after: avoid; }
+</style>
+
+
+
+
+<h1>דוח מצב פרויקט — עוזרת אישית עסקית</h1>
+<div class="sub">09/11/2026 · דוח מקוצר · השלב הנוכחי: שלב 1 — עוזרת שמישה</div>
+
+<div class="headline">כמעט כל מה ששלב 1 צריך כבר בנוי, ונבנו גם חלקים מרכזיים של שלב 2. מה שחוסם את הסיום הוא שני דברים: הפאנל שמחבר עסק חדש, והרצה אחת מרוכזת מול הספקים האמיתיים (Google, Microsoft, GREEN-API) — שנדחתה בהכרעתך לסוף.</div>
+
+<div class="legend">
+  <span class="green">ירוק — הושלם ונבדק</span>
+  <span class="yellow">צהוב — בנוי, חסרה בדיקה או הרצה אמיתית</span>
+  <span class="red">אדום — טרם החל</span>
+</div>
+
+<h2>מפת השלבים</h2>
+<div class="phases">
+  <div class="ph yellow">שלב 0<br>עמוד שדרה<br><b>בעבודה</b></div>
+  <div class="ph yellow">שלב 1<br>עוזרת שמישה<br><b>בעבודה — כאן אנחנו</b></div>
+  <div class="ph yellow">שלב 2<br>מעקב ותוצרים<br><b>התחיל חלקית</b></div>
+  <div class="ph red">שלב 3<br>הישג יד<br><b>טרם החל</b></div>
+  <div class="ph red">שלב 4<br>ליטוש וקנה מידה<br><b>טרם החל</b></div>
+</div>
+
+<h2>הבדיקות — נמדד היום</h2>
+<p>כל הבדיקות הורצו היום על הגרסה הראשית: <b>4,547 עברו, 1 נכשל, 1 דולג</b> מתוך 4,549 (בדוח הקודם: 3,187). הכישלון היה מבחן עם תאריך קבוע שפג — תוקן היום, ושמור ב-GitHub. תקינות הטיפוסים — נקי.</p>
+
+<h2>מה השתנה מאז הדוח הקודם (29/10)</h2>
+<table>
+  <tr><th>יכולת</th><th>מצב</th><th>הראיה</th></tr>
+  <tr><td>ראיון הקמה שמייצר תקנון לעסק חדש</td><td class="st green">הושלם</td><td class="note">מוזג 01/11 — מאדום לירוק; עשרה שלבים, הסיכום שמוצג הוא התקנון שנחתם</td></tr>
+  <tr><td>פנקס משימות ופולואפ (כסף נכנס/יוצא, לידים, ממתין לתשובה...)</td><td class="st green">הושלם</td><td class="note">מוזג 03/11, נבדק ועבר סקירה; סגירה לפי מייל-ראיה ותזכורות</td></tr>
+  <tr><td>הפקת Word, PDF, Excel ומצגת</td><td class="st yellow">בעבודה</td><td class="note">מוזג 06/11; שתי בדיקות על כל קובץ. השופט והלולאה המלאה לא הורצו חי</td></tr>
+  <tr><td>תיאום פגישות ביומן (קביעה, הזזה, ביטול, לו"ז לבוס)</td><td class="st yellow">בעבודה</td><td class="note">מוזג היום; 15 משימות, כל אחת נבדקה. לא הורץ מול Google או Outlook אמיתיים</td></tr>
+</table>
+
+<h2>שלב 0 — עמוד שדרה <span class="note">(בעבודה)</span></h2>
+<table>
+  <tr><th>תחום</th><th>מצב</th><th>הראיה</th></tr>
+  <tr><td>שער ההרשאות, תקנון חתום, ביקורת שאי אפשר למחוק, כפתור עצירה, כספת סודות, סוכן אחד מקצה לקצה</td><td class="st green">הושלם</td><td class="note">תנאי היציאה הוכח בהרצה חיה; שמונה סעיפים ירוקים</td></tr>
+  <tr><td>אחסון זיכרון (חיפוש לפי משמעות), פרוטוקול בין סוכנים, מסירת אישורים כאפליקציה</td><td class="st yellow">בעבודה</td><td class="note">עובדים בהיקף שהמערכת צריכה היום; החלקים החסרים לא חוסמים</td></tr>
+</table>
+
+<h2>שלב 1 — עוזרת שמישה <span class="note">(בעבודה — השלב הנוכחי)</span></h2>
+<table>
+  <tr><th>תחום</th><th>מצב</th><th>הראיה</th></tr>
+  <tr><td>ציווי הבוס, מצב צל ורמת לימוד, תדריך יומי, מענה למיילים, קריאת מסמכים ו-PDF, זיהוי אנשי קשר, ראיון הקמה</td><td class="st green">הושלם</td><td class="note">נבדקו, מוזגו; חלקם נוסו חי</td></tr>
+  <tr><td>תיבת המייל (Gmail / Microsoft 365), וואטסאפ לבוס, יומן ופגישות, זיכרון עסקי, מיון דואר נכנס</td><td class="st yellow">בעבודה</td><td class="note">כולם בנויים ונבדקים — ממתינים להרצה מול ספק אמיתי</td></tr>
+  <tr><td>פאנל שמחבר עסק חדש (מספר וואטסאפ, תקנון, סודות)</td><td class="st red">טרם החל</td><td class="note">המערכת רצה על עסק אחד מקובץ ההגדרות</td></tr>
+</table>
+
+<h2>שאר השלבים</h2>
+<table>
+  <tr><th>שלב</th><th>מצב</th><th>מה כבר קיים / מה חסר</th></tr>
+  <tr><td>שלב 2 — מעקב ותוצרים</td><td class="st yellow">התחיל חלקית</td><td class="note">נבנו: פנקס ופולואפ, הפקת מסמכים, קידום חופש, בדיקה לפני שליחה. חסרים: חיבור CRM והנהלת חשבונות, "מה נורמלי לעסק", הצעות לשינוי התקנון</td></tr>
+  <tr><td>שלב 3 — הישג יד</td><td class="st red">טרם החל</td><td class="note">וואטסאפ ללקוחות, דפדפן, תשלומים ורכש. תלוי בשלב 2 בשל ובאימות הגשר לוואטסאפ</td></tr>
+  <tr><td>שלב 4 — ליטוש וקנה מידה</td><td class="st red">טרם החל</td><td class="note">כמה משתמשים, תבניות לפי ענף, תפעול מרחוק. תלוי בלקוחות אמיתיים</td></tr>
+</table>
+
+<h2>משימות פתוחות — לפי סדר עדיפות</h2>
+<ol>
+  <li><b>חתימה מחדש על הכללים בסביבת הפיתוח</b> — סוג פעולה חדש (עריכת פגישה) נוסף, ועד החתימה הסבב האוטומטי לא ירוץ שם.</li>
+  <li><b>הפאנל שמחבר עסק חדש</b> — חוסם הצבה אצל לקוח שני. דורש מפרט ואישור שלך.</li>
+  <li><b>אימות מרוכז מול הספקים</b> — Google ו-Microsoft (מייל ויומן), GREEN-API. חמשת הצהובים של שלב 1 ושני חדשים ממתינים לזה. הרשימה המלאה ב-docs/11.</li>
+  <li><b>הרצה חיה של הפקת מסמך</b> — מבקשה ועד קובץ שנשלח במייל.</li>
+  <li><b>חיבור CRM והנהלת חשבונות</b> — ההמשך הטבעי של שלב 2; דורש בחירת מערכות.</li>
+</ol>
+
+<h2>המלצות</h2>
+<ul>
+  <li>לחתום מחדש על הכללים בסביבת הפיתוח — פעולה של דקות שמחזירה את הסבב לפעולה.</li>
+  <li>לבנות את הפאנל שמחבר עסק חדש — הפריט האחרון בשלב 1 שלא תלוי בספק.</li>
+  <li>מיד אחריו: האימות המרוכז על עסק לדוגמה — זה מה שהופך את הצהובים לירוקים וסוגר את שלב 1.</li>
+</ul>
