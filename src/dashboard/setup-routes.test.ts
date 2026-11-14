@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
-import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -19,6 +19,7 @@ import { MAILBOX_AUTHORISATION_TEXT, PREFLIGHT_REFUSAL_TITLE, RESTART_NOTE } fro
 import { escapeHtml } from './views.js';
 import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { createServer } from './server.js';
+import { DESCRIPTION_CAP_NOTICE, DESCRIPTION_PROPOSER_FAILED } from './setup-routes.js';
 import type { DescriptionProposer } from '../business/description-proposals.js';
 import {
   BUSINESS_DESCRIPTION_MAX_CHARS,
@@ -467,7 +468,7 @@ describe('the business description (step 10)', () => {
     const csrf = await csrfFor(baseUrl, cookie, '/setup/step/10');
     const res = await post(baseUrl, cookie, '/setup/about', { csrf, description: DESCRIPTION });
     expect(res.status).toBe(200);
-    expect(await res.text()).toContain('מכסת ההצעות היומית');
+    expect(await res.text()).toContain(escapeHtml(DESCRIPTION_CAP_NOTICE));
     expect(calls).toEqual([]);
     expect((await withBusiness(BUSINESS, (bdb) => loadActiveDescription(bdb)))?.text).toBe(DESCRIPTION);
   });
@@ -511,6 +512,7 @@ describe('the business description (step 10)', () => {
   });
 
   it('a proposer that fails keeps the saved description and says so', async () => {
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
     const baseUrl = await startServer(undefined, async () => {
       throw new Error('model down');
     });
@@ -518,8 +520,30 @@ describe('the business description (step 10)', () => {
     const csrf = await csrfFor(baseUrl, cookie, '/setup/step/10');
     const res = await post(baseUrl, cookie, '/setup/about', { csrf, description: DESCRIPTION });
     expect(res.status).toBe(200);
-    expect(await res.text()).toContain('לא הצלחתי להציע כללים');
+    expect(await res.text()).toContain(escapeHtml(DESCRIPTION_PROPOSER_FAILED));
     expect((await withBusiness(BUSINESS, (bdb) => loadActiveDescription(bdb)))?.text).toBe(DESCRIPTION);
+    expect(logged).toHaveBeenCalledWith('description proposals failed: model down');
+    logged.mockRestore();
+  });
+
+  it('a description with bidi controls round-trips unchanged, and resubmitting it calls no proposer', async () => {
+    const calls: string[] = [];
+    const baseUrl = await startServer(undefined, quoteProposer(calls));
+    const cookie = await login(baseUrl);
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/10');
+    const withBidi = `${DESCRIPTION} שם \u202Eהפוך\u202C.`;
+    await post(baseUrl, cookie, '/setup/about', { csrf, description: withBidi });
+    expect(calls).toHaveLength(1);
+
+    const page = await (await get(baseUrl, cookie, '/setup/step/10')).text();
+    const shown = /<textarea name="description"[^>]*>([\s\S]*?)<\/textarea>/.exec(page)?.[1];
+    expect(shown).toBe(escapeHtml(withBidi));
+
+    // The browser posts back what the box shows (HTML-unescaped).
+    const again = await post(baseUrl, cookie, '/setup/about', { csrf: csrfOf(page), description: withBidi });
+    expect(again.status).toBe(303);
+    expect(calls).toHaveLength(1);
+    expect((await withBusiness(BUSINESS, (bdb) => loadActiveDescription(bdb)))?.version).toBe(1);
   });
 });
 

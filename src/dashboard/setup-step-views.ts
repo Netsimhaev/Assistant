@@ -440,6 +440,11 @@ export const DESCRIPTION_HINTS: readonly string[] = [
   'מה מפריע לך ובמה אפשר לעזור',
 ];
 
+/**
+ * The textarea is HTML-escaped only (`esc`), never `escLabel`: it is the
+ * owner's own text in an input, and stripping bidi controls would make an
+ * unchanged resubmit a new version — and a paid proposer call.
+ */
 function descriptionBox(view: StepView): string {
   return `<div class="card">
 <form method="post" action="/setup/about">
@@ -447,7 +452,7 @@ function descriptionBox(view: StepView): string {
   <h3>ספר לי על העסק (רשות)</h3>
   <ul class="muted">${DESCRIPTION_HINTS.map((h) => `<li>${esc(h)}</li>`).join('')}</ul>
   <label>תיאור העסק <span class="muted">(עד ${BUSINESS_DESCRIPTION_MAX_CHARS.toLocaleString('en-US')} תווים)</span>
-    <textarea name="description" rows="8">${escLabel(view.descriptionText ?? '')}</textarea>
+    <textarea name="description" rows="8">${esc(view.descriptionText ?? '')}</textarea>
   </label>
   ${view.descriptionError === undefined ? '' : `<p class="error">${esc(view.descriptionError)}</p>`}
   ${view.descriptionNotice === undefined ? '' : `<p class="muted">${esc(view.descriptionNotice)}</p>`}

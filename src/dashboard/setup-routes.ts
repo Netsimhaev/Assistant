@@ -328,8 +328,15 @@ export async function addDescriptionProposals(
   return { added: proposals.length };
 }
 
-const DESCRIPTION_CAP_NOTICE = `התיאור נשמר. הגעת למכסת ההצעות היומית (${DESCRIPTION_PROPOSAL_RUNS_PER_DAY} ביממה), ולכן הפעם לא הצעתי כללים מהתיאור. אפשר לנסות שוב מחר.`;
-const DESCRIPTION_PROPOSER_FAILED = 'התיאור נשמר, אבל לא הצלחתי להציע כללים ממנו הפעם. אפשר לשמור אותו שוב מאוחר יותר.';
+/**
+ * The two notices after a save that proposed nothing. Both say what is true:
+ * saving the same text again is `unchanged` and never re-runs the proposer,
+ * so proposals come only with the next CHANGED save. Task 6 reuses them.
+ */
+export const DESCRIPTION_CAP_NOTICE =
+  'התיאור נשמר. להיום כבר הצעתי כללים מספיק פעמים — הצעות יופיעו בפעם הבאה שתשנה את התיאור ותשמור.';
+export const DESCRIPTION_PROPOSER_FAILED =
+  'התיאור נשמר, אבל לא הצלחתי להציע ממנו כללים כרגע. הצעות יופיעו בפעם הבאה שתשנה את התיאור ותשמור.';
 
 /**
  * `POST /setup/about` — save the business description, then (on a real
