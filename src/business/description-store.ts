@@ -2,6 +2,9 @@ import { createHash } from 'node:crypto';
 import { appendAudit } from '../audit/log.js';
 import { acquireAdvisoryLock, transaction, type BusinessDb } from '../db/pool.js';
 import { canonicalHash } from '../util/canonical.js';
+import { sentenceHash } from './sentence.js';
+
+export { normaliseSentence, sentenceHash } from './sentence.js';
 
 export const BUSINESS_DESCRIPTION_MAX_CHARS = 8000;
 export const DESCRIPTION_PROPOSAL_RUNS_PER_DAY = 10;
@@ -122,17 +125,6 @@ export async function proposalRunsInLastDay(db: BusinessDb): Promise<number> {
     [db.businessId],
   );
   return Number(rows[0]?.n ?? '0');
-}
-
-export function normaliseSentence(s: string): string {
-  return s
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/[A-Z]/g, (c) => c.toLowerCase());
-}
-
-export function sentenceHash(s: string): string {
-  return createHash('sha256').update(normaliseSentence(s)).digest('hex');
 }
 
 export async function recordRejectedSentence(db: BusinessDb, sentence: string): Promise<void> {
