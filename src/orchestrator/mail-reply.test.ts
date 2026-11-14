@@ -11,6 +11,7 @@
  * just as well for a job nothing ever ran.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { saveDescription } from '../business/description-store.js';
 import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import {
@@ -1119,5 +1120,29 @@ ${MAY_HAVE_SENT_WARNING}`);
     const fresh = (await mailRow(mail.mailId)).reply_job_id;
     if (fresh === null) throw new Error('mail not relinked');
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, fresh)))?.phase).toBe('await_approval');
+  });
+});
+
+describe('business description', () => {
+  async function drafterSees(): Promise<Record<string, unknown>> {
+    const bundle = await installMailboxCharter();
+    const mail = await storedMail();
+    let seen: Record<string, unknown> | null = null;
+    const drafter: Drafter = async (request) => {
+      seen = request as unknown as Record<string, unknown>;
+      return { status: 'drafted', body: 'שלום' };
+    };
+    await withBusiness(BUSINESS, (db) => raiseMailReply(db, { mail, triage: TRIAGE, bundle, drafter }));
+    if (seen === null) throw new Error('drafter not called');
+    return seen;
+  }
+
+  it("passes the owner's business description to the drafter", async () => {
+    await withBusiness(BUSINESS, (db) => saveDescription(db, { text: 'אנחנו משרד עורכי דין קטן בחיפה.', createdBy: 'owner' }));
+    expect((await drafterSees()).businessDescription).toBe('אנחנו משרד עורכי דין קטן בחיפה.');
+  });
+
+  it('passes no description key when none exists', async () => {
+    expect('businessDescription' in (await drafterSees())).toBe(false);
   });
 });

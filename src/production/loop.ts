@@ -95,6 +95,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { loadActiveCharter, type ActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
+import { descriptionFragment } from '../business/description-store.js';
 import type { BusinessDb } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { renderArtifactFull } from '../documents/brief.js';
@@ -454,6 +455,7 @@ async function stepQueued(ctx: Ctx, p: Production): Promise<StepOutcome> {
 async function stepDrafting(ctx: Ctx, p: Production): Promise<StepOutcome> {
   const sources = await loadSources(p, p.work.memoryIds ?? [], ctx.db);
   const today = ctx.today();
+  const descriptionFrag = await descriptionFragment(ctx.db);
   const previousSpec = p.work.previous === null ? null : DocumentSpec.safeParse(p.work.previous.spec);
   let outcome: Awaited<ReturnType<Drafter>>;
   try {
@@ -471,6 +473,7 @@ async function stepDrafting(ctx: Ctx, p: Production): Promise<StepOutcome> {
           ...(previousSpec?.success === true && p.work.previous !== null
             ? { previous: { spec: previousSpec.data, findings: p.work.previous.findings } }
             : {}),
+          ...descriptionFrag,
         },
         signal,
       ),

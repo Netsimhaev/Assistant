@@ -6,6 +6,7 @@
  * are injected — the real model is never called.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { saveDescription } from '../business/description-store.js';
 import { CALENDAR_SYSTEM, HOLD_TITLE_PREFIX } from '../calendar/calendar.js';
 import type { CalendarClient, CalendarEvent, EventWrite } from '../calendar/types.js';
 import { calendarConnection } from '../charter/amend-calendar.js';
@@ -821,5 +822,29 @@ describe('runMeetingOperation — fix round 1', () => {
     const stored = await withBusiness(BUSINESS, (db) => loadPlanBody(db, outcome.jobId));
     // Not 09:00 on `day` (turned down — its hold was released, so only the exclusion keeps it out).
     expect(stored?.plan.steps[0]?.input['start']).toBe(at(day2, '09:00'));
+  });
+});
+
+describe('business description', () => {
+  async function extractorSees(): Promise<Record<string, unknown>> {
+    const day = workDay();
+    const cal = fakeCalendar();
+    let seen: Record<string, unknown> | null = null;
+    const extractor: MeetingExtractor = async (input) => {
+      seen = input as unknown as Record<string, unknown>;
+      return { status: 'extracted', request: createRequest(day) };
+    };
+    await instruct(`תקבעי פגישה עם דני כהן ביום ${day}`, cal.client, extractor);
+    if (seen === null) throw new Error('extractor not called');
+    return seen;
+  }
+
+  it("passes the owner's business description to the meeting extractor", async () => {
+    await withBusiness(BUSINESS, (db) => saveDescription(db, { text: 'אנחנו משרד עורכי דין קטן בחיפה.', createdBy: 'owner' }));
+    expect((await extractorSees()).businessDescription).toBe('אנחנו משרד עורכי דין קטן בחיפה.');
+  });
+
+  it('passes no description key when none exists', async () => {
+    expect('businessDescription' in (await extractorSees())).toBe(false);
   });
 });

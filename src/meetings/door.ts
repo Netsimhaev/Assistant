@@ -10,6 +10,7 @@
  */
 import { resolveCalendarAccess, type CalendarAccess } from '../calendar/client-for.js';
 import { isCalendarFailure, type CalendarClient, type CalendarEvent } from '../calendar/types.js';
+import { descriptionFragment } from '../business/description-store.js';
 import type { BusinessDb } from '../db/pool.js';
 import type { Plan } from '../domain/plan.js';
 import type { ConfirmationOption } from '../governance/instruction-confirmations.js';
@@ -216,6 +217,7 @@ async function askMeetingQuestion(door: DoorContext, question: string): Promise<
 
 /** The extractor, with a throw read as `failed`: an SDK failure is never a guess. */
 async function extractSafely(
+  db: BusinessDb,
   extractor: MeetingExtractor,
   text: string,
   now: Date,
@@ -223,6 +225,7 @@ async function extractSafely(
 ): Promise<ExtractorOutcome> {
   try {
     return await extractor({
+      ...(await descriptionFragment(db)),
       text,
       today: localParts(now, timeZone).date,
       timeZone,
@@ -536,7 +539,7 @@ export async function runMeetingOperation(
     if (source === null) return failMeetingJob(door, 'source instruction not found', OTHER_SLOT_FAILED_REPLY);
     sourceText = `${source.text}\n\n${o.answerTo.answer}`;
     sourceOrigin = source.textOrigin === 'typed' && door.textOrigin === 'typed' ? 'typed' : 'transcribed';
-    const extracted = await extractSafely(extractor, sourceText, now, door.timeZone);
+    const extracted = await extractSafely(door.db, extractor, sourceText, now, door.timeZone);
     if (extracted.status === 'not_meeting') return null;
     if (extracted.status === 'failed') {
       return failMeetingJob(door, `extraction failed (${extracted.reason})`, MEETING_NOT_UNDERSTOOD_REPLY);
@@ -578,7 +581,7 @@ export async function runMeetingOperation(
     // The SOURCE instruction's origin, not this message's: "תני אחר" typed under a
     // voice-note request does not make the recorded address typed.
     sourceOrigin = source.textOrigin;
-    const extracted = await extractSafely(extractor, sourceText, now, door.timeZone);
+    const extracted = await extractSafely(door.db, extractor, sourceText, now, door.timeZone);
     if (extracted.status !== 'extracted') {
       return failMeetingJob(door, `re-extraction ${extracted.status}`, OTHER_SLOT_FAILED_REPLY);
     }
@@ -593,7 +596,7 @@ export async function runMeetingOperation(
     if ('refusal' in ready && namesMeeting(door.instruction.text)) {
       return failMeetingJob(door, ready.refusal.audit, ready.refusal.reply);
     }
-    const extracted = await extractSafely(extractor, door.instruction.text, now, door.timeZone);
+    const extracted = await extractSafely(door.db, extractor, door.instruction.text, now, door.timeZone);
     if (extracted.status === 'not_meeting') return null;
     if (extracted.status === 'failed') {
       return failMeetingJob(door, `extraction failed (${extracted.reason})`, MEETING_NOT_UNDERSTOOD_REPLY);

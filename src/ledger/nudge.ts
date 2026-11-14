@@ -29,6 +29,7 @@
 import { monotonicFactory } from 'ulid';
 import type { ActiveCharter } from '../charter/store.js';
 import { loadActiveCharter } from '../charter/store.js';
+import { descriptionFragment } from '../business/description-store.js';
 import { transaction, type BusinessDb } from '../db/pool.js';
 import type { LedgerFamily, LedgerItem } from '../domain/ledger.js';
 import { Plan } from '../domain/plan.js';
@@ -264,6 +265,7 @@ export async function openNudge(
 
   let draft: string;
   try {
+    const descriptionFrag = await descriptionFragment(db);
     const drafted = await o.drafter({
       bundle: active.bundle,
       family: item.family,
@@ -272,6 +274,7 @@ export async function openNudge(
       dueText: dueText(item, r.timeZone),
       counterpartyName: item.counterpartyName,
       nudgeNumber: current.nudge_count + 1,
+      ...descriptionFrag,
     });
     if (drafted.status !== 'drafted') return fallback(DRAFT_FAILED_REASON, null, 'draft_failed', 'draft_failed');
     draft = drafted.body;

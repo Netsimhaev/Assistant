@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { saveDescription } from '../business/description-store.js';
 import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
@@ -1676,5 +1677,35 @@ describe('an instruction that asks for a document (document production §5.6)', 
         planner: async () => ({ status: 'planned', plan: producePlan({ ...VALID, format: 'exe' }) }),
       }));
     expect(result.status).toBe('refused');
+  });
+});
+
+describe('business description', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+    await withCharter();
+  });
+
+  async function plannerSees(): Promise<PlanRequest> {
+    let seen: PlanRequest | null = null;
+    await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי ל-dana@example.com את ההצעה' }, {
+      textOrigin: 'typed',
+      channel: 'dashboard',
+      planner: async (request) => {
+        seen = request;
+        return { status: 'planned', plan: mailPlan('dana@example.com') };
+      },
+    }));
+    if (seen === null) throw new Error('planner not called');
+    return seen;
+  }
+
+  it("passes the owner's business description to the planner", async () => {
+    await withBusiness(BUSINESS, (db) => saveDescription(db, { text: 'אנחנו משרד עורכי דין קטן בחיפה.', createdBy: 'owner' }));
+    expect((await plannerSees()).businessDescription).toBe('אנחנו משרד עורכי דין קטן בחיפה.');
+  });
+
+  it('passes no description key when none exists', async () => {
+    expect('businessDescription' in (await plannerSees())).toBe(false);
   });
 });

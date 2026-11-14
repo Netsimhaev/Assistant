@@ -11,6 +11,7 @@
  * and a control reminder in the same pass.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { saveDescription } from '../business/description-store.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import { closePool, withBusiness } from '../db/pool.js';
@@ -576,5 +577,26 @@ describe('runNudgeDrafter', () => {
         nudgeNumber: 1,
       }),
     ).rejects.toThrow(/refusing to run under NODE_ENV=test/);
+  });
+});
+
+describe('business description', () => {
+  async function nudgeDrafterSees(): Promise<NudgeDraftRequest> {
+    await actMode();
+    await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
+    const drafter = stubDrafter();
+    await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, drafter: drafter.fn, sendAlert: recordingAlert([]) }));
+    const call = drafter.calls[0];
+    if (call === undefined) throw new Error('drafter not called');
+    return call;
+  }
+
+  it("passes the owner's business description to the nudge drafter", async () => {
+    await withBusiness(B, (db) => saveDescription(db, { text: 'אנחנו משרד עורכי דין קטן בחיפה.', createdBy: 'owner' }));
+    expect((await nudgeDrafterSees()).businessDescription).toBe('אנחנו משרד עורכי דין קטן בחיפה.');
+  });
+
+  it('passes no description key when none exists', async () => {
+    expect('businessDescription' in (await nudgeDrafterSees())).toBe(false);
   });
 });

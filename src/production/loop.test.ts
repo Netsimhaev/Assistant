@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import mammoth from 'mammoth';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { saveDescription } from '../business/description-store.js';
 import { installCharter } from '../charter/store.js';
 import { closePool, withBusiness } from '../db/pool.js';
 import type { DocumentSpec, DocxSpec, PdfSpec } from '../domain/document-spec.js';
@@ -623,5 +624,23 @@ describe('fix round 1', () => {
     expect(await second.promise).toMatchObject({ ready: 1 });
     expect(judged).toBe(1);
     expect(second.renderer.calls).toHaveLength(0);
+  });
+});
+
+describe('business description', () => {
+  it("passes the owner's business description to the document drafter on every attempt", async () => {
+    await withBusiness(B, (db) => saveDescription(db, { text: 'אנחנו משרד עורכי דין קטן בחיפה.', createdBy: 'owner' }));
+    await produce();
+    const drafter = drafterOf([ungrounded()]);
+    await run({ drafter: drafter.fn }).promise;
+    expect(drafter.calls.length).toBeGreaterThan(1);
+    for (const call of drafter.calls) expect(call.businessDescription).toBe('אנחנו משרד עורכי דין קטן בחיפה.');
+  });
+
+  it('passes no description key when none exists', async () => {
+    await produce();
+    const drafter = drafterOf([letter()]);
+    await run({ drafter: drafter.fn }).promise;
+    expect('businessDescription' in drafter.calls[0]!).toBe(false);
   });
 });

@@ -53,6 +53,7 @@ import {
 import { buildFacts } from '../policy/facts.js';
 import { stripBidiControls } from '../util/bidi.js';
 import { assessRisk } from '../policy/risk.js';
+import { descriptionFragment } from '../business/description-store.js';
 import type { Drafter } from '../sdk/mail-drafter.js';
 import { createJob, transition, type Job } from './jobs.js';
 import { bindPlanToJob, loadPlanBody } from './plan-store.js';
@@ -126,6 +127,7 @@ export async function raiseMailReply(
     summary: triage.summary,
     replyGist: triage.replyGist,
     subject: mail.subject,
+    ...(await descriptionFragment(db)),
   });
   if (draft.status !== 'drafted') return null;
 

@@ -29,6 +29,16 @@ function toDescription(row: DescriptionRow): BusinessDescription {
   };
 }
 
+/**
+ * The request fragment production callers spread into a planner or drafter
+ * call: the owner's description when one exists and is not blank, else `{}`
+ * (the key is absent, not `undefined`, for exactOptionalPropertyTypes).
+ */
+export async function descriptionFragment(db: BusinessDb): Promise<{ businessDescription?: string }> {
+  const d = await loadActiveDescription(db);
+  return d !== null && d.text.trim() !== '' ? { businessDescription: d.text } : {};
+}
+
 export async function loadActiveDescription(db: BusinessDb): Promise<BusinessDescription | null> {
   const { rows } = await db.query<DescriptionRow>(
     `SELECT version, text, created_at, created_by
