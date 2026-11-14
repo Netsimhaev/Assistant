@@ -36,7 +36,15 @@ const PROBE = 'zz_erase-probe-7f3a@nowhere.example';
  * so the scan below is a positive control: everything not on this list must
  * come back clean, including a table added next year.
  */
-const SURVIVES: readonly string[] = ['audit_log', 'spend_ledger', 'signatures'];
+const SURVIVES: readonly string[] = [
+  'audit_log',
+  'spend_ledger',
+  'signatures',
+  // The owner's own business description (business-description spec): never
+  // edited or deleted by an erasure. A table that survives by name must show
+  // the owner a notice instead — see the test on `descriptionMentionsContact`.
+  'business_descriptions',
+];
 
 describe('what an erasure leaves behind', () => {
   beforeEach(async () => {
@@ -631,6 +639,12 @@ describe('what an erasure leaves behind', () => {
       `INSERT INTO meeting_holds (hold_id, business_id, job_id, calendar_id, event_id, start_at, end_at)
        VALUES ('MH-probe', $1, $2, 'cal-1', 'ev-hold-probe', '2026-12-01T09:00:00Z', '2026-12-01T10:00:00Z')`,
       [BUSINESS, meetingJob.jobId],
+    );
+
+    await db.query(
+      `INSERT INTO business_descriptions (business_id, version, text, created_by)
+       VALUES ($1, 1, $2, 'owner')`,
+      [BUSINESS, `אנחנו עובדים עם ${PROBE} כבר שנים`],
     );
 
     const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PROBE }));
@@ -1438,6 +1452,18 @@ describe('what an erasure leaves behind', () => {
    * would go (spec §3). Checked by reading the source, because the property
    * is about who may import it, not about what it does when called.
    */
+  it('a table that survives by name shows the owner a notice: business_descriptions → plan.descriptionMentionsContact', async () => {
+    await testDb().query(
+      `INSERT INTO business_descriptions (business_id, version, text, created_by)
+       VALUES ($1, 1, $2, 'owner')`,
+      [BUSINESS, `אנחנו עובדים עם ${PROBE} כבר שנים`],
+    );
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PROBE }));
+    expect(plan.descriptionMentionsContact).toBe(true);
+    // The description is never part of what the executor deletes.
+    expect(plan.items.some((item) => item.table === 'business_descriptions')).toBe(false);
+  });
+
   it('is imported by nothing outside erasure.ts itself and the dashboard', async () => {
     const offenders: string[] = [];
 

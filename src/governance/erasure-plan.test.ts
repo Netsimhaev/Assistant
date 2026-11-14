@@ -15,6 +15,7 @@ import { recordSignature } from './signatures.js';
 import { keepItem } from './kept-items.js';
 import { buildErasurePlan } from './erasure-plan.js';
 import { ErasureRefusedError, executeErasure } from './erasure.js';
+import { saveDescription } from '../business/description-store.js';
 import { renderErasure } from '../dashboard/views.js';
 
 const BUSINESS = 'test-business';
@@ -1531,5 +1532,68 @@ describe('calendar scheduling', () => {
     const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
 
     expect(plan.jobIds).toEqual(expect.arrayContaining([nudge, reminder]));
+  });
+});
+
+describe('the business description notice', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+  });
+
+  const describe_ = async (text: string): Promise<void> => {
+    const r = await withBusiness(BUSINESS, (db) => saveDescription(db, { text, createdBy: 'owner' }));
+    expect(r.saved).toBe(true);
+  };
+  const planFor = (anchor: Parameters<typeof buildErasurePlan>[1]) =>
+    withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, anchor));
+
+  it('flags a contact named in the active description', async () => {
+    await describe_(`אנחנו עובדים עם ${RONIT} כבר שנים`);
+    expect((await planFor({ kind: 'contact', identifier: RONIT })).descriptionMentionsContact).toBe(true);
+  });
+
+  it('does not flag a contact named only in an older version', async () => {
+    await describe_(`אנחנו עובדים עם ${RONIT} כבר שנים`);
+    await describe_('תיאור חדש בלי שם');
+    expect((await planFor({ kind: 'contact', identifier: RONIT })).descriptionMentionsContact).toBe(false);
+  });
+
+  it('matches an identifier containing _ literally', async () => {
+    await describe_('הלקוח dana_x@a.co חשוב');
+    expect((await planFor({ kind: 'contact', identifier: 'dana_x@a.co' })).descriptionMentionsContact).toBe(true);
+    expect((await planFor({ kind: 'contact', identifier: 'dana%x@a.co' })).descriptionMentionsContact).toBe(false);
+    expect((await planFor({ kind: 'contact', identifier: 'danaQx@a.co' })).descriptionMentionsContact).toBe(false);
+  });
+
+  it('is false for a window anchor', async () => {
+    await describe_(`אנחנו עובדים עם ${RONIT}`);
+    const plan = await planFor({ kind: 'window', fromIso: '2020-01-01T00:00:00Z', toIso: '2030-01-01T00:00:00Z' });
+    expect(plan.descriptionMentionsContact).toBe(false);
+  });
+
+  it('executeErasure leaves the description untouched', async () => {
+    await describe_(`אנחנו עובדים עם ${RONIT} כבר שנים`);
+    await jobAbout(RONIT, 'with-description');
+    const plan = await planFor({ kind: 'contact', identifier: RONIT });
+    expect(plan.descriptionMentionsContact).toBe(true);
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
+    const { rows } = await testDb().query<{ text: string }>(
+      'SELECT text FROM business_descriptions WHERE business_id = $1',
+      [BUSINESS],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.text).toContain(RONIT);
+  });
+
+  it('the preview shows the notice and a link only when flagged', async () => {
+    await describe_(`אנחנו עובדים עם ${RONIT}`);
+    const render = (plan: Awaited<ReturnType<typeof planFor>>): string =>
+      renderErasure({ plan, csrf: 'c', planHash: 'h', anchorLabel: RONIT, timeZone: null } as unknown as Parameters<typeof renderErasure>[0]);
+    const flagged = render(await planFor({ kind: 'contact', identifier: RONIT }));
+    expect(flagged).toContain('השם מופיע בתיאור העסק שלך. אם צריך, ערוך אותו בעצמך.');
+    expect(flagged).toContain('href="/settings/description"');
+    const plain = render(await planFor({ kind: 'contact', identifier: 'nobody@else.example' }));
+    expect(plain).not.toContain('השם מופיע בתיאור העסק');
+    expect(plain).not.toContain('/settings/description');
   });
 });

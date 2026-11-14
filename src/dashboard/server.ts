@@ -2023,6 +2023,9 @@ function planFingerprint(plan: ErasurePlan): string {
     calendarEventsKept: plan.calendarEventsKept
       .map((e) => `${e.kind}\u0000${e.calendarId}\u0000${e.eventId}\u0000${e.start ?? ''}`)
       .sort(),
+    // Display-only (the description is never touched), but what the owner was
+    // told is part of what he confirms.
+    descriptionMentionsContact: plan.descriptionMentionsContact,
     items: plan.items.map((item) => `${item.table}:${item.action}:${item.count}`).sort(),
     excluded: plan.excluded.map((k) => `${k.itemKind}:${k.itemId}`).sort(),
     refusals: plan.refusals.map((r) => `${r.kind}:${r.detail}`).sort(),

@@ -395,6 +395,14 @@ export interface ErasurePlan {
    * instant or null. Included in `planFingerprint`.
    */
   calendarEventsKept: CalendarEventKept[];
+  /**
+   * True only for a `contact` anchor whose identifier appears in the ACTIVE
+   * (latest) business description. The description is the owner's own text and
+   * is never edited or deleted by an erasure — the preview only tells him, so
+   * he can edit it himself (business-description spec). Included in
+   * `planFingerprint`.
+   */
+  descriptionMentionsContact: boolean;
   items: ErasureItem[];
   excluded: KeptExclusion[];
   refusals: ErasureRefusal[];
@@ -1931,6 +1939,20 @@ export async function buildErasurePlan(
     calendarEventsKept.sort((a, b) => cmp(a.calendarId, b.calendarId) || cmp(a.eventId, b.eventId));
   }
 
+  // The business description survives erasure by name; the owner is told when
+  // the contact appears in its latest version. One SELECT, latest only.
+  let descriptionMentionsContact = false;
+  if (anchor.kind === 'contact') {
+    const { rows } = await db.query<{ hit: boolean }>(
+      `SELECT (text ILIKE $2 ${LIKE_ESCAPE}) AS hit
+         FROM business_descriptions
+        WHERE business_id = $1
+        ORDER BY version DESC LIMIT 1`,
+      [businessId, `%${likeLiteral(anchor.identifier)}%`],
+    );
+    descriptionMentionsContact = rows[0]?.hit === true;
+  }
+
   const digestList = [...digestIds];
   const draftList = [...draftIds];
   const mailList = [...mailIds];
@@ -1956,6 +1978,7 @@ export async function buildErasurePlan(
     savedCopies,
     filesNotDeleted,
     calendarEventsKept,
+    descriptionMentionsContact,
     items,
     excluded,
     refusals,
