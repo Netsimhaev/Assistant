@@ -108,6 +108,8 @@ export async function resetDatabase(): Promise<void> {
       digest_settings,
       digests,
       charter_interview_drafts,
+      business_descriptions,
+      description_rule_rejections,
       dashboard_sessions,
       dashboard_recovery_codes,
       dashboard_unknown_user_throttle,

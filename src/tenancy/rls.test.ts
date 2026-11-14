@@ -44,6 +44,14 @@ const EXCLUDED: ReadonlySet<string> = new Set([
 
 const POLICY_NAME = 'tenant_isolation';
 
+/**
+ * Tables the runtime account may only SELECT and INSERT (UPDATE and DELETE are
+ * revoked), so tests (2) and (3) below cannot issue those statements on them:
+ * the privilege wall refuses before the policy is reached. Their isolation is
+ * still covered by SELECT, by the policy checks and by the grants test.
+ */
+const APPEND_ONLY = new Set(['business_descriptions']);
+
 /** Every base table in `public` with a `business_id` column, minus the named exclusions. */
 async function businessTables(db: Queryable): Promise<string[]> {
   const { rows } = await db.query<{ table_name: string }>(
@@ -474,7 +482,7 @@ describe('row level security on every business table (spec §5.6)', () => {
 
     it('(2) UPDATE touches nothing', async () => {
       await withBusiness(BIZ_B, async (db) => {
-        for (const table of tables) {
+        for (const table of tables.filter((t) => !APPEND_ONLY.has(t))) {
           const result = await db.query(`UPDATE ${table} SET business_id = business_id`);
           expect({ table, n: result.rowCount }).toEqual({ table, n: 0 });
         }
@@ -483,7 +491,7 @@ describe('row level security on every business table (spec §5.6)', () => {
 
     it('(3) DELETE touches nothing', async () => {
       await withBusiness(BIZ_B, async (db) => {
-        for (const table of tables) {
+        for (const table of tables.filter((t) => !APPEND_ONLY.has(t))) {
           const result = await db.query(`DELETE FROM ${table}`);
           expect({ table, n: result.rowCount }).toEqual({ table, n: 0 });
         }

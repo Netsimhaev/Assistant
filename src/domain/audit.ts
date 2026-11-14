@@ -143,6 +143,12 @@ export const AuditKind = z.enum([
    * name a person, and this table is the one an erasure cannot reach.
    */
   'document_production',
+  /**
+   * The owner saved a new version of the free-text business description.
+   * Carries a hash and the length only, never the text: the description can
+   * name people, and this table is the one an erasure cannot reach.
+   */
+  'description_change',
 ]);
 export type AuditKind = z.infer<typeof AuditKind>;
 
