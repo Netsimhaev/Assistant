@@ -43,6 +43,7 @@ import {
   type SetupIssue,
 } from './setup-forms.js';
 import { STEP_TAGS, STEP_TITLES, STEP_WHY, issuesAt, issuesBox, setupPage } from './setup-views.js';
+import { BUSINESS_DESCRIPTION_MAX_CHARS } from '../business/description-store.js';
 import { canonicalHash } from '../util/canonical.js';
 import { escLabel, escapeHtml as esc } from './views.js';
 
@@ -67,6 +68,14 @@ export interface StepView {
   /** Step 10: text to prefill (a "fix"), and an error on the proposal form. */
   ruleText?: string;
   ruleError?: string;
+  /**
+   * Step 10: the business description box — the text to show (the active
+   * description, or what a refused POST carried), and an error or notice
+   * under it. Not charter input: it never reaches the summary or the hash.
+   */
+  descriptionText?: string;
+  descriptionError?: string;
+  descriptionNotice?: string;
   /**
    * Step 9: the dial as it stands now, preselected while the section is
    * unsaved — on an edit the owner starts from what is live, not from `off`.
@@ -421,6 +430,32 @@ function ruleButton(csrf: string, i: number, rule: AcceptedRule, choice: string,
 </form>`;
 }
 
+/** The hint list under the description box (spec ⚙ decision, task 5). */
+export const DESCRIPTION_HINTS: readonly string[] = [
+  'תחום העיסוק',
+  'איך נראה יום עבודה',
+  'איך מקבלים תשלומים',
+  'מי המתחרים',
+  'אילו שירותים נותנים',
+  'מה מפריע לך ובמה אפשר לעזור',
+];
+
+function descriptionBox(view: StepView): string {
+  return `<div class="card">
+<form method="post" action="/setup/about">
+  <input type="hidden" name="csrf" value="${esc(view.csrf)}">
+  <h3>ספר לי על העסק (רשות)</h3>
+  <ul class="muted">${DESCRIPTION_HINTS.map((h) => `<li>${esc(h)}</li>`).join('')}</ul>
+  <label>תיאור העסק <span class="muted">(עד ${BUSINESS_DESCRIPTION_MAX_CHARS.toLocaleString('en-US')} תווים)</span>
+    <textarea name="description" rows="8">${escLabel(view.descriptionText ?? '')}</textarea>
+  </label>
+  ${view.descriptionError === undefined ? '' : `<p class="error">${esc(view.descriptionError)}</p>`}
+  ${view.descriptionNotice === undefined ? '' : `<p class="muted">${esc(view.descriptionNotice)}</p>`}
+  <button type="submit">שמור את התיאור</button>
+</form>
+</div>`;
+}
+
 function step10(view: StepView): string {
   const v = obj(view.value);
   const accepted = Array.isArray(v['accepted']) ? (v['accepted'] as AcceptedRule[]) : [];
@@ -445,7 +480,8 @@ ${ruleButton(view.csrf, i, r, 'delete', 'מחק')}
     .join('');
   return frame(
     view,
-    `${acceptedHtml}
+    `${descriptionBox(view)}
+${acceptedHtml}
 ${pendingHtml}
 <form method="post" action="/setup/rule">
   <input type="hidden" name="csrf" value="${esc(view.csrf)}">

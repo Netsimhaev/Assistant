@@ -49,6 +49,16 @@ import {
 import { RULE_TEXT_MAX, renderStep, type StepView } from './setup-step-views.js';
 import { STEP_COUNT, UNREADABLE_NOTICE, renderSetupRefusal, renderSummary } from './setup-views.js';
 import type { BusinessDb } from '../db/pool.js';
+import { parseDescriptionProposals, type DescriptionProposer } from '../business/description-proposals.js';
+import {
+  DESCRIPTION_PROPOSAL_RUNS_PER_DAY,
+  loadActiveDescription,
+  proposalRunsInLastDay,
+  recordRejectedSentence,
+  rejectedSentenceHashes,
+  saveDescription,
+} from '../business/description-store.js';
+import { proposeFromDescriptionWithModel } from '../sdk/description-rules.js';
 
 export interface SetupSession {
   sessionId: string;
@@ -58,6 +68,8 @@ export interface SetupSession {
 export interface SetupOptions {
   /** Test seam: the stage-10 proposer. Production leaves it unset and the model proposes. */
   ruleProposer?: RuleProposer;
+  /** Test seam: the description proposer. Production leaves it unset and the model proposes. */
+  descriptionProposer?: DescriptionProposer;
   /**
    * The master-key file the mailbox preflight loads — the same value the
    * connections screen's mailbox sign receives (`OAuthRouteOptions`).
@@ -134,6 +146,11 @@ async function stepView(
   }
   // Step 9 preselects the dial as it is now: on an edit, the live position.
   if (step === 9) view.currentMode = await loadAutonomyMode(db);
+  // Step 10's description box shows the active description unless a refused
+  // POST is re-rendering what the owner typed.
+  if (step === 10 && view.descriptionText === undefined) {
+    view.descriptionText = (await loadActiveDescription(db))?.text ?? '';
+  }
   return view;
 }
 
@@ -266,6 +283,93 @@ export async function handleRulePost(
   seeOther(res, '/setup/step/10');
 }
 
+// --- the business description (step 10) ------------------------------------
+
+export type DescriptionProposalsOutcome = { added: number } | { added: 0; reason: 'cap' | 'no_draft' };
+
+/**
+ * Ask the model for rules from the owner's description and append the ones
+ * that survive `parseDescriptionProposals` to `extra.pending` — proposals
+ * only; the owner still chooses each one on step 10.
+ *
+ * The daily cap counts description versions (`proposalRunsInLastDay`) and is
+ * read AFTER the caller saved, so the save just made is in the count: more
+ * than `DESCRIPTION_PROPOSAL_RUNS_PER_DAY` versions in 24 hours means this
+ * one does not call the model — the tenth save of the day still proposes,
+ * the eleventh does not.
+ *
+ * `'interview'` writes to the interview draft, creating it as `handleRulePost`
+ * does; with an active charter and no draft, an edit must start from the
+ * prefill, so nothing is proposed (`no_draft`). A proposer that throws
+ * propagates — the description is already saved, and the caller says so.
+ */
+export async function addDescriptionProposals(
+  db: BusinessDb,
+  description: string,
+  proposer: DescriptionProposer,
+  draftSource: 'interview' | 'edit',
+): Promise<DescriptionProposalsOutcome> {
+  if (draftSource === 'edit') throw new Error('addDescriptionProposals: edit source not implemented yet');
+  if (await editMustStartFromPrefill(await loadDraft(db), db)) return { added: 0, reason: 'no_draft' };
+  if ((await proposalRunsInLastDay(db)) > DESCRIPTION_PROPOSAL_RUNS_PER_DAY) return { added: 0, reason: 'cap' };
+
+  const raw = await proposer(description);
+  // Read the draft after the model call: the owner may have acted meanwhile.
+  const draft = await loadDraft(db);
+  const extra = extraOf(draft);
+  const proposals = parseDescriptionProposals(raw, description, {
+    rejectedHashes: await rejectedSentenceHashes(db),
+    existingTexts: [...extra.pending, ...extra.accepted].map((r) => r.text),
+  });
+  if (proposals.length === 0) return { added: 0 };
+  extra.pending.push(...proposals);
+  const baseCharterVersion = draft === null ? await activeCharterVersion(db) : undefined;
+  await saveSection(db, 'extra', extra, baseCharterVersion === undefined ? {} : { baseCharterVersion });
+  return { added: proposals.length };
+}
+
+const DESCRIPTION_CAP_NOTICE = `התיאור נשמר. הגעת למכסת ההצעות היומית (${DESCRIPTION_PROPOSAL_RUNS_PER_DAY} ביממה), ולכן הפעם לא הצעתי כללים מהתיאור. אפשר לנסות שוב מחר.`;
+const DESCRIPTION_PROPOSER_FAILED = 'התיאור נשמר, אבל לא הצלחתי להציע כללים ממנו הפעם. אפשר לשמור אותו שוב מאוחר יותר.';
+
+/**
+ * `POST /setup/about` — save the business description, then (on a real
+ * change, non-empty, under the cap) propose rules from it. The description is
+ * not charter input: it is saved now, independently of the draft and of any
+ * charter, and never reaches the summary or the signed hash.
+ */
+export async function handleAboutPost(
+  res: ServerResponse,
+  db: BusinessDb,
+  session: SetupSession,
+  form: URLSearchParams,
+  options: SetupOptions,
+): Promise<void> {
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return refuseCsrf(res);
+  const text = form.get('description') ?? '';
+  const saved = await saveDescription(db, { text, createdBy: session.username });
+  if (!saved.saved) {
+    if (saved.reason === 'too_long') {
+      return renderStep10(res, 400, db, session, { descriptionText: text, descriptionError: saved.messageHe });
+    }
+    return seeOther(res, '/setup/step/10');
+  }
+  // A cleared description has nothing to propose from.
+  if (saved.description.text === '') return seeOther(res, '/setup/step/10');
+
+  const proposer = options.descriptionProposer ?? proposeFromDescriptionWithModel;
+  let outcome: DescriptionProposalsOutcome;
+  try {
+    outcome = await addDescriptionProposals(db, saved.description.text, proposer, 'interview');
+  } catch (err) {
+    console.error(`description proposals failed: ${err instanceof Error ? err.message : 'unknown error'}`);
+    return renderStep10(res, 200, db, session, { descriptionNotice: DESCRIPTION_PROPOSER_FAILED });
+  }
+  if ('reason' in outcome && outcome.reason === 'cap') {
+    return renderStep10(res, 200, db, session, { descriptionNotice: DESCRIPTION_CAP_NOTICE });
+  }
+  seeOther(res, '/setup/step/10');
+}
+
 const RULE_CHOICES = new Set(['accept', 'guidance', 'delete', 'fix', 'remove']);
 
 /**
@@ -300,6 +404,8 @@ export async function handleRuleChoice(
     });
   }
   list.splice(index, 1);
+  // A deleted proposal's sentence is never proposed again from the description.
+  if (choice === 'delete') await recordRejectedSentence(db, rule.text);
   if (choice === 'accept') extra.accepted.push(rule);
   if (choice === 'guidance') extra.accepted.push({ kind: 'guidance', text: rule.text });
   await saveSection(db, 'extra', extra);

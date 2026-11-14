@@ -47,7 +47,9 @@ import {
 } from '../governance/action-update-settings.js';
 import { activeCharterVersion, probeActiveCharter, loadActiveCharter } from '../charter/store.js';
 import type { RuleProposer } from '../charter/interview/rule-proposal.js';
+import type { DescriptionProposer } from '../business/description-proposals.js';
 import {
+  handleAboutPost,
   handleRuleChoice,
   handleRulePost,
   handleSetupEdit,
@@ -276,6 +278,11 @@ export interface DashboardOptions {
    * caller passes it: absent, the model proposes (`proposeRuleWithModel`).
    */
   ruleProposer?: RuleProposer;
+  /**
+   * Test seam for the setup interview's description proposer. No production
+   * caller passes it: absent, the model proposes (`proposeFromDescriptionWithModel`).
+   */
+  descriptionProposer?: DescriptionProposer;
   /**
    * Test seam for the instruction door's planner (`POST /instruct`). No
    * production caller passes it: absent, `runInstruction` uses the real one.
@@ -3164,6 +3171,9 @@ async function route(
   if (method === 'POST' && pathname === '/setup/sign') {
     return handleSignPost(res, db, session, await readFormBody(req), setupOptions);
   }
+  if (method === 'POST' && pathname === '/setup/about') {
+    return handleAboutPost(res, db, session, await readFormBody(req), setupOptions);
+  }
   if (method === 'POST' && pathname === '/setup/rule') {
     return handleRulePost(res, db, session, await readFormBody(req), setupOptions);
   }
@@ -3465,6 +3475,7 @@ export function createServer(options: DashboardOptions = {}): Server {
     const setupOptions: SetupOptions = {
       credentialKeyPath: oauthOptions.credentialKeyPath,
       ...(options.ruleProposer !== undefined ? { ruleProposer: options.ruleProposer } : {}),
+      ...(options.descriptionProposer !== undefined ? { descriptionProposer: options.descriptionProposer } : {}),
     };
     const meetingOptions: MeetingRouteOptions = {
       credentialKeyPath: oauthOptions.credentialKeyPath,

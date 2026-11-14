@@ -19,6 +19,14 @@ import { MAILBOX_AUTHORISATION_TEXT, PREFLIGHT_REFUSAL_TITLE, RESTART_NOTE } fro
 import { escapeHtml } from './views.js';
 import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { createServer } from './server.js';
+import type { DescriptionProposer } from '../business/description-proposals.js';
+import {
+  BUSINESS_DESCRIPTION_MAX_CHARS,
+  DESCRIPTION_PROPOSAL_RUNS_PER_DAY,
+  loadActiveDescription,
+  rejectedSentenceHashes,
+  sentenceHash,
+} from '../business/description-store.js';
 
 const BUSINESS = 'setup-business';
 const USERNAME = 'owner';
@@ -42,8 +50,12 @@ afterAll(async () => {
   await closePool();
 });
 
-async function startServer(ruleProposer?: RuleProposer): Promise<string> {
-  server = createServer({ port: 0, ...(ruleProposer ? { ruleProposer } : {}) });
+async function startServer(ruleProposer?: RuleProposer, descriptionProposer?: DescriptionProposer): Promise<string> {
+  server = createServer({
+    port: 0,
+    ...(ruleProposer ? { ruleProposer } : {}),
+    ...(descriptionProposer ? { descriptionProposer } : {}),
+  });
   await once(server, 'listening');
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
@@ -341,6 +353,173 @@ describe('stage 10', () => {
     expect((await withBusiness(BUSINESS, (bdb) => loadDraft(bdb)))?.answers.extra?.accepted).toEqual([
       { kind: 'guidance', text: 'לא להגיד שאנחנו זולים' },
     ]);
+  });
+});
+
+describe('the business description (step 10)', () => {
+  const SENTENCE = 'לעולם לא להוציא הצעת מחיר בלי אישורי.';
+  const DESCRIPTION = `אנחנו מספרה בחולון. ${SENTENCE} עובדים א-ה.`;
+
+  function quoteProposer(calls: string[], sentence = SENTENCE): DescriptionProposer {
+    return async (description) => {
+      calls.push(description);
+      return JSON.stringify([
+        { sentence, kind: 'forbid', actionClasses: ['quote.issue'] },
+        { sentence: 'משפט שלא נכתב בתיאור', kind: 'forbid', actionClasses: ['quote.issue'] },
+      ]);
+    };
+  }
+
+  async function seedVersions(n: number): Promise<void> {
+    for (let v = 1; v <= n; v += 1) {
+      await testDb().query(
+        `INSERT INTO business_descriptions (business_id, version, text, created_by) VALUES ($1, $2, $3, 'owner')`,
+        [BUSINESS, v, `גרסה ${v}`],
+      );
+    }
+  }
+
+  it('shows the box on step 10, headed and prefilled with the active description', async () => {
+    await seedVersions(1);
+    const baseUrl = await startServer();
+    const cookie = await login(baseUrl);
+    const page = await (await get(baseUrl, cookie, '/setup/step/10')).text();
+    expect(page).toContain('ספר לי על העסק (רשות)');
+    expect(page).toContain('action="/setup/about"');
+    expect(page).toContain('מה מפריע לך ובמה אפשר לעזור');
+    expect(page).toContain('גרסה 1</textarea>');
+    expect(page.indexOf('action="/setup/about"')).toBeLessThan(page.indexOf('יש עוד משהו שאסור לי לעשות'));
+  });
+
+  it('POST /setup/about saves the description and appends verified proposals to extra.pending', async () => {
+    const calls: string[] = [];
+    const baseUrl = await startServer(undefined, quoteProposer(calls));
+    const cookie = await login(baseUrl);
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/10');
+    const res = await post(baseUrl, cookie, '/setup/about', { csrf, description: DESCRIPTION });
+    expect(res.status).toBe(303);
+    expect(res.headers.get('location')).toBe('/setup/step/10');
+    expect(calls).toEqual([DESCRIPTION]);
+    const saved = await withBusiness(BUSINESS, (bdb) => loadActiveDescription(bdb));
+    expect(saved?.text).toBe(DESCRIPTION);
+    expect(saved?.createdBy).toBe(USERNAME);
+    // Only the sentence that is really in the description survives.
+    expect((await withBusiness(BUSINESS, (bdb) => loadDraft(bdb)))?.answers.extra?.pending).toEqual([
+      { kind: 'forbid', text: SENTENCE, actionClasses: ['quote.issue'] },
+    ]);
+    expect(await (await get(baseUrl, cookie, '/setup/step/10')).text()).toContain('נכון?');
+  });
+
+  it('the description is saved before any charter exists', async () => {
+    expect(await withBusiness(BUSINESS, (bdb) => activeCharterVersion(bdb))).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadDraft(bdb))).toBeNull();
+    const baseUrl = await startServer(undefined, quoteProposer([]));
+    const cookie = await login(baseUrl);
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/10');
+    const res = await post(baseUrl, cookie, '/setup/about', { csrf, description: DESCRIPTION });
+    expect(res.status).toBe(303);
+    expect((await withBusiness(BUSINESS, (bdb) => loadActiveDescription(bdb)))?.text).toBe(DESCRIPTION);
+    expect((await withBusiness(BUSINESS, (bdb) => loadDraft(bdb)))?.answers.extra?.pending).toHaveLength(1);
+  });
+
+  it('refuses a bad CSRF token and writes nothing', async () => {
+    const calls: string[] = [];
+    const baseUrl = await startServer(undefined, quoteProposer(calls));
+    const cookie = await login(baseUrl);
+    const res = await post(baseUrl, cookie, '/setup/about', { csrf: 'deadbeef', description: DESCRIPTION });
+    expect(res.status).toBe(403);
+    expect(calls).toEqual([]);
+    expect(await withBusiness(BUSINESS, (bdb) => loadActiveDescription(bdb))).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadDraft(bdb))).toBeNull();
+  });
+
+  it(`refuses ${BUSINESS_DESCRIPTION_MAX_CHARS + 1} characters with the Hebrew message, keeps the text in the box, calls no proposer`, async () => {
+    const calls: string[] = [];
+    const baseUrl = await startServer(undefined, quoteProposer(calls));
+    const cookie = await login(baseUrl);
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/10');
+    const long = 'א'.repeat(BUSINESS_DESCRIPTION_MAX_CHARS + 1);
+    const res = await post(baseUrl, cookie, '/setup/about', { csrf, description: long });
+    expect(res.status).toBe(400);
+    const page = await res.text();
+    expect(page).toContain('התיאור ארוך מדי');
+    expect(page).toContain(`${long}</textarea>`);
+    expect(calls).toEqual([]);
+    expect(await withBusiness(BUSINESS, (bdb) => loadActiveDescription(bdb))).toBeNull();
+  });
+
+  it('under the daily cap: the tenth save of the day still proposes', async () => {
+    await seedVersions(DESCRIPTION_PROPOSAL_RUNS_PER_DAY - 1);
+    const calls: string[] = [];
+    const baseUrl = await startServer(undefined, quoteProposer(calls));
+    const cookie = await login(baseUrl);
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/10');
+    const res = await post(baseUrl, cookie, '/setup/about', { csrf, description: DESCRIPTION });
+    expect(res.status).toBe(303);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('over the daily cap: saves, does not call the proposer, says so in Hebrew', async () => {
+    await seedVersions(DESCRIPTION_PROPOSAL_RUNS_PER_DAY);
+    const calls: string[] = [];
+    const baseUrl = await startServer(undefined, quoteProposer(calls));
+    const cookie = await login(baseUrl);
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/10');
+    const res = await post(baseUrl, cookie, '/setup/about', { csrf, description: DESCRIPTION });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('מכסת ההצעות היומית');
+    expect(calls).toEqual([]);
+    expect((await withBusiness(BUSINESS, (bdb) => loadActiveDescription(bdb)))?.text).toBe(DESCRIPTION);
+  });
+
+  it('an unchanged description calls no proposer', async () => {
+    const calls: string[] = [];
+    const baseUrl = await startServer(undefined, quoteProposer(calls));
+    const cookie = await login(baseUrl);
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/10');
+    await post(baseUrl, cookie, '/setup/about', { csrf, description: DESCRIPTION });
+    const again = await post(baseUrl, cookie, '/setup/about', { csrf, description: `  ${DESCRIPTION}  ` });
+    expect(again.status).toBe(303);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('deleting a proposal on step 10 records its sentence as rejected, and the next save does not propose it again', async () => {
+    const calls: string[] = [];
+    const baseUrl = await startServer(undefined, quoteProposer(calls));
+    const cookie = await login(baseUrl);
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/10');
+    await post(baseUrl, cookie, '/setup/about', { csrf, description: DESCRIPTION });
+    const page = await (await get(baseUrl, cookie, '/setup/step/10')).text();
+    const deleted = await post(baseUrl, cookie, '/setup/rule/0', { csrf, ruleHash: ruleHashOf(page, 0), choice: 'delete' });
+    expect(deleted.status).toBe(303);
+    expect(await withBusiness(BUSINESS, (bdb) => rejectedSentenceHashes(bdb))).toEqual(new Set([sentenceHash(SENTENCE)]));
+
+    await post(baseUrl, cookie, '/setup/about', { csrf, description: `${DESCRIPTION} יש חניה.` });
+    expect(calls).toHaveLength(2);
+    expect((await withBusiness(BUSINESS, (bdb) => loadDraft(bdb)))?.answers.extra?.pending).toEqual([]);
+  });
+
+  it('a proposal already pending is not appended twice', async () => {
+    const calls: string[] = [];
+    const baseUrl = await startServer(undefined, quoteProposer(calls));
+    const cookie = await login(baseUrl);
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/10');
+    await post(baseUrl, cookie, '/setup/about', { csrf, description: DESCRIPTION });
+    await post(baseUrl, cookie, '/setup/about', { csrf, description: `${DESCRIPTION} יש חניה.` });
+    expect(calls).toHaveLength(2);
+    expect((await withBusiness(BUSINESS, (bdb) => loadDraft(bdb)))?.answers.extra?.pending).toHaveLength(1);
+  });
+
+  it('a proposer that fails keeps the saved description and says so', async () => {
+    const baseUrl = await startServer(undefined, async () => {
+      throw new Error('model down');
+    });
+    const cookie = await login(baseUrl);
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/10');
+    const res = await post(baseUrl, cookie, '/setup/about', { csrf, description: DESCRIPTION });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('לא הצלחתי להציע כללים');
+    expect((await withBusiness(BUSINESS, (bdb) => loadActiveDescription(bdb)))?.text).toBe(DESCRIPTION);
   });
 });
 
