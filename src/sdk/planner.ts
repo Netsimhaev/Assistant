@@ -7,6 +7,7 @@ import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
 import { READ_ONLY_CLASS_LABEL, capabilityCatalogue, renderCatalogue } from '../orchestrator/catalogue.js';
 import { REFINEMENT_RULES } from '../policy/classify.js';
 import { renderLocalToolContracts } from '../orchestrator/local-tools.js';
+import { renderDescriptionSection } from '../business/description-prompt.js';
 import { toOneLine } from '../util/bidi.js';
 import { buildFence, stripFenceMarkers } from '../util/fence.js';
 import { extractJsonObjects } from '../util/json-extract.js';
@@ -31,6 +32,12 @@ export interface PlanRequest {
    * deliberate exception and why it does not extend to any other caller.
    */
   instruction?: string;
+  /**
+   * The owner's description of the business (background, never authority).
+   * Rendered between the charter and the catalogue; omitted when absent so a
+   * prompt without one is byte-identical to before.
+   */
+  businessDescription?: string;
   /**
    * Who a name in the instruction was resolved to, when the owner's words fit
    * more than one contact and each candidate is planned separately (boss
@@ -119,6 +126,11 @@ function renderAttachedDocuments(
   ];
 }
 
+function descriptionLines(description: string | undefined): string[] {
+  const section = renderDescriptionSection(description);
+  return section === '' ? [] : [section, ''];
+}
+
 export function buildPlannerPrompt(
   request: PlanRequest,
   nonce: string = randomBytes(16).toString('hex'),
@@ -133,6 +145,7 @@ export function buildPlannerPrompt(
     '# התקנון',
     request.bundle.plainLanguage,
     '',
+    ...descriptionLines(request.businessDescription),
     '# מה כל סוכן יכול לעשות עכשיו',
     'הרשימה כבר לוקחת בחשבון את מקור השרשרת ואת רמת האוטונומיה. כלי שאינו ברשימה ייענה בסירוב.',
     catalogue,

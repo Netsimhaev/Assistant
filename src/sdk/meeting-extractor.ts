@@ -4,6 +4,7 @@
  * The owner's text is the trusted channel and is not fenced. The CALLER
  * applies `verifyTypedEmails` to a successful result.
  */
+import { renderDescriptionSection } from '../business/description-prompt.js';
 import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
 import { config } from '../config.js';
 import { MeetingRequest } from '../meetings/request.js';
@@ -22,6 +23,8 @@ export type MeetingExtractor = (i: {
   today: string;
   timeZone: string;
   signal: AbortSignal;
+  /** The owner's business description (background only); omit when absent. */
+  businessDescription?: string;
 }) => Promise<ExtractorOutcome>;
 
 const SHAPE = `{"ops":[
@@ -54,7 +57,8 @@ export function weekdayOf(date: string): { he: string; en: string } | null {
   return WEEKDAYS[new Date(ms).getUTCDay()] ?? null;
 }
 
-export function buildExtractorSystemPrompt(today: string, timeZone: string): string {
+export function buildExtractorSystemPrompt(today: string, timeZone: string, businessDescription?: string): string {
+  const description = renderDescriptionSection(businessDescription);
   const weekday = weekdayOf(today);
   const todayLine =
     weekday === null
@@ -72,6 +76,7 @@ export function buildExtractorSystemPrompt(today: string, timeZone: string): str
     '- NEVER invent an email address or phone number that is not written in the text.',
     '- Respond with one JSON object only, no prose, no code fences.',
     '- If the text is not about creating, moving, cancelling or editing a meeting, respond with exactly {"notMeeting": true}.',
+    ...(description === '' ? [] : ['', description]),
   ].join('\n');
 }
 
@@ -79,11 +84,12 @@ export function buildExtractorCall(
   text: string,
   today: string,
   timeZone: string,
+  businessDescription?: string,
 ): { prompt: string; options: Options } {
   return {
     prompt: text,
     options: {
-      systemPrompt: buildExtractorSystemPrompt(today, timeZone),
+      systemPrompt: buildExtractorSystemPrompt(today, timeZone, businessDescription),
       tools: [],
       model: MEETING_EXTRACTOR_MODEL,
       settingSources: [],
@@ -117,9 +123,9 @@ function refuseUnderTest(): void {
   );
 }
 
-export const runMeetingExtractor: MeetingExtractor = async ({ text, today, timeZone, signal }) => {
+export const runMeetingExtractor: MeetingExtractor = async ({ text, today, timeZone, signal, businessDescription }) => {
   refuseUnderTest();
-  const { prompt, options } = buildExtractorCall(text, today, timeZone);
+  const { prompt, options } = buildExtractorCall(text, today, timeZone, businessDescription);
   const abortController = linkedAbortController(signal);
   let raw = '';
   let failure: string | null = null;

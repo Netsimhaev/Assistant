@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { buildExtractorSystemPrompt, parseExtractorReply, runMeetingExtractor, weekdayOf } from './meeting-extractor.js';
+import { DESCRIPTION_HEADING } from '../business/description-prompt.js';
+import { buildExtractorCall, buildExtractorSystemPrompt, parseExtractorReply, runMeetingExtractor, weekdayOf } from './meeting-extractor.js';
 
 const json = {
   ops: [{ kind: 'cancel', clientName: 'דני', onDate: '2026-11-10' }],
@@ -39,5 +40,16 @@ describe('runMeetingExtractor', () => {
     await expect(
       runMeetingExtractor({ text: 'x', today: '2026-11-08', timeZone: 'Asia/Jerusalem', signal: new AbortController().signal }),
     ).rejects.toThrow(/refusing to run under NODE_ENV=test/);
+  });
+});
+
+describe('business description in the system prompt', () => {
+  it('the system prompt carries the description when given and omits the heading when not', () => {
+    const withDesc = String(buildExtractorCall('x', '2026-11-10', 'Asia/Jerusalem', 'מספרה בחיפה').options.systemPrompt);
+    expect(withDesc).toContain(DESCRIPTION_HEADING);
+    expect(withDesc).toContain('מספרה בחיפה');
+    expect(String(buildExtractorCall('x', '2026-11-10', 'Asia/Jerusalem').options.systemPrompt)).not.toContain(
+      DESCRIPTION_HEADING,
+    );
   });
 });

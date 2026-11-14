@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { DESCRIPTION_HEADING } from '../business/description-prompt.js';
 import type { DocumentSpec } from '../domain/document-spec.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { FORMULA_FUNCTIONS } from '../production/formula.js';
@@ -302,5 +303,14 @@ describe('draftWithQuery: the caller signal reaches the SDK query', () => {
     }) as never;
     await draftWithQuery(request(), pre.signal, once);
     expect(early!.signal.aborted).toBe(true);
+  });
+});
+
+describe('business description in the system prompt', () => {
+  it('the system prompt carries the description when given and omits the heading when not', () => {
+    const withDesc = String(buildDraftCall(request({ businessDescription: 'מספרה בחיפה' }), 'n').options.systemPrompt);
+    expect(withDesc).toContain(DESCRIPTION_HEADING);
+    expect(withDesc).toContain('מספרה בחיפה');
+    expect(String(buildDraftCall(request(), 'n').options.systemPrompt)).not.toContain(DESCRIPTION_HEADING);
   });
 });

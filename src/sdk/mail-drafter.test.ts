@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { DESCRIPTION_HEADING } from '../business/description-prompt.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { buildFence } from '../util/fence.js';
 import { buildDraftCall, interpretDraft, renderDraftPrompt, runMailDrafter } from './mail-drafter.js';
@@ -39,5 +40,14 @@ describe('mail drafter', () => {
     expect(d.status === 'drafted' && d.body.length).toBe(4_000);
     expect(interpretDraft('שלום [שם]').status).toBe('failed');
     expect(interpretDraft('  ').status).toBe('failed');
+  });
+});
+
+describe('business description in the system prompt', () => {
+  it('the system prompt carries the description when given and omits the heading when not', () => {
+    const withDesc = String(buildDraftCall({ ...req, businessDescription: 'מספרה בחיפה' }, 'n').options.systemPrompt);
+    expect(withDesc).toContain(DESCRIPTION_HEADING);
+    expect(withDesc).toContain('מספרה בחיפה');
+    expect(String(buildDraftCall(req, 'n').options.systemPrompt)).not.toContain(DESCRIPTION_HEADING);
   });
 });

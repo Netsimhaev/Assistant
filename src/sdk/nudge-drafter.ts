@@ -17,6 +17,7 @@ import type { LedgerFamily } from '../domain/ledger.js';
 import { ledgerFamilyLabel } from '../domain/labels.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { stripBidiControls } from '../util/bidi.js';
+import { renderDescriptionSection } from '../business/description-prompt.js';
 import { buildFence, stripFenceMarkers } from '../util/fence.js';
 import { interpretDraft, MAIL_DRAFTER_MODEL, type DraftOutcome } from './mail-drafter.js';
 
@@ -29,6 +30,8 @@ export interface NudgeDraftRequest {
   counterpartyName: string | null;
   /** 1 for the first nudge on the item, 2 for the second, … */
   nudgeNumber: number;
+  /** The owner's business description (background only); omit when absent. */
+  businessDescription?: string;
 }
 export type NudgeDrafter = (request: NudgeDraftRequest) => Promise<DraftOutcome>;
 
@@ -74,6 +77,11 @@ function buildContract(nonce: string): string {
   );
 }
 
+function descriptionBlock(d: string | undefined): string[] {
+  const s = renderDescriptionSection(d);
+  return s === '' ? [] : ['', s];
+}
+
 export function buildNudgeDraftCall(
   request: NudgeDraftRequest,
   nonce: string = randomBytes(16).toString('hex'),
@@ -81,7 +89,12 @@ export function buildNudgeDraftCall(
   return {
     prompt: renderNudgePrompt(request, nonce),
     options: {
-      systemPrompt: [request.bundle.promptFragments['comms.email'], '', buildContract(nonce)].join('\n'),
+      systemPrompt: [
+        request.bundle.promptFragments['comms.email'],
+        ...descriptionBlock(request.businessDescription),
+        '',
+        buildContract(nonce),
+      ].join('\n'),
       tools: [],
       model: MAIL_DRAFTER_MODEL,
       settingSources: [],

@@ -9,6 +9,7 @@ import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
 import { config } from '../config.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { stripBidiControls } from '../util/bidi.js';
+import { renderDescriptionSection } from '../business/description-prompt.js';
 import { buildFence, stripFenceMarkers } from '../util/fence.js';
 
 export const MAIL_DRAFTER_MODEL = 'sonnet';
@@ -20,6 +21,8 @@ export interface DraftRequest {
   summary: string;
   replyGist: string;
   subject: string;
+  /** The owner's business description (background only); omit when absent. */
+  businessDescription?: string;
 }
 export type Drafter = (request: DraftRequest) => Promise<DraftOutcome>;
 
@@ -58,6 +61,11 @@ function buildContract(nonce: string): string {
   );
 }
 
+function descriptionBlock(d: string | undefined): string[] {
+  const s = renderDescriptionSection(d);
+  return s === '' ? [] : ['', s];
+}
+
 export function buildDraftCall(
   request: DraftRequest,
   nonce: string = randomBytes(16).toString('hex'),
@@ -65,7 +73,12 @@ export function buildDraftCall(
   return {
     prompt: renderDraftPrompt(request, nonce),
     options: {
-      systemPrompt: [request.bundle.promptFragments['comms.email'], '', buildContract(nonce)].join('\n'),
+      systemPrompt: [
+        request.bundle.promptFragments['comms.email'],
+        ...descriptionBlock(request.businessDescription),
+        '',
+        buildContract(nonce),
+      ].join('\n'),
       tools: [],
       model: MAIL_DRAFTER_MODEL,
       settingSources: [],

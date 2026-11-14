@@ -33,6 +33,7 @@
  * that omits `language` gets the request's; one that states another value is
  * a parse failure, not an override — and so is another format or kind.
  */
+import { renderDescriptionSection } from '../business/description-prompt.js';
 import { randomBytes } from 'node:crypto';
 import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
@@ -86,6 +87,8 @@ export interface DraftRequest {
   kind: DocumentKind;
   sources: FencedSource[];
   memories: DraftMemory[];
+  /** The owner's business description (background only); omit when absent. */
+  businessDescription?: string;
   /** The previous attempt and the check's findings, on a fix round. */
   previous?: { spec: DocumentSpec; findings: { he: string }[] };
   /**
@@ -295,6 +298,11 @@ export function renderDraftPrompt(request: DraftRequest, nonce: string): string 
   return [head, ...(boundary === '' ? [] : [boundary]), ...sections].join('\n\n');
 }
 
+function descriptionBlock(d: string | undefined): string[] {
+  const s = renderDescriptionSection(d);
+  return s === '' ? [] : ['', s];
+}
+
 export function buildDraftCall(
   request: DraftRequest,
   nonce: string = randomBytes(16).toString('hex'),
@@ -302,7 +310,12 @@ export function buildDraftCall(
   return {
     prompt: renderDraftPrompt(request, nonce),
     options: {
-      systemPrompt: [renderFormatCatalogue(), '', request.bundle.promptFragments['prod.docs']].join('\n'),
+      systemPrompt: [
+        renderFormatCatalogue(),
+        '',
+        request.bundle.promptFragments['prod.docs'],
+        ...descriptionBlock(request.businessDescription),
+      ].join('\n'),
       tools: [],
       model: pickDrafterModel(request),
       settingSources: [],

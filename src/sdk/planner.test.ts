@@ -4,6 +4,7 @@ import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { PolicyBundle } from '../domain/policy.js';
+import { DESCRIPTION_HEADING } from '../business/description-prompt.js';
 import { buildPlannerPrompt, parsePlan, type PlanRequest } from './planner.js';
 
 const BUSINESS = 'test-business';
@@ -117,6 +118,16 @@ describe('the planner prompt', () => {
     const prefixOf = (text: string) => text.slice(0, text.indexOf('# ה-intents'));
     expect(prefixOf(first)).toBe(prefixOf(second));
     expect(first).not.toBe(second);
+  });
+
+  it('places the description after the charter and before the catalogue', async () => {
+    const b = await bundle();
+    const base = { bundle: b, intents: { id: 'A' }, provenance: 'boss', rampLevel: 'auto' } as const;
+    const withDesc = buildPlannerPrompt({ ...base, businessDescription: 'מספרה בחיפה' });
+    expect(withDesc.indexOf(b.plainLanguage)).toBeLessThan(withDesc.indexOf(DESCRIPTION_HEADING));
+    expect(withDesc.indexOf(DESCRIPTION_HEADING)).toBeLessThan(withDesc.indexOf('# מה כל סוכן יכול לעשות עכשיו'));
+    expect(withDesc).toContain('מספרה בחיפה');
+    expect(buildPlannerPrompt(base)).not.toContain(DESCRIPTION_HEADING);
   });
 
   it('tells the planner what it will actually be allowed to do', async () => {
