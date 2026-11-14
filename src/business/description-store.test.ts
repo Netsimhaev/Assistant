@@ -1,7 +1,9 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { BusinessDb } from '../db/pool.js';
 import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import {
+  descriptionFragment,
   loadActiveDescription,
   normaliseSentence,
   proposalRunsInLastDay,
@@ -108,5 +110,15 @@ describe('business description store', () => {
     const set = await withBusiness(TEST_BUSINESS, (db) => rejectedSentenceHashes(db));
     expect(set.size).toBe(1);
     expect(set.has(sentenceHash('do not call rival'))).toBe(true);
+  });
+});
+
+describe('descriptionFragment', () => {
+  it('degrades to no description when the read fails', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const db = { businessId: TEST_BUSINESS, query: async () => { throw new Error('boom'); } } as unknown as BusinessDb;
+    expect(await descriptionFragment(db)).toEqual({});
+    expect(spy).toHaveBeenCalledOnce();
+    spy.mockRestore();
   });
 });

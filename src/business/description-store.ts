@@ -35,8 +35,15 @@ function toDescription(row: DescriptionRow): BusinessDescription {
  * (the key is absent, not `undefined`, for exactOptionalPropertyTypes).
  */
 export async function descriptionFragment(db: BusinessDb): Promise<{ businessDescription?: string }> {
-  const d = await loadActiveDescription(db);
-  return d !== null && d.text.trim() !== '' ? { businessDescription: d.text } : {};
+  // A missing description only narrows what the model knows, never widens
+  // authority, so a failed read degrades to none (like the memory/ledger blocks).
+  try {
+    const d = await loadActiveDescription(db);
+    return d !== null && d.text.trim() !== '' ? { businessDescription: d.text } : {};
+  } catch (err) {
+    console.error(`business description load failed: ${err instanceof Error ? err.message : 'unknown error'}`);
+    return {};
+  }
 }
 
 export async function loadActiveDescription(db: BusinessDb): Promise<BusinessDescription | null> {
