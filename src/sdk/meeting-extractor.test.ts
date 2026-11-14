@@ -48,6 +48,9 @@ describe('business description in the system prompt', () => {
     const withDesc = String(buildExtractorCall('x', '2026-11-10', 'Asia/Jerusalem', 'מספרה בחיפה').options.systemPrompt);
     expect(withDesc).toContain(DESCRIPTION_HEADING);
     expect(withDesc).toContain('מספרה בחיפה');
+    // The format rules stay last: the description precedes them.
+    expect(withDesc.indexOf(DESCRIPTION_HEADING)).toBeLessThan(withDesc.indexOf('Respond with one JSON object only'));
+    expect(withDesc.trimEnd().endsWith('{"notMeeting": true}.')).toBe(true);
     expect(String(buildExtractorCall('x', '2026-11-10', 'Asia/Jerusalem').options.systemPrompt)).not.toContain(
       DESCRIPTION_HEADING,
     );

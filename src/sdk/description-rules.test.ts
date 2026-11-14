@@ -11,7 +11,7 @@ describe('buildDescriptionRulesCall', () => {
     expect(options.maxTurns).toBe(1);
     expect(options.settingSources).toEqual([]);
     expect(options.model).toBe('haiku');
-    expect(Object.keys(options.env ?? {}).every((k) => k === 'PATH')).toBe(true);
+    expect(options.env).toEqual(process.env['PATH'] === undefined ? {} : { PATH: process.env['PATH'] });
   });
 
   it('strips a forged fence marker from the description', () => {

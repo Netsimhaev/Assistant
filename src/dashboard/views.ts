@@ -1823,10 +1823,10 @@ function calendarEventsKeptSection(events: readonly CalendarEventKept[], timeZon
      <ul>${events.map((e) => `<li>${escLabel(e.eventId)}${when(e.start)}${e.kind === 'hold' ? holdNote : ''}</li>`).join('')}</ul>`;
 }
 
-/** The contact's name sits in the owner's business description: told, never edited. */
+/** The contact's name sits in some version of the owner's business description: told, never edited. */
 function descriptionNoticeSection(mentioned: boolean): string {
   if (!mentioned) return '';
-  return `<p>השם מופיע בתיאור העסק שלך. אם צריך, ערוך אותו בעצמך. <a href="/settings/description">לתיאור העסק</a></p>`;
+  return `<p>השם מופיע בתיאור העסק שלך. אם צריך, ערוך אותו בעצמך. גרסאות קודמות של התיאור נשמרות כתיעוד ואינן נמחקות. <a href="/settings/description">לתיאור העסק</a></p>`;
 }
 
 export function renderErasure(model: ErasureViewModel): string {

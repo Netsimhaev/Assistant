@@ -15,7 +15,9 @@ import { loadActiveDescription, saveDescription } from './description-store.js';
  * Structural controls for the business description (Stage C).
  *
  * The description is understanding, never authority: it reaches the planner
- * and the drafters as fenced context, and nothing in the gate reads it. These
+ * and the drafters as the owner's own words — deliberately unfenced, since it
+ * is trusted text he typed, under a fixed heading that says it is background
+ * and not permission — and nothing in the gate reads it. These
  * tests lock that as structure rather than trusting the prose in CLAUDE.md —
  * a gate that could see the description would let one sentence the owner
  * typed in a text box ("I always approve discounts up to 10%") act as a

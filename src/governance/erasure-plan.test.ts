@@ -1552,9 +1552,15 @@ describe('the business description notice', () => {
     expect((await planFor({ kind: 'contact', identifier: RONIT })).descriptionMentionsContact).toBe(true);
   });
 
-  it('does not flag a contact named only in an older version', async () => {
+  it('flags a contact named only in an older version — older versions persist', async () => {
     await describe_(`אנחנו עובדים עם ${RONIT} כבר שנים`);
     await describe_('תיאור חדש בלי שם');
+    expect((await planFor({ kind: 'contact', identifier: RONIT })).descriptionMentionsContact).toBe(true);
+  });
+
+  it('does not flag a contact named in no version at all', async () => {
+    await describe_('תיאור ראשון בלי שם');
+    await describe_('תיאור שני בלי שם');
     expect((await planFor({ kind: 'contact', identifier: RONIT })).descriptionMentionsContact).toBe(false);
   });
 
@@ -1563,6 +1569,12 @@ describe('the business description notice', () => {
     expect((await planFor({ kind: 'contact', identifier: 'dana_x@a.co' })).descriptionMentionsContact).toBe(true);
     expect((await planFor({ kind: 'contact', identifier: 'dana%x@a.co' })).descriptionMentionsContact).toBe(false);
     expect((await planFor({ kind: 'contact', identifier: 'danaQx@a.co' })).descriptionMentionsContact).toBe(false);
+  });
+
+  it('does not let _ in the identifier act as a wildcard', async () => {
+    // An unescaped `_` matches any one character, so `dana_x` would hit `danaQx`.
+    await describe_('הלקוח danaQx@a.co חשוב');
+    expect((await planFor({ kind: 'contact', identifier: 'dana_x@a.co' })).descriptionMentionsContact).toBe(false);
   });
 
   it('is false for a window anchor', async () => {
@@ -1591,9 +1603,11 @@ describe('the business description notice', () => {
       renderErasure({ plan, csrf: 'c', planHash: 'h', anchorLabel: RONIT, timeZone: null } as unknown as Parameters<typeof renderErasure>[0]);
     const flagged = render(await planFor({ kind: 'contact', identifier: RONIT }));
     expect(flagged).toContain('השם מופיע בתיאור העסק שלך. אם צריך, ערוך אותו בעצמך.');
+    expect(flagged).toContain('גרסאות קודמות של התיאור נשמרות כתיעוד ואינן נמחקות.');
     expect(flagged).toContain('href="/settings/description"');
     const plain = render(await planFor({ kind: 'contact', identifier: 'nobody@else.example' }));
     expect(plain).not.toContain('השם מופיע בתיאור העסק');
     expect(plain).not.toContain('/settings/description');
+    expect(plain).not.toContain('גרסאות קודמות של התיאור');
   });
 });

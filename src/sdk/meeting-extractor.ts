@@ -67,6 +67,9 @@ export function buildExtractorSystemPrompt(today: string, timeZone: string, busi
   return [
     "You turn a business owner's free-text instruction (usually Hebrew) about meetings into one JSON object. You have no tools and you only describe the request; you never act.",
     `${todayLine} The time zone is ${timeZone}. The week starts on Sunday (יום ראשון) and ends on Saturday (שבת). Resolve relative words (היום, מחר, מחרתיים, "ביום שלישי", "בשבוע הבא") to concrete dates using today and its weekday.`,
+    // The description is background; it sits before the shape and the rules
+    // so the output-format rules stay the last thing the model reads.
+    ...(description === '' ? [] : [description, '']),
     `Reply with exactly this JSON shape and nothing else (up to 8 ops):\n${SHAPE}`,
     'Rules:',
     '- Dates are YYYY-MM-DD. Times are HH:MM in 24-hour form.',
@@ -76,7 +79,6 @@ export function buildExtractorSystemPrompt(today: string, timeZone: string, busi
     '- NEVER invent an email address or phone number that is not written in the text.',
     '- Respond with one JSON object only, no prose, no code fences.',
     '- If the text is not about creating, moving, cancelling or editing a meeting, respond with exactly {"notMeeting": true}.',
-    ...(description === '' ? [] : ['', description]),
   ].join('\n');
 }
 

@@ -1940,14 +1940,18 @@ export async function buildErasurePlan(
   }
 
   // The business description survives erasure by name; the owner is told when
-  // the contact appears in its latest version. One SELECT, latest only.
+  // the contact appears in ANY version of it. Versions are append-only, so an
+  // older one that still names the contact persists even after the owner
+  // edited the name out of the latest — checking only the latest would tell
+  // him the name is gone while a stored copy keeps it.
   let descriptionMentionsContact = false;
   if (anchor.kind === 'contact') {
     const { rows } = await db.query<{ hit: boolean }>(
-      `SELECT (text ILIKE $2 ${LIKE_ESCAPE}) AS hit
-         FROM business_descriptions
-        WHERE business_id = $1
-        ORDER BY version DESC LIMIT 1`,
+      `SELECT EXISTS (
+         SELECT 1 FROM business_descriptions
+          WHERE business_id = $1
+            AND text ILIKE $2 ${LIKE_ESCAPE}
+       ) AS hit`,
       [businessId, `%${likeLiteral(anchor.identifier)}%`],
     );
     descriptionMentionsContact = rows[0]?.hit === true;

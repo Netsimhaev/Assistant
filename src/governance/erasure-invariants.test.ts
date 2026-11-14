@@ -1446,12 +1446,6 @@ describe('what an erasure leaves behind', () => {
     join('src', 'governance', 'erasure-plan.ts'),
   ]);
 
-  /**
-   * Erasure must never become something a plan can invoke: an injected
-   * document would say "forget what you found out about me" and the evidence
-   * would go (spec §3). Checked by reading the source, because the property
-   * is about who may import it, not about what it does when called.
-   */
   it('a table that survives by name shows the owner a notice: business_descriptions → plan.descriptionMentionsContact', async () => {
     await testDb().query(
       `INSERT INTO business_descriptions (business_id, version, text, created_by)
@@ -1464,6 +1458,12 @@ describe('what an erasure leaves behind', () => {
     expect(plan.items.some((item) => item.table === 'business_descriptions')).toBe(false);
   });
 
+  /**
+   * Erasure must never become something a plan can invoke: an injected
+   * document would say "forget what you found out about me" and the evidence
+   * would go (spec §3). Checked by reading the source, because the property
+   * is about who may import it, not about what it does when called.
+   */
   it('is imported by nothing outside erasure.ts itself and the dashboard', async () => {
     const offenders: string[] = [];
 
