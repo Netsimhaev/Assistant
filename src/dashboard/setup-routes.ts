@@ -17,8 +17,9 @@
  * an index; the rule moved is the server's `extra.pending[i]`. The proposer
  * only ever proposes — the owner chooses.
  *
- * **`probeActiveCharter` is called in exactly one route here, `/setup/edit`**
- * — an install path, one of the callers its docblock admits. Every other
+ * **`probeActiveCharter` is called in exactly one function here,
+ * `prepareEditDraft`** (behind `ensureEditDraft`, `/setup/edit` and the settings screen's
+ * description save) — an install path, one of the callers its docblock admits. Every other
  * question about the charter is `activeCharterVersion` (a column, no parse)
  * or `previousForDraft` (the draft's own base).
  */
@@ -300,7 +301,10 @@ export type DescriptionProposalsOutcome = { added: number } | { added: 0; reason
  *
  * `'interview'` writes to the interview draft, creating it as `handleRulePost`
  * does; with an active charter and no draft, an edit must start from the
- * prefill, so nothing is proposed (`no_draft`). A proposer that throws
+ * prefill, so nothing is proposed (`no_draft`). `'edit'` (the settings screen,
+ * after setup) gets its draft from `ensureEditDraft` — the open edit draft,
+ * or a fresh prefill of the active charter — and proposes nothing when the
+ * active charter is unreadable (`no_draft`). A proposer that throws
  * propagates — the description is already saved, and the caller says so.
  */
 export async function addDescriptionProposals(
@@ -309,13 +313,23 @@ export async function addDescriptionProposals(
   proposer: DescriptionProposer,
   draftSource: 'interview' | 'edit',
 ): Promise<DescriptionProposalsOutcome> {
-  if (draftSource === 'edit') throw new Error('addDescriptionProposals: edit source not implemented yet');
-  if (await editMustStartFromPrefill(await loadDraft(db), db)) return { added: 0, reason: 'no_draft' };
+  if (draftSource === 'edit') {
+    if ((await ensureEditDraft(db)) === null) return { added: 0, reason: 'no_draft' };
+  } else if (await editMustStartFromPrefill(await loadDraft(db), db)) {
+    return { added: 0, reason: 'no_draft' };
+  }
   if ((await proposalRunsInLastDay(db)) > DESCRIPTION_PROPOSAL_RUNS_PER_DAY) return { added: 0, reason: 'cap' };
 
   const raw = await proposer(description);
-  // Read the draft after the model call: the owner may have acted meanwhile.
-  const draft = await loadDraft(db);
+  // Read the draft after the model call: the owner may have acted meanwhile
+  // (on the edit path, even signed — the draft is then prefilled anew).
+  let draft: InterviewDraft | null;
+  if (draftSource === 'edit') {
+    draft = await ensureEditDraft(db);
+    if (draft === null) return { added: 0, reason: 'no_draft' };
+  } else {
+    draft = await loadDraft(db);
+  }
   const extra = extraOf(draft);
   const proposals = parseDescriptionProposals(raw, description, {
     rejectedHashes: await rejectedSentenceHashes(db),
@@ -335,6 +349,9 @@ export async function addDescriptionProposals(
  */
 export const DESCRIPTION_CAP_NOTICE =
   'התיאור נשמר. להיום כבר הצעתי כללים מספיק פעמים — הצעות יופיעו בפעם הבאה שתשנה את התיאור ותשמור.';
+/** After a save from the settings screen over an unreadable active charter (`no_draft`). */
+export const DESCRIPTION_NO_DRAFT_NOTICE =
+  'התיאור נשמר. לא הצעתי כללים, כי לא הצלחתי לקרוא את הכללים הנוכחיים — אפשר לעדכן אותם ב"ערוך את הכללים".';
 export const DESCRIPTION_PROPOSER_FAILED =
   'התיאור נשמר, אבל לא הצלחתי להציע ממנו כללים כרגע. הצעות יופיעו בפעם הבאה שתשנה את התיאור ותשמור.';
 
@@ -515,20 +532,44 @@ export async function handleSignPost(
  *   - none → the first-time interview.
  */
 export async function handleSetupEdit(res: ServerResponse, db: BusinessDb, session: SetupSession): Promise<void> {
-  const probe = await probeActiveCharter(db);
+  const prepared = await prepareEditDraft(db);
+  if (prepared.kind === 'draft') return seeOther(res, '/setup/step/1');
+  if (prepared.kind === 'none') return seeOther(res, '/setup');
+  console.error('setup edit: the active charter does not parse:', prepared.reason);
   const draft = await loadDraft(db);
-  if (probe.ok) {
-    if (probe.active === null) return seeOther(res, '/setup');
-    const version = probe.active.charter.charterVersion;
-    if (draft === null || draft.baseCharterVersion !== version) {
-      const prefill = prefillFromCharter(probe.active.charter);
-      await replaceDraft(db, prefill, version);
-    }
-    return seeOther(res, '/setup/step/1');
-  }
-  console.error('setup edit: the active charter does not parse:', probe.reason);
   const version = await activeCharterVersion(db);
   const current =
     draft !== null && draft.baseCharterVersion === version ? draft : await replaceDraft(db, {}, version);
   sendHtml(res, 200, renderStep(await stepView(db, session, 1, current, { notice: UNREADABLE_NOTICE })));
+}
+
+/**
+ * The edit draft over the readable active charter: the open draft when it
+ * started from that charter, otherwise one REPLACED by its prefill (a draft
+ * started from anything else is stale — the rule `/setup/edit` has always
+ * applied). `null` when there is no readable active charter — none, or one
+ * that does not parse; the caller decides what that means.
+ *
+ * It calls `probeActiveCharter` and is therefore an install path in the sense
+ * that function's docblock admits: it prepares the draft a signature installs.
+ * Its callers are `/setup/edit` and the settings screen's description save.
+ */
+export async function ensureEditDraft(db: BusinessDb): Promise<InterviewDraft | null> {
+  const prepared = await prepareEditDraft(db);
+  return prepared.kind === 'draft' ? prepared.draft : null;
+}
+
+type PreparedEditDraft =
+  | { kind: 'draft'; draft: InterviewDraft }
+  | { kind: 'none' }
+  | { kind: 'unreadable'; reason: string };
+
+async function prepareEditDraft(db: BusinessDb): Promise<PreparedEditDraft> {
+  const probe = await probeActiveCharter(db);
+  if (!probe.ok) return { kind: 'unreadable', reason: probe.reason };
+  if (probe.active === null) return { kind: 'none' };
+  const version = probe.active.charter.charterVersion;
+  const draft = await loadDraft(db);
+  if (draft !== null && draft.baseCharterVersion === version) return { kind: 'draft', draft };
+  return { kind: 'draft', draft: await replaceDraft(db, prefillFromCharter(probe.active.charter), version) };
 }

@@ -132,6 +132,7 @@ import {
   handleLedgerSettingsGet,
   handleLedgerSettingsPost,
 } from './ledger-routes.js';
+import { DESCRIPTION_SETTINGS_PATH, handleDescriptionGet, handleDescriptionPost } from './description-routes.js';
 import { handleDocumentFile, handleInvoices, handleMailDetail, handleMailDocuments, handleMailList, notFound } from './mail-handlers.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
@@ -3277,6 +3278,12 @@ async function route(
     return handleAutonomyUpdatesPost(req, res, db, session);
   if (method === 'GET' && pathname === '/autonomy/actions')
     return handleAutonomousActionsGet(res, db, session);
+
+  // The business description after setup: proposals go to the edit draft.
+  if (method === 'GET' && pathname === DESCRIPTION_SETTINGS_PATH) return handleDescriptionGet(res, db, session);
+  if (method === 'POST' && pathname === DESCRIPTION_SETTINGS_PATH) {
+    return handleDescriptionPost(res, db, session, await readFormBody(req), setupOptions);
+  }
 
   // The task ledger ("הפנקס"): list + owner actions, settings, critical rules.
   if (method === 'GET' && pathname === '/ledger') return handleLedgerGet(res, db, session, requestUrl);
