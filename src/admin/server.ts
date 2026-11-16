@@ -59,7 +59,6 @@ import {
   PANEL_LOGIN_FAILED,
   PANEL_LOGIN_LOCKED,
   renderForbidden,
-  renderHome,
   renderJoin,
   renderLogin,
   renderNotFound,
@@ -71,6 +70,7 @@ import {
   TOTP_LOCKED,
   type PanelViewer,
 } from './views.js';
+import { handleBusinessRoute } from './business-routes.js';
 
 export interface AdminOptions {
   /** Loopback by default; anything else is refused unless `allowNonLoopbackBind`. */
@@ -88,7 +88,7 @@ export interface AdminOptions {
   masterKey: Buffer;
   /** Where business files live (the logo, Task 10). */
   documentRoot: string;
-  /** The owner dashboard's public base URL, for the links the panel shows (Task 10). */
+  /** The owner dashboard's public base URL, for the invite links the panel shows. */
   dashboardBaseUrl: string;
 }
 
@@ -356,6 +356,7 @@ async function handleJoinPost(req: IncomingMessage, res: ServerResponse, token: 
 
 interface RouteOptions {
   masterKey: Buffer;
+  dashboardBaseUrl: string;
 }
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse, options: RouteOptions): Promise<void> {
@@ -398,7 +399,21 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
   if (pathname === '/2fa' || pathname === '/2fa/enrol') return seeOther(res, '/');
 
   if (method === 'POST' && pathname === '/logout') return handleLogout(req, res, session);
-  if (method === 'GET' && pathname === '/') return sendHtml(res, 200, renderHome(viewerOf(session)));
+
+  const handled = await handleBusinessRoute({
+    req,
+    res,
+    method,
+    pathname,
+    staff: { staffId: session.staffId, displayName: session.displayName },
+    viewer: viewerOf(session),
+    dashboardBaseUrl: options.dashboardBaseUrl,
+    readForm: () => readFormBody(req),
+    csrfOk: (form) => verifyCsrfToken(session.token, form.get('csrf')),
+    sendHtml: (status, html) => sendHtml(res, status, html),
+    seeOther: (location) => seeOther(res, location),
+  });
+  if (handled) return;
 
   sendHtml(res, 404, renderNotFound());
 }
@@ -410,7 +425,7 @@ export function createAdminServer(options: AdminOptions): Server {
   assertBindableHost(host, options.allowNonLoopbackBind ?? false, ADMIN_BIND);
 
   const server = createHttpServer((req, res) => {
-    handleRequest(req, res, { masterKey: options.masterKey }).catch((err: unknown) => {
+    handleRequest(req, res, { masterKey: options.masterKey, dashboardBaseUrl: options.dashboardBaseUrl }).catch((err: unknown) => {
       if (err instanceof FormBodyTooLargeError) {
         if (!res.headersSent) sendHtml(res, 413, renderTooLarge());
         else res.end();

@@ -149,6 +149,14 @@ export const AuditKind = z.enum([
    * name people, and this table is the one an erasure cannot reach.
    */
   'description_change',
+  /**
+   * A technician acted on this business from the operator panel (open,
+   * suspend, resume, a setup action). Carries the action kind and the staff
+   * member's display name in `reason`, and `inputHash = canonicalHash({ action })`
+   * — never anything typed: the panel's every action writes this row through
+   * `recordStaffAction` (`src/admin/record.ts`), its one writer.
+   */
+  'staff_action',
 ]);
 export type AuditKind = z.infer<typeof AuditKind>;
 

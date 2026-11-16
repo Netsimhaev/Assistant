@@ -85,6 +85,26 @@ export async function issueOwnerLink(
   return `${db.businessId}.${raw}`;
 }
 
+/**
+ * Retire every unused link of `kind` in this business, whatever login it was
+ * issued for. The panel calls it before a fresh invite: a business has one
+ * owner, so an invite sent to a mistyped address must stop working the
+ * moment the technician sends the corrected one — `issueOwnerLink` alone
+ * retires only links for the same login. Joins the caller's transaction.
+ */
+export async function retireUnusedOwnerLinks(
+  db: BusinessDb,
+  kind: OwnerLinkKind,
+  now: Date = new Date(),
+): Promise<number> {
+  const result = await db.query(
+    `UPDATE owner_links SET used_at = $3
+      WHERE business_id = $1 AND kind = $2 AND used_at IS NULL`,
+    [db.businessId, kind, now],
+  );
+  return result.rowCount ?? 0;
+}
+
 async function loadLink(db: BusinessDb, rawToken: string, lock: boolean): Promise<LinkRow | null> {
   if (!RAW_TOKEN_SHAPE.test(rawToken)) return null;
   const { rows } = await db.query<LinkRow>(
