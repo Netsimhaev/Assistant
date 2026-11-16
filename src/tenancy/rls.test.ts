@@ -48,6 +48,8 @@ const EXCLUDED: ReadonlySet<string> = new Set([
   'platform_staff_devices',
   'platform_staff_links',
   'platform_activity_log',
+  // The panel's unknown-login bucket (migration 074): one server row, like the dashboard's.
+  'platform_staff_unknown_login_throttle',
 ]);
 
 const POLICY_NAME = 'tenant_isolation';

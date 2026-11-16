@@ -117,6 +117,7 @@ export async function resetDatabase(): Promise<void> {
       dashboard_trusted_devices,
       owner_links,
       dashboard_unknown_user_throttle,
+      platform_staff_unknown_login_throttle,
       dashboard_users,
       platform_activity_log,
       platform_staff_links,

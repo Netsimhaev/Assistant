@@ -391,7 +391,12 @@ export async function staffLogin(input: {
     );
     const row = rows[0];
     if (!row || row.removed_at !== null || row.password_hash === null || row.password_salt === null) {
+      // The panel's own unknown-login bucket (migration 074): once it is
+      // locked the decoy scrypt is not paid at all, so nobody can make the
+      // panel spend scrypt without limit on addresses that are not members.
+      if (await unknownLoginLocked(db, now)) return { ok: false, code: 'bad_credentials' };
       await verifyPassword(input.password, DECOY_HASH, DECOY_SALT);
+      await recordUnknownLoginFailure(db, now);
       return { ok: false, code: 'bad_credentials' };
     }
 
@@ -423,6 +428,42 @@ export async function staffLogin(input: {
     ]);
     return { ok: true, staffId: row.staff_id };
   });
+}
+
+/**
+ * Is the panel's shared unknown-login bucket locked? An expired lock is
+ * cleared on the way through, with the expiry re-checked in SQL so a fresh
+ * lock set in between is not clobbered — the owner bucket's pattern
+ * (`dashboard/unknown-user-throttle.ts`), on the panel's own row.
+ */
+async function unknownLoginLocked(db: Queryable, now: Date): Promise<boolean> {
+  const { rows } = await db.query<{ locked_until: Date | null }>(
+    'SELECT locked_until FROM platform_staff_unknown_login_throttle',
+  );
+  const lockedUntil = rows[0]?.locked_until ?? null;
+  if (lockedUntil === null) return false;
+  if (lockedUntil.getTime() > now.getTime()) return true;
+  const cleared = await db.query(
+    `UPDATE platform_staff_unknown_login_throttle SET failed_attempts = 0, locked_until = NULL
+      WHERE locked_until <= $1`,
+    [now],
+  );
+  return (cleared.rowCount ?? 0) === 0;
+}
+
+/** One more failure in the bucket, counted by Postgres in one statement; locks at `MAX_FAILED`. */
+async function recordUnknownLoginFailure(db: Queryable, now: Date): Promise<void> {
+  await db.query(
+    `INSERT INTO platform_staff_unknown_login_throttle (singleton, failed_attempts, locked_until)
+     VALUES (true, 1, CASE WHEN 1 >= $1 THEN $2::timestamptz END)
+     ON CONFLICT (singleton) DO UPDATE
+        SET failed_attempts = platform_staff_unknown_login_throttle.failed_attempts + 1,
+            locked_until = CASE
+              WHEN platform_staff_unknown_login_throttle.failed_attempts + 1 >= $1 THEN $2::timestamptz
+              ELSE platform_staff_unknown_login_throttle.locked_until
+            END`,
+    [MAX_FAILED, new Date(now.getTime() + LOCK_MINUTES * 60_000)],
+  );
 }
 
 async function insertSession(
@@ -742,17 +783,22 @@ export async function staffResetSecondFactor(staffId: string, now: Date = new Da
   });
 }
 
-/** Mint a trusted-device token; only its sha256 is stored. Returns the raw token. */
+/**
+ * Mint a trusted-device token; only its sha256 is stored. Returns the raw
+ * token. A removed (or unknown) member gets no row at all — the insert reads
+ * the member in the same statement and refuses with `StaffError`.
+ */
 export async function issueStaffDevice(staffId: string, now: Date = new Date()): Promise<string> {
   const token = newToken();
   const expiresAt = new Date(now.getTime() + TRUSTED_DEVICE_DAYS * 86_400_000);
-  await withPlatform((db) =>
+  const inserted = await withPlatform((db) =>
     db.query(
       `INSERT INTO platform_staff_devices (device_hash, staff_id, created_at, expires_at)
-       VALUES ($1, $2, $3, $4)`,
+       SELECT $1, staff_id, $3, $4 FROM platform_staff WHERE staff_id = $2 AND removed_at IS NULL`,
       [sha256(token), staffId, now, expiresAt],
     ),
   );
+  if ((inserted.rowCount ?? 0) === 0) throw new StaffError('איש הצוות לא נמצא.');
   return token;
 }
 
