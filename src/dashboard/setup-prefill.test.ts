@@ -13,7 +13,7 @@ import { saveSetupPackage, type SetupPackage } from '../business/setup-package.j
 import { saveAddress, saveLogo } from '../business/profile.js';
 import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { createServer } from './server.js';
-import { SETUP_PEOPLE_SUMMARY_TITLE } from './setup-views.js';
+import { SETUP_PEOPLE_SUMMARY_TITLE, UNCONFIRMED_SETUP_PEOPLE_NOTE } from './setup-views.js';
 import { BOSS_PREFILL_NOTE, PROFILE_CHANGE_NOTE } from './setup-step-views.js';
 
 const BUSINESS = 'setup-prefill-business';
@@ -162,6 +162,24 @@ describe('the technician\'s setup data in the interview', () => {
     expect(html).toContain(SETUP_PEOPLE_SUMMARY_TITLE);
     expect(html).toContain('יוסי');
     expect(html).toContain('משה לוי');
+    // Everyone in the package is in the snapshot: no leftover line.
+    expect(html).not.toContain(UNCONFIRMED_SETUP_PEOPLE_NOTE);
+  });
+
+  it('the summary tells the owner about package people that signing will not add', async () => {
+    await seed();
+    await withBusiness(BUSINESS, (db) => replaceDraft(db, completeAnswers(), null));
+    const { baseUrl, cookie } = await start();
+    // Not confirmed at all.
+    expect(await (await get(baseUrl, cookie, '/setup/summary')).text()).toContain(UNCONFIRMED_SETUP_PEOPLE_NOTE);
+    // Confirmed, then the technician adds one more.
+    const csrf = csrfOf(await (await get(baseUrl, cookie, '/setup/step/8')).text());
+    await post(baseUrl, cookie, '/setup/people', { csrf });
+    expect(await (await get(baseUrl, cookie, '/setup/summary')).text()).not.toContain(UNCONFIRMED_SETUP_PEOPLE_NOTE);
+    await withBusiness(BUSINESS, (db) =>
+      saveSetupPackage(db, { ...PACKAGE, colleagues: [...PACKAGE.colleagues, { name: 'חדש', role: 'עובד', phone: '+972501110010' }] }, 'tech'),
+    );
+    expect(await (await get(baseUrl, cookie, '/setup/summary')).text()).toContain(UNCONFIRMED_SETUP_PEOPLE_NOTE);
   });
 
   it('POST /setup/people refuses a bad CSRF and bad indices, writing nothing', async () => {

@@ -10,7 +10,7 @@ import type { InterviewAnswers } from '../charter/interview/answers.js';
 import { isPrincipalSender } from '../governance/principal-number.js';
 import { setupDataForPanel } from '../tenancy/panel-reads.js';
 import { listColleagues } from './colleagues.js';
-import { CONFIRM_PEOPLE_JOB_TITLE, SetupPeopleInputError, confirmSetupPeople } from './confirm-people.js';
+import { CONFIRM_PEOPLE_JOB_TITLE, SetupPeopleInputError, confirmSetupPeople, unconfirmedSetupPeople } from './confirm-people.js';
 import { loadSetupPackage, saveSetupPackage, type SetupPackage } from './setup-package.js';
 
 const TECH = 'tech-1';
@@ -67,6 +67,21 @@ async function liveEntities(): Promise<Array<{ subject_key: string; body: Record
   );
   return rows;
 }
+
+describe('unconfirmedSetupPeople', () => {
+  it('counts package people the snapshot does not hold, per list', () => {
+    expect(unconfirmedSetupPeople(null, undefined)).toBe(0);
+    expect(unconfirmedSetupPeople(PACKAGE, undefined)).toBe(3);
+    const snapshot = {
+      contacts: PACKAGE.contacts.map((c) => ({ ...c, known: false })),
+      colleagues: [...PACKAGE.colleagues],
+    };
+    expect(unconfirmedSetupPeople(PACKAGE, snapshot)).toBe(0);
+    expect(unconfirmedSetupPeople({ ...PACKAGE, contacts: [...PACKAGE.contacts, { name: 'x', role: 'y', phone: '+972501110009' }] }, snapshot)).toBe(1);
+    // A contact's phone confirmed as a colleague is still an unconfirmed contact.
+    expect(unconfirmedSetupPeople(PACKAGE, { contacts: [], colleagues: [...PACKAGE.colleagues] })).toBe(2);
+  });
+});
 
 describe('confirmSetupPeople (step 8)', () => {
   beforeEach(async () => {
@@ -205,7 +220,7 @@ describe('signing applies the confirmed setup people', () => {
     expect(await run((db) => listColleagues(db))).toHaveLength(1);
   });
 
-  it('keeps package people the technician added after the owner confirmed', async () => {
+  it('clears package people the technician added after the owner confirmed — only the snapshot takes effect', async () => {
     await seedPackage();
     await startDraft();
     await run((db) => confirmSetupPeople(db, { knownIndices: [] }));
@@ -213,18 +228,19 @@ describe('signing applies the confirmed setup people', () => {
     await seedPackage({ ...PACKAGE, contacts: [...PACKAGE.contacts, later] });
 
     expect((await freezeAndSign()).outcome).toBe('installed');
-    // Only the snapshot took effect; the later entry is still pending, the boss number is cleared.
+    // Only the snapshot took effect; the leftover is cleared with the rest, not stranded.
     expect(await liveEntities()).toHaveLength(2);
-    expect(await run((db) => loadSetupPackage(db))).toEqual({ bossWhatsapp: null, contacts: [later], colleagues: [] });
+    expect(JSON.stringify(await liveEntities())).not.toContain('+972501110009');
+    expect(await run((db) => loadSetupPackage(db))).toBeNull();
   });
 
-  it('a sign with no snapshot clears only the boss number', async () => {
+  it('a sign with no snapshot adds nobody and clears the whole package', async () => {
     await seedPackage();
     await startDraft();
     expect((await freezeAndSign()).outcome).toBe('installed');
     expect(await liveEntities()).toEqual([]);
     expect(await run((db) => listColleagues(db))).toEqual([]);
-    expect(await run((db) => loadSetupPackage(db))).toEqual({ ...PACKAGE, bossWhatsapp: null });
+    expect(await run((db) => loadSetupPackage(db))).toBeNull();
   });
 
   it('the summary hash covers the snapshot', async () => {

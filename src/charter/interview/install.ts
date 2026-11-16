@@ -5,7 +5,7 @@ import type { BusinessCharter } from '../../domain/charter.js';
 import { setAutonomyMode } from '../../governance/autonomy-mode.js';
 import type { MailProvider } from '../../mail/mailbox.js';
 import { applySetupPeople } from '../../business/confirm-people.js';
-import { clearSetupBoss } from '../../business/setup-package.js';
+import { clearSetupBoss, clearSetupPeople } from '../../business/setup-package.js';
 import { canonicalHash } from '../../util/canonical.js';
 import { signCharter } from '../sign.js';
 import { installCharter, loadCharterVersion } from '../store.js';
@@ -211,12 +211,16 @@ export async function signAndInstallInterview(
       });
       // The technician's setup data takes effect here and nowhere earlier:
       // the people step 8 confirmed (a job needs this charter version), and
-      // the package's boss number — now in the signed charter, or replaced by
-      // the owner — is cleared. Both join this transaction without a second
+      // the whole package is emptied — the boss number (now in the signed
+      // charter, or replaced by the owner) and every person in it, confirmed
+      // or not: from here on the package is locked for the technician and the
+      // owner manages people in settings, so a leftover would be stranded,
+      // and the summary told the owner about any (`unconfirmedSetupPeople`). Both join this transaction without a second
       // lock (`lockedChecks` already holds the install lock), so a failure
       // rolls the install back, and a double sign, refused as `stale`, adds
       // nothing twice.
       await applySetupPeople(tx, answers.setupPeople, signed.charterVersion);
+      await clearSetupPeople(tx);
       await clearSetupBoss(tx);
       await deleteDraft(tx);
     });

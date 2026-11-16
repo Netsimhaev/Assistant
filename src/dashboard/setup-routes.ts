@@ -28,7 +28,7 @@ import { InterviewAnswers, INTERVIEW_SECTIONS, type AcceptedRule } from '../char
 import { buildCharterFromInterview, buildConnections, prefillFromCharter } from '../charter/interview/build.js';
 import { freezeDraft, loadDraft, replaceDraft, saveSection, type InterviewDraft } from '../charter/interview/draft-store.js';
 import { previousForDraft, signAndInstallInterview, summaryHash } from '../charter/interview/install.js';
-import { SetupPeopleInputError, confirmSetupPeople } from '../business/confirm-people.js';
+import { SetupPeopleInputError, confirmSetupPeople, unconfirmedSetupPeople } from '../business/confirm-people.js';
 import { loadProfile, readLogo } from '../business/profile.js';
 import { loadSetupPackage } from '../business/setup-package.js';
 import type { RuleProposer } from '../charter/interview/rule-proposal.js';
@@ -550,6 +550,7 @@ export async function handleSummaryGet(res: ServerResponse, db: BusinessDb, sess
       summary,
       shownHash: summaryHash(unsigned, parsed.data.setupPeople),
       setupPeople: parsed.data.setupPeople,
+      unconfirmedSetupPeople: unconfirmedSetupPeople(await loadSetupPackage(db), parsed.data.setupPeople),
       csrf: issueCsrfToken(session.sessionId),
       business: {
         legalName: unsigned.identity.legalName,

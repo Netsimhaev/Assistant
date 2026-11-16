@@ -171,6 +171,9 @@ function knownCard(known: readonly SummaryCounterparty[]): string {
 }
 
 export const SETUP_PEOPLE_SUMMARY_TITLE = 'מה החתימה תוסיף מנתוני ההקמה';
+/** Shown on the summary when the package holds people the snapshot does not — signing clears them. */
+export const UNCONFIRMED_SETUP_PEOPLE_NOTE =
+  'יש בהקמה אנשים שלא אושרו — הם לא יתווספו. אפשר להוסיף אותם אחר כך בהגדרות ← אנשים.';
 
 /**
  * The people step 8 confirmed: what the signature writes besides the charter
@@ -220,6 +223,8 @@ export function renderSummary(options: {
   mode: AutonomyMode;
   /** The people step 8 confirmed, applied by the signature; bound by the hash. */
   setupPeople?: SetupPeopleSnapshot | undefined;
+  /** People in the setup package the snapshot does not hold; the signature clears them. */
+  unconfirmedSetupPeople?: number;
 }): string {
   const { summary, business } = options;
   const changes =
@@ -258,6 +263,7 @@ ${principalCard(summary.principal)}
 <div class="card"><h2>גבולות</h2>${bulletList(summary.limits, 'לא נקבעו גבולות נוספים.')}</div>
 ${knownCard(summary.knownCounterparties)}
 ${setupPeopleCard(options.setupPeople)}
+${(options.unconfirmedSetupPeople ?? 0) > 0 ? `<p class="note">${esc(UNCONFIRMED_SETUP_PEOPLE_NOTE)}</p>` : ''}
 ${mailboxCard(summary)}
 <p class="note">רמת החופש אחרי החתימה: <b>${esc(AUTONOMY_MODE_INTERVIEW_HE[options.mode])}</b> — לא חלק מהכללים; אפשר לשנות בכל רגע במסך „כמה חופש לתת”.</p>
 <div class="card"><h2>מה ידוע לי על העסק</h2>${guidance}</div>

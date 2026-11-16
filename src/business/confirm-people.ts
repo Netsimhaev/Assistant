@@ -35,7 +35,7 @@ import { authorityNumberKey } from '../governance/principal-number.js';
 import { writeMemory } from '../memory/store.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
 import { addColleague, listColleagues } from './colleagues.js';
-import { loadSetupPackage, removeSetupPeople } from './setup-package.js';
+import { loadSetupPackage, type SetupPackage } from './setup-package.js';
 
 export const CONFIRM_PEOPLE_JOB_TITLE = 'אישור אנשי קשר מההקמה';
 /** The `memories.source_ref` that marks a contact confirmed from the setup package. */
@@ -112,11 +112,28 @@ export async function confirmSetupPeople(
 }
 
 /**
+ * How many people in the package the snapshot does not hold — never
+ * confirmed, or added by a technician after the owner confirmed. The
+ * signature clears the whole package, so the summary tells the owner these
+ * will not be added. Matched by phone, per list (a contact is not a colleague).
+ */
+export function unconfirmedSetupPeople(
+  pkg: SetupPackage | null,
+  snapshot: SetupPeopleSnapshot | undefined,
+): number {
+  if (pkg === null) return 0;
+  const missing = (list: readonly { phone: string }[], confirmed: readonly { phone: string }[]) =>
+    list.filter((p) => !confirmed.some((c) => samePhone(c.phone, p.phone))).length;
+  return missing(pkg.contacts, snapshot?.contacts ?? []) + missing(pkg.colleagues, snapshot?.colleagues ?? []);
+}
+
+/**
  * At signature, inside the install transaction (`tx`), after
  * `installCharter(…charterVersion)`: write the confirmed contacts to memory,
  * insert the colleagues (a phone already in `business_colleagues` is not
- * inserted twice), close the job, and take the applied people out of the
- * setup package. No snapshot, or an empty one, does nothing.
+ * inserted twice), and close the job. No snapshot, or an empty one, does
+ * nothing. Emptying the package is the install's (`clearSetupPeople`), for
+ * every person in it, confirmed or not.
  */
 export async function applySetupPeople(
   tx: BusinessDb,
@@ -148,8 +165,4 @@ export async function applySetupPeople(
     await transition(tx, job.jobId, { to, actor: 'human', reason });
   }
 
-  await removeSetupPeople(tx, {
-    contactPhones: snapshot.contacts.map((c) => c.phone),
-    colleaguePhones: snapshot.colleagues.map((c) => c.phone),
-  });
 }
