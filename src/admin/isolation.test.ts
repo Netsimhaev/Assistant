@@ -79,7 +79,12 @@ describe('panel and dashboard sessions do not cross', () => {
     // The owner's cookie is live on its own server.
     expect((await getHome(dashboard, `sid=${sid}`)).status).toBe(200);
 
-    for (const cookie of [`asid=${sid}`, `sid=${sid}`]) {
+    // The shape cases fail before any lookup. The bare token is well-formed
+    // for the panel (64 hex), so its refusal must come from the session
+    // lookup: the owner's token is not in the panel's session table.
+    const bare = sid.split('.')[1] ?? '';
+    expect(bare).toMatch(/^[0-9a-f]{64}$/);
+    for (const cookie of [`asid=${sid}`, `sid=${sid}`, `asid=${bare}`]) {
       const res = await getHome(panel, cookie);
       expect(res.status, cookie).toBe(303);
       expect(res.headers.get('location'), cookie).toBe('/login');
@@ -102,7 +107,9 @@ describe('panel and dashboard sessions do not cross', () => {
     const asid = await staffToken();
     expect((await getHome(panel, `asid=${asid}`)).status).toBe(200);
 
-    for (const cookie of [`sid=${asid}`, `asid=${asid}`]) {
+    // `<business>.<staff token>` is well-formed for the dashboard, so its
+    // refusal must come from the dashboard's own session lookup.
+    for (const cookie of [`sid=${asid}`, `asid=${asid}`, `sid=${BUSINESS}.${asid}`]) {
       const res = await getHome(dashboard, cookie);
       // The dashboard's own redirect to /login is a 302 (unchanged here); a
       // refusal either way, never the page.
