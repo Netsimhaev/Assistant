@@ -24,7 +24,7 @@ import { upsertBinding } from '../orchestrator/bindings.js';
 import { writeGrant } from '../governance/oauth-grants.js';
 import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase, testDb } from '../test/db.js';
-import { createTestOwner, ownerLogin } from '../test/owner.js';
+import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { issueCsrfToken } from './csrf.js';
 import { CALENDAR_AUTHORISATION_TEXT } from './calendar-connect.js';
 import { createServer } from './server.js';
@@ -79,20 +79,13 @@ afterAll(async () => {
 });
 
 async function startServer(): Promise<string> {
-  server = createServer({ port: 0, credentialKeyPath: keyPath, dashboardBaseUrl: 'http://127.0.0.1:4173' });
+  server = createServer({ masterKey: TEST_MASTER_KEY, port: 0, credentialKeyPath: keyPath, dashboardBaseUrl: 'http://127.0.0.1:4173' });
   await once(server, 'listening');
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
 
 async function login(baseUrl: string): Promise<string> {
-  const res = await fetch(`${baseUrl}/login`, {
-    method: 'POST',
-    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
-    redirect: 'manual',
-  });
-  const pair = (res.headers.get('set-cookie') ?? '').split(';')[0];
-  if (!pair) throw new Error('no session cookie');
-  return pair;
+  return loginWithSecondFactor(baseUrl, BUSINESS, { username: USERNAME, password: PASSWORD });
 }
 
 function csrfFor(cookie: string): string {

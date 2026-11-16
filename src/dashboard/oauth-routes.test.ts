@@ -30,7 +30,7 @@ import { loadBindings, upsertBinding } from '../orchestrator/bindings.js';
 import { closePool, withBusiness } from '../db/pool.js';
 import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase, testDb } from '../test/db.js';
-import { createTestOwner, ownerLogin } from '../test/owner.js';
+import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { issueCsrfToken } from './csrf.js';
 import { createServer } from './server.js';
 import { buildMailboxAmendment } from '../charter/amend-mailbox.js';
@@ -109,7 +109,7 @@ afterAll(async () => {
 async function startServer(
   options: { oauthFetch?: typeof fetch; mailboxClientFor?: (provider: MailProvider) => MailboxClient } = {},
 ): Promise<string> {
-  server = createServer({
+  server = createServer({ masterKey: TEST_MASTER_KEY,
     port: 0,
     credentialKeyPath: keyPath,
     dashboardBaseUrl: DASHBOARD_BASE_URL,
@@ -121,13 +121,6 @@ async function startServer(
   return `http://127.0.0.1:${address.port}`;
 }
 
-function cookiePair(setCookieHeader: string | null): string {
-  if (!setCookieHeader) throw new Error('no Set-Cookie header on response');
-  const pair = setCookieHeader.split(';')[0];
-  if (!pair) throw new Error('empty Set-Cookie header');
-  return pair;
-}
-
 /** The cookie's own value IS the session id `loadSession` reads — see `server.ts`'s `loadSession`. */
 function sessionIdFromCookie(cookie: string): string {
   const value = cookie.split('=')[1];
@@ -136,13 +129,7 @@ function sessionIdFromCookie(cookie: string): string {
 }
 
 async function loginWithPassword(baseUrl: string): Promise<string> {
-  const res = await fetch(`${baseUrl}/login`, {
-    method: 'POST',
-    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
-    redirect: 'manual',
-  });
-  expect(res.status).toBe(302);
-  return cookiePair(res.headers.get('set-cookie'));
+  return loginWithSecondFactor(baseUrl, BUSINESS, { username: USERNAME, password: PASSWORD });
 }
 
 function jsonResponse(status: number, body: unknown): Response {

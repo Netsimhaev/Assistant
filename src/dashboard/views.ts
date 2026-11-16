@@ -139,6 +139,67 @@ ${errorBlock}
   );
 }
 
+/** The instruction on the enrolment screen. */
+export const TOTP_ENROL_INSTRUCTION =
+  'סרוק את הקוד באפליקציית Google Authenticator והקלד את הקוד בן שש הספרות שמופיע בה.';
+/** A wrong, replayed or expired code. */
+export const TOTP_BAD_CODE = 'הקוד שגוי או שפג תוקפו. נסה שוב עם הקוד שמופיע עכשיו באפליקציה.';
+/** Too many wrong codes. */
+export const TOTP_LOCKED = 'יותר מדי ניסיונות. נסה שוב בעוד כמה דקות.';
+
+function totpCodeForm(action: string, csrf: string): string {
+  return `<form method="post" action="${esc(action)}">
+  <input type="hidden" name="csrf" value="${esc(csrf)}">
+  <label>קוד בן שש ספרות<input type="text" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></label>
+  <button type="submit">אישור</button>
+</form>`;
+}
+
+/**
+ * Connecting Google Authenticator. `qr` is the SVG `qrSvg` built from the
+ * otpauth URI — markup this server generated, never anything a user typed —
+ * and `secretBase32` the same secret for typing by hand, in groups of four.
+ * Both are absent after a wrong code: showing the page again must not mint a
+ * new secret under an app that already scanned the old one, so the owner is
+ * offered the code field and, separately, a fresh start.
+ */
+export function renderTotpEnrol(options: {
+  csrf: string;
+  qr?: string;
+  secretBase32?: string;
+  error?: string;
+}): string {
+  const errorBlock = options.error ? `<p class="error">${esc(options.error)}</p>` : '';
+  const shown =
+    options.qr !== undefined && options.secretBase32 !== undefined
+      ? `<div class="card totp-qr">${options.qr}</div>
+<p class="muted">או הקלד את המפתח ידנית:</p>
+<p><code class="totp-secret">${esc(options.secretBase32.match(/.{1,4}/g)?.join(' ') ?? options.secretBase32)}</code></p>`
+      : '<p class="muted">אם עוד לא סרקת את הקוד, <a href="/2fa/enrol">הצג קוד חדש</a>.</p>';
+  return page(
+    'חיבור Google Authenticator',
+    `<h1>חיבור Google Authenticator</h1>
+<p>${esc(TOTP_ENROL_INSTRUCTION)}</p>
+${errorBlock}
+${shown}
+${totpCodeForm('/2fa/enrol', options.csrf)}
+${logoutForm(options.csrf)}`,
+  );
+}
+
+/** The second factor at sign-in, on a device that is not trusted. */
+export function renderTotpVerify(options: { csrf: string; error?: string }): string {
+  const errorBlock = options.error ? `<p class="error">${esc(options.error)}</p>` : '';
+  return page(
+    'אימות דו-שלבי',
+    `<h1>אימות דו-שלבי</h1>
+<p>הקלד את הקוד בן שש הספרות שמופיע עכשיו באפליקציית Google Authenticator.</p>
+${errorBlock}
+${totpCodeForm('/2fa', options.csrf)}
+${logoutForm(options.csrf)}`,
+  );
+}
+
 /**
  * `requireCurrent` is false on exactly one path: the forced change on a
  * session minted with `mustChangePassword`, where by definition the owner

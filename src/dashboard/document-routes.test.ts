@@ -25,7 +25,7 @@ import type { PlanOutcome, PlanRequest } from '../sdk/planner.js';
 import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import { businessSaveFolder } from '../test/save-root.js';
 import { buildCharter } from '../test/fixtures.js';
-import { createTestOwner, ownerLogin } from '../test/owner.js';
+import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { createServer, type DashboardOptions } from './server.js';
 
 const B = 'test-business';
@@ -69,20 +69,13 @@ afterAll(async () => {
 });
 
 async function start(options: Partial<DashboardOptions> = {}): Promise<string> {
-  server = createServer({ port: 0, documentRoot: uploadRoot, ...options });
+  server = createServer({ masterKey: TEST_MASTER_KEY, port: 0, documentRoot: uploadRoot, ...options });
   await once(server, 'listening');
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
 
 async function login(baseUrl: string): Promise<string> {
-  const res = await fetch(`${baseUrl}/login`, {
-    method: 'POST',
-    body: new URLSearchParams({ email: ownerLogin(B, USERNAME), password: PASSWORD }),
-    redirect: 'manual',
-  });
-  const pair = (res.headers.get('set-cookie') ?? '').split(';')[0];
-  if (!pair) throw new Error('no session cookie');
-  return pair;
+  return loginWithSecondFactor(baseUrl, B, { username: USERNAME, password: PASSWORD });
 }
 
 async function get(baseUrl: string, cookie: string, path: string): Promise<Response> {
@@ -462,15 +455,10 @@ describe('/documents', () => {
     const a = await card();
     await createTestOwner('other-business', { username: 'other', password: PASSWORD });
     await withBusiness('other-business', (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' })));
-    server = createServer({ port: 0 });
+    server = createServer({ masterKey: TEST_MASTER_KEY, port: 0 });
     await once(server, 'listening');
     const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-    const res = await fetch(`${baseUrl}/login`, {
-      method: 'POST',
-      body: new URLSearchParams({ email: ownerLogin('other-business', 'other'), password: PASSWORD }),
-      redirect: 'manual',
-    });
-    const cookie = (res.headers.get('set-cookie') ?? '').split(';')[0]!;
+    const cookie = await loginWithSecondFactor(baseUrl, 'other-business', { username: 'other', password: PASSWORD });
     expect((await get(baseUrl, cookie, `/documents/${a.cardId}`)).status).toBe(404);
     expect((await get(baseUrl, cookie, `/documents/${a.cardId}/download`)).status).toBe(404);
   });

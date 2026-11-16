@@ -36,7 +36,7 @@ import {
 import { loadBindings } from '../orchestrator/bindings.js';
 import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase, testDb } from '../test/db.js';
-import { createTestOwner, ownerLogin } from '../test/owner.js';
+import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { issueCsrfToken } from './csrf.js';
 import { createServer } from './server.js';
 import { putPlatformSecret, removePlatformSecret } from '../tenancy/platform-credentials.js';
@@ -109,7 +109,7 @@ function fakeClientFor(log: FakeClientLog, fail = false): (provider: MailProvide
 async function startServer(
   options: { oauthFetch?: typeof fetch; mailboxClientFor?: (p: MailProvider) => MailboxClient } = {},
 ): Promise<string> {
-  server = createServer({
+  server = createServer({ masterKey: TEST_MASTER_KEY,
     port: 0,
     credentialKeyPath: keyPath,
     dashboardBaseUrl: 'http://127.0.0.1:4173',
@@ -121,15 +121,7 @@ async function startServer(
 }
 
 async function login(baseUrl: string): Promise<string> {
-  const res = await fetch(`${baseUrl}/login`, {
-    method: 'POST',
-    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
-    redirect: 'manual',
-  });
-  expect(res.status).toBe(302);
-  const pair = (res.headers.get('set-cookie') ?? '').split(';')[0];
-  if (!pair) throw new Error('no session cookie');
-  return pair;
+  return loginWithSecondFactor(baseUrl, BUSINESS, { username: USERNAME, password: PASSWORD });
 }
 
 function csrfFor(cookie: string): string {

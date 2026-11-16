@@ -24,7 +24,7 @@ import { GOOGLE_CLIENT_ID_REF, GOOGLE_CLIENT_SECRET_REF } from '../orchestrator/
 import { loadBindings } from '../orchestrator/bindings.js';
 import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase, testDb } from '../test/db.js';
-import { createTestOwner, ownerLogin } from '../test/owner.js';
+import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { createServer } from './server.js';
 import { putPlatformSecret } from '../tenancy/platform-credentials.js';
 
@@ -78,7 +78,7 @@ afterAll(async () => {
 });
 
 async function startServer(oauthFetch: typeof fetch): Promise<string> {
-  server = createServer({
+  server = createServer({ masterKey: TEST_MASTER_KEY,
     port: 0,
     credentialKeyPath: keyPath,
     dashboardBaseUrl: 'http://127.0.0.1:4173',
@@ -89,15 +89,7 @@ async function startServer(oauthFetch: typeof fetch): Promise<string> {
 }
 
 async function login(baseUrl: string): Promise<string> {
-  const res = await fetch(`${baseUrl}/login`, {
-    method: 'POST',
-    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
-    redirect: 'manual',
-  });
-  expect(res.status).toBe(302);
-  const pair = (res.headers.get('set-cookie') ?? '').split(';')[0];
-  if (!pair) throw new Error('no session cookie');
-  return pair;
+  return loginWithSecondFactor(baseUrl, BUSINESS, { username: USERNAME, password: PASSWORD });
 }
 
 /** Installs a base charter, then the calendar amendment signed for `provider`. */

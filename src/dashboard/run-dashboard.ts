@@ -15,7 +15,8 @@
  */
 import type { AddressInfo } from 'node:net';
 import { closePool } from '../db/pool.js';
-import { closePlatform } from '../tenancy/platform.js';
+import { closePlatform, verifyServerKeyState } from '../tenancy/platform.js';
+import { loadMasterKey, MasterKeyError } from '../governance/master-key.js';
 import { createServer } from './server.js';
 
 const port = Number(process.env['DASHBOARD_PORT'] ?? 4173);
@@ -36,7 +37,21 @@ const trustProxy = process.env['DASHBOARD_TRUST_PROXY'] === '1';
  */
 const allowNonLoopbackBind = process.env['DASHBOARD_ALLOW_PUBLIC_BIND'] === '1';
 
+/**
+ * The master key, loaded once for the process: the owner's second factor is
+ * sealed under it, so without it nobody could sign in. Checked against the
+ * server's key state the way the scheduler checks it — a wrong key file would
+ * otherwise read as "wrong code" for every owner.
+ */
+const keyPath = process.env['CREDENTIAL_KEY_PATH'];
+if (keyPath === undefined || keyPath.length === 0) {
+  throw new MasterKeyError('CREDENTIAL_KEY_PATH אינו מוגדר — בלי מפתח האב אי אפשר לאמת כניסה, והדשבורד מסרב לעלות');
+}
+const masterKey = await loadMasterKey(keyPath);
+await verifyServerKeyState(masterKey);
+
 const server = createServer({
+  masterKey,
   host,
   port,
   trustProxy,

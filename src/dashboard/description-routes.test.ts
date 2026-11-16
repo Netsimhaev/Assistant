@@ -10,7 +10,7 @@ import { loadDraft, saveSection } from '../charter/interview/draft-store.js';
 import type { DescriptionProposer } from '../business/description-proposals.js';
 import { DESCRIPTION_PROPOSAL_RUNS_PER_DAY, loadActiveDescription } from '../business/description-store.js';
 import { escapeHtml } from './views.js';
-import { createTestOwner, ownerLogin } from '../test/owner.js';
+import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { createServer } from './server.js';
 import { DESCRIPTION_CAP_NOTICE, DESCRIPTION_NO_DRAFT_NOTICE } from './setup-routes.js';
 
@@ -46,20 +46,13 @@ function quoteProposer(calls: string[]): DescriptionProposer {
 }
 
 async function startServer(descriptionProposer?: DescriptionProposer): Promise<string> {
-  server = createServer({ port: 0, ...(descriptionProposer ? { descriptionProposer } : {}) });
+  server = createServer({ masterKey: TEST_MASTER_KEY, port: 0, ...(descriptionProposer ? { descriptionProposer } : {}) });
   await once(server, 'listening');
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
 
 async function login(baseUrl: string): Promise<string> {
-  const res = await fetch(`${baseUrl}/login`, {
-    method: 'POST',
-    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
-    redirect: 'manual',
-  });
-  const pair = (res.headers.get('set-cookie') ?? '').split(';')[0];
-  if (!pair) throw new Error('no session cookie');
-  return pair;
+  return loginWithSecondFactor(baseUrl, BUSINESS, { username: USERNAME, password: PASSWORD });
 }
 
 function csrfOf(html: string): string {

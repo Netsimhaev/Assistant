@@ -29,7 +29,7 @@ import { writeMemory } from '../memory/store.js';
 import { keepItem } from '../governance/kept-items.js';
 import { readForgetCommand } from '../governance/forget-command.js';
 import { buildErasurePlan } from '../governance/erasure-plan.js';
-import { createTestOwner, ownerLogin } from '../test/owner.js';
+import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { createServer } from './server.js';
 import { renderErasure, renderErasureDone, TABLE_LABELS } from './views.js';
 import type { ErasureOutcome } from '../governance/erasure.js';
@@ -69,27 +69,14 @@ afterAll(async () => {
 });
 
 async function startServer(): Promise<string> {
-  server = createServer({ port: 0 });
+  server = createServer({ masterKey: TEST_MASTER_KEY, port: 0 });
   await once(server, 'listening');
   const address = server.address() as AddressInfo;
   return `http://127.0.0.1:${address.port}`;
 }
 
-function cookiePair(setCookieHeader: string | null): string {
-  if (!setCookieHeader) throw new Error('no Set-Cookie header on response');
-  const pair = setCookieHeader.split(';')[0];
-  if (!pair) throw new Error('empty Set-Cookie header');
-  return pair;
-}
-
 async function signIn(baseUrl: string): Promise<string> {
-  const res = await fetch(`${baseUrl}/login`, {
-    method: 'POST',
-    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
-    redirect: 'manual',
-  });
-  expect(res.status).toBe(302);
-  return cookiePair(res.headers.get('set-cookie'));
+  return loginWithSecondFactor(baseUrl, BUSINESS, { username: USERNAME, password: PASSWORD });
 }
 
 function extractCsrf(html: string): string {

@@ -17,7 +17,7 @@ import { loadAutonomyMode, setAutonomyMode } from '../governance/autonomy-mode.j
 import { NO_CHANGES_NOTE } from '../charter/interview/summary.js';
 import { MAILBOX_AUTHORISATION_TEXT, PREFLIGHT_REFUSAL_TITLE, RESTART_NOTE } from './mailbox-connect.js';
 import { escapeHtml } from './views.js';
-import { createTestOwner, ownerLogin } from '../test/owner.js';
+import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { createServer } from './server.js';
 import { DESCRIPTION_CAP_NOTICE, DESCRIPTION_PROPOSER_FAILED } from './setup-routes.js';
 import type { DescriptionProposer } from '../business/description-proposals.js';
@@ -52,7 +52,7 @@ afterAll(async () => {
 });
 
 async function startServer(ruleProposer?: RuleProposer, descriptionProposer?: DescriptionProposer): Promise<string> {
-  server = createServer({
+  server = createServer({ masterKey: TEST_MASTER_KEY,
     port: 0,
     ...(ruleProposer ? { ruleProposer } : {}),
     ...(descriptionProposer ? { descriptionProposer } : {}),
@@ -62,14 +62,7 @@ async function startServer(ruleProposer?: RuleProposer, descriptionProposer?: De
 }
 
 async function login(baseUrl: string): Promise<string> {
-  const res = await fetch(`${baseUrl}/login`, {
-    method: 'POST',
-    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
-    redirect: 'manual',
-  });
-  const pair = (res.headers.get('set-cookie') ?? '').split(';')[0];
-  if (!pair) throw new Error('no session cookie');
-  return pair;
+  return loginWithSecondFactor(baseUrl, BUSINESS, { username: USERNAME, password: PASSWORD });
 }
 
 /** The `ruleHash` on the buttons of rule `index` (every button of a rule carries the same one). */
@@ -730,7 +723,7 @@ describe('final review fixes', () => {
   });
 
   it('a sign that adds a mailbox is refused when the preflight fails, and nothing changes', async () => {
-    server = createServer({ port: 0, credentialKeyPath: join(tmpdir(), 'no-such-dir-xyz', 'master.key') });
+    server = createServer({ masterKey: TEST_MASTER_KEY, port: 0, credentialKeyPath: join(tmpdir(), 'no-such-dir-xyz', 'master.key') });
     await once(server, 'listening');
     const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     const cookie = await login(baseUrl);

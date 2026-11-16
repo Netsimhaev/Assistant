@@ -216,7 +216,19 @@ export async function loginUnknown(
  */
 export async function login(
   db: BusinessDb,
-  input: { login: string; password: string; now?: Date },
+  input: {
+    login: string;
+    password: string;
+    now?: Date;
+    /**
+     * The second factor the new session owes, decided once the password is
+     * known to be right and before the session row exists — so the row is
+     * born with it, never patched afterwards. The dashboard always passes
+     * this; without it the session owes nothing (callers outside the HTTP
+     * path, i.e. tests).
+     */
+    pendingFactorFor?: (username: string) => Promise<PendingFactor | null>;
+  },
 ): Promise<
   { ok: true; sessionId: string; username: string } | { ok: false; code: 'bad_credentials' | 'locked' }
 > {
@@ -305,6 +317,7 @@ export async function login(
     return { ok: false, code: 'bad_credentials' };
   }
 
+  const pendingFactor = input.pendingFactorFor ? await input.pendingFactorFor(username) : null;
   const token = randomBytes(TOKEN_BYTES).toString('hex');
   const tokenHash = hashToken(token);
   const expiresAt = new Date(now.getTime() + SESSION_HOURS * 3600_000);
@@ -320,9 +333,9 @@ export async function login(
       [businessId, username, now],
     );
     await tx.query(
-      `INSERT INTO dashboard_sessions (session_id, business_id, username, created_at, expires_at)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [tokenHash, businessId, username, now, expiresAt],
+      `INSERT INTO dashboard_sessions (session_id, business_id, username, created_at, expires_at, pending_factor)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [tokenHash, businessId, username, now, expiresAt, pendingFactor],
     );
   });
 

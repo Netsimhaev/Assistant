@@ -11,7 +11,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import type { CalendarClient, CalendarEvent } from '../calendar/types.js';
 import { installCharter } from '../charter/store.js';
-import { createTestOwner, ownerLogin } from '../test/owner.js';
+import { createTestOwner, loginWithSecondFactor, TEST_MASTER_KEY } from '../test/owner.js';
 import { issueCsrfToken } from '../dashboard/csrf.js';
 import { createServer } from '../dashboard/server.js';
 import { closePool, withBusiness } from '../db/pool.js';
@@ -129,19 +129,14 @@ describe('both doors pass the calendar', () => {
   it('the dashboard /instruct route answers a schedule question (no planner injected, no job)', async () => {
     await bindCalendar();
     await createTestOwner(BUSINESS, { username: 'owner', password: 'correct horse battery staple' });
-    server = createServer({
+    server = createServer({ masterKey: TEST_MASTER_KEY,
       port: 0,
       calendarCredentials: CREDENTIALS,
       calendarClient: clientWith('לקוח מהדשבורד'),
     });
     await once(server, 'listening');
     const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-    const login = await fetch(`${baseUrl}/login`, {
-      method: 'POST',
-      body: new URLSearchParams({ email: ownerLogin(BUSINESS, 'owner'), password: 'correct horse battery staple' }),
-      redirect: 'manual',
-    });
-    const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0] as string;
+    const cookie = await loginWithSecondFactor(baseUrl, BUSINESS, { username: 'owner', password: 'correct horse battery staple' });
     const sessionId = cookie.split('=')[1] as string;
     const res = await fetch(`${baseUrl}/instruct`, {
       method: 'POST',
@@ -171,15 +166,10 @@ describe('both doors pass the calendar', () => {
     if (parkedOutcome.status !== 'needs_answer') throw new Error(`expected a parked question, got ${parkedOutcome.status}`);
     const jobsBefore = await count('jobs');
 
-    server = createServer({ port: 0, calendarCredentials: CREDENTIALS, calendarClient: clientWith('לקוח מתשובה') });
+    server = createServer({ masterKey: TEST_MASTER_KEY, port: 0, calendarCredentials: CREDENTIALS, calendarClient: clientWith('לקוח מתשובה') });
     await once(server, 'listening');
     const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-    const login = await fetch(`${baseUrl}/login`, {
-      method: 'POST',
-      body: new URLSearchParams({ email: ownerLogin(BUSINESS, 'owner'), password: 'correct horse battery staple' }),
-      redirect: 'manual',
-    });
-    const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0] as string;
+    const cookie = await loginWithSecondFactor(baseUrl, BUSINESS, { username: 'owner', password: 'correct horse battery staple' });
     const sessionId = cookie.split('=')[1] as string;
     const res = await fetch(`${baseUrl}/instruct/${parkedOutcome.jobId}/answer`, {
       method: 'POST',

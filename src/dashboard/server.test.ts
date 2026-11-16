@@ -40,7 +40,7 @@ import {
 import { DIGEST_DEFAULTS, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
 import { loadActionUpdateSettings, saveActionUpdateSettings } from '../governance/action-update-settings.js';
 import { login, sessionCookieValue, startSession } from './auth.js';
-import { createTestOwner, ownerLogin } from '../test/owner.js';
+import { createTestOwner, enrolTestOwner, loginWithSecondFactor, ownerLogin, TEST_MASTER_KEY } from '../test/owner.js';
 import {
   assertBindableHost,
   createServer,
@@ -89,7 +89,7 @@ afterEach(async () => {
 async function startServer(
   options: { trustProxy?: boolean; documentRoot?: string } = {},
 ): Promise<string> {
-  server = createServer({ port: 0, ...options });
+  server = createServer({ masterKey: TEST_MASTER_KEY, port: 0, ...options });
   await once(server, 'listening');
   const address = server.address() as AddressInfo;
   return `http://127.0.0.1:${address.port}`;
@@ -384,22 +384,8 @@ async function aSignableApproval(
   return { approvalId, jobId, documentId, sha256 };
 }
 
-/** The `sid=...` cookie-pair from a Set-Cookie header, without its attributes. */
-function cookiePair(setCookieHeader: string | null): string {
-  if (!setCookieHeader) throw new Error('no Set-Cookie header on response');
-  const pair = setCookieHeader.split(';')[0];
-  if (!pair) throw new Error('empty Set-Cookie header');
-  return pair;
-}
-
 async function loginWithPassword(baseUrl: string, username: string, password: string): Promise<string> {
-  const res = await fetch(`${baseUrl}/login`, {
-    method: 'POST',
-    body: new URLSearchParams({ email: ownerLogin(BUSINESS, username), password }),
-    redirect: 'manual',
-  });
-  expect(res.status).toBe(302);
-  return cookiePair(res.headers.get('set-cookie'));
+  return loginWithSecondFactor(baseUrl, BUSINESS, { username, password });
 }
 
 function extractCsrf(html: string): string {
@@ -963,7 +949,7 @@ describe('renderInstructionOutcome - the note on a needs_answer outcome', () => 
       },
     } as unknown as ServerResponse;
 
-    await withBusiness(BUSINESS, (db) => renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome, db));
+    await withBusiness(BUSINESS, (db) => renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false, token: 'T1', pendingFactor: null }, outcome, db));
     return body;
   }
 
@@ -1026,7 +1012,7 @@ describe('renderInstruct and renderInstructionOutcome - recordingNote', () => {
       },
     } as unknown as ServerResponse;
 
-    await withBusiness(BUSINESS, (db) => renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome, db));
+    await withBusiness(BUSINESS, (db) => renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false, token: 'T1', pendingFactor: null }, outcome, db));
     return body;
   }
 
@@ -2445,6 +2431,9 @@ describe('session cookie', () => {
  * technician reset link will mint exactly this kind of session.
  */
 async function mustChangeCookie(): Promise<string> {
+  // Past the second factor (the gate before this one), so what is under test
+  // is the must-change gate alone.
+  await enrolTestOwner(BUSINESS, USERNAME);
   const token = await withBusiness(BUSINESS, (db) => startSession(db, USERNAME, { mustChangePassword: true }));
   return `sid=${sessionCookieValue(BUSINESS, token)}`;
 }
@@ -3578,7 +3567,7 @@ describe('boss-command confirmation on the dashboard', () => {
     } as unknown as ServerResponse;
     await withBusiness(BUSINESS, (db) => renderInstructionOutcome(
       res,
-      { sessionId: 'S1', username: 'owner', mustChangePassword: false },
+      { sessionId: 'S1', username: 'owner', mustChangePassword: false, token: 'T1', pendingFactor: null },
       outcome,
       db,
     ));

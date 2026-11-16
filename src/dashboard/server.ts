@@ -156,6 +156,20 @@ import {
   SESSION_HOURS,
 } from './auth.js';
 import { resolveLogin } from '../tenancy/platform.js';
+import {
+  beginEnrolment,
+  confirmEnrolment,
+  isTrustedDevice,
+  issueTrustedDevice,
+  setPendingFactor,
+  totpStatus,
+  TotpAlreadyEnrolledError,
+  TRUSTED_DEVICE_DAYS,
+  verifySecondFactor,
+} from './second-factor.js';
+import { otpauthUri } from '../auth/totp.js';
+import { qrSvg } from '../auth/qr.js';
+import type { PendingFactor } from './auth.js';
 import { withSessionLockOn } from '../orchestrator/session-lock.js';
 import { getBusiness } from '../tenancy/businesses.js';
 import { issueCsrfToken, verifyCsrfToken } from './csrf.js';
@@ -196,12 +210,25 @@ import {
   renderReadings,
   renderServerError,
   renderSuspended,
+  renderTotpEnrol,
+  renderTotpVerify,
   SUSPENDED_MESSAGE,
+  TOTP_BAD_CODE,
+  TOTP_LOCKED,
 } from './views.js';
 import type { CharterReadStatus, PendingConfirmation, PendingQuestion } from './views.js';
 import type { ErasurePrefill } from './views.js';
 
 const SESSION_COOKIE = 'sid';
+/**
+ * The trusted-device cookie: `<businessId>.<token>`, the same shape as `sid`
+ * and a separate name, for `TRUSTED_DEVICE_DAYS`. Only the token's sha256 is
+ * stored (`issueTrustedDevice`).
+ */
+const TRUSTED_DEVICE_COOKIE = 'tdev';
+const TRUSTED_DEVICE_MAX_AGE_SECONDS = TRUSTED_DEVICE_DAYS * 86_400;
+/** What Google Authenticator shows above the account name. */
+const TOTP_ISSUER = 'העוזרת';
 const SESSION_MAX_AGE_SECONDS = SESSION_HOURS * 3600;
 const MIN_PASSWORD_LENGTH = 10;
 /** Refuses a form body past this size before it is ever parsed. */
@@ -213,6 +240,12 @@ const MAX_BODY_BYTES = 64 * 1024;
  * and its session row confirms, read inside that business's `withBusiness`.
  */
 export interface DashboardOptions {
+  /**
+   * The server's master key, loaded once by the process (`run-dashboard.ts`).
+   * The owner's second-factor secret is sealed under it; without it nobody
+   * could enrol or sign in, so it is required, not defaulted.
+   */
+  masterKey: Buffer;
   /**
    * Permission to bind an interface other than loopback. Off by default, and
    * `assertBindableHost` refuses loudly without it.
@@ -453,7 +486,15 @@ function redirect(res: ServerResponse, location: string, headers: Record<string,
  * value, business part included, means a token issued under one business
  * never verifies under another.
  */
-type Session = { sessionId: string; username: string; mustChangePassword: boolean };
+type Session = {
+  sessionId: string;
+  /** The raw token (the cookie value without its business part). */
+  token: string;
+  username: string;
+  mustChangePassword: boolean;
+  /** The second factor this session still owes; `null` once it owes none. */
+  pendingFactor: PendingFactor | null;
+};
 
 /**
  * The cookie's business and token; `'none'` when there is no cookie; or
@@ -482,7 +523,13 @@ async function loadSession(
 ): Promise<Session | null> {
   const details = await verifySessionDetails(db, cookie.token);
   if (!details) return null;
-  return { sessionId: cookie.value, username: details.username, mustChangePassword: details.mustChangePassword };
+  return {
+    sessionId: cookie.value,
+    token: cookie.token,
+    username: details.username,
+    mustChangePassword: details.mustChangePassword,
+    pendingFactor: details.pendingFactor,
+  };
 }
 
 function noteFrom(form: URLSearchParams): string | undefined {
@@ -523,6 +570,8 @@ async function handleLoginPost(req: IncomingMessage, res: ServerResponse): Promi
   }
 
   const resolved = await resolveLogin(email);
+  const device = trustedDeviceFrom(req, resolved === null ? null : resolved.businessId);
+  let owed: PendingFactor | null = null;
   const suspended = resolved !== null && resolved.status !== 'active';
 
   const typed = password ?? '';
@@ -530,7 +579,11 @@ async function handleLoginPost(req: IncomingMessage, res: ServerResponse): Promi
     resolved === null
       ? await withNoBusiness((db) => loginUnknown(db, typed))
       : await withBusiness(resolved.businessId, async (db) => {
-          const attempt = await login(db, { login: email, password: typed });
+          const attempt = await login(db, {
+            login: email,
+            password: typed,
+            pendingFactorFor: async (username) => (owed = await pendingFactorAtLogin(db, username, device)),
+          });
           // Correct password, suspended business: the session must not
           // survive this request.
           if (attempt.ok && suspended) await revokeSession(db, attempt.sessionId);
@@ -547,7 +600,132 @@ async function handleLoginPost(req: IncomingMessage, res: ServerResponse): Promi
   if (resolved === null) return sendHtml(res, 401, renderLogin({ error: 'שם משתמש או סיסמה שגויים.' }));
   if (suspended) return sendHtml(res, 403, renderLogin({ error: SUSPENDED_MESSAGE }));
 
-  redirect(res, '/', { 'Set-Cookie': sessionCookie(resolved.businessId, result.sessionId) });
+  const next = owed === 'enroll' ? '/2fa/enrol' : owed === 'verify' ? '/2fa' : '/';
+  seeOtherWith(res, next, { 'Set-Cookie': sessionCookie(resolved.businessId, result.sessionId) });
+}
+
+/**
+ * The trusted-device token the request carries for `businessId`, or `null`.
+ * A cookie naming another business, or one that does not parse, is no device.
+ */
+function trustedDeviceFrom(req: IncomingMessage, businessId: string | null): string | null {
+  if (businessId === null) return null;
+  const value = parseCookies(req.headers.cookie)[TRUSTED_DEVICE_COOKIE];
+  if (!value) return null;
+  const parsed = parseSessionCookie(value);
+  return parsed !== null && parsed.businessId === businessId ? parsed.token : null;
+}
+
+/**
+ * The factor a fresh session owes: enrolment for an owner who never enrolled
+ * (whatever device they are on — a trusted device of an unenrolled account
+ * must not count if one somehow exists), nothing on a device this account
+ * trusts, and a code otherwise.
+ */
+async function pendingFactorAtLogin(
+  db: BusinessDb,
+  username: string,
+  device: string | null,
+): Promise<PendingFactor | null> {
+  if ((await totpStatus(db, username)) === 'not_enrolled') return 'enroll';
+  if (device !== null && (await isTrustedDevice(db, username, device))) return null;
+  return 'verify';
+}
+
+/**
+ * Where a session that still owes its second factor must go, or `null` for
+ * a session that owes nothing. Read from the account's enrolment on every
+ * request, not only from the session's own `pending_factor`: a session from
+ * before the second factor existed has `pending_factor` NULL, and its owner,
+ * never having enrolled, must not be waved through (Review Focus 1). An
+ * enrolled owner always gets the code screen, never a fresh secret.
+ */
+async function screenForSession(db: BusinessDb, session: Session): Promise<'/2fa' | '/2fa/enrol' | null> {
+  const enrolled = (await totpStatus(db, session.username)) === 'enrolled';
+  if (session.pendingFactor === null && enrolled) return null;
+  return enrolled ? '/2fa' : '/2fa/enrol';
+}
+
+function seeOtherWith(res: ServerResponse, location: string, headers: Record<string, string> = {}): void {
+  res.writeHead(303, { Location: location, ...SECURITY_HEADERS, ...headers });
+  res.end();
+}
+
+function trustedDeviceCookie(businessId: string, token: string): string {
+  return `${TRUSTED_DEVICE_COOKIE}=${sessionCookieValue(businessId, token)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${TRUSTED_DEVICE_MAX_AGE_SECONDS}`;
+}
+
+/** The address the owner signs in with — how the authenticator app labels the entry. */
+async function loginAddressOf(db: BusinessDb, username: string): Promise<string> {
+  const { rows } = await db.query<{ login: string | null }>(
+    'SELECT login FROM dashboard_users WHERE business_id = $1 AND username = $2',
+    [db.businessId, username],
+  );
+  return rows[0]?.login ?? username;
+}
+
+/**
+ * The second factor is settled: the session owes nothing, and this browser
+ * becomes a trusted device for `TRUSTED_DEVICE_DAYS`.
+ */
+async function finishSecondFactor(res: ServerResponse, db: BusinessDb, session: Session): Promise<void> {
+  await setPendingFactor(db, session.token, null);
+  const device = await issueTrustedDevice(db, session.username);
+  seeOtherWith(res, '/', { 'Set-Cookie': trustedDeviceCookie(db.businessId, device) });
+}
+
+async function handleTotpEnrolGet(res: ServerResponse, db: BusinessDb, session: Session, key: Buffer): Promise<void> {
+  let secretBase32: string;
+  try {
+    ({ secretBase32 } = await beginEnrolment(db, session.username, key));
+  } catch (err) {
+    // Enrolled in the meantime (another browser): the code screen, never a new secret.
+    if (err instanceof TotpAlreadyEnrolledError) return seeOther(res, '/2fa');
+    throw err;
+  }
+  const account = await loginAddressOf(db, session.username);
+  const qr = await qrSvg(otpauthUri({ issuer: TOTP_ISSUER, account, secretBase32 }));
+  sendHtml(res, 200, renderTotpEnrol({ csrf: issueCsrfToken(session.sessionId), qr, secretBase32 }));
+}
+
+/** The typed code, spaces removed (the app shows it as "123 456"). */
+function codeFrom(form: URLSearchParams): string {
+  return (form.get('code') ?? '').replace(/\s+/g, '');
+}
+
+async function handleTotpEnrolPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  db: BusinessDb,
+  session: Session,
+  key: Buffer,
+): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return sendHtml(res, 403, renderForbidden());
+  const result = await confirmEnrolment(db, session.username, codeFrom(form), key);
+  if (result === 'ok') return finishSecondFactor(res, db, session);
+  const csrf = issueCsrfToken(session.sessionId);
+  sendHtml(res, 401, renderTotpEnrol({ csrf, error: result === 'locked' ? TOTP_LOCKED : TOTP_BAD_CODE }));
+}
+
+function handleTotpVerifyGet(res: ServerResponse, session: Session): void {
+  sendHtml(res, 200, renderTotpVerify({ csrf: issueCsrfToken(session.sessionId) }));
+}
+
+async function handleTotpVerifyPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  db: BusinessDb,
+  session: Session,
+  key: Buffer,
+): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return sendHtml(res, 403, renderForbidden());
+  const result = await verifySecondFactor(db, session.username, codeFrom(form), key);
+  if (result === 'ok') return finishSecondFactor(res, db, session);
+  if (result === 'not_enrolled') return seeOther(res, '/2fa/enrol');
+  const csrf = issueCsrfToken(session.sessionId);
+  sendHtml(res, 401, renderTotpVerify({ csrf, error: result === 'locked' ? TOTP_LOCKED : TOTP_BAD_CODE }));
 }
 
 /**
@@ -2986,6 +3164,7 @@ const OUTCOME_FOR_ACTION = {
 
 /** The per-request options `createServer` builds once and every request carries. */
 interface RouteOptions {
+  masterKey: Buffer;
   trustProxy: boolean;
   documentRoot: string | undefined;
   oauthOptions: OAuthRouteOptions;
@@ -3040,6 +3219,26 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
     // cached in the session, so a suspension takes effect on the next click.
     const business = await getBusiness(db.businessId);
     if (business?.status !== 'active') return sendHtml(res, 403, renderSuspended());
+
+    // The second factor. A session that still owes it — or whose owner never
+    // enrolled, which also catches sessions from before it existed — reaches
+    // only its own factor screen and `/logout`; everything else, `/password`
+    // included, is sent there.
+    const screen = await screenForSession(db, session);
+    if (screen !== null) {
+      if (method === 'POST' && pathname === '/logout') return handleLogout(req, res, db, session);
+      if (pathname === screen && screen === '/2fa/enrol') {
+        if (method === 'GET') return handleTotpEnrolGet(res, db, session, options.masterKey);
+        if (method === 'POST') return handleTotpEnrolPost(req, res, db, session, options.masterKey);
+      }
+      if (pathname === screen && screen === '/2fa') {
+        if (method === 'GET') return handleTotpVerifyGet(res, session);
+        if (method === 'POST') return handleTotpVerifyPost(req, res, db, session, options.masterKey);
+      }
+      return seeOther(res, screen);
+    }
+    // Past the factor, its screens are behind the owner.
+    if (pathname === '/2fa' || pathname === '/2fa/enrol') return seeOther(res, '/');
 
     return route(
       req,
@@ -3385,7 +3584,7 @@ export function assertBindableHost(host: string, allowNonLoopback: boolean): voi
   );
 }
 
-export function createServer(options: DashboardOptions = {}): Server {
+export function createServer(options: DashboardOptions): Server {
   // Loopback only, always — see docs/dashboard-deployment.md. This server
   // does not terminate TLS; anything reachable from the internet must arrive
   // through a tunnel or reverse proxy that does, never by binding a public
@@ -3419,6 +3618,7 @@ export function createServer(options: DashboardOptions = {}): Server {
       ...(options.uploadMaxBytes !== undefined ? { uploadMaxBytes: options.uploadMaxBytes } : {}),
     };
     handleRequest(req, res, {
+      masterKey: options.masterKey,
       trustProxy: options.trustProxy ?? false,
       documentRoot: options.documentRoot,
       oauthOptions,

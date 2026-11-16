@@ -25,7 +25,7 @@ import type { CredentialSource } from '../orchestrator/credentials.js';
 import { loadMeetingSettings, saveMeetingSettings, MEETING_DEFAULTS } from '../meetings/settings.js';
 import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase, testDb } from '../test/db.js';
-import { createTestOwner, ownerLogin } from '../test/owner.js';
+import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { issueCsrfToken } from './csrf.js';
 import { createServer } from './server.js';
 
@@ -71,7 +71,7 @@ async function bindCalendar(): Promise<void> {
 }
 
 async function start(client?: CalendarClient, credentials: CredentialSource = CREDENTIALS): Promise<string> {
-  server = createServer({
+  server = createServer({ masterKey: TEST_MASTER_KEY,
     port: 0,
     ...(client !== undefined ? { calendarClient: client } : {}),
     calendarCredentials: credentials,
@@ -81,14 +81,7 @@ async function start(client?: CalendarClient, credentials: CredentialSource = CR
 }
 
 async function login(baseUrl: string): Promise<string> {
-  const res = await fetch(`${baseUrl}/login`, {
-    method: 'POST',
-    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
-    redirect: 'manual',
-  });
-  const pair = (res.headers.get('set-cookie') ?? '').split(';')[0];
-  if (!pair) throw new Error('no session cookie');
-  return pair;
+  return loginWithSecondFactor(baseUrl, BUSINESS, { username: USERNAME, password: PASSWORD });
 }
 
 function csrfFor(cookie: string): string {
@@ -190,7 +183,7 @@ describe('GET /meetings/settings', () => {
       await writeKeyState(key, 'KEY-pool-test', testDb());
       await withBusiness(BUSINESS, (db) => putSecret(db, { ref: 'OAUTH_CALENDAR', value: 'stored-token', updatedBy: 'test' }, key));
       await bindCalendar();
-      server = createServer({ port: 0, calendarClient: clientListing(CALENDARS), credentialKeyPath: keyPath });
+      server = createServer({ masterKey: TEST_MASTER_KEY, port: 0, calendarClient: clientListing(CALENDARS), credentialKeyPath: keyPath });
       await once(server, 'listening');
       const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
       const cookie = await login(baseUrl);

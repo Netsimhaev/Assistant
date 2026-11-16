@@ -22,7 +22,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { createJob } from '../orchestrator/jobs.js';
 import { writeMemory } from '../memory/store.js';
-import { createTestOwner, ownerLogin } from '../test/owner.js';
+import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { createServer } from './server.js';
 
 const BUSINESS = 'test-business';
@@ -49,27 +49,14 @@ afterAll(async () => {
 });
 
 async function startServer(): Promise<string> {
-  server = createServer({ port: 0 });
+  server = createServer({ masterKey: TEST_MASTER_KEY, port: 0 });
   await once(server, 'listening');
   const address = server.address() as AddressInfo;
   return `http://127.0.0.1:${address.port}`;
 }
 
-function cookiePair(setCookieHeader: string | null): string {
-  if (!setCookieHeader) throw new Error('no Set-Cookie header on response');
-  const pair = setCookieHeader.split(';')[0];
-  if (!pair) throw new Error('empty Set-Cookie header');
-  return pair;
-}
-
 async function loginWithPassword(baseUrl: string): Promise<string> {
-  const res = await fetch(`${baseUrl}/login`, {
-    method: 'POST',
-    body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
-    redirect: 'manual',
-  });
-  expect(res.status).toBe(302);
-  return cookiePair(res.headers.get('set-cookie'));
+  return loginWithSecondFactor(baseUrl, BUSINESS, { username: USERNAME, password: PASSWORD });
 }
 
 /** A job at a given trust level, so `writeMemory` can stamp its provenance. */

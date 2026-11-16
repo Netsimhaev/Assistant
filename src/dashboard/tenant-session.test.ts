@@ -23,6 +23,7 @@ import { run as createOwnerRun } from '../cli/create-owner.js';
 import type { PromptIo } from '../cli/prompt-io.js';
 import { createOwner, parseSessionCookie, sessionBinding, sessionCookieValue } from './auth.js';
 import { createServer } from './server.js';
+import { loginWithSecondFactor, TEST_MASTER_KEY } from '../test/owner.js';
 
 const A = 'tenant-a';
 const B = 'tenant-b';
@@ -56,7 +57,7 @@ afterAll(async () => {
 });
 
 async function startServer(): Promise<string> {
-  server = createServer({ port: 0 });
+  server = createServer({ masterKey: TEST_MASTER_KEY, port: 0 });
   await once(server, 'listening');
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
@@ -69,12 +70,11 @@ async function postLogin(baseUrl: string, email: string, password: string): Prom
   });
 }
 
+/** A full session (past the second factor) for the owner signing in as `email`. */
 async function loginCookie(baseUrl: string, email: string): Promise<string> {
-  const res = await postLogin(baseUrl, email, PASSWORD);
-  expect(res.status).toBe(302);
-  const pair = (res.headers.get('set-cookie') ?? '').split(';')[0];
-  if (!pair) throw new Error('no session cookie');
-  return pair;
+  const resolved = await resolveLogin(email);
+  if (resolved === null) throw new Error(`no business for ${email}`);
+  return loginWithSecondFactor(baseUrl, resolved.businessId, { username: 'owner', password: PASSWORD, login: email });
 }
 
 function facts(proposedInput: unknown): ActionFacts {
@@ -169,7 +169,7 @@ describe('one dashboard for every business', () => {
 
     const baseUrl = await startServer();
     const res = await postLogin(baseUrl, '  Dana@TENANT-A.example  ', PASSWORD);
-    expect(res.status).toBe(302);
+    expect(res.status).toBe(303);
     expect(res.headers.get('set-cookie')).toMatch(new RegExp(`^sid=${A}\\.[0-9a-f]+;`));
   });
 
@@ -302,7 +302,7 @@ describe('one dashboard for every business', () => {
     expect(await sixth.text()).toContain('שם משתמש או סיסמה שגויים.');
 
     // Both real accounts, in either business, still log in.
-    expect((await postLogin(baseUrl, A_LOGIN, PASSWORD)).status).toBe(302);
-    expect((await postLogin(baseUrl, B_LOGIN, PASSWORD)).status).toBe(302);
+    expect((await postLogin(baseUrl, A_LOGIN, PASSWORD)).status).toBe(303);
+    expect((await postLogin(baseUrl, B_LOGIN, PASSWORD)).status).toBe(303);
   });
 });
