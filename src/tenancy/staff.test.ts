@@ -28,8 +28,10 @@ import {
   staffVerifySecondFactor,
   startStaffSession,
   verifyStaffSession,
+  findLiveStaffByLogin,
+  reissueStaffLink,
 } from './staff.js';
-import { logStaffAction, recentStaffActions, STAFF_ACTIONS } from './activity-log.js';
+import { CLI_ACTOR_LABEL, logStaffAction, recentStaffActions, STAFF_ACTIONS } from './activity-log.js';
 
 const KEY = randomBytes(32);
 const NOW = new Date('2026-11-16T10:00:00.000Z');
@@ -400,6 +402,70 @@ describe('removal', () => {
     await expect(removeStaff(h, { by: h })).rejects.toThrow(StaffError);
     await expect(removeStaff(tech, { by: tech })).rejects.toThrow(StaffError);
     expect((await listStaff()).every((s) => !s.removed)).toBe(true);
+  });
+});
+
+describe('re-invite and break-glass (final review I2)', () => {
+  it('a removed address can be invited again: the same row comes back, with no password, factor or head role', async () => {
+    const h = await head();
+    const tech = await colleague(h);
+    await enrol(tech);
+    await removeStaff(tech, { by: h });
+
+    const { staffId, token } = await inviteStaff({ login: 'TECH@company.example', displayName: 'טכנאי חדש', issuedBy: h });
+    expect(staffId).toBe(tech);
+    const back = (await listStaff()).find((s) => s.staffId === tech);
+    expect(back).toMatchObject({ removed: false, enrolled: false, isHead: false, displayName: 'טכנאי חדש' });
+    // The old password is gone until the link is redeemed.
+    expect(await staffLogin({ login: 'tech@company.example', password: 'tech password long' })).toEqual({
+      ok: false,
+      code: 'bad_credentials',
+    });
+    expect(await redeemStaffLink({ rawToken: token, typedLogin: 'tech@company.example', password: 'brand new password' })).toEqual({
+      ok: true,
+      staffId: tech,
+    });
+    expect((await staffLogin({ login: 'tech@company.example', password: 'brand new password' })).ok).toBe(true);
+  });
+
+  it('a live address is still refused', async () => {
+    const h = await head();
+    await colleague(h);
+    await expect(inviteStaff({ login: 'tech@company.example', displayName: 'x', issuedBy: h })).rejects.toThrow('הכתובת כבר רשומה.');
+  });
+
+  it('reissueStaffLink gives a live member a fresh one-time link that sets a new password, and spends older links', async () => {
+    const h = await head();
+    const first = await reissueStaffLink('Head@Company.example', NOW);
+    const second = await reissueStaffLink('head@company.example', NOW);
+    expect(second.staffId).toBe(h);
+    expect(
+      await redeemStaffLink({ rawToken: first.token, typedLogin: HEAD_LOGIN, password: 'a new head password' }, NOW),
+    ).toEqual({ ok: false, code: 'used' });
+    expect(
+      await redeemStaffLink({ rawToken: second.token, typedLogin: HEAD_LOGIN, password: 'a new head password' }, NOW),
+    ).toEqual({ ok: true, staffId: h });
+    expect((await staffLogin({ login: HEAD_LOGIN, password: 'a new head password' })).ok).toBe(true);
+    const { rows } = await testDb().query('SELECT issued_by FROM platform_staff_links WHERE staff_id = $1', [h]);
+    expect(rows.length).toBe(2);
+    expect(rows.every((r) => r.issued_by === null)).toBe(true);
+  });
+
+  it('reissueStaffLink and findLiveStaffByLogin refuse an unknown or removed address', async () => {
+    const h = await head();
+    const tech = await colleague(h);
+    await removeStaff(tech, { by: h });
+    await expect(reissueStaffLink('tech@company.example', NOW)).rejects.toThrow(StaffError);
+    await expect(reissueStaffLink('nobody@company.example', NOW)).rejects.toThrow(StaffError);
+    expect(await findLiveStaffByLogin('tech@company.example')).toBeNull();
+    expect(await findLiveStaffByLogin('HEAD@company.example')).toEqual({ staffId: h, displayName: 'ראש צוות' });
+  });
+
+  it('an action by the server command line is logged with no staff id and listed as such', async () => {
+    await head();
+    await logStaffAction({ staffId: null, action: 'staff_link_reissued', businessId: null, detail: { via: 'cli' } });
+    const recent = await recentStaffActions(10);
+    expect(recent.map((r) => [r.action, r.staffDisplayName])).toEqual([['staff_link_reissued', CLI_ACTOR_LABEL]]);
   });
 });
 

@@ -2,9 +2,20 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool } from '../db/pool.js';
 import { closePlatformPool } from '../db/platform-pool.js';
 import { resetDatabase } from '../test/db.js';
-import { listStaff, staffLogin } from '../tenancy/staff.js';
+import {
+  createHeadStaff,
+  listStaff,
+  redeemStaffLink,
+  staffBeginEnrolment,
+  staffConfirmEnrolment,
+  staffLogin,
+  staffTotpStatus,
+} from '../tenancy/staff.js';
+import { recentStaffActions } from '../tenancy/activity-log.js';
+import { currentStep, totpCode } from '../auth/totp.js';
+import { randomBytes } from 'node:crypto';
 import type { PromptIo } from './prompt-io.js';
-import { ENROL_ON_FIRST_PANEL_LOGIN_NOTE, HEAD_EXISTS_MESSAGE, run } from './staff.js';
+import { ENROL_ON_FIRST_PANEL_LOGIN_NOTE, HEAD_EXISTS_MESSAGE, run, STAFF_NOT_FOUND_CLI } from './staff.js';
 
 const PASSWORD = 'head password long enough';
 
@@ -71,5 +82,54 @@ describe('staff create-head', () => {
     expect(await run(['create-head', '--email', 'a@company.example', '--name', 'א'], io)).toBe(1);
     expect(io.errors.join('\n')).toMatch(/סיסמה/);
     expect(await listStaff()).toHaveLength(0);
+  });
+});
+
+describe('staff break-glass (final review I2)', () => {
+  const KEY = randomBytes(32);
+
+  it("reset-factor forgets a member's Authenticator and logs it as the command line", async () => {
+    const id = await createHeadStaff({ login: 'head@company.example', displayName: 'דנה', password: PASSWORD });
+    const { secretBase32 } = await staffBeginEnrolment(id, KEY);
+    const now = new Date();
+    expect(await staffConfirmEnrolment(id, totpCode(secretBase32, currentStep(now)), KEY, now)).toBe('ok');
+
+    const io = fakeIo([]);
+    expect(await run(['reset-factor', '--email', 'HEAD@company.example'], io)).toBe(0);
+    expect(await staffTotpStatus(id)).toBe('not_enrolled');
+    const actions = await recentStaffActions(5);
+    expect(actions.map((r) => r.action)).toEqual(['totp_reset']);
+  });
+
+  it('reissue-link prints a one-time link once that lets the member set a new password', async () => {
+    await createHeadStaff({ login: 'head@company.example', displayName: 'דנה', password: PASSWORD });
+    const io = fakeIo([]);
+    const previous = process.env['ADMIN_BASE_URL'];
+    process.env['ADMIN_BASE_URL'] = 'https://panel.example';
+    try {
+      expect(await run(['reissue-link', '--email', 'head@company.example'], io)).toBe(0);
+    } finally {
+      if (previous === undefined) delete process.env['ADMIN_BASE_URL'];
+      else process.env['ADMIN_BASE_URL'] = previous;
+    }
+    const line = io.prints.find((p) => p.includes('/join/'));
+    const token = /\/join\/([0-9a-f]{64})/.exec(line ?? '')?.[1];
+    expect(line).toContain('https://panel.example/join/');
+    expect(token).toBeDefined();
+    expect(io.prints.filter((p) => p.includes(token ?? 'never'))).toHaveLength(1);
+    expect(
+      await redeemStaffLink({ rawToken: token ?? '', typedLogin: 'head@company.example', password: 'a fresh password here' }),
+    ).toMatchObject({ ok: true });
+    expect((await staffLogin({ login: 'head@company.example', password: 'a fresh password here' })).ok).toBe(true);
+    expect((await recentStaffActions(5)).map((r) => r.action)).toEqual(['staff_link_reissued']);
+  });
+
+  it('refuses an unknown address and a missing --email', async () => {
+    const io = fakeIo([]);
+    expect(await run(['reset-factor', '--email', 'nobody@company.example'], io)).toBe(1);
+    expect(io.errors).toContain(STAFF_NOT_FOUND_CLI);
+    expect(await run(['reissue-link', '--email', 'nobody@company.example'], fakeIo([]))).toBe(1);
+    expect(await run(['reissue-link'], fakeIo([]))).toBe(2);
+    expect(await recentStaffActions(5)).toEqual([]);
   });
 });

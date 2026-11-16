@@ -193,6 +193,11 @@ export async function headExists(): Promise<boolean> {
 /**
  * A head invites a colleague: a staff row with no password, and a one-time
  * link (72 h) that sets it. Returns the raw token; only its sha256 is stored.
+ *
+ * **A removed address comes back as the same row** (final review I2): its
+ * password, second factor, counters and head role are cleared, its name is
+ * the one typed now, and `removed_at` is cleared — one address, one member,
+ * one history in the activity log. A live address is refused.
  */
 export async function inviteStaff(
   input: { login: string; displayName: string; issuedBy: string },
@@ -200,27 +205,93 @@ export async function inviteStaff(
 ): Promise<{ staffId: string; token: string }> {
   const login = checkLogin(input.login);
   const displayName = checkName(input.displayName);
-  const staffId = `ST-${ulid()}`;
   const token = newToken();
   const expiresAt = new Date(now.getTime() + LINK_HOURS * 3600_000);
   try {
-    await platformTx(async (db) => {
+    const staffId = await platformTx(async (db) => {
       await db.query(STAFF_LOCK);
       if (!(await isLiveHead(db, input.issuedBy))) throw new StaffError('רק ראש צוות מוסיף אנשי צוות.');
-      await db.query(
-        `INSERT INTO platform_staff (staff_id, login, display_name, created_at) VALUES ($1, $2, $3, $4)`,
-        [staffId, login, displayName, now],
+      const { rows } = await db.query<{ staff_id: string; removed_at: Date | null }>(
+        'SELECT staff_id, removed_at FROM platform_staff WHERE lower(login) = $1 FOR UPDATE',
+        [login],
       );
+      const existing = rows[0];
+      let id: string;
+      if (existing === undefined) {
+        id = `ST-${ulid()}`;
+        await db.query(
+          `INSERT INTO platform_staff (staff_id, login, display_name, created_at) VALUES ($1, $2, $3, $4)`,
+          [id, login, displayName, now],
+        );
+      } else if (existing.removed_at !== null) {
+        id = existing.staff_id;
+        await db.query(
+          `UPDATE platform_staff
+              SET display_name = $2, removed_at = NULL, is_head = false,
+                  password_hash = NULL, password_salt = NULL, failed_attempts = 0, locked_until = NULL,
+                  totp_ciphertext = NULL, totp_nonce = NULL, totp_enrolled_at = NULL, totp_last_step = NULL,
+                  totp_failed_attempts = 0, totp_locked_until = NULL
+            WHERE staff_id = $1`,
+          [id, displayName],
+        );
+        await revokeAll(db, id, now);
+      } else {
+        throw new StaffError('הכתובת כבר רשומה.');
+      }
       await db.query(
         `INSERT INTO platform_staff_links (link_hash, staff_id, created_at, expires_at, issued_by)
          VALUES ($1, $2, $3, $4, $5)`,
-        [sha256(token), staffId, now, expiresAt, input.issuedBy],
+        [sha256(token), id, now, expiresAt, input.issuedBy],
       );
+      return id;
     });
+    return { staffId, token };
   } catch (err) {
     if (isUniqueViolation(err)) throw new StaffError('הכתובת כבר רשומה.');
     throw err;
   }
+}
+
+/** A live member by address, for the server command line; `null` when unknown or removed. */
+export async function findLiveStaffByLogin(login: string): Promise<{ staffId: string; displayName: string } | null> {
+  const { rows } = await withPlatform((db) =>
+    db.query<{ staff_id: string; display_name: string }>(
+      'SELECT staff_id, display_name FROM platform_staff WHERE lower(login) = $1 AND removed_at IS NULL',
+      [normaliseLogin(login)],
+    ),
+  );
+  const row = rows[0];
+  return row ? { staffId: row.staff_id, displayName: row.display_name } : null;
+}
+
+/**
+ * The break-glass link (final review I2), run only from the server's command
+ * line (`npm run staff -- reissue-link`): a fresh one-time link (72 h) for a
+ * live member that sets a new password through `redeemStaffLink`, exactly as
+ * an invite does. Every older unused link of the member is spent in the same
+ * transaction. `issued_by` is NULL — the command line, not a head (migration
+ * 076). A removed or unknown address is refused.
+ */
+export async function reissueStaffLink(login: string, now: Date = new Date()): Promise<{ staffId: string; token: string }> {
+  const normalised = normaliseLogin(login);
+  const token = newToken();
+  const expiresAt = new Date(now.getTime() + LINK_HOURS * 3600_000);
+  const staffId = await platformTx(async (db) => {
+    await db.query(STAFF_LOCK);
+    const { rows } = await db.query<{ staff_id: string }>(
+      'SELECT staff_id FROM platform_staff WHERE lower(login) = $1 AND removed_at IS NULL',
+      [normalised],
+    );
+    const id = rows[0]?.staff_id;
+    if (id === undefined) throw new StaffError('איש הצוות לא נמצא.');
+    await db.query('UPDATE platform_staff_links SET used_at = $2 WHERE staff_id = $1 AND used_at IS NULL', [id, now]);
+    await db.query(
+      `INSERT INTO platform_staff_links (link_hash, staff_id, created_at, expires_at, issued_by)
+       VALUES ($1, $2, $3, $4, NULL)`,
+      [sha256(token), id, now, expiresAt],
+    );
+    return id;
+  });
   return { staffId, token };
 }
 

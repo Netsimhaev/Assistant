@@ -23,7 +23,15 @@ export const STAFF_ACTIONS = [
   'totp_reset',
   'staff_invited',
   'staff_removed',
+  'staff_link_reissued',
 ] as const;
+
+/**
+ * How the log names an action the server command line performed (migration
+ * 076: `staff_id` NULL) — the break-glass `npm run staff -- reset-factor |
+ * reissue-link`, which no staff member did.
+ */
+export const CLI_ACTOR_LABEL = 'שורת הפקודה בשרת';
 
 export type StaffAction = (typeof STAFF_ACTIONS)[number];
 
@@ -43,7 +51,8 @@ function checkDetail(detail: Record<string, number | boolean | string>): void {
 }
 
 export async function logStaffAction(input: {
-  staffId: string;
+  /** `null` is the server command line (migration 076), never a guess at a member. */
+  staffId: string | null;
   action: StaffAction;
   businessId: string | null;
   detail?: Record<string, number | boolean | string>;
@@ -72,9 +81,9 @@ export interface StaffActionRow {
 export async function recentStaffActions(limit: number): Promise<StaffActionRow[]> {
   const bounded = Math.max(0, Math.min(Math.floor(limit), 1000));
   const { rows } = await withPlatform((db) =>
-    db.query<{ at: Date; display_name: string; action: StaffAction; business_id: string | null }>(
+    db.query<{ at: Date; display_name: string | null; action: StaffAction; business_id: string | null }>(
       `SELECT l.at, s.display_name, l.action, l.business_id
-         FROM platform_activity_log l JOIN platform_staff s ON s.staff_id = l.staff_id
+         FROM platform_activity_log l LEFT JOIN platform_staff s ON s.staff_id = l.staff_id
         ORDER BY l.seq DESC
         LIMIT $1`,
       [bounded],
@@ -82,7 +91,7 @@ export async function recentStaffActions(limit: number): Promise<StaffActionRow[
   );
   return rows.map((r) => ({
     at: r.at,
-    staffDisplayName: r.display_name,
+    staffDisplayName: r.display_name ?? CLI_ACTOR_LABEL,
     action: r.action,
     businessId: r.business_id,
   }));

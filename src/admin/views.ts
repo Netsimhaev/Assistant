@@ -543,6 +543,7 @@ export const STAFF_ACTION_LABELS: Record<StaffAction, string> = {
   totp_reset: 'איפוס Authenticator',
   staff_invited: 'הזמנת איש צוות',
   staff_removed: 'הסרת איש צוות',
+  staff_link_reissued: 'הנפקת קישור סיסמה לאיש צוות',
 };
 
 export interface StaffPageOptions {
