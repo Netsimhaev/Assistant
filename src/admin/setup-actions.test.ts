@@ -22,6 +22,7 @@ import { LOGO_MAX_BYTES } from '../business/logo.js';
 import { saveAddress } from '../business/profile.js';
 import { createHeadStaff, staffBeginEnrolment, staffConfirmEnrolment, startStaffSession } from '../tenancy/staff.js';
 import { createAdminServer } from './server.js';
+import { OWNER_NOTICE_TEXT, type OwnerNoticeSender } from './owner-notice.js';
 
 const BASE = 'https://dashboard.example';
 const LOCKED_COPY = 'העסק כבר נחתם על ידי בעל העסק. מעכשיו רק הוא מעדכן את הפרטים האלה.';
@@ -56,8 +57,14 @@ afterAll(async () => {
   await closePool();
 });
 
-async function startPanel(): Promise<string> {
-  panel = createAdminServer({ port: 0, masterKey: TEST_MASTER_KEY, documentRoot: ROOT, dashboardBaseUrl: BASE });
+async function startPanel(ownerNotice?: OwnerNoticeSender): Promise<string> {
+  panel = createAdminServer({
+    port: 0,
+    masterKey: TEST_MASTER_KEY,
+    documentRoot: ROOT,
+    dashboardBaseUrl: BASE,
+    ...(ownerNotice ? { ownerNotice } : {}),
+  });
   await once(panel, 'listening');
   return `http://127.0.0.1:${(panel.address() as AddressInfo).port}`;
 }
@@ -518,6 +525,55 @@ describe('owner reset link and Authenticator reset', () => {
     });
     expect(login.status).toBe(303);
     expect(login.headers.get('location')).toBe('/2fa/enrol');
+  });
+});
+
+describe('the owner hears about a technician reset (final review I1)', () => {
+  it('notifies the owner on a TOTP reset and on a reset link, through the business seam', async () => {
+    await createTestOwner(TEST_BUSINESS, { username: 'owner', password: OWNER_PASSWORD });
+    const sent: Array<{ businessId: string; body: string }> = [];
+    const fake: OwnerNoticeSender = async (businessId, _subject, body) => {
+      sent.push({ businessId, body });
+      return { status: 'sent' };
+    };
+    const { cookie } = await signedIn();
+    const baseUrl = await startPanel(fake);
+    const csrf = await pageCsrf(baseUrl, cookie);
+
+    expect((await post(baseUrl, `/businesses/${TEST_BUSINESS}/totp-reset`, { csrf }, cookie)).status).toBe(303);
+    expect((await post(baseUrl, `/businesses/${TEST_BUSINESS}/reset-link`, { csrf }, cookie)).status).toBe(200);
+    expect(sent.map((s) => s.businessId)).toEqual([TEST_BUSINESS, TEST_BUSINESS]);
+    expect(sent[0]?.body).toContain(OWNER_NOTICE_TEXT.totp_reset.body);
+    expect(sent[1]?.body).toContain(OWNER_NOTICE_TEXT.reset_issued.body);
+  });
+
+  it('the reset still happens when the notice fails, and the failure is recorded', async () => {
+    await createTestOwner(TEST_BUSINESS, { username: 'owner', password: OWNER_PASSWORD });
+    const { cookie } = await signedIn();
+    const baseUrl = await startPanel(async () => {
+      throw new Error('smtp down');
+    });
+    const csrf = await pageCsrf(baseUrl, cookie);
+    expect((await post(baseUrl, `/businesses/${TEST_BUSINESS}/totp-reset`, { csrf }, cookie)).status).toBe(303);
+    expect((await activity()).map((r) => r.action)).toEqual(['totp_reset']);
+    const { rows } = await testDb().query<{ reason: string }>(
+      "SELECT reason FROM audit_log WHERE business_id = $1 AND kind = 'incident'",
+      [TEST_BUSINESS],
+    );
+    expect(rows.map((r) => r.reason.split(' ')[0])).toEqual(['owner_notice_failed:totp_reset']);
+  });
+
+  it('with no notice seam configured, nothing is sent and that is recorded', async () => {
+    await createTestOwner(TEST_BUSINESS, { username: 'owner', password: OWNER_PASSWORD });
+    const { cookie } = await signedIn();
+    const baseUrl = await startPanel();
+    const csrf = await pageCsrf(baseUrl, cookie);
+    expect((await post(baseUrl, `/businesses/${TEST_BUSINESS}/reset-link`, { csrf }, cookie)).status).toBe(200);
+    const { rows } = await testDb().query<{ reason: string }>(
+      "SELECT reason FROM audit_log WHERE business_id = $1 AND kind = 'incident'",
+      [TEST_BUSINESS],
+    );
+    expect(rows.map((r) => r.reason.split(' ')[0])).toEqual(['owner_notice_not_sent:reset_issued']);
   });
 });
 

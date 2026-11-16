@@ -48,6 +48,7 @@ import { normaliseLogin } from '../tenancy/login.js';
 import { businessDetailForPanel, listBusinessesForPanel, setupDataForPanel } from '../tenancy/panel-reads.js';
 import { resolveLogin } from '../tenancy/platform.js';
 import { recordStaffAction, type RecordingStaff } from './record.js';
+import { noticeOwner, type OwnerNoticeSender } from './owner-notice.js';
 import {
   renderBusinessList,
   renderBusinessPage,
@@ -111,6 +112,8 @@ export interface BusinessRouteContext {
   masterKey: Buffer;
   /** Where business files live; the logo is written under it. */
   documentRoot: string;
+  /** Tells the owner a technician touched his sign-in (final review I1). */
+  ownerNotice: OwnerNoticeSender;
   readForm(): Promise<URLSearchParams>;
   /** A multipart body with at most one file of at most `maxFileBytes`. */
   readUpload(maxFileBytes: number): Promise<UploadBody>;
@@ -519,6 +522,7 @@ async function handleResetLink(ctx: BusinessRouteContext, businessId: string): P
   });
   if (token === null) return showBusiness(ctx, businessId, 409, NO_OWNER_YET);
   await recordStaffAction(ctx.staff, 'reset_issued', businessId);
+  await noticeOwner(ctx.ownerNotice, businessId, 'reset_issued');
   ctx.sendHtml(200, renderResetIssued(ctx.viewer, { businessId, link: resetUrl(ctx.dashboardBaseUrl, token) }));
 }
 
@@ -533,5 +537,6 @@ async function handleTotpReset(ctx: BusinessRouteContext, businessId: string): P
   });
   if (!done) return showBusiness(ctx, businessId, 409, NO_OWNER_YET);
   await recordStaffAction(ctx.staff, 'totp_reset', businessId);
+  await noticeOwner(ctx.ownerNotice, businessId, 'totp_reset');
   ctx.seeOther(`/businesses/${businessId}`);
 }

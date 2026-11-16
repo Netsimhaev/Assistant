@@ -27,6 +27,7 @@
  * no OAuth callback that a cross-site navigation must carry a session to.
  */
 import { createServer as createHttpServer } from 'node:http';
+import { NO_OWNER_NOTICE, type OwnerNoticeSender } from './owner-notice.js';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { issueCsrfToken, verifyCsrfToken } from '../dashboard/csrf.js';
 import { ADMIN_BIND, assertBindableHost } from '../util/bind.js';
@@ -92,6 +93,13 @@ export interface AdminOptions {
   documentRoot: string;
   /** The owner dashboard's public base URL, for the invite links the panel shows. */
   dashboardBaseUrl: string;
+  /**
+   * How the owner is told a technician reset his Authenticator or issued him
+   * a reset link (final review I1). Absent: nothing is sent, and every such
+   * action records that in the business's trail. `run-admin.ts` passes the
+   * business notification seam.
+   */
+  ownerNotice?: OwnerNoticeSender;
 }
 
 const SESSION_COOKIE = 'asid';
@@ -378,6 +386,7 @@ interface RouteOptions {
   masterKey: Buffer;
   documentRoot: string;
   dashboardBaseUrl: string;
+  ownerNotice: OwnerNoticeSender;
 }
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse, options: RouteOptions): Promise<void> {
@@ -446,6 +455,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
     dashboardBaseUrl: options.dashboardBaseUrl,
     masterKey: options.masterKey,
     documentRoot: options.documentRoot,
+    ownerNotice: options.ownerNotice,
     readForm: () => readFormBody(req),
     readUpload: (maxFileBytes) => readUploadBody(req, res, maxFileBytes),
     csrfOk: (form) => verifyCsrfToken(session.token, form.get('csrf')),
@@ -468,6 +478,7 @@ export function createAdminServer(options: AdminOptions): Server {
       masterKey: options.masterKey,
       documentRoot: options.documentRoot,
       dashboardBaseUrl: options.dashboardBaseUrl,
+      ownerNotice: options.ownerNotice ?? NO_OWNER_NOTICE,
     }).catch((err: unknown) => {
       if (err instanceof FormBodyTooLargeError) {
         if (!res.headersSent) sendHtml(res, 413, renderTooLarge());

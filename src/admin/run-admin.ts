@@ -18,6 +18,8 @@ import { closePlatform, verifyServerKeyState } from '../tenancy/platform.js';
 import { loadMasterKey, MasterKeyError } from '../governance/master-key.js';
 import { config } from '../config.js';
 import { createAdminServer } from './server.js';
+import { buildServerRuntime } from '../orchestrator/runtime.js';
+import { runtimeOwnerNoticeSender } from './owner-notice.js';
 
 const port = Number(process.env['ADMIN_PORT'] ?? 8788);
 const host = process.env['ADMIN_HOST'] ?? '127.0.0.1';
@@ -31,6 +33,9 @@ if (keyPath === undefined || keyPath.length === 0) {
 }
 const masterKey = await loadMasterKey(keyPath);
 await verifyServerKeyState(masterKey);
+// The business notification seam, for telling an owner a technician reset his
+// sign-in (final review I1). Its warnings are the scheduler's to print.
+const serverRuntime = await buildServerRuntime();
 
 const server = createAdminServer({
   masterKey,
@@ -40,6 +45,7 @@ const server = createAdminServer({
   allowNonLoopbackBind,
   documentRoot: config.documentRoot,
   dashboardBaseUrl,
+  ownerNotice: runtimeOwnerNoticeSender(serverRuntime),
 });
 
 server.on('listening', () => {
