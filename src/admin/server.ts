@@ -71,6 +71,7 @@ import {
   type PanelViewer,
 } from './views.js';
 import { handleBusinessRoute, type UploadBody } from './business-routes.js';
+import { adminBaseUrlFor, handleStaffRoute } from './staff-routes.js';
 import { readBoundedMultipart } from '../dashboard/multipart.js';
 
 export interface AdminOptions {
@@ -419,6 +420,21 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
   if (pathname === '/2fa' || pathname === '/2fa/enrol') return seeOther(res, '/');
 
   if (method === 'POST' && pathname === '/logout') return handleLogout(req, res, session);
+
+  const staffHandled = await handleStaffRoute({
+    req,
+    res,
+    method,
+    pathname,
+    staff: { staffId: session.staffId, displayName: session.displayName },
+    viewer: viewerOf(session),
+    adminBaseUrl: adminBaseUrlFor(req),
+    readForm: () => readFormBody(req),
+    csrfOk: (form) => verifyCsrfToken(session.token, form.get('csrf')),
+    sendHtml: (status, html) => sendHtml(res, status, html),
+    seeOther: (location) => seeOther(res, location),
+  });
+  if (staffHandled) return;
 
   const handled = await handleBusinessRoute({
     req,

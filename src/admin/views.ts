@@ -10,6 +10,8 @@
  */
 import { escapeHtml } from '../util/html.js';
 import { formatMinor } from '../util/money.js';
+import type { StaffAction, StaffActionRow } from '../tenancy/activity-log.js';
+import type { StaffListing } from '../tenancy/staff.js';
 import type { PanelBusinessDetail, PanelBusinessRow, PanelSetupData } from '../tenancy/panel-reads.js';
 
 const esc = escapeHtml;
@@ -516,4 +518,100 @@ export function renderServerError(): string {
 
 export function renderTooLarge(): string {
   return page('הבקשה גדולה מדי', '<h1>הבקשה גדולה מדי</h1>');
+}
+
+// ---------------------------------------------------------------------------
+// Staff management and the activity log
+// ---------------------------------------------------------------------------
+
+export const STAFF_NOT_HEAD = 'רק מנהל ראשי יכול לנהל את הצוות.';
+export const STAFF_NOT_FOUND = 'איש הצוות לא נמצא או כבר הוסר.';
+export const STAFF_LINK_COPY =
+  'העתק את הקישור ושלח אותו לאיש הצוות. הקישור תקף ל-72 שעות ולשימוש אחד ולא יוצג שוב.';
+
+/** One Hebrew label per action kind; a new kind is a compile error until it is named here. */
+export const STAFF_ACTION_LABELS: Record<StaffAction, string> = {
+  business_open: 'פתיחת עסק',
+  business_suspend: 'השעיית עסק',
+  business_resume: 'חידוש עסק',
+  whatsapp_saved: 'שמירת חיבור וואטסאפ',
+  setup_package_saved: 'שמירת חבילת הקמה',
+  profile_saved: 'שמירת פרופיל העסק',
+  logo_saved: 'שמירת לוגו',
+  invite_issued: 'הנפקת הזמנה לבעל עסק',
+  reset_issued: 'הנפקת קישור איפוס לבעל עסק',
+  totp_reset: 'איפוס Authenticator',
+  staff_invited: 'הזמנת איש צוות',
+  staff_removed: 'הסרת איש צוות',
+};
+
+export interface StaffPageOptions {
+  error?: string;
+  /** The just-issued invite link: shown on the response to the POST that made it, never again. */
+  inviteLink?: string;
+  values?: { name: string; email: string };
+}
+
+export function renderStaffPage(viewer: PanelViewer, staff: StaffListing[], options: StaffPageOptions = {}): string {
+  const form = (action: string, label: string): string =>
+    `<form method="post" action="${esc(action)}" style="display:inline"><input type="hidden" name="csrf" value="${esc(viewer.csrf)}"><button type="submit">${esc(label)}</button></form>`;
+  const rows = staff
+    .map((s) => {
+      const actions =
+        viewer.isHead && !s.removed
+          ? `${form(`/staff/${s.staffId}/reset-factor`, 'איפוס Authenticator')} ${form(`/staff/${s.staffId}/remove`, 'הסרה')}`
+          : '';
+      return `<tr><td>${esc(s.displayName)}</td><td dir="ltr">${esc(s.login)}</td><td>${s.isHead ? 'מנהל ראשי' : 'צוות'}</td><td>${s.enrolled ? '✓' : '—'}</td><td>${s.removed ? 'הוסר' : ''}</td><td>${actions}</td></tr>`;
+    })
+    .join('\n');
+  const link =
+    options.inviteLink === undefined
+      ? ''
+      : `<div class="card"><p>${esc(STAFF_LINK_COPY)}</p><p><code dir="ltr" class="invite-link">${esc(options.inviteLink)}</code></p></div>`;
+  const v = options.values ?? { name: '', email: '' };
+  const add = viewer.isHead
+    ? `<div class="card"><h2>הוספת איש צוות</h2>
+<form method="post" action="/staff/invite">
+  <input type="hidden" name="csrf" value="${esc(viewer.csrf)}">
+  <label>שם<input type="text" name="name" value="${esc(v.name)}" required></label>
+  <label>כתובת מייל<input type="email" name="email" value="${esc(v.email)}" required dir="ltr"></label>
+  <button type="submit">הוספה</button>
+</form></div>`
+    : '';
+  return page(
+    'צוות',
+    `<h1>צוות</h1>
+${errorBlock(options.error)}
+${link}
+<table>
+<thead><tr><th>שם</th><th>כניסה</th><th>תפקיד</th><th>Authenticator</th><th>מצב</th><th></th></tr></thead>
+<tbody>
+${rows}
+</tbody>
+</table>
+${add}`,
+    viewer,
+  );
+}
+
+export function renderStaffRefused(viewer: PanelViewer): string {
+  return page('אין הרשאה', `<h1>אין הרשאה</h1><p class="error">${esc(STAFF_NOT_HEAD)}</p>`, viewer);
+}
+
+export function renderActivityLog(viewer: PanelViewer, rows: StaffActionRow[]): string {
+  const body =
+    rows.length === 0
+      ? '<p class="muted">עדיין אין פעולות.</p>'
+      : `<table>
+<thead><tr><th>זמן</th><th>איש צוות</th><th>פעולה</th><th>עסק</th></tr></thead>
+<tbody>
+${rows
+  .map(
+    (r) =>
+      `<tr><td>${esc(formatWhen(r.at))}</td><td>${esc(r.staffDisplayName)}</td><td>${esc(STAFF_ACTION_LABELS[r.action])}</td><td>${r.businessId === null ? '—' : esc(r.businessId)}</td></tr>`,
+  )
+  .join('\n')}
+</tbody>
+</table>`;
+  return page('יומן פעולות', `<h1>יומן פעולות</h1>\n${body}`, viewer);
 }
