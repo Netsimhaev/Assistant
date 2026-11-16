@@ -21,7 +21,7 @@ import {
 import type { AutonomyMode } from '../governance/autonomy-mode.js';
 import { MAIL_PROVIDER_NAME } from '../mail/mailbox.js';
 import { MAILBOX_AUTHORISATION_TEXT, RESTART_NOTE } from './mailbox-connect.js';
-import type { InterviewAnswersDraft } from '../charter/interview/answers.js';
+import type { InterviewAnswersDraft, SetupPeopleSnapshot } from '../charter/interview/answers.js';
 import { INTERVIEW_SECTIONS } from '../charter/interview/answers.js';
 import type { SetupIssue } from './setup-forms.js';
 import { escLabel, escapeHtml as esc, page } from './views.js';
@@ -170,6 +170,27 @@ function knownCard(known: readonly SummaryCounterparty[]): string {
   return `<div class="card"><h2>לקוחות וספקים מוכרים</h2>${body}</div>`;
 }
 
+export const SETUP_PEOPLE_SUMMARY_TITLE = 'מה החתימה תוסיף מנתוני ההקמה';
+
+/**
+ * The people step 8 confirmed: what the signature writes besides the charter
+ * — contacts the assistant will recognise (memory), and colleagues. Bound by
+ * the shown hash (`summaryHash`). Typed by a technician: `escLabel`.
+ */
+function setupPeopleCard(people: SetupPeopleSnapshot | undefined): string {
+  if (people === undefined || (people.contacts.length === 0 && people.colleagues.length === 0)) return '';
+  const line = (p: { name: string; role: string; phone: string }) =>
+    `${escLabel(p.name)} — ${escLabel(p.role)} <bdi dir="ltr">${escLabel(p.phone)}</bdi>`;
+  const contacts = people.contacts
+    .map((c) => `<li>${line(c)}${c.known ? ' <span class="tag">מוכר</span>' : ''}</li>`)
+    .join('');
+  const colleagues = people.colleagues.map((c) => `<li>${line(c)}</li>`).join('');
+  return `<div class="card"><h2>${esc(SETUP_PEOPLE_SUMMARY_TITLE)}</h2>
+${contacts === '' ? '' : `<h3>אנשי קשר שאכיר</h3><ul>${contacts}</ul>`}
+${colleagues === '' ? '' : `<h3>קולגות — עובדים איתך, ולא נותנים לי הוראות</h3><ul>${colleagues}</ul>`}
+</div>`;
+}
+
 /**
  * A mailbox this signature adds: the same two statements the connections
  * screen's own mailbox sign page carries (`mailbox-connect.ts`) — what
@@ -197,6 +218,8 @@ export function renderSummary(options: {
   business: { legalName: string; tradeName: string; principal: string | null };
   /** The dial applied right after signing (step 9) — not part of the rules, but bound by the hash. */
   mode: AutonomyMode;
+  /** The people step 8 confirmed, applied by the signature; bound by the hash. */
+  setupPeople?: SetupPeopleSnapshot | undefined;
 }): string {
   const { summary, business } = options;
   const changes =
@@ -234,6 +257,7 @@ ${principalCard(summary.principal)}
 </div>
 <div class="card"><h2>גבולות</h2>${bulletList(summary.limits, 'לא נקבעו גבולות נוספים.')}</div>
 ${knownCard(summary.knownCounterparties)}
+${setupPeopleCard(options.setupPeople)}
 ${mailboxCard(summary)}
 <p class="note">רמת החופש אחרי החתימה: <b>${esc(AUTONOMY_MODE_INTERVIEW_HE[options.mode])}</b> — לא חלק מהכללים; אפשר לשנות בכל רגע במסך „כמה חופש לתת”.</p>
 <div class="card"><h2>מה ידוע לי על העסק</h2>${guidance}</div>

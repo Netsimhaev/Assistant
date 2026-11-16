@@ -27,7 +27,10 @@ import type { ServerResponse } from 'node:http';
 import { InterviewAnswers, INTERVIEW_SECTIONS, type AcceptedRule } from '../charter/interview/answers.js';
 import { buildCharterFromInterview, buildConnections, prefillFromCharter } from '../charter/interview/build.js';
 import { freezeDraft, loadDraft, replaceDraft, saveSection, type InterviewDraft } from '../charter/interview/draft-store.js';
-import { previousForDraft, signAndInstallInterview } from '../charter/interview/install.js';
+import { previousForDraft, signAndInstallInterview, summaryHash } from '../charter/interview/install.js';
+import { SetupPeopleInputError, confirmSetupPeople } from '../business/confirm-people.js';
+import { loadProfile, readLogo } from '../business/profile.js';
+import { loadSetupPackage } from '../business/setup-package.js';
 import type { RuleProposer } from '../charter/interview/rule-proposal.js';
 import { summarizeCharter } from '../charter/interview/summary.js';
 import { signedMailboxProvider } from '../charter/amend-mailbox.js';
@@ -144,6 +147,32 @@ async function stepView(
     view.pinnedMailbox = mailboxPinnedBy(previous);
     const provider = answers.reading?.mailbox ?? 'none';
     view.connections = buildConnections(provider === 'none' ? null : provider, previous).connections;
+  }
+  // Step 1 shows the address and logo the technician entered, read-only.
+  if (step === 1) {
+    const profile = await loadProfile(db);
+    view.profile = { address: profile.address, hasLogo: profile.logo !== null };
+  }
+  // Step 2: the package's boss number fills an empty field, until the draft
+  // has a number of its own. Not on a refused POST — that shows what was typed.
+  if (step === 2 && extra.value === undefined && (answers.principal?.whatsapp ?? null) === null) {
+    const boss = (await loadSetupPackage(db))?.bossWhatsapp ?? null;
+    if (boss !== null) {
+      view.value = { ...(answers.principal ?? {}), whatsapp: boss };
+      view.bossPrefilled = true;
+    }
+  }
+  // Step 8 lists the package's people, and what a recorded confirmation chose.
+  if (step === 8) {
+    const pkg = await loadSetupPackage(db);
+    const snapshot = answers.setupPeople;
+    view.setupPeople = {
+      contacts: pkg?.contacts ?? [],
+      colleagues: pkg?.colleagues ?? [],
+      knownPhones: (snapshot?.contacts ?? []).filter((c) => c.known).map((c) => c.phone),
+      confirmed: snapshot !== undefined,
+      ...(extra.setupPeople?.error === undefined ? {} : { error: extra.setupPeople.error }),
+    };
   }
   // Step 9 preselects the dial as it is now: on an edit, the live position.
   if (step === 9) view.currentMode = await loadAutonomyMode(db);
@@ -437,6 +466,59 @@ export async function handleRuleChoice(
   seeOther(res, '/setup/step/10');
 }
 
+// --- step 8: the technician's people -----------------------------------------
+
+const PEOPLE_BAD_INPUT = 'הבחירה אינה תקינה. לא בוצעה כל פעולה — יש לרענן ולבחור שוב.';
+
+/**
+ * `POST /setup/people` — record which of the setup package's people the owner
+ * confirms (`confirmSetupPeople`). Each `known` value must be a plain
+ * non-negative integer; the range is checked against the package as read
+ * under the lock. Nothing recorded takes effect before the signature.
+ */
+export async function handlePeoplePost(
+  res: ServerResponse,
+  db: BusinessDb,
+  session: SetupSession,
+  form: URLSearchParams,
+): Promise<void> {
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return refuseCsrf(res);
+  const raw = form.getAll('known');
+  const draft = await loadDraft(db);
+  const refuse = async (message: string) =>
+    sendHtml(res, 400, renderStep(await stepView(db, session, 8, draft, { setupPeople: { contacts: [], colleagues: [], knownPhones: [], confirmed: false, error: message } })));
+  if (!raw.every((v) => /^\d{1,3}$/.test(v))) return refuse(PEOPLE_BAD_INPUT);
+  if (await editMustStartFromPrefill(draft, db)) return seeOther(res, '/setup/edit');
+  try {
+    await confirmSetupPeople(db, { knownIndices: [...new Set(raw.map(Number))] });
+  } catch (err) {
+    if (err instanceof SetupPeopleInputError) return refuse(err.message);
+    throw err;
+  }
+  seeOther(res, '/setup/step/8');
+}
+
+/**
+ * `GET /setup/logo` — the stored logo, for step 1's read-only card.
+ * `readLogo` re-hashes the file and refuses a mismatch; the type is the
+ * sniffed one, never guessed, and `nosniff` keeps the browser to it.
+ */
+export async function handleSetupLogo(res: ServerResponse, db: BusinessDb, documentRoot: string): Promise<void> {
+  const logo = await readLogo(db, documentRoot);
+  if (logo === null) {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', ...SECURITY_HEADERS });
+    res.end('אין לוגו');
+    return;
+  }
+  res.writeHead(200, {
+    'Content-Type': logo.mediaType,
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Length': String(logo.bytes.length),
+    ...SECURITY_HEADERS,
+  });
+  res.end(logo.bytes);
+}
+
 // --- summary and sign --------------------------------------------------------
 
 export async function handleSummaryGet(res: ServerResponse, db: BusinessDb, session: SetupSession): Promise<void> {
@@ -466,7 +548,8 @@ export async function handleSummaryGet(res: ServerResponse, db: BusinessDb, sess
     renderSummary({
       draft: draft.answers,
       summary,
-      shownHash: canonicalHash(unsigned),
+      shownHash: summaryHash(unsigned, parsed.data.setupPeople),
+      setupPeople: parsed.data.setupPeople,
       csrf: issueCsrfToken(session.sessionId),
       business: {
         legalName: unsigned.identity.legalName,

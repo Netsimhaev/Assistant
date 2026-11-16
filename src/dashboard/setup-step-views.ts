@@ -47,6 +47,22 @@ import { BUSINESS_DESCRIPTION_MAX_CHARS } from '../business/description-store.js
 import { canonicalHash } from '../util/canonical.js';
 import { escLabel, escapeHtml as esc } from './views.js';
 
+/** Under step 2's WhatsApp field when the number came from the technician's setup package. */
+export const BOSS_PREFILL_NOTE = 'המספר הוזן בהקמה. העוזרת תקבל הוראות רק מהמספר הזה, ורק אחרי שתחתום.';
+/** Under step 1's read-only address and logo. */
+export const PROFILE_CHANGE_NOTE = 'אפשר לשנות בהגדרות ← פרטי העסק';
+/** Step 8's section title, and the checkbox beside each contact. */
+export const SETUP_PEOPLE_TITLE = 'אנשי קשר וקולגות מההקמה';
+export const SETUP_PEOPLE_KNOWN_LABEL = 'מוכר (הוסף לרשימת המוכרים)';
+export const SETUP_PEOPLE_CONFIRM_BUTTON = 'אשר את הרשימה';
+
+/** One person the technician typed: name, role, canonical phone. */
+export interface SetupPersonView {
+  name: string;
+  role: string;
+  phone: string;
+}
+
 /** Maximum length of one stage-10 sentence; `AcceptedRule.text` is capped at the same. */
 export const RULE_TEXT_MAX = 500;
 
@@ -81,6 +97,22 @@ export interface StepView {
    * unsaved — on an edit the owner starts from what is live, not from `off`.
    */
   currentMode?: AutonomyMode;
+  /** Step 1: the business's address and whether a logo is stored — read-only here. */
+  profile?: { address: string | null; hasLogo: boolean };
+  /** Step 2: the WhatsApp value shown came from the setup package. */
+  bossPrefilled?: boolean;
+  /**
+   * Step 8: the setup package's people (typed by a technician — every value
+   * through `escLabel`), the phones a recorded confirmation marked known,
+   * and whether a confirmation is recorded.
+   */
+  setupPeople?: {
+    contacts: readonly SetupPersonView[];
+    colleagues: readonly SetupPersonView[];
+    knownPhones: readonly string[];
+    confirmed: boolean;
+    error?: string;
+  };
 }
 
 function obj(v: unknown): Record<string, unknown> {
@@ -150,6 +182,16 @@ function followUpUnder(value: string, line: string): string {
   return n > 0 && n < FOLLOW_UP_UNDER_WORDS ? `<p class="note">${esc(line)}</p>` : '';
 }
 
+/** Step 1: the address and logo the technician entered, read-only. Nothing when neither is set. */
+function profileCard(view: StepView): string {
+  const profile = view.profile;
+  if (profile === undefined || (profile.address === null && !profile.hasLogo)) return '';
+  return `<div class="card"><h3>פרטי העסק</h3>
+${profile.hasLogo ? '<p><img src="/setup/logo" alt="הלוגו של העסק" style="max-height:80px"></p>' : ''}
+${profile.address === null ? '' : `<p>כתובת: ${escLabel(profile.address)}</p>`}
+<p class="muted">${esc(PROFILE_CHANGE_NOTE)}</p></div>`;
+}
+
 function step1(view: StepView): string {
   const v = obj(view.value);
   const facts = Array.isArray(v['keyFacts']) ? v['keyFacts'].map(obj) : [];
@@ -165,7 +207,7 @@ function step1(view: StepView): string {
   const expectations = str(v['expectations']);
   return frame(
     view,
-    `${view.followUp === true ? `<p class="note">${esc(FOLLOW_UPS[2])}</p>` : ''}
+    `${profileCard(view)}${view.followUp === true ? `<p class="note">${esc(FOLLOW_UPS[2])}</p>` : ''}
 ${form(
   view,
   `${area('ספר לי על העסק בכמה משפטים: במה אתם עוסקים ולמי?', 'description', description, view.issues)}
@@ -196,6 +238,7 @@ ${form(
   `${field('מה השם שלך?', 'displayName', str(v['displayName']), view.issues)}
 ${field('מה התפקיד שלך?', 'role', str(v['role']), view.issues)}
 ${field('מה מספר הוואטסאפ שלך? (עם קידומת מדינה, לדוגמה ‎+972541234567)', 'whatsapp', str(v['whatsapp']), view.issues)}
+${view.bossPrefilled === true ? `<p class="note">${esc(BOSS_PREFILL_NOTE)}</p>` : ''}
 ${field('מה כתובת המייל שלך?', 'email', str(v['email']), view.issues, 'email')}`,
 )}`,
   );
@@ -375,10 +418,39 @@ function counterpartyRows(list: string, prefix: string, entries: unknown, issues
     .join('');
 }
 
+/**
+ * Step 8: the setup package's people. Each contact has a "known" box,
+ * unchecked unless a recorded confirmation marked it; colleagues have none —
+ * they are never charter counterparties. The button posts to
+ * `/setup/people`; nothing it records takes effect before the signature.
+ */
+function setupPeopleSection(view: StepView): string {
+  const people = view.setupPeople;
+  if (people === undefined || (people.contacts.length === 0 && people.colleagues.length === 0)) return '';
+  const line = (p: SetupPersonView) => `${escLabel(p.name)} — ${escLabel(p.role)} <bdi dir="ltr">${escLabel(p.phone)}</bdi>`;
+  const contacts = people.contacts
+    .map(
+      (c, i) =>
+        `<li>${line(c)} <label><input type="checkbox" name="known" value="${i}"${people.knownPhones.includes(c.phone) ? ' checked' : ''}> ${esc(SETUP_PEOPLE_KNOWN_LABEL)}</label></li>`,
+    )
+    .join('');
+  const colleagues = people.colleagues.map((c) => `<li>${line(c)}</li>`).join('');
+  return `<div class="card"><h3>${esc(SETUP_PEOPLE_TITLE)}</h3>
+${people.error === undefined ? '' : `<p class="error">${esc(people.error)}</p>`}
+${people.confirmed ? '<p class="note">אישרת את הרשימה. היא תיכנס לתוקף כשתחתום.</p>' : ''}
+<form method="post" action="/setup/people">
+  <input type="hidden" name="csrf" value="${esc(view.csrf)}">
+  ${contacts === '' ? '' : `<h4>אנשי קשר — אכיר אותם בשמם</h4><ul>${contacts}</ul>`}
+  ${colleagues === '' ? '' : `<h4>קולגות — עובדים איתך, ולא נותנים לי הוראות</h4><ul>${colleagues}</ul>`}
+  <button type="submit">${esc(SETUP_PEOPLE_CONFIRM_BUTTON)}</button>
+</form></div>`;
+}
+
 function step8(view: StepView): string {
   const v = obj(view.value);
   return frame(
     view,
+    setupPeopleSection(view) +
     form(
       view,
       `<fieldset><legend>לקוחות או ספקים קבועים: שם, ודומיין מייל או מספר טלפון</legend>

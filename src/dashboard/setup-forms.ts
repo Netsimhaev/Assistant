@@ -29,11 +29,12 @@ import { Weekday } from '../domain/charter.js';
 import {
   INTERVIEW_SECTIONS,
   InterviewAnswers,
+  type InterviewSection,
   type InterviewAnswersDraft,
 } from '../charter/interview/answers.js';
 import { ALONE_ALLOWED, INTERVIEW_ROWS, MONEY_ROWS, ROW_DEFAULTS } from '../charter/interview/rows.js';
 
-export type SectionName = keyof InterviewAnswers;
+export type SectionName = InterviewSection;
 
 export interface SetupIssue {
   path: readonly (string | number)[];

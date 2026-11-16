@@ -4,10 +4,12 @@ import { transaction, type BusinessDb } from '../../db/pool.js';
 import type { BusinessCharter } from '../../domain/charter.js';
 import { setAutonomyMode } from '../../governance/autonomy-mode.js';
 import type { MailProvider } from '../../mail/mailbox.js';
+import { applySetupPeople } from '../../business/confirm-people.js';
+import { clearSetupBoss } from '../../business/setup-package.js';
 import { canonicalHash } from '../../util/canonical.js';
 import { signCharter } from '../sign.js';
 import { installCharter, loadCharterVersion } from '../store.js';
-import { InterviewAnswers } from './answers.js';
+import { InterviewAnswers, type SetupPeopleSnapshot } from './answers.js';
 import { buildCharterFromInterview } from './build.js';
 import { deleteDraft, loadDraft, type InterviewDraft } from './draft-store.js';
 import { mailboxAddedBy } from './summary.js';
@@ -25,7 +27,9 @@ import { mailboxAddedBy } from './summary.js';
  * "rebuild, compare a handle" shape `POST /erase/confirm` keeps with
  * `planFingerprint`.
  *
- * **One transaction: install, audit row, draft delete.** A failure in any of
+ * **One transaction: install, audit row, the setup people step 8 confirmed
+ * (`applySetupPeople` — memories, colleagues, their closed job), the setup
+ * package's boss number cleared, draft delete.** A failure in any of
  * them rolls back all three. Inside it, under a per-business advisory lock:
  *   - the active pointer must still be the version the draft started from
  *     (`null` on a first install). A first install has no `charter_active`
@@ -65,11 +69,23 @@ export type InstallOutcome =
 /** The mailbox preflight: `null` when the provider's OAuth ceremony can start, else the Hebrew reason. */
 export type MailboxPreflight = (provider: MailProvider) => Promise<string | null>;
 
-/** The hash the summary carries: `canonicalHash` of the unsigned charter the frozen draft builds. */
+/**
+ * The hash the summary carries and the sign compares: `canonicalHash` of the
+ * unsigned charter the frozen draft builds — and, when step 8 confirmed setup
+ * people, of those people too, because the signature applies them (memories,
+ * colleagues) and the summary shows them. Without a snapshot it is exactly the
+ * charter's hash, as before.
+ */
+export function summaryHash(unsigned: ReturnType<typeof buildCharterFromInterview>, setupPeople: SetupPeopleSnapshot | undefined): string {
+  return setupPeople === undefined ? canonicalHash(unsigned) : canonicalHash({ charter: unsigned, setupPeople });
+}
+
+/** `summaryHash` of what the frozen draft builds. */
 export function shownHashFor(draft: InterviewDraft, businessId: string, previous: BusinessCharter | null): string {
   if (draft.frozenAt === null) throw new Error('shownHashFor needs a frozen draft');
   const answers = InterviewAnswers.parse(draft.answers);
-  return canonicalHash(buildCharterFromInterview(answers, { businessId, frozenAt: draft.frozenAt, previous }));
+  const unsigned = buildCharterFromInterview(answers, { businessId, frozenAt: draft.frozenAt, previous });
+  return summaryHash(unsigned, answers.setupPeople);
 }
 
 /**
@@ -167,7 +183,7 @@ export async function signAndInstallInterview(
   const { previous } = base;
 
   const unsigned = buildCharterFromInterview(answers, { businessId, frozenAt: draft.frozenAt, previous });
-  if (canonicalHash(unsigned) !== input.shownHash) return { outcome: 'hash_mismatch' };
+  if (summaryHash(unsigned, answers.setupPeople) !== input.shownHash) return { outcome: 'hash_mismatch' };
 
   const addedMailbox = mailboxAddedBy(unsigned, previous);
   if (addedMailbox !== null) {
@@ -193,6 +209,15 @@ export async function signAndInstallInterview(
         inputHash: canonicalHash({ businessId, contentHash: signed.signature.contentHash }),
         reason,
       });
+      // The technician's setup data takes effect here and nowhere earlier:
+      // the people step 8 confirmed (a job needs this charter version), and
+      // the package's boss number — now in the signed charter, or replaced by
+      // the owner — is cleared. Both join this transaction without a second
+      // lock (`lockedChecks` already holds the install lock), so a failure
+      // rolls the install back, and a double sign, refused as `stale`, adds
+      // nothing twice.
+      await applySetupPeople(tx, answers.setupPeople, signed.charterVersion);
+      await clearSetupBoss(tx);
       await deleteDraft(tx);
     });
   } catch (error) {

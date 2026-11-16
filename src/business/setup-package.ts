@@ -145,6 +145,36 @@ export async function clearSetupPeople(db: BusinessDb): Promise<void> {
   });
 }
 
+/**
+ * Remove the contacts and colleagues whose phone is in the given lists — the
+ * ones the owner's signature just applied — and keep any the technician added
+ * after the owner confirmed, so they stay pending rather than vanish unseen.
+ * The row goes when everything is empty. Runs in the caller's transaction
+ * when it has one (the install).
+ */
+export async function removeSetupPeople(
+  db: BusinessDb,
+  applied: { contactPhones: readonly string[]; colleaguePhones: readonly string[] },
+): Promise<void> {
+  await transaction(db, async (tx) => {
+    const { rows } = await tx.query<SetupPackageRow>(
+      'SELECT boss_whatsapp, contacts, colleagues FROM setup_packages WHERE business_id = $1 FOR UPDATE',
+      [tx.businessId],
+    );
+    const row = rows[0];
+    if (!row) return;
+    const pkg = toSetupPackage(row);
+    const contacts = pkg.contacts.filter((c) => !applied.contactPhones.includes(c.phone));
+    const colleagues = pkg.colleagues.filter((c) => !applied.colleaguePhones.includes(c.phone));
+    await tx.query(
+      `UPDATE setup_packages SET contacts = $2::jsonb, colleagues = $3::jsonb, updated_at = now()
+        WHERE business_id = $1`,
+      [tx.businessId, JSON.stringify(contacts), JSON.stringify(colleagues)],
+    );
+    await tx.query(DELETE_WHEN_EMPTY, [tx.businessId]);
+  });
+}
+
 /** Empty the boss number; the row goes when the contacts and colleagues are empty too. */
 export async function clearSetupBoss(db: BusinessDb): Promise<void> {
   await transaction(db, async (tx) => {

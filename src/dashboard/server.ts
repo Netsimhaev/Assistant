@@ -52,7 +52,9 @@ import type { DescriptionProposer } from '../business/description-proposals.js';
 import {
   handleAboutPost,
   handleRuleChoice,
+  handlePeoplePost,
   handleRulePost,
+  handleSetupLogo,
   handleSetupEdit,
   handleSetupIndex,
   handleSetupStepGet,
@@ -64,6 +66,7 @@ import {
   type SetupOptions,
 } from './setup-routes.js';
 import type { ActiveCharter } from '../charter/store.js';
+import { config } from '../config.js';
 import { DigestSchedule, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
 import type { DigestSettings } from '../governance/digest-settings.js';
 import { recentDigests } from '../orchestrator/digest-store.js';
@@ -3389,6 +3392,12 @@ async function route(
   }
   if (method === 'POST' && pathname === '/setup/about') {
     return handleAboutPost(res, db, session, await readFormBody(req), setupOptions);
+  }
+  if (method === 'POST' && pathname === '/setup/people') {
+    return handlePeoplePost(res, db, session, await readFormBody(req));
+  }
+  if (method === 'GET' && pathname === '/setup/logo') {
+    return handleSetupLogo(res, db, documentRoot ?? config.documentRoot);
   }
   if (method === 'POST' && pathname === '/setup/rule') {
     return handleRulePost(res, db, session, await readFormBody(req), setupOptions);

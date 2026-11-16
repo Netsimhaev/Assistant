@@ -70,6 +70,37 @@ export const AcceptedRule = z.discriminatedUnion('kind', [
 ]);
 export type AcceptedRule = z.infer<typeof AcceptedRule>;
 
+/**
+ * One person from the technician's setup package, as the owner confirmed it
+ * on step 8 (admin-panel spec). A snapshot, not an index into the package: a
+ * technician editing the package after the owner confirmed cannot change who
+ * the signature adds. The phone is the package's canonical `+<digits>` form.
+ */
+const SetupPersonFields = {
+  name: z.string().min(1).max(120),
+  role: z.string().min(1).max(120),
+  phone: z
+    .string()
+    .refine((v) => /^\+\d+$/.test(v) && authorityNumberKey(v) === v.slice(1), {
+      message: 'מספר טלפון בפורמט בינלאומי בלבד',
+    }),
+};
+
+/**
+ * The people step 8 confirmed. Nothing here takes effect before the
+ * signature: `signAndInstallInterview` writes the contacts to memory and the
+ * colleagues to `business_colleagues`, inside the install transaction. A
+ * contact marked `known` is ALSO appended to `counterparties.known` on step
+ * 8, which is how it becomes a signed counterparty.
+ */
+export const SetupPeopleSnapshot = z
+  .object({
+    contacts: z.array(z.object({ ...SetupPersonFields, known: z.boolean() }).strict()),
+    colleagues: z.array(z.object(SetupPersonFields).strict()),
+  })
+  .strict();
+export type SetupPeopleSnapshot = z.infer<typeof SetupPeopleSnapshot>;
+
 export const InterviewAnswers = z.object({
   business: z.object({
     description: z.string(),
@@ -129,6 +160,8 @@ export const InterviewAnswers = z.object({
     accepted: z.array(AcceptedRule),
     pending: z.array(AcceptedRule),
   }),
+  /** Not a step: written by `POST /setup/people` (step 8), applied at signature. */
+  setupPeople: SetupPeopleSnapshot.optional(),
 });
 export type InterviewAnswers = z.infer<typeof InterviewAnswers>;
 
@@ -137,7 +170,10 @@ export const InterviewAnswersDraft = InterviewAnswers.partial();
 export type InterviewAnswersDraft = z.infer<typeof InterviewAnswersDraft>;
 
 /** Step order; step n is index n - 1. */
-export const INTERVIEW_SECTIONS: readonly (keyof InterviewAnswers)[] = [
+/** A section a step saves — every key but `setupPeople`, which no step form writes. */
+export type InterviewSection = Exclude<keyof InterviewAnswers, 'setupPeople'>;
+
+export const INTERVIEW_SECTIONS: readonly InterviewSection[] = [
   'business',
   'principal',
   'voice',
