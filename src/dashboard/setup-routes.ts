@@ -34,7 +34,7 @@ import {
   setupPeopleListHash,
   unconfirmedSetupPeople,
 } from '../business/confirm-people.js';
-import { loadProfile, readLogo } from '../business/profile.js';
+import { loadProfile } from '../business/profile.js';
 import { loadSetupPackage } from '../business/setup-package.js';
 import type { RuleProposer } from '../charter/interview/rule-proposal.js';
 import { summarizeCharter } from '../charter/interview/summary.js';
@@ -501,27 +501,6 @@ export async function handlePeoplePost(
     throw err;
   }
   seeOther(res, '/setup/step/8');
-}
-
-/**
- * `GET /setup/logo` — the stored logo, for step 1's read-only card.
- * `readLogo` re-hashes the file and refuses a mismatch; the type is the
- * sniffed one, never guessed, and `nosniff` keeps the browser to it.
- */
-export async function handleSetupLogo(res: ServerResponse, db: BusinessDb, documentRoot: string): Promise<void> {
-  const logo = await readLogo(db, documentRoot);
-  if (logo === null) {
-    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', ...SECURITY_HEADERS });
-    res.end('אין לוגו');
-    return;
-  }
-  res.writeHead(200, {
-    'Content-Type': logo.mediaType,
-    'X-Content-Type-Options': 'nosniff',
-    'Content-Length': String(logo.bytes.length),
-    ...SECURITY_HEADERS,
-  });
-  res.end(logo.bytes);
 }
 
 // --- summary and sign --------------------------------------------------------

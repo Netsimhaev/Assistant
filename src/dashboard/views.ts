@@ -318,7 +318,7 @@ export function renderPendingList(options: {
   ${logoutForm(options.csrf)}
 </header>
 ${options.modeFailed === true ? `<p class="error" role="alert">${esc(MODE_NOT_APPLIED_NOTICE)} <a href="/autonomy">כמה חופש לתת</a></p>` : ''}
-<p><a href="/instruct">מה לעשות</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/ledger">הפנקס</a> · <a href="/meetings">פגישות</a> · <a href="/documents">מסמכים</a> · <a href="/digest">מה קרה</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/setup/edit">ערוך את הכללים</a> · <a href="/settings/description">תיאור העסק</a></p>
+<p><a href="/instruct">מה לעשות</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/ledger">הפנקס</a> · <a href="/meetings">פגישות</a> · <a href="/documents">מסמכים</a> · <a href="/digest">מה קרה</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/setup/edit">ערוך את הכללים</a> · <a href="/settings/description">תיאור העסק</a> · <a href="/settings/profile">פרטי העסק</a> · <a href="/settings/people">אנשים</a></p>
 ${list}`,
   );
 }

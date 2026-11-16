@@ -54,7 +54,6 @@ import {
   handleRuleChoice,
   handlePeoplePost,
   handleRulePost,
-  handleSetupLogo,
   handleSetupEdit,
   handleSetupIndex,
   handleSetupStepGet,
@@ -137,6 +136,15 @@ import {
   handleLedgerSettingsPost,
 } from './ledger-routes.js';
 import { DESCRIPTION_SETTINGS_PATH, handleDescriptionGet, handleDescriptionPost } from './description-routes.js';
+import { PEOPLE_ACTION_PATH, PEOPLE_SETTINGS_PATH, handlePeopleAction, handlePeopleGet } from './people-routes.js';
+import {
+  PROFILE_LOGO_PATH,
+  PROFILE_SETTINGS_PATH,
+  handleAddressPost,
+  handleLogoGet,
+  handleLogoPost,
+  handleProfileGet,
+} from './profile-routes.js';
 import { handleDocumentFile, handleInvoices, handleMailDetail, handleMailDocuments, handleMailList, notFound } from './mail-handlers.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
@@ -3397,7 +3405,7 @@ async function route(
     return handlePeoplePost(res, db, session, await readFormBody(req));
   }
   if (method === 'GET' && pathname === '/setup/logo') {
-    return handleSetupLogo(res, db, documentRoot ?? config.documentRoot);
+    return handleLogoGet(res, db, documentRoot ?? config.documentRoot);
   }
   if (method === 'POST' && pathname === '/setup/rule') {
     return handleRulePost(res, db, session, await readFormBody(req), setupOptions);
@@ -3507,6 +3515,25 @@ async function route(
   if (method === 'GET' && pathname === DESCRIPTION_SETTINGS_PATH) return handleDescriptionGet(res, db, session);
   if (method === 'POST' && pathname === DESCRIPTION_SETTINGS_PATH) {
     return handleDescriptionPost(res, db, session, await readFormBody(req), setupOptions);
+  }
+
+  // The business profile (address, logo) and people — the owner's after the first signature.
+  if (method === 'GET' && pathname === PROFILE_SETTINGS_PATH) return handleProfileGet(res, db, session);
+  if (method === 'POST' && pathname === PROFILE_SETTINGS_PATH) {
+    return handleAddressPost(res, db, session, await readFormBody(req));
+  }
+  if (method === 'GET' && pathname === PROFILE_LOGO_PATH) {
+    return handleLogoGet(res, db, documentRoot ?? config.documentRoot);
+  }
+  if (method === 'POST' && pathname === PROFILE_LOGO_PATH) {
+    return handleLogoPost(req, res, db, session, documentRoot ?? config.documentRoot);
+  }
+  if (method === 'GET' && pathname === PEOPLE_SETTINGS_PATH) return handlePeopleGet(res, db, session);
+  const peopleActionMatch = PEOPLE_ACTION_PATH.exec(pathname);
+  if (method === 'POST' && peopleActionMatch?.[1] !== undefined && peopleActionMatch[2] !== undefined) {
+    const list = peopleActionMatch[1] as 'colleague' | 'contact';
+    const action = peopleActionMatch[2] as 'add' | 'edit' | 'remove';
+    return handlePeopleAction(res, db, session, list, action, await readFormBody(req));
   }
 
   // The task ledger ("הפנקס"): list + owner actions, settings, critical rules.
