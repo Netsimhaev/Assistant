@@ -144,14 +144,14 @@ describe('what an erasure leaves behind', () => {
    * content. `business_profiles` holds the business's own address and logo,
    * not a counterparty, and is not wired.
    *
-   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen, then twenty, then twenty-one, then twenty-two" count is spec §5.1's own
+   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen, then twenty, then twenty-one, then twenty-two, then twenty-three" count is spec §5.1's own
    * original content-store enumeration, growing as new content-bearing
    * tables were added to it — it is a DIFFERENT number from "how many
-   * tables `countItems`/the executor each name today" (34 since migrations 053–061; CLAUDE.md states
+   * tables `countItems`/the executor each name today" (36 since migration 073 added `business_colleagues` and `setup_packages`; CLAUDE.md states
    * that figure, because it is the one a reader can grep `erasure-plan.ts`
    * and count directly). The two will not generally match: this file's
    * count tracks a design document's own enumeration of content-bearing
-   * stores, while the 34 also includes tables scrubbed as a consequence of
+   * stores, while the 36 also includes tables scrubbed as a consequence of
    * a kept-vs-erased JOB rather than discovered as a content store in their
    * own right (`jobs`, `job_steps`, `job_step_results`), and counts a table
    * once per table name regardless of how many `action`s `countItems` runs
