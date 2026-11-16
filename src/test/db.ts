@@ -114,7 +114,12 @@ export async function resetDatabase(): Promise<void> {
       dashboard_trusted_devices,
       owner_links,
       dashboard_unknown_user_throttle,
-      dashboard_users
+      dashboard_users,
+      platform_activity_log,
+      platform_staff_links,
+      platform_staff_devices,
+      platform_staff_sessions,
+      platform_staff
     RESTART IDENTITY CASCADE
   `);
 }

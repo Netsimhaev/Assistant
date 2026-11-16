@@ -25,6 +25,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { transaction, type BusinessDb } from '../db/pool.js';
+import { TRUSTED_DEVICE_DAYS } from '../auth/lifetimes.js';
 import { generateTotpSecret, matchTotp } from '../auth/totp.js';
 import { decryptSecret, encryptSecret, type SecretAad } from '../governance/secret-cipher.js';
 import {
@@ -35,8 +36,8 @@ import {
   type PendingFactor,
 } from './auth.js';
 
-/** How long a trusted device skips the second factor. */
-export const TRUSTED_DEVICE_DAYS = 30;
+/** How long a trusted device skips the second factor (shared with the staff store). */
+export { TRUSTED_DEVICE_DAYS } from '../auth/lifetimes.js';
 
 /** Raw trusted-device token size: 256 bits. Only its sha256 is stored. */
 const DEVICE_TOKEN_BYTES = 32;

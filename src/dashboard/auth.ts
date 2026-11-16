@@ -1,72 +1,37 @@
-import { createHash, randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
-import { promisify } from 'node:util';
+import { createHash, randomBytes } from 'node:crypto';
 import { isValidBusinessId, transaction, type BusinessDb, type Queryable } from '../db/pool.js';
 import { normaliseLogin } from '../tenancy/login.js';
+import {
+  DECOY_HASH,
+  DECOY_SALT,
+  hashPassword,
+  LOCK_MINUTES,
+  MAX_FAILED,
+  verifyPassword,
+} from '../auth/password.js';
+import { SESSION_HOURS } from '../auth/lifetimes.js';
 import { revokeTrustedDevices } from './second-factor.js';
 import { recordUnknownUserFailure, unknownUserLocked } from './unknown-user-throttle.js';
 
-const scrypt = promisify(scryptCb) as (
-  password: string,
-  salt: string,
-  keylen: number,
-) => Promise<Buffer>;
+/**
+ * Hashing, the lock's numbers, the decoy pair and the shortest password live
+ * in `auth/password.ts`, and the session's life in `auth/lifetimes.ts` —
+ * shared with the platform staff store, which must not import the dashboard.
+ * Re-exported here so every existing importer is unchanged.
+ */
+export {
+  DECOY_HASH,
+  DECOY_SALT,
+  hashPassword,
+  LOCK_MINUTES,
+  MAX_FAILED,
+  MIN_PASSWORD_LENGTH,
+  verifyPassword,
+} from '../auth/password.js';
+export { SESSION_HOURS } from '../auth/lifetimes.js';
 
-const KEY_LENGTH = 64;
-/**
- * The password lock: five wrong attempts, fifteen minutes. Exported because
- * the second factor (`second-factor.ts`) locks with exactly these numbers —
- * one definition, not two drifting apart.
- */
-export const MAX_FAILED = 5;
-export const LOCK_MINUTES = 15;
-/**
- * Exported because the dashboard server needs the same number twice: once to
- * compute a session's `expires_at` (here) and once to set the cookie's
- * `Max-Age` (server.ts) — hardcoding it a second time invites the two to
- * drift.
- */
-export const SESSION_HOURS = 12;
-/**
- * The shortest password the dashboard accepts — when the owner changes it
- * (`POST /password`) and when an invite or reset link sets it
- * (`owner-links.ts`). Defined once, here, so the two cannot drift.
- */
-export const MIN_PASSWORD_LENGTH = 10;
 /** Raw session token size. 256 bits — comfortably more than a browser cookie needs to resist guessing. */
 const TOKEN_BYTES = 32;
-
-export async function hashPassword(plain: string): Promise<{ hash: string; salt: string }> {
-  const salt = randomBytes(16).toString('hex');
-  const derived = await scrypt(plain, salt, KEY_LENGTH);
-  return { hash: derived.toString('hex'), salt };
-}
-
-/**
- * Compared in constant time. A plain `===` on hex strings leaks how many
- * leading characters matched through timing, which is enough to recover a
- * hash byte by byte given enough attempts.
- */
-export async function verifyPassword(
-  plain: string,
-  hash: string,
-  salt: string,
-): Promise<boolean> {
-  const derived = await scrypt(plain, salt, KEY_LENGTH);
-  const expected = Buffer.from(hash, 'hex');
-  if (expected.length !== derived.length) return false;
-  return timingSafeEqual(derived, expected);
-}
-
-/**
- * A fixed salt/hash pair that never matches any real password. `login` runs
- * a verification against this when the username does not
- * exist, so a "no such user" response costs the same scrypt work as a
- * "wrong password" response. Without this, the two cases are distinguishable
- * by response time alone, which lets an attacker enumerate usernames on a
- * system that is meant to have exactly one.
- */
-export const DECOY_SALT = '0'.repeat(32);
-export const DECOY_HASH = '0'.repeat(KEY_LENGTH * 2);
 
 /**
  * Session tokens are hashed with a fast digest, deliberately NOT scrypt.

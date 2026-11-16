@@ -24,11 +24,12 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { transaction, type BusinessDb } from '../db/pool.js';
+import { LINK_HOURS } from '../auth/lifetimes.js';
 import { normaliseLogin } from '../tenancy/login.js';
 import { createOwner, MIN_PASSWORD_LENGTH, setPassword } from './auth.js';
 
-/** How long a link stays valid. */
-export const LINK_HOURS = 72;
+/** How long a link stays valid (shared with the staff store). */
+export { LINK_HOURS } from '../auth/lifetimes.js';
 
 /** Raw link token size: 256 bits. Only its sha256 is stored. */
 const LINK_TOKEN_BYTES = 32;

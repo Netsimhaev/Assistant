@@ -40,6 +40,14 @@ const EXCLUDED: ReadonlySet<string> = new Set([
   'platform_credentials',
   'server_key_state',
   'dashboard_unknown_user_throttle',
+  // The operator panel's staff (migration 072): the server's, not a business's.
+  // platform_activity_log's business_id names the business an action touched;
+  // it does not scope the row.
+  'platform_staff',
+  'platform_staff_sessions',
+  'platform_staff_devices',
+  'platform_staff_links',
+  'platform_activity_log',
 ]);
 
 const POLICY_NAME = 'tenant_isolation';
@@ -674,7 +682,10 @@ describe('the excluded tables: only what the app path provably uses', () => {
          FROM information_schema.sequences WHERE sequence_schema = 'public'`,
     );
     expect(rows.length).toBeGreaterThan(0);
-    expect(rows.filter((r) => !r.ok)).toEqual([]);
+    // The one sequence of an excluded table (migration 072): the app account
+    // reaches nothing of the panel's activity log, its sequence included.
+    expect(rows.filter((r) => !r.ok && r.seq !== 'platform_activity_log_seq_seq')).toEqual([]);
+    expect(rows.find((r) => r.seq === 'platform_activity_log_seq_seq')?.ok).toBe(false);
   });
 });
 
