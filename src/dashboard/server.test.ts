@@ -39,9 +39,8 @@ import {
 } from '../governance/instructions.js';
 import { DIGEST_DEFAULTS, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
 import { loadActionUpdateSettings, saveActionUpdateSettings } from '../governance/action-update-settings.js';
-import { login } from './auth.js';
+import { login, sessionCookieValue, startSession } from './auth.js';
 import { createTestOwner, ownerLogin } from '../test/owner.js';
-import { issueRecoveryCodes, remainingCodes } from './recovery.js';
 import {
   assertBindableHost,
   createServer,
@@ -49,7 +48,7 @@ import {
   reasonForSupersededJob,
   renderInstructionOutcome,
 } from './server.js';
-import { renderInstruct } from './views.js';
+import { renderInstruct, renderLogin } from './views.js';
 
 const BUSINESS = 'test-business';
 const OTHER_BUSINESS = 'test-business-other';
@@ -2440,22 +2439,20 @@ describe('session cookie', () => {
   });
 });
 
-describe('recovery-code login', () => {
-  it('forces a password change after a recovery-code login', async () => {
+/**
+ * A session minted with `mustChangePassword` — no caller mints one since the
+ * recovery codes were removed (migration 070), but the gate stays: the
+ * technician reset link will mint exactly this kind of session.
+ */
+async function mustChangeCookie(): Promise<string> {
+  const token = await withBusiness(BUSINESS, (db) => startSession(db, USERNAME, { mustChangePassword: true }));
+  return `sid=${sessionCookieValue(BUSINESS, token)}`;
+}
+
+describe('a session that must change its password', () => {
+  it('is sent to /password from everywhere else', async () => {
     const baseUrl = await startServer();
-    const codes = await withBusiness(BUSINESS, (db) => issueRecoveryCodes(db, { username: USERNAME }));
-    const code = codes[0];
-    expect(code).toBeDefined();
-
-    const loginRes = await fetch(`${baseUrl}/login`, {
-      method: 'POST',
-      body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), code: code! }),
-      redirect: 'manual',
-    });
-    expect(loginRes.status).toBe(302);
-    expect(loginRes.headers.get('location')).toBe('/password');
-    const cookie = cookiePair(loginRes.headers.get('set-cookie'));
-
+    const cookie = await mustChangeCookie();
     const res = await fetch(`${baseUrl}/`, { headers: { cookie }, redirect: 'manual' });
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/password');
@@ -2463,16 +2460,7 @@ describe('recovery-code login', () => {
 
   it('refuses to decide an approval while a password change is pending, even with a valid CSRF token', async () => {
     const baseUrl = await startServer();
-    const codes = await withBusiness(BUSINESS, (db) => issueRecoveryCodes(db, { username: USERNAME }));
-    const code = codes[0];
-    expect(code).toBeDefined();
-
-    const loginRes = await fetch(`${baseUrl}/login`, {
-      method: 'POST',
-      body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), code: code! }),
-      redirect: 'manual',
-    });
-    const cookie = cookiePair(loginRes.headers.get('set-cookie'));
+    const cookie = await mustChangeCookie();
 
     // /password is reachable precisely because the gate lets it through —
     // its CSRF token is the same session-wide token every other page for
@@ -2494,16 +2482,31 @@ describe('recovery-code login', () => {
     const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
     expect(approval?.state).toBe('pending');
   });
+});
 
-  it('shows how many recovery codes remain', async () => {
+describe('recovery codes are gone', () => {
+  it('a code with no password is the generic login failure, and opens no session', async () => {
     const baseUrl = await startServer();
-    await withBusiness(BUSINESS, (db) => issueRecoveryCodes(db, { username: USERNAME }));
-    const expected = await withBusiness(BUSINESS, (db) => remainingCodes(db, USERNAME));
-    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const res = await fetch(`${baseUrl}/login`, {
+      method: 'POST',
+      body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), code: 'ABCD-EFGH-IJKL' }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get('set-cookie')).toBeNull();
+    expect(await res.text()).toContain('שם משתמש או סיסמה שגויים.');
+  });
 
-    const res = await fetch(`${baseUrl}/`, { headers: { cookie } });
-    const body = await res.text();
-    expect(body).toContain(String(expected));
+  it('the login form offers no recovery code', () => {
+    expect(renderLogin()).not.toContain('קוד שחזור');
+    expect(renderLogin()).not.toContain('name="code"');
+  });
+
+  it('the pending list no longer counts recovery codes', async () => {
+    const baseUrl = await startServer();
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const body = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+    expect(body).not.toContain('קודי שחזור');
   });
 });
 
@@ -2589,17 +2592,11 @@ describe('changing the password', () => {
     expect((await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: NEW_PASSWORD }))).ok).toBe(true);
   });
 
-  // The one path where there is no current password to ask for: the owner
-  // just proved ownership with a recovery code, which is why they are here.
-  it('does not ask for a current password on the forced change after a recovery code', async () => {
+  // The one path where there is no current password to ask for: a session
+  // minted with `mustChangePassword`.
+  it('does not ask for a current password on the forced change', async () => {
     const baseUrl = await startServer();
-    const codes = await withBusiness(BUSINESS, (db) => issueRecoveryCodes(db, { username: USERNAME }));
-    const loginRes = await fetch(`${baseUrl}/login`, {
-      method: 'POST',
-      body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), code: codes[0]! }),
-      redirect: 'manual',
-    });
-    const cookie = cookiePair(loginRes.headers.get('set-cookie'));
+    const cookie = await mustChangeCookie();
 
     const page = await fetch(`${baseUrl}/password`, { headers: { cookie } });
     const html = await page.text();
@@ -2615,56 +2612,6 @@ describe('changing the password', () => {
     });
     expect(res.status).toBe(302);
     expect((await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: NEW_PASSWORD }))).ok).toBe(true);
-  });
-});
-
-describe('the address a recovery redemption is audited from', () => {
-  /** The reason line of the incident entry `redeemRecoveryCode` writes. */
-  async function redemptionAudit(businessId: string): Promise<string> {
-    const { rows } = await testDb().query<{ reason: string }>(
-      `SELECT reason FROM audit_log
-        WHERE business_id = $1 AND reason LIKE 'recovery code redeemed%'
-        ORDER BY seq DESC LIMIT 1`,
-      [businessId],
-    );
-    const reason = rows[0]?.reason;
-    if (reason === undefined) throw new Error('no redemption audit entry');
-    return reason;
-  }
-
-  async function redeem(baseUrl: string, code: string, forwardedFor: string): Promise<void> {
-    const res = await fetch(`${baseUrl}/login`, {
-      method: 'POST',
-      headers: { 'x-forwarded-for': forwardedFor },
-      body: new URLSearchParams({ email: ownerLogin(BUSINESS, USERNAME), code }),
-      redirect: 'manual',
-    });
-    expect(res.status).toBe(302);
-  }
-
-  it('records the proxy hop as a proxy hop, and never believes a header it was not told to trust', async () => {
-    const baseUrl = await startServer();
-    const codes = await withBusiness(BUSINESS, (db) => issueRecoveryCodes(db, { username: USERNAME }));
-    await redeem(baseUrl, codes[0]!, '203.0.113.9');
-
-    const reason = await redemptionAudit(BUSINESS);
-    // The header was sent by the client on an open socket. Believing it
-    // would let whoever redeems a code choose what the only record of that
-    // event says about where it came from.
-    expect(reason).not.toContain('203.0.113.9');
-    expect(reason).toContain('proxy hop');
-  });
-
-  it('records the nearest hop of a forwarded-for header when the deployment says to trust one', async () => {
-    const baseUrl = await startServer({ trustProxy: true });
-    const codes = await withBusiness(BUSINESS, (db) => issueRecoveryCodes(db, { username: USERNAME }));
-    // Two entries: the left one is whatever the client sent, the right one
-    // is what the trusted proxy appended. The right one is the answer.
-    await redeem(baseUrl, codes[0]!, '198.51.100.7, 203.0.113.9');
-
-    const reason = await redemptionAudit(BUSINESS);
-    expect(reason).toContain('203.0.113.9');
-    expect(reason).not.toContain('198.51.100.7');
   });
 });
 

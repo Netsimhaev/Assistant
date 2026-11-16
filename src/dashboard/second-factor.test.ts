@@ -1,0 +1,313 @@
+import { randomBytes } from 'node:crypto';
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { closePool, withBusiness } from '../db/pool.js';
+import { createTestOwner, ownerLogin } from '../test/owner.js';
+import { resetDatabase, testDb } from '../test/db.js';
+import { currentStep, totpCode } from '../auth/totp.js';
+import { decryptSecret } from '../governance/secret-cipher.js';
+import {
+  login,
+  LOCK_MINUTES,
+  MAX_FAILED,
+  setPassword,
+  startSession,
+  verifySession,
+  verifySessionDetails,
+} from './auth.js';
+import {
+  beginEnrolment,
+  confirmEnrolment,
+  isTrustedDevice,
+  issueTrustedDevice,
+  resetSecondFactor,
+  revokeTrustedDevices,
+  setPendingFactor,
+  totpStatus,
+  TotpAlreadyEnrolledError,
+  TRUSTED_DEVICE_DAYS,
+  verifySecondFactor,
+} from './second-factor.js';
+
+const BUSINESS = 'test-business';
+const USERNAME = 'owner';
+const PASSWORD = 'correct horse battery staple';
+const KEY = randomBytes(32);
+const NOW = new Date('2026-11-16T10:00:00.000Z');
+
+beforeEach(async () => {
+  await resetDatabase();
+  await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
+});
+
+afterAll(async () => {
+  await closePool();
+});
+
+/** Enrols the owner at `NOW` and returns the plain secret. */
+async function enrol(): Promise<string> {
+  return withBusiness(BUSINESS, async (db) => {
+    const { secretBase32 } = await beginEnrolment(db, USERNAME, KEY);
+    const result = await confirmEnrolment(db, USERNAME, totpCode(secretBase32, currentStep(NOW)), KEY, NOW);
+    expect(result).toBe('ok');
+    return secretBase32;
+  });
+}
+
+/** A six-digit code that is not the right one for any accepted step around `at`. */
+function wrongCode(secret: string, at: Date): string {
+  const step = currentStep(at);
+  const valid = new Set([step - 1, step, step + 1].map((s) => totpCode(secret, s)));
+  for (let n = 0; ; n += 1) {
+    const candidate = String(n).padStart(6, '0');
+    if (!valid.has(candidate)) return candidate;
+  }
+}
+
+describe('enrol and confirm', () => {
+  it('starts not enrolled, enrols on a correct code, and refuses a second enrolment', async () => {
+    expect(await withBusiness(BUSINESS, (db) => totpStatus(db, USERNAME))).toBe('not_enrolled');
+
+    const secret = await withBusiness(BUSINESS, async (db) => {
+      const { secretBase32 } = await beginEnrolment(db, USERNAME, KEY);
+      expect(secretBase32).toMatch(/^[A-Z2-7]{32}$/);
+      // Pending, not enrolled yet.
+      expect(await totpStatus(db, USERNAME)).toBe('not_enrolled');
+      return secretBase32;
+    });
+
+    const result = await withBusiness(BUSINESS, (db) =>
+      confirmEnrolment(db, USERNAME, totpCode(secret, currentStep(NOW)), KEY, NOW),
+    );
+    expect(result).toBe('ok');
+    expect(await withBusiness(BUSINESS, (db) => totpStatus(db, USERNAME))).toBe('enrolled');
+
+    const { rows } = await testDb().query<{ totp_last_step: string; totp_enrolled_at: Date | null }>(
+      `SELECT totp_last_step, totp_enrolled_at FROM dashboard_users WHERE business_id = $1 AND username = $2`,
+      [BUSINESS, USERNAME],
+    );
+    expect(Number(rows[0]?.totp_last_step)).toBe(currentStep(NOW));
+    expect(rows[0]?.totp_enrolled_at).not.toBeNull();
+
+    await expect(withBusiness(BUSINESS, (db) => beginEnrolment(db, USERNAME, KEY))).rejects.toBeInstanceOf(
+      TotpAlreadyEnrolledError,
+    );
+  });
+
+  it('replaces the pending secret when enrolment is begun again', async () => {
+    const first = await withBusiness(BUSINESS, (db) => beginEnrolment(db, USERNAME, KEY));
+    const second = await withBusiness(BUSINESS, (db) => beginEnrolment(db, USERNAME, KEY));
+    expect(second.secretBase32).not.toBe(first.secretBase32);
+    // The first secret no longer confirms.
+    const stale = await withBusiness(BUSINESS, (db) =>
+      confirmEnrolment(db, USERNAME, totpCode(first.secretBase32, currentStep(NOW)), KEY, NOW),
+    );
+    expect(stale).toBe('bad_code');
+  });
+
+  it('confirm without a pending secret is a bad code, not an exception', async () => {
+    expect(await withBusiness(BUSINESS, (db) => confirmEnrolment(db, USERNAME, '123456', KEY, NOW))).toBe(
+      'bad_code',
+    );
+  });
+
+  it('verify before enrolment is not_enrolled, even with a pending secret', async () => {
+    const { secretBase32 } = await withBusiness(BUSINESS, (db) => beginEnrolment(db, USERNAME, KEY));
+    expect(
+      await withBusiness(BUSINESS, (db) =>
+        verifySecondFactor(db, USERNAME, totpCode(secretBase32, currentStep(NOW)), KEY, NOW),
+      ),
+    ).toBe('not_enrolled');
+  });
+});
+
+describe('verifySecondFactor', () => {
+  it('accepts the next code and rejects a replay of the code just used', async () => {
+    const secret = await enrol();
+    const later = new Date(NOW.getTime() + 60_000);
+    const code = totpCode(secret, currentStep(later));
+    expect(await withBusiness(BUSINESS, (db) => verifySecondFactor(db, USERNAME, code, KEY, later))).toBe('ok');
+    expect(await withBusiness(BUSINESS, (db) => verifySecondFactor(db, USERNAME, code, KEY, later))).toBe(
+      'bad_code',
+    );
+  });
+
+  it('rejects the enrolment code itself (its step is already spent)', async () => {
+    const secret = await enrol();
+    expect(
+      await withBusiness(BUSINESS, (db) =>
+        verifySecondFactor(db, USERNAME, totpCode(secret, currentStep(NOW)), KEY, NOW),
+      ),
+    ).toBe('bad_code');
+  });
+
+  it('locks after the password-lock count of wrong codes, even for a correct code, until the lock expires', async () => {
+    const secret = await enrol();
+    const at = new Date(NOW.getTime() + 60_000);
+    for (let i = 0; i < MAX_FAILED - 1; i += 1) {
+      expect(
+        await withBusiness(BUSINESS, (db) => verifySecondFactor(db, USERNAME, wrongCode(secret, at), KEY, at)),
+      ).toBe('bad_code');
+    }
+    // The attempt that reaches the threshold still reads as a bad code; the
+    // account is locked from the next one.
+    expect(
+      await withBusiness(BUSINESS, (db) => verifySecondFactor(db, USERNAME, wrongCode(secret, at), KEY, at)),
+    ).toBe('bad_code');
+
+    const right = totpCode(secret, currentStep(at));
+    expect(await withBusiness(BUSINESS, (db) => verifySecondFactor(db, USERNAME, right, KEY, at))).toBe('locked');
+
+    const afterLock = new Date(at.getTime() + LOCK_MINUTES * 60_000 + 1_000);
+    expect(
+      await withBusiness(BUSINESS, (db) =>
+        verifySecondFactor(db, USERNAME, totpCode(secret, currentStep(afterLock)), KEY, afterLock),
+      ),
+    ).toBe('ok');
+  });
+
+  it('a corrupt stored secret is a bad code, never an exception', async () => {
+    await enrol();
+    await testDb().query(
+      `UPDATE dashboard_users SET totp_ciphertext = $3 WHERE business_id = $1 AND username = $2`,
+      [BUSINESS, USERNAME, randomBytes(40)],
+    );
+    const at = new Date(NOW.getTime() + 60_000);
+    expect(await withBusiness(BUSINESS, (db) => verifySecondFactor(db, USERNAME, '123456', KEY, at))).toBe(
+      'bad_code',
+    );
+  });
+
+  it('a different key cannot open the secret (bad code)', async () => {
+    const secret = await enrol();
+    const at = new Date(NOW.getTime() + 60_000);
+    expect(
+      await withBusiness(BUSINESS, (db) =>
+        verifySecondFactor(db, USERNAME, totpCode(secret, currentStep(at)), randomBytes(32), at),
+      ),
+    ).toBe('bad_code');
+  });
+});
+
+describe('the secret at rest', () => {
+  it('is not stored in clear, and is bound to its business in the AAD', async () => {
+    const secret = await enrol();
+    const { rows } = await testDb().query<{ totp_ciphertext: Buffer; totp_nonce: Buffer }>(
+      `SELECT totp_ciphertext, totp_nonce FROM dashboard_users WHERE business_id = $1 AND username = $2`,
+      [BUSINESS, USERNAME],
+    );
+    const row = rows[0];
+    expect(row).toBeDefined();
+    if (!row) return;
+    expect(row.totp_ciphertext.includes(Buffer.from(secret, 'utf8'))).toBe(false);
+
+    const sealed = { ciphertext: row.totp_ciphertext, nonce: row.totp_nonce };
+    expect(decryptSecret(sealed, KEY, { businessId: BUSINESS, ref: `totp:${USERNAME}` })).toBe(secret);
+    expect(decryptSecret(sealed, KEY, { businessId: 'other-business', ref: `totp:${USERNAME}` })).toBeNull();
+  });
+
+  it('refuses a half-set secret at the schema level', async () => {
+    await expect(
+      testDb().query(
+        `UPDATE dashboard_users SET totp_ciphertext = $3 WHERE business_id = $1 AND username = $2`,
+        [BUSINESS, USERNAME, randomBytes(40)],
+      ),
+    ).rejects.toThrow();
+  });
+});
+
+describe('trusted devices', () => {
+  it('a fresh token is trusted; another token is not', async () => {
+    const token = await withBusiness(BUSINESS, (db) => issueTrustedDevice(db, USERNAME, NOW));
+    expect(await withBusiness(BUSINESS, (db) => isTrustedDevice(db, USERNAME, token, NOW))).toBe(true);
+    expect(
+      await withBusiness(BUSINESS, (db) => isTrustedDevice(db, USERNAME, randomBytes(32).toString('hex'), NOW)),
+    ).toBe(false);
+    expect(await withBusiness(BUSINESS, (db) => isTrustedDevice(db, 'someone-else', token, NOW))).toBe(false);
+  });
+
+  it('stores only the hash of the token', async () => {
+    const token = await withBusiness(BUSINESS, (db) => issueTrustedDevice(db, USERNAME, NOW));
+    const { rows } = await testDb().query<{ device_hash: string }>(
+      `SELECT device_hash FROM dashboard_trusted_devices WHERE business_id = $1`,
+      [BUSINESS],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.device_hash).not.toContain(token);
+  });
+
+  it('is no longer trusted after resetSecondFactor', async () => {
+    await enrol();
+    const token = await withBusiness(BUSINESS, (db) => issueTrustedDevice(db, USERNAME, NOW));
+    await withBusiness(BUSINESS, (db) => resetSecondFactor(db, USERNAME));
+    expect(await withBusiness(BUSINESS, (db) => isTrustedDevice(db, USERNAME, token, NOW))).toBe(false);
+  });
+
+  it('is no longer trusted after setPassword', async () => {
+    const token = await withBusiness(BUSINESS, (db) => issueTrustedDevice(db, USERNAME, NOW));
+    await withBusiness(BUSINESS, (db) => setPassword(db, { username: USERNAME, password: 'a brand new password' }));
+    expect(await withBusiness(BUSINESS, (db) => isTrustedDevice(db, USERNAME, token, NOW))).toBe(false);
+  });
+
+  it(`expires after ${TRUSTED_DEVICE_DAYS} days`, async () => {
+    expect(TRUSTED_DEVICE_DAYS).toBe(30);
+    const token = await withBusiness(BUSINESS, (db) => issueTrustedDevice(db, USERNAME, NOW));
+    const later = new Date(NOW.getTime() + 31 * 86_400_000);
+    expect(await withBusiness(BUSINESS, (db) => isTrustedDevice(db, USERNAME, token, later))).toBe(false);
+  });
+
+  it('revokeTrustedDevices returns how many it revoked', async () => {
+    await withBusiness(BUSINESS, (db) => issueTrustedDevice(db, USERNAME, NOW));
+    await withBusiness(BUSINESS, (db) => issueTrustedDevice(db, USERNAME, NOW));
+    expect(await withBusiness(BUSINESS, (db) => revokeTrustedDevices(db, USERNAME))).toBe(2);
+    expect(await withBusiness(BUSINESS, (db) => revokeTrustedDevices(db, USERNAME))).toBe(0);
+  });
+});
+
+describe('resetSecondFactor', () => {
+  it('clears enrolment and revokes an open session', async () => {
+    await enrol();
+    const result = await withBusiness(BUSINESS, (db) =>
+      login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const token = result.sessionId;
+    expect(await withBusiness(BUSINESS, (db) => verifySession(db, token))).not.toBeNull();
+
+    await withBusiness(BUSINESS, (db) => resetSecondFactor(db, USERNAME));
+
+    expect(await withBusiness(BUSINESS, (db) => verifySession(db, token))).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => totpStatus(db, USERNAME))).toBe('not_enrolled');
+    const { rows } = await testDb().query<Record<string, unknown>>(
+      `SELECT totp_ciphertext, totp_nonce, totp_enrolled_at, totp_last_step, totp_failed_attempts, totp_locked_until
+         FROM dashboard_users WHERE business_id = $1 AND username = $2`,
+      [BUSINESS, USERNAME],
+    );
+    expect(rows[0]).toEqual({
+      totp_ciphertext: null,
+      totp_nonce: null,
+      totp_enrolled_at: null,
+      totp_last_step: null,
+      totp_failed_attempts: 0,
+      totp_locked_until: null,
+    });
+  });
+});
+
+describe('the pending factor on a session', () => {
+  it('is carried by startSession, read by verifySessionDetails, and cleared by setPendingFactor', async () => {
+    const token = await withBusiness(BUSINESS, (db) => startSession(db, USERNAME, { pendingFactor: 'enroll' }));
+    expect((await withBusiness(BUSINESS, (db) => verifySessionDetails(db, token)))?.pendingFactor).toBe('enroll');
+
+    await withBusiness(BUSINESS, (db) => setPendingFactor(db, token, 'verify'));
+    expect((await withBusiness(BUSINESS, (db) => verifySessionDetails(db, token)))?.pendingFactor).toBe('verify');
+
+    await withBusiness(BUSINESS, (db) => setPendingFactor(db, token, null));
+    expect((await withBusiness(BUSINESS, (db) => verifySessionDetails(db, token)))?.pendingFactor).toBeNull();
+  });
+
+  it('defaults to none', async () => {
+    const token = await withBusiness(BUSINESS, (db) => startSession(db, USERNAME));
+    expect((await withBusiness(BUSINESS, (db) => verifySessionDetails(db, token)))?.pendingFactor).toBeNull();
+  });
+});

@@ -111,7 +111,7 @@ export async function resetDatabase(): Promise<void> {
       business_descriptions,
       description_rule_rejections,
       dashboard_sessions,
-      dashboard_recovery_codes,
+      dashboard_trusted_devices,
       dashboard_unknown_user_throttle,
       dashboard_users
     RESTART IDENTITY CASCADE

@@ -1,11 +1,10 @@
 /**
  * The failure counter for usernames that have no `dashboard_users` row.
  *
- * `login` and `redeemRecoveryCode` both count failures with an UPDATE against
- * the user's own row. When the username does not exist that UPDATE matches
- * nothing, so the counter never advanced and the lockout never engaged: an
- * unauthenticated caller could spend the server's CPU — up to eight `scrypt`
- * calls per recovery attempt — without limit. See
+ * `login` counts failures with an UPDATE against the user's own row. When the
+ * username does not exist that UPDATE matches nothing, so the counter never
+ * advanced and the lockout never engaged: an unauthenticated caller could
+ * spend the server's CPU on `scrypt` calls without limit. See
  * `src/db/migrations/010_unknown_user_throttle.sql` for why the counter lives
  * in one shared row rather than one row per submitted name, and for what that
  * choice does and does not leak. Since migration 066 that row is one for the
@@ -13,29 +12,14 @@
  * resolved to any business when it fails, so there is no business to file the
  * failure under (spec §5.5).
  *
- * The two budgets stay separate here exactly as they are on `dashboard_users`:
- * wrong recovery codes must not spend login's allowance, and vice versa. The
- * thresholds are NOT defined in this module — each caller passes its own, so
- * there is one definition of "five attempts, fifteen minutes" and one of "ten
- * attempts, one minute", not two of each drifting apart.
+ * The threshold is NOT defined in this module — the caller passes it, so
+ * there is one definition of "five attempts, fifteen minutes", in `auth.ts`.
+ * (The table still carries the recovery codes' columns from migration 010;
+ * nothing reads or writes them since the codes were removed in 070.)
  */
 import type { Queryable } from '../db/pool.js';
 
-/** Which of the two budgets a call is spending. */
-export type ThrottleKind = 'login' | 'recovery';
-
-/**
- * Column names per budget. A closed map of literals, never interpolated from
- * anything a caller supplies — `ThrottleKind` is a two-value union, so this
- * cannot be reached with an arbitrary string.
- */
-const COLUMNS: Record<ThrottleKind, { attempts: string; lockedUntil: string }> = {
-  login: { attempts: 'failed_attempts', lockedUntil: 'locked_until' },
-  recovery: { attempts: 'recovery_failed_attempts', lockedUntil: 'recovery_locked_until' },
-};
-
 export interface ThrottleInput {
-  kind: ThrottleKind;
   maxFailed: number;
   lockMinutes: number;
   now?: Date;
@@ -50,8 +34,8 @@ export interface ThrottleInput {
 /**
  * Is the shared unknown-username bucket currently locked?
  *
- * Clears an expired lock lazily on the way through, the same pattern both
- * per-user paths use: the WHERE clause re-checks the expiry in Postgres
+ * Clears an expired lock lazily on the way through, the same pattern the
+ * per-user path uses: the WHERE clause re-checks the expiry in Postgres
  * rather than trusting the JavaScript-side read, so a concurrent failure that
  * re-locked the bucket between the two statements is not clobbered a moment
  * after it was set.
@@ -59,10 +43,9 @@ export interface ThrottleInput {
 export async function unknownUserLocked(input: ThrottleInput): Promise<boolean> {
   const now = input.now ?? new Date();
   const db = input.db;
-  const col = COLUMNS[input.kind];
 
   const { rows } = await db.query<{ locked_until: Date | null }>(
-    `SELECT ${col.lockedUntil} AS locked_until
+    `SELECT locked_until
        FROM dashboard_unknown_user_throttle`,
   );
   const lockedUntil = rows[0]?.locked_until ?? null;
@@ -71,8 +54,8 @@ export async function unknownUserLocked(input: ThrottleInput): Promise<boolean> 
   if (lockedUntil.getTime() <= now.getTime()) {
     const cleared = await db.query(
       `UPDATE dashboard_unknown_user_throttle
-          SET ${col.attempts} = 0, ${col.lockedUntil} = NULL
-        WHERE ${col.lockedUntil} <= $1`,
+          SET failed_attempts = 0, locked_until = NULL
+        WHERE locked_until <= $1`,
       [now],
     );
     // A no-op means someone else's fresh lock won the race, and that lock
@@ -97,17 +80,16 @@ export async function unknownUserLocked(input: ThrottleInput): Promise<boolean> 
 export async function recordUnknownUserFailure(input: ThrottleInput): Promise<void> {
   const now = input.now ?? new Date();
   const db = input.db;
-  const col = COLUMNS[input.kind];
   const lockUntilIfThresholdReached = new Date(now.getTime() + input.lockMinutes * 60_000);
 
   await db.query(
-    `INSERT INTO dashboard_unknown_user_throttle (singleton, ${col.attempts}, ${col.lockedUntil})
+    `INSERT INTO dashboard_unknown_user_throttle (singleton, failed_attempts, locked_until)
      VALUES (true, 1, CASE WHEN 1 >= $1 THEN $2::timestamptz END)
      ON CONFLICT (singleton) DO UPDATE
-        SET ${col.attempts} = dashboard_unknown_user_throttle.${col.attempts} + 1,
-            ${col.lockedUntil} = CASE
-              WHEN dashboard_unknown_user_throttle.${col.attempts} + 1 >= $1 THEN $2::timestamptz
-              ELSE dashboard_unknown_user_throttle.${col.lockedUntil}
+        SET failed_attempts = dashboard_unknown_user_throttle.failed_attempts + 1,
+            locked_until = CASE
+              WHEN dashboard_unknown_user_throttle.failed_attempts + 1 >= $1 THEN $2::timestamptz
+              ELSE dashboard_unknown_user_throttle.locked_until
             END`,
     [input.maxFailed, lockUntilIfThresholdReached],
   );

@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { login, verifySession } from '../dashboard/auth.js';
+import { isTrustedDevice, issueTrustedDevice } from '../dashboard/second-factor.js';
 import { closePool, withBusiness } from '../db/pool.js';
 import { ownerLogin } from '../test/owner.js';
 import { createBusiness } from '../tenancy/businesses.js';
@@ -83,14 +84,14 @@ describe('owner:create', () => {
     expect(result.ok).toBe(true);
   });
 
-  it('prints exactly eight recovery codes, each a distinct value', async () => {
+  it('prints the enrolment note and no recovery codes', async () => {
     const io = fakeIo([PASSWORD, PASSWORD]);
     const code = await createOwnerRun([USERNAME, ...BIZ, ...EMAIL], io);
     expect(code).toBe(0);
 
-    const codeLines = io.prints.filter((line) => /^\s*\d+\.\s/.test(line));
-    expect(codeLines).toHaveLength(8);
-    expect(new Set(codeLines).size).toBe(8);
+    expect(io.prints).toContain('בכניסה הראשונה תתבקש לחבר את Google Authenticator.');
+    expect(io.prints.filter((line) => /^\s*\d+\.\s/.test(line))).toHaveLength(0);
+    expect(io.prints.join('\n')).not.toContain('קודי שחזור');
   });
 
   it('rejects mismatched password confirmation without creating the account', async () => {
@@ -114,11 +115,8 @@ describe('owner:create', () => {
 });
 
 describe('owner:password', () => {
-  let creationIo: ReturnType<typeof fakeIo>;
-
   beforeEach(async () => {
-    creationIo = fakeIo([PASSWORD, PASSWORD]);
-    await createOwnerRun([USERNAME, ...BIZ, ...EMAIL], creationIo);
+    await createOwnerRun([USERNAME, ...BIZ, ...EMAIL], fakeIo([PASSWORD, PASSWORD]));
   });
 
   it('refuses a password passed as an argument, citing shell history', async () => {
@@ -147,24 +145,16 @@ describe('owner:password', () => {
     expect(withNew.ok).toBe(true);
   });
 
-  it('re-issues recovery codes on reset, replacing the old set entirely', async () => {
-    const codePattern = /^\s*\d+\.\s/;
-    const oldCodes = creationIo.prints.filter((line) => codePattern.test(line));
-    expect(oldCodes).toHaveLength(8);
+  it('revokes every trusted device on reset, and prints no recovery codes', async () => {
+    const token = await withBusiness(TEST_BUSINESS, (db) => issueTrustedDevice(db, USERNAME));
+    expect(await withBusiness(TEST_BUSINESS, (db) => isTrustedDevice(db, USERNAME, token))).toBe(true);
 
     const newPassword = 'a brand new password';
     const io = fakeIo([newPassword, newPassword]);
-    const code = await ownerPasswordRun([USERNAME, ...BIZ], io);
-    expect(code).toBe(0);
+    expect(await ownerPasswordRun([USERNAME, ...BIZ], io)).toBe(0);
 
-    const newCodes = io.prints.filter((line) => codePattern.test(line));
-    expect(newCodes).toHaveLength(8);
-    // Not just "eight lines printed" — the strengthened assertion: this
-    // would still pass a command that reprinted the same eight codes it
-    // handed out at creation, which the weaker length-only check above did
-    // not rule out.
-    const overlap = newCodes.filter((line) => oldCodes.includes(line));
-    expect(overlap).toHaveLength(0);
+    expect(await withBusiness(TEST_BUSINESS, (db) => isTrustedDevice(db, USERNAME, token))).toBe(false);
+    expect(io.prints.filter((line) => /^\s*\d+\.\s/.test(line))).toHaveLength(0);
   });
 
   it('refuses to reset a password for an account that does not exist', async () => {

@@ -24,8 +24,8 @@ const host = process.env['DASHBOARD_HOST'] ?? '127.0.0.1';
  * Off unless the deployment says otherwise, and it is the deployment that
  * knows: an `X-Forwarded-For` header is client-supplied text unless the only
  * route to this port is through a proxy that writes it. Set this only when
- * that is true — with it on and the port reachable directly, whoever redeems
- * a recovery code chooses what the audit log says about where they were.
+ * that is true — with it on and the port reachable directly, whoever signs
+ * in chooses what an audit row says about where they were.
  */
 const trustProxy = process.env['DASHBOARD_TRUST_PROXY'] === '1';
 /**

@@ -2,6 +2,7 @@ import { createHash, randomBytes, scrypt as scryptCb, timingSafeEqual } from 'no
 import { promisify } from 'node:util';
 import { isValidBusinessId, transaction, type BusinessDb, type Queryable } from '../db/pool.js';
 import { normaliseLogin } from '../tenancy/login.js';
+import { revokeTrustedDevices } from './second-factor.js';
 import { recordUnknownUserFailure, unknownUserLocked } from './unknown-user-throttle.js';
 
 const scrypt = promisify(scryptCb) as (
@@ -11,8 +12,13 @@ const scrypt = promisify(scryptCb) as (
 ) => Promise<Buffer>;
 
 const KEY_LENGTH = 64;
-const MAX_FAILED = 5;
-const LOCK_MINUTES = 15;
+/**
+ * The password lock: five wrong attempts, fifteen minutes. Exported because
+ * the second factor (`second-factor.ts`) locks with exactly these numbers —
+ * one definition, not two drifting apart.
+ */
+export const MAX_FAILED = 5;
+export const LOCK_MINUTES = 15;
 /**
  * Exported because the dashboard server needs the same number twice: once to
  * compute a session's `expires_at` (here) and once to set the cookie's
@@ -46,17 +52,12 @@ export async function verifyPassword(
 }
 
 /**
- * A fixed salt/hash pair that never matches any real password or recovery
- * code. `login` runs a verification against this when the username does not
+ * A fixed salt/hash pair that never matches any real password. `login` runs
+ * a verification against this when the username does not
  * exist, so a "no such user" response costs the same scrypt work as a
  * "wrong password" response. Without this, the two cases are distinguishable
  * by response time alone, which lets an attacker enumerate usernames on a
  * system that is meant to have exactly one.
- *
- * Exported so `redeemRecoveryCode` can pay the same decoy cost when a
- * username has no recovery codes issued — reusing this pair rather than
- * minting a second one keeps there being exactly one "costs real work but
- * matches nothing" constant in the system.
  */
 export const DECOY_SALT = '0'.repeat(32);
 export const DECOY_HASH = '0'.repeat(KEY_LENGTH * 2);
@@ -142,17 +143,21 @@ function toUserRecord(row: UserRow): UserRecord {
   };
 }
 
+/** A session that still owes its second factor; `null` is a full session. */
+export type PendingFactor = 'enroll' | 'verify';
+
 interface SessionRow {
   username: string;
   expires_at: Date;
   revoked_at: Date | null;
   must_change_password: boolean;
+  pending_factor: PendingFactor | null;
 }
 
 /**
  * `login` is the email the owner signs in with, unique across the whole
  * server (migration 066); it is stored normalised. `username` is the
- * account's name inside its business — sessions, recovery codes and the
+ * account's name inside its business — sessions, trusted devices and the
  * audit trail name it.
  */
 export async function createOwner(
@@ -175,9 +180,8 @@ export async function createOwner(
  * A login with no row has no counter of its own, so its failures go to the
  * shared unknown-login bucket (./unknown-user-throttle.js), one for the whole
  * server. Without it, the UPDATE in `login` matched nothing and this branch
- * was an unthrottled scrypt call for anyone who could reach the port — one
- * call rather than recovery's eight, but still unbounded, and still the
- * owner's only way in.
+ * was an unthrottled scrypt call for anyone who could reach the port —
+ * unbounded, and the owner's only way in.
  *
  * A locked bucket returns before the decoy runs. That is the same trade the
  * per-user lock already makes ('locked' is answered without touching a hash),
@@ -191,7 +195,6 @@ export async function loginUnknown(
   now: Date = new Date(),
 ): Promise<{ ok: false; code: 'bad_credentials' }> {
   const throttle = {
-    kind: 'login' as const,
     maxFailed: MAX_FAILED,
     lockMinutes: LOCK_MINUTES,
     now,
@@ -326,6 +329,12 @@ export async function login(
   return { ok: true, sessionId: token, username };
 }
 
+export interface SessionDetails {
+  username: string;
+  mustChangePassword: boolean;
+  pendingFactor: PendingFactor | null;
+}
+
 /**
  * Read inside the cookie's business (spec §5.5): `business_id = $2` is the
  * first layer, and RLS on `dashboard_sessions` the second. A cookie whose
@@ -336,12 +345,12 @@ async function loadSession(
   db: BusinessDb,
   sessionId: string,
   options: { now?: Date },
-): Promise<{ username: string; mustChangePassword: boolean } | null> {
+): Promise<SessionDetails | null> {
   const businessId = db.businessId;
   const now = options.now ?? new Date();
 
   const { rows } = await db.query<SessionRow>(
-    `SELECT username, expires_at, revoked_at, must_change_password
+    `SELECT username, expires_at, revoked_at, must_change_password, pending_factor
        FROM dashboard_sessions
       WHERE session_id = $1 AND business_id = $2`,
     [hashToken(sessionId), businessId],
@@ -351,7 +360,11 @@ async function loadSession(
   if (row.revoked_at !== null) return null;
   if (row.expires_at.getTime() <= now.getTime()) return null;
 
-  return { username: row.username, mustChangePassword: row.must_change_password };
+  return {
+    username: row.username,
+    mustChangePassword: row.must_change_password,
+    pendingFactor: row.pending_factor,
+  };
 }
 
 export async function verifySession(
@@ -364,37 +377,33 @@ export async function verifySession(
 }
 
 /**
- * Same lookup as `verifySession`, plus whether this particular session was
- * minted mid recovery-code login and has not yet been through a password
- * change. `verifySession` keeps its narrower `{ username }` shape because
- * every existing caller already asserts an exact match against it
- * (`toEqual({ username })`); adding a field there would break all of them.
- * The dashboard is the one caller that needs the extra bit, to redirect
- * everywhere except `/password` until it clears.
+ * Same lookup as `verifySession`, plus the two flags that hold a session back
+ * from the app: whether it must change its password first, and whether it
+ * still owes its second factor (`pendingFactor`). `verifySession` keeps its
+ * narrower `{ username }` shape because every existing caller already asserts
+ * an exact match against it (`toEqual({ username })`); adding a field there
+ * would break all of them. The dashboard is the one caller that needs the
+ * extra bits, to redirect everywhere else until they clear.
  */
 export async function verifySessionDetails(
   db: BusinessDb,
   sessionId: string,
   options: { now?: Date } = {},
-): Promise<{ username: string; mustChangePassword: boolean } | null> {
+): Promise<SessionDetails | null> {
   return loadSession(db, sessionId, options);
 }
 
 /**
  * Mint a session without a password check.
  *
- * Two callers need this, and neither has a password to verify: the dashboard
- * after a recovery code was just redeemed (proof of ownership already came
- * from `redeemRecoveryCode`, which also revoked every prior session — this
- * only writes the new one `login`'s success path would have written), and
- * the dashboard again right after `setPassword` completes, so the owner who
- * just finished the forced password change lands back in the app instead of
- * at a login form.
+ * The dashboard calls this right after `setPassword` completes, so the owner
+ * who just changed the password lands back in the app instead of at a login
+ * form. `pendingFactor` marks a session that still owes its second factor.
  */
 export async function startSession(
   db: BusinessDb,
   username: string,
-  options: { now?: Date; mustChangePassword?: boolean } = {},
+  options: { now?: Date; mustChangePassword?: boolean; pendingFactor?: PendingFactor } = {},
 ): Promise<string> {
   const businessId = db.businessId;
   const now = options.now ?? new Date();
@@ -403,12 +412,38 @@ export async function startSession(
 
   await db.query(
     `INSERT INTO dashboard_sessions
-       (session_id, business_id, username, created_at, expires_at, must_change_password)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [hashToken(token), businessId, username, now, expiresAt, options.mustChangePassword ?? false],
+       (session_id, business_id, username, created_at, expires_at, must_change_password, pending_factor)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      hashToken(token),
+      businessId,
+      username,
+      now,
+      expiresAt,
+      options.mustChangePassword ?? false,
+      options.pendingFactor ?? null,
+    ],
   );
 
   return token;
+}
+
+/**
+ * Set or clear the second factor a session still owes. Only an unrevoked
+ * session of this business is touched. `second-factor.ts` re-exports this as
+ * `setPendingFactor`; it lives here because only this module knows how a
+ * session token is hashed.
+ */
+export async function setSessionPendingFactor(
+  db: BusinessDb,
+  token: string,
+  factor: PendingFactor | null,
+): Promise<void> {
+  await db.query(
+    `UPDATE dashboard_sessions SET pending_factor = $3
+      WHERE session_id = $1 AND business_id = $2 AND revoked_at IS NULL`,
+    [hashToken(token), db.businessId, factor],
+  );
 }
 
 /**
@@ -427,10 +462,9 @@ export async function revokeSession(db: BusinessDb, token: string): Promise<void
 
 export async function revokeAllSessions(db: BusinessDb, username: string): Promise<number> {
   // Takes the caller's connection, which may be a transaction, so a caller
-  // (recovery-code redemption, for one) can revoke sessions atomically with
-  // whatever else it is doing — e.g. claiming the code and writing the audit
-  // entry — rather than leaving a window where the code is spent but a stolen
-  // session survives it.
+  // (a second-factor reset, for one) can revoke sessions atomically with
+  // whatever else it is doing, rather than leaving a window where the factor
+  // is gone but a stolen session survives it.
   const result = await db.query(
     `UPDATE dashboard_sessions SET revoked_at = now()
       WHERE business_id = $1 AND username = $2 AND revoked_at IS NULL`,
@@ -481,10 +515,11 @@ export async function setPassword(
   const businessId = db.businessId;
   const { hash, salt } = await hashPassword(input.password);
 
-  // Hashing the new password and revoking every open session happen in one
-  // transaction: a session opened under the old password must not survive a
-  // password change, and a failure partway through must not leave the
-  // account with a new password but an old, still-valid session.
+  // Hashing the new password, revoking every open session and every trusted
+  // device happen in one transaction: neither a session nor a device trusted
+  // under the old password may survive a password change, and a failure
+  // partway through must not leave the account with a new password but an
+  // old, still-valid way in.
   await transaction(db, async (tx) => {
     await tx.query(
       `UPDATE dashboard_users SET password_hash = $3, password_salt = $4
@@ -496,5 +531,6 @@ export async function setPassword(
         WHERE business_id = $1 AND username = $2 AND revoked_at IS NULL`,
       [businessId, input.username],
     );
+    await revokeTrustedDevices(tx, input.username);
   });
 }

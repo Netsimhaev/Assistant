@@ -155,7 +155,6 @@ import {
   verifySessionDetails,
   SESSION_HOURS,
 } from './auth.js';
-import { redeemRecoveryCode, redeemUnknown, remainingCodes } from './recovery.js';
 import { resolveLogin } from '../tenancy/platform.js';
 import { withSessionLockOn } from '../orchestrator/session-lock.js';
 import { getBusiness } from '../tenancy/businesses.js';
@@ -230,10 +229,11 @@ export interface DashboardOptions {
    *
    * The header is client-supplied text on an open socket. Trusting it
    * unconditionally is worse than ignoring it: an attacker would then choose
-   * what the audit log says about where a credential-recovery event came
-   * from, which is more damaging than a record that plainly says "this is
-   * the proxy's address". So this is opt-in, per deployment, by whoever
-   * knows the topology.
+   * what the audit log says about where a sign-in event came from, which is
+   * more damaging than a record that plainly says "this is the proxy's
+   * address". So this is opt-in, per deployment, by whoever knows the
+   * topology. (Nothing reads it since the recovery codes were removed; it is
+   * kept for the second-factor audit trail.)
    */
   trustProxy?: boolean;
   /**
@@ -356,31 +356,6 @@ function clearedCookie(): string {
   return `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
 }
 
-/** An audited address is never longer than this. A header is attacker-supplied text even when the proxy is trusted. */
-const MAX_ADDRESS_LENGTH = 64;
-
-/**
- * Where a request came from, as the audit log should name it.
- *
- * `req.socket.remoteAddress` is the *previous hop*, and this server is
- * required to sit behind a tunnel or reverse proxy
- * (docs/dashboard-deployment.md) — so in every real deployment that address
- * is the proxy, and recording it bare made every recovery-code redemption
- * audit as coming from localhost. The only record of a credential-recovery
- * event named the wrong origin, and named it confidently.
- *
- * Two honest answers, and this returns whichever one the deployment has
- * earned:
- *
- *   * `trustProxy` off (the default): the socket address, labelled as the
- *     proxy's and not the client's. Useless for tracing, but it does not
- *     claim to be something it is not.
- *   * `trustProxy` on: the LAST entry of `X-Forwarded-For`. Last, not first:
- *     each proxy appends the address it saw, so the rightmost entry is the
- *     one the nearest (and only trusted) proxy wrote, while everything to
- *     its left may have been sent by the client. Reading the leftmost entry
- *     — the usual mistake — is reading whatever an attacker typed.
- */
 /**
  * `decodeURIComponent` on a path segment, refused rather than thrown.
  *
@@ -397,25 +372,6 @@ function decodePathSegment(raw: string): string | null {
   } catch {
     return null;
   }
-}
-
-function clientAddress(req: IncomingMessage, trustProxy: boolean): string {
-  const socketAddress = req.socket.remoteAddress ?? 'unknown';
-  if (!trustProxy) return `${socketAddress} (proxy hop; not the client address)`;
-
-  const raw = req.headers['x-forwarded-for'];
-  const joined = Array.isArray(raw) ? raw.join(',') : (raw ?? '');
-  const hops = joined
-    .split(',')
-    .map((hop) => hop.trim())
-    .filter((hop) => hop.length > 0);
-  const nearest = hops[hops.length - 1];
-  if (nearest === undefined) {
-    // Trusted proxy configured, no header present: say so rather than
-    // silently reporting the socket as the client.
-    return `${socketAddress} (proxy hop; no forwarded-for header)`;
-  }
-  return nearest.slice(0, MAX_ADDRESS_LENGTH);
 }
 
 function parseCookies(header: string | undefined): Record<string, string> {
@@ -539,8 +495,8 @@ async function handleLoginGet(res: ServerResponse): Promise<void> {
 }
 
 /**
- * The login form: an email and a password, or an email and a recovery code.
- * The email alone decides the business (spec §5.5):
+ * The login form: an email and a password. The email alone decides the
+ * business (spec §5.5):
  *
  *   1. `resolveLogin` — the one cross-business read, on the platform role,
  *      returning the business id and its status and nothing else.
@@ -552,48 +508,22 @@ async function handleLoginGet(res: ServerResponse): Promise<void> {
  *   4. A suspended business is told so only AFTER a correct password: the
  *      session `login` just minted is revoked and no cookie is set. A wrong
  *      password gets the ordinary generic reply, so the suspension notice
- *      never tells a prober that an address exists. A recovery code against
- *      a suspended business is refused like an unknown address (decoy cost,
- *      server-wide bucket) and never redeemed: redeeming would spend the code
- *      and revoke every session of an account that cannot be entered anyway.
+ *      never tells a prober that an address exists.
+ *
+ * There is no other way in: the recovery codes are gone (migration 070), and
+ * a `code` field is not read at all.
  */
-async function handleLoginPost(
-  req: IncomingMessage,
-  res: ServerResponse,
-  trustProxy: boolean,
-): Promise<void> {
+async function handleLoginPost(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const form = await readFormBody(req);
   const email = form.get('email') ?? '';
-  const code = form.get('code');
   const password = form.get('password');
-  const withCode = code !== null && code.length > 0;
 
-  if (!withCode && (password === null || password.length === 0)) {
-    return sendHtml(res, 400, renderLogin({ error: 'יש להזין סיסמה או קוד שחזור.' }));
+  if (password === null || password.length === 0) {
+    return sendHtml(res, 401, renderLogin({ error: 'שם משתמש או סיסמה שגויים.' }));
   }
 
   const resolved = await resolveLogin(email);
   const suspended = resolved !== null && resolved.status !== 'active';
-
-  if (withCode) {
-    const codeRefused = (): void =>
-      sendHtml(res, 401, renderLogin({ error: 'קוד שגוי, כבר נוצל, או שהמערכת נעולה זמנית.' }));
-    if (resolved === null || suspended) {
-      await withNoBusiness((db) => redeemUnknown(db, code));
-      return codeRefused();
-    }
-    const token = await withBusiness(resolved.businessId, async (db) => {
-      const result = await redeemRecoveryCode(db, {
-        login: email,
-        code,
-        sourceAddress: clientAddress(req, trustProxy),
-      });
-      if (!result.ok) return null;
-      return startSession(db, result.username, { mustChangePassword: true });
-    });
-    if (token === null) return codeRefused();
-    return redirect(res, '/password', { 'Set-Cookie': sessionCookie(resolved.businessId, token) });
-  }
 
   const typed = password ?? '';
   const result =
@@ -621,15 +551,13 @@ async function handleLoginPost(
 }
 
 /**
- * A password change needs the current password — except on the one path
- * where there cannot be one.
- *
- * `mustChangePassword` is set only by the session minted immediately after a
- * recovery code was redeemed, and redemption is itself proof of ownership
- * (it revoked every other session on the way through). Everywhere else, a
- * session alone must not be enough: this route sits before the
- * must-change gate and after nothing at all, so without the current password
- * a stolen cookie is a permanent takeover rather than a twelve-hour one.
+ * A password change needs the current password — except on a session that
+ * was minted with `mustChangePassword`, where by definition there is none to
+ * type (no caller mints one since the recovery codes were removed; the
+ * technician reset link will). Everywhere else, a session alone must not be
+ * enough: this route sits before the must-change gate and after nothing at
+ * all, so without the current password a stolen cookie is a permanent
+ * takeover rather than a twelve-hour one.
  */
 function requiresCurrentPassword(session: Session): boolean {
   return !session.mustChangePassword;
@@ -699,12 +627,7 @@ async function handlePendingList(
   // Sequential, never `Promise.all`: both read on this request's one
   // connection, and two queries in flight on it interleave.
   const approvals = await pendingApprovals(db);
-  const remaining = await remainingCodes(db, session.username);
-  sendHtml(
-    res,
-    200,
-    renderPendingList({ approvals, remainingCodes: remaining, csrf: issueCsrfToken(session.sessionId), modeFailed }),
-  );
+  sendHtml(res, 200, renderPendingList({ approvals, csrf: issueCsrfToken(session.sessionId), modeFailed }));
 }
 
 /** How many recent readings the "מה קראתי" screen shows. */
@@ -3099,13 +3022,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
   // known credentials so the victim's browser ends up authenticated as the
   // attacker) has no target here either: every account is created
   // out-of-band by a local CLI command, with no self-registration — making
-  // either branch of this form succeed already requires possessing an
-  // account's password or an unredeemed recovery code, at which point the
-  // attacker already has direct access and gains nothing by routing it
-  // through the victim's browser.
-  if (method === 'POST' && pathname === '/login') {
-    return handleLoginPost(req, res, options.trustProxy);
-  }
+  // this form succeed already requires possessing an account's password, at
+  // which point the attacker already has direct access and gains nothing by
+  // routing it through the victim's browser.
+  if (method === 'POST' && pathname === '/login') return handleLoginPost(req, res);
 
   // Everything past this point requires a session.
   const cookie = sessionCookieFrom(req);
@@ -3155,7 +3075,7 @@ async function route(
   if (method === 'POST' && pathname === '/password') return handlePasswordPost(req, res, db, session);
   if (method === 'POST' && pathname === '/logout') return handleLogout(req, res, db, session);
 
-  // A session minted from a recovery code cannot reach anything else —
+  // A session that must change its password cannot reach anything else —
   // checked here, after /password and /logout have already had their turn,
   // so the forced change can neither be skipped by navigating straight to
   // `/` nor leave the owner stuck with no way to sign out.

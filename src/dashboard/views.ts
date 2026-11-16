@@ -130,30 +130,20 @@ export function renderLogin(options: { error?: string } = {}): string {
     `<h1>עוזרת אישית — כניסה</h1>
 ${errorBlock}
 <div class="card">
-<h2>סיסמה</h2>
 <form method="post" action="/login">
   <label>כתובת מייל<input type="email" name="email" autocomplete="username" required></label>
   <label>סיסמה<input type="password" name="password" autocomplete="current-password" required></label>
   <button type="submit">כניסה</button>
-</form>
-</div>
-<div class="card">
-<h2>קוד שחזור</h2>
-<p class="muted">איבדת את הסיסמה? קוד שחזור חד-פעמי נכנס כאן במקומה, ומחייב קביעת סיסמה חדשה מיד.</p>
-<form method="post" action="/login">
-  <label>כתובת מייל<input type="email" name="email" autocomplete="username" required></label>
-  <label>קוד שחזור<input type="text" name="code" autocomplete="off" required></label>
-  <button type="submit">כניסה עם קוד</button>
 </form>
 </div>`,
   );
 }
 
 /**
- * `requireCurrent` is false on exactly one path: the forced change right
- * after a recovery-code login, where by definition the owner does not have a
- * current password to type. Everywhere else the field is mandatory — see
- * `verifyCurrentPassword` for why.
+ * `requireCurrent` is false on exactly one path: the forced change on a
+ * session minted with `mustChangePassword`, where by definition the owner
+ * does not have a current password to type. Everywhere else the field is
+ * mandatory — see `verifyCurrentPassword` for why.
  */
 export function renderPasswordChange(options: {
   csrf: string;
@@ -163,7 +153,7 @@ export function renderPasswordChange(options: {
   const errorBlock = options.error ? `<p class="error">${esc(options.error)}</p>` : '';
   const intro = options.requireCurrent
     ? '<p class="muted">להחלפת הסיסמה יש להזין את הסיסמה הנוכחית.</p>'
-    : '<p class="muted">הכניסה בוצעה עם קוד שחזור. יש לקבוע סיסמה חדשה לפני שאפשר להמשיך.</p>';
+    : '<p class="muted">יש לקבוע סיסמה חדשה לפני שאפשר להמשיך.</p>';
   const currentField = options.requireCurrent
     ? '<label>סיסמה נוכחית<input type="password" name="current" autocomplete="current-password" required></label>'
     : '';
@@ -214,7 +204,6 @@ export const MODE_NOT_APPLIED_NOTICE =
 
 export function renderPendingList(options: {
   approvals: ApprovalRequest[];
-  remainingCodes: number;
   csrf: string;
   /** The interview's install could not apply the chosen dial. */
   modeFailed?: boolean;
@@ -231,7 +220,6 @@ export function renderPendingList(options: {
   ${logoutForm(options.csrf)}
 </header>
 ${options.modeFailed === true ? `<p class="error" role="alert">${esc(MODE_NOT_APPLIED_NOTICE)} <a href="/autonomy">כמה חופש לתת</a></p>` : ''}
-<p class="muted">קודי שחזור שנותרו: ${esc(options.remainingCodes)}</p>
 <p><a href="/instruct">מה לעשות</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/ledger">הפנקס</a> · <a href="/meetings">פגישות</a> · <a href="/documents">מסמכים</a> · <a href="/digest">מה קרה</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/setup/edit">ערוך את הכללים</a> · <a href="/settings/description">תיאור העסק</a></p>
 ${list}`,
   );

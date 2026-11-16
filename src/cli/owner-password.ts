@@ -8,27 +8,12 @@
  * rather than shared, so this file's refusal does not depend on that one
  * staying unchanged.
  *
- * `setPassword` (src/dashboard/auth.ts) already revokes every open session
- * in the same transaction as the password write, so a session opened under
- * the old password does not survive a reset here.
- *
- * This command also re-issues the recovery codes, printed once exactly like
- * `owner:create` does. That is a deliberate choice, not an oversight: a
- * password reset through this path is, by construction, the "I have lost
- * access and need the local recovery route" case, and the account's own
- * `setPassword` already treats a password change as grounds to revoke every
- * derived credential (open sessions) rather than leave any of them valid on
- * the old password's authority. A recovery code is exactly that kind of
- * derived credential — proof that stands in for the password — so leaving
- * the old set live after a reset would silently keep an alternate way in
- * open precisely when the owner had reason to distrust the old one. The
- * cost is that the owner must re-save a new set of eight codes every time
- * they reset their password, even if they still have the old ones safely
- * stored; that is judged cheaper than a stale credential nobody remembers
- * to revoke.
+ * `setPassword` (src/dashboard/auth.ts) revokes every open session and
+ * every trusted device in the same transaction as the password write, so
+ * neither a session opened nor a device trusted under the old password
+ * survives a reset here. The second factor itself is left as it is.
  */
 import { setPassword } from '../dashboard/auth.js';
-import { issueRecoveryCodes } from '../dashboard/recovery.js';
 import { withBusiness } from '../db/pool.js';
 import { BUSINESS_ARG_EXIT_CODE, closeCliPools, resolveBusinessArg } from './business-arg.js';
 import { nodePromptIo } from './node-prompt-io.js';
@@ -80,16 +65,9 @@ export async function run(argv: string[], io: PromptIo): Promise<number> {
     return 1;
   }
 
-  const codes = await withBusiness(businessId, async (db) => {
-    await setPassword(db, { username, password });
-    return issueRecoveryCodes(db, { username });
-  });
+  await withBusiness(businessId, (db) => setPassword(db, { username, password }));
 
-  io.print(`הסיסמה עבור "${username}" עודכנה. כל ההתחברויות הפעילות בוטלו.`);
-  io.print('');
-  io.print('קודי השחזור הישנים בוטלו וקבוצה חדשה הונפקה — מוצגת כאן פעם אחת בלבד ולעולם לא תוצג שוב:');
-  io.print('שמור אותם עכשיו במקום בטוח לפני שאתה ממשיך. הם אינם נשמרים במערכת בצורה שניתן לשחזר.');
-  codes.forEach((code, index) => io.print(`  ${index + 1}. ${code}`));
+  io.print(`הסיסמה עבור "${username}" עודכנה. כל ההתחברויות הפעילות וכל המכשירים המהימנים בוטלו.`);
 
   return 0;
 }

@@ -20,7 +20,6 @@
 import { DatabaseError } from 'pg';
 import { createOwner } from '../dashboard/auth.js';
 import { normaliseLogin } from '../tenancy/login.js';
-import { issueRecoveryCodes } from '../dashboard/recovery.js';
 import { withBusiness } from '../db/pool.js';
 import { EMAIL_SHAPE } from '../governance/typed-recipients.js';
 import { resolveLogin } from '../tenancy/platform.js';
@@ -35,6 +34,9 @@ const UNIQUE_VIOLATION = '23505';
 
 /** Migration 066's index: the login is unique across every business. */
 const LOGIN_UNIQUE_INDEX = 'dashboard_users_login_unique';
+
+/** Printed after a new account is created: the second factor comes at first sign-in. */
+export const ENROL_ON_FIRST_LOGIN_NOTE = 'בכניסה הראשונה תתבקש לחבר את Google Authenticator.';
 
 /** Printed when the address is already some business's login, in any case. */
 export const LOGIN_TAKEN_MESSAGE = 'הכתובת כבר רשומה';
@@ -146,17 +148,10 @@ export async function run(argv: string[], io: PromptIo): Promise<number> {
     throw err;
   }
 
-  // A brand-new account gets a brand-new set of recovery codes in the same
-  // run — there is nothing to rotate away from yet, so this is simply
-  // "issue the first set", not the same judgement call `owner:password`
-  // has to make about an *existing* set.
-  const codes = await withBusiness(businessId, (db) => issueRecoveryCodes(db, { username }));
-
+  // No recovery codes (migration 070): the second factor is enrolled at the
+  // first sign-in, and a lost one is reset by a technician link.
   io.print(`החשבון "${username}" נוצר בהצלחה. הכניסה לדשבורד: ${login}`);
-  io.print('');
-  io.print('קודי שחזור — מוצגים כאן פעם אחת בלבד ולעולם לא יוצגו שוב:');
-  io.print('שמור אותם עכשיו במקום בטוח לפני שאתה ממשיך. הם אינם נשמרים במערכת בצורה שניתן לשחזר.');
-  codes.forEach((code, index) => io.print(`  ${index + 1}. ${code}`));
+  io.print(ENROL_ON_FIRST_LOGIN_NOTE);
 
   return 0;
 }
