@@ -152,14 +152,17 @@ async function recordFailure(db: BusinessDb, username: string, now: Date): Promi
 
 /**
  * Record an accepted step and clear the counters — only if no concurrent
- * request has already accepted this step or a later one. `false` means this
- * request lost the race: the code was a replay after all.
+ * request has already accepted this step or a later one, the secret is still
+ * the one the code was matched against (`ciphertext`: a second
+ * `beginEnrolment` in between must not let a code of the old pending secret
+ * enrol the new one), and no lock has been set since the state was read.
+ * `false` means this request lost a race, and is counted as a failure.
  */
 async function acceptStep(
   db: BusinessDb,
   username: string,
   step: number,
-  options: { enrolNow: Date | null },
+  options: { enrolNow: Date | null; ciphertext: Buffer; now: Date },
 ): Promise<boolean> {
   const result = await db.query(
     `UPDATE dashboard_users
@@ -170,8 +173,10 @@ async function acceptStep(
       WHERE business_id = $1 AND username = $2
         AND totp_ciphertext IS NOT NULL
         AND (totp_last_step IS NULL OR totp_last_step < $3)
-        AND (($4::timestamptz IS NULL) = (totp_enrolled_at IS NOT NULL))`,
-    [db.businessId, username, step, options.enrolNow],
+        AND (($4::timestamptz IS NULL) = (totp_enrolled_at IS NOT NULL))
+        AND totp_ciphertext = $5
+        AND (totp_locked_until IS NULL OR totp_locked_until <= $6)`,
+    [db.businessId, username, step, options.enrolNow, options.ciphertext, options.now],
   );
   return (result.rowCount ?? 0) > 0;
 }
@@ -227,7 +232,12 @@ export async function confirmEnrolment(
   if (await lockedNow(db, username, state, now)) return 'locked';
 
   const step = matchSealed(db, username, state, code, key, now);
-  if (step !== null && (await acceptStep(db, username, step, { enrolNow: now }))) return 'ok';
+  if (
+    step !== null &&
+    (await acceptStep(db, username, step, { enrolNow: now, ciphertext: state.sealed.ciphertext, now }))
+  ) {
+    return 'ok';
+  }
 
   await recordFailure(db, username, now);
   return 'bad_code';
@@ -246,7 +256,13 @@ export async function verifySecondFactor(
   if (await lockedNow(db, username, state, now)) return 'locked';
 
   const step = matchSealed(db, username, state, code, key, now);
-  if (step !== null && (await acceptStep(db, username, step, { enrolNow: null }))) return 'ok';
+  if (
+    step !== null &&
+    state.sealed !== null &&
+    (await acceptStep(db, username, step, { enrolNow: null, ciphertext: state.sealed.ciphertext, now }))
+  ) {
+    return 'ok';
+  }
 
   await recordFailure(db, username, now);
   return 'bad_code';

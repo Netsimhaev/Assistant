@@ -4,7 +4,7 @@ import { closePool, withBusiness } from '../db/pool.js';
 import { createTestOwner, ownerLogin } from '../test/owner.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { currentStep, totpCode } from '../auth/totp.js';
-import { decryptSecret } from '../governance/secret-cipher.js';
+import { decryptSecret, encryptSecret } from '../governance/secret-cipher.js';
 import {
   login,
   LOCK_MINUTES,
@@ -309,5 +309,99 @@ describe('the pending factor on a session', () => {
   it('defaults to none', async () => {
     const token = await withBusiness(BUSINESS, (db) => startSession(db, USERNAME));
     expect((await withBusiness(BUSINESS, (db) => verifySessionDetails(db, token)))?.pendingFactor).toBeNull();
+  });
+});
+
+/**
+ * Hold the owner's row with `FOR UPDATE` on a migrator connection, start
+ * `act` (whose final UPDATE then blocks on the row lock), run `meanwhile`
+ * on the locking connection and commit. The blocked UPDATE re-checks its
+ * WHERE against the row as `meanwhile` left it — exactly the window between
+ * `loadTotp` and `acceptStep` that a concurrent request could land in.
+ */
+async function interleave<T>(
+  act: () => Promise<T>,
+  meanwhile: (q: (sql: string, params: unknown[]) => Promise<unknown>) => Promise<void>,
+): Promise<T> {
+  const client = await testDb().connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `SELECT 1 FROM dashboard_users WHERE business_id = $1 AND username = $2 FOR UPDATE`,
+      [BUSINESS, USERNAME],
+    );
+    const pending = act();
+    // Wait until the act's UPDATE is actually waiting on our row lock.
+    for (let i = 0; ; i += 1) {
+      const { rows } = await testDb().query<{ n: string }>(
+        `SELECT count(*) AS n FROM pg_locks WHERE NOT granted`,
+      );
+      if (Number(rows[0]?.n ?? 0) > 0) break;
+      if (i > 200) throw new Error('interleave: the act never blocked on the row lock');
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    await meanwhile((sql, params) => client.query(sql, params));
+    await client.query('COMMIT');
+    return await pending;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+describe('accepting a step is bound to what was read', () => {
+  it('a confirm with an old pending secret cannot enrol a newer one written in between', async () => {
+    const { secretBase32: old } = await withBusiness(BUSINESS, (db) => beginEnrolment(db, USERNAME, KEY));
+    const fresh = 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP';
+    const sealed = encryptSecret(fresh, KEY, { businessId: BUSINESS, ref: `totp:${USERNAME}` });
+
+    const result = await interleave(
+      () => withBusiness(BUSINESS, (db) => confirmEnrolment(db, USERNAME, totpCode(old, currentStep(NOW)), KEY, NOW)),
+      async (q) => {
+        await q(
+          `UPDATE dashboard_users SET totp_ciphertext = $3, totp_nonce = $4, totp_last_step = NULL
+            WHERE business_id = $1 AND username = $2`,
+          [BUSINESS, USERNAME, sealed.ciphertext, sealed.nonce],
+        );
+      },
+    );
+    expect(result).toBe('bad_code');
+    expect(await withBusiness(BUSINESS, (db) => totpStatus(db, USERNAME))).toBe('not_enrolled');
+  });
+
+  it('a correct code does not get through a lock set in between', async () => {
+    const secret = await enrol();
+    const at = new Date(NOW.getTime() + 60_000);
+    const result = await interleave(
+      () => withBusiness(BUSINESS, (db) => verifySecondFactor(db, USERNAME, totpCode(secret, currentStep(at)), KEY, at)),
+      async (q) => {
+        await q(
+          `UPDATE dashboard_users SET totp_failed_attempts = $3, totp_locked_until = $4
+            WHERE business_id = $1 AND username = $2`,
+          [BUSINESS, USERNAME, MAX_FAILED, new Date(at.getTime() + LOCK_MINUTES * 60_000)],
+        );
+      },
+    );
+    expect(result).not.toBe('ok');
+    const { rows } = await testDb().query<{ totp_last_step: string | null }>(
+      `SELECT totp_last_step FROM dashboard_users WHERE business_id = $1 AND username = $2`,
+      [BUSINESS, USERNAME],
+    );
+    // The step was not spent by the refused attempt.
+    expect(Number(rows[0]?.totp_last_step)).toBe(currentStep(NOW));
+  });
+
+  it('two concurrent verifications with the same valid code: exactly one is ok', async () => {
+    const secret = await enrol();
+    const at = new Date(NOW.getTime() + 60_000);
+    const code = totpCode(secret, currentStep(at));
+    const results = await Promise.all([
+      withBusiness(BUSINESS, (db) => verifySecondFactor(db, USERNAME, code, KEY, at)),
+      withBusiness(BUSINESS, (db) => verifySecondFactor(db, USERNAME, code, KEY, at)),
+    ]);
+    expect(results.filter((r) => r === 'ok')).toHaveLength(1);
+    expect(results.filter((r) => r === 'bad_code')).toHaveLength(1);
   });
 });
