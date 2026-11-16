@@ -9,6 +9,7 @@ import {
 } from '../../domain/charter.js';
 import { AutonomyMode } from '../../governance/autonomy-mode.js';
 import { authorityNumberKey } from '../../governance/principal-number.js';
+import { PERSON_FIELD_MAX_CHARS } from '../../business/setup-package.js';
 
 /**
  * The owner's answers to the setup interview. This is the single shape a
@@ -77,8 +78,8 @@ export type AcceptedRule = z.infer<typeof AcceptedRule>;
  * the signature adds. The phone is the package's canonical `+<digits>` form.
  */
 const SetupPersonFields = {
-  name: z.string().min(1).max(120),
-  role: z.string().min(1).max(120),
+  name: z.string().min(1).max(PERSON_FIELD_MAX_CHARS),
+  role: z.string().min(1).max(PERSON_FIELD_MAX_CHARS),
   phone: z
     .string()
     .refine((v) => /^\+\d+$/.test(v) && authorityNumberKey(v) === v.slice(1), {

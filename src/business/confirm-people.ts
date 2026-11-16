@@ -34,6 +34,7 @@ import { transaction, type BusinessDb } from '../db/pool.js';
 import { authorityNumberKey } from '../governance/principal-number.js';
 import { writeMemory } from '../memory/store.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
+import { canonicalHash } from '../util/canonical.js';
 import { addColleague, listColleagues } from './colleagues.js';
 import { loadSetupPackage, type SetupPackage } from './setup-package.js';
 
@@ -57,17 +58,37 @@ export interface ConfirmPeopleResult {
 const samePhone = (a: string | undefined, b: string): boolean =>
   a !== undefined && authorityNumberKey(a) !== null && authorityNumberKey(a) === authorityNumberKey(b);
 
+/** The label `confirmSetupPeople` gives a known contact it appends to `counterparties.known`. */
+const knownLabel = (c: { name: string; role: string }): string => `${c.name} — ${c.role}`;
+
+/**
+ * A handle on the package's people exactly as step 8 rendered them: the form
+ * carries it, and `confirmSetupPeople` recomputes it under the lock. Indices
+ * are positions in that list — a technician edit between the render and the
+ * POST would shift them onto other people, and a ✓ makes a signed known
+ * counterparty, so a changed list is refused rather than reinterpreted.
+ */
+export function setupPeopleListHash(pkg: SetupPackage | null): string {
+  return canonicalHash({ contacts: pkg?.contacts ?? [], colleagues: pkg?.colleagues ?? [] });
+}
+
+const LIST_CHANGED = 'הרשימה השתנתה או שהבחירה אינה תקינה. לא בוצעה כל פעולה — יש לרענן ולבחור שוב.';
+
 /**
  * Step 8: record what the owner confirmed. Idempotent — a package with no
  * people returns zeros and writes nothing; a second confirm replaces the
- * snapshot and never appends a known entry twice. Serialised with the install
- * (and with a concurrent confirm) on the install's advisory lock, so two posts
- * at once cannot both append, and no confirm lands between the install's
- * checks and its commit.
+ * snapshot and never appends a known entry twice, and a contact un-ticked on
+ * a re-confirm loses the entry this function appended for it (same phone and
+ * label — an entry the owner typed on step 8 is left alone). Serialised with
+ * the install (and with a concurrent confirm) on the install's advisory lock,
+ * so two posts at once cannot both append, and no confirm lands between the
+ * install's checks and its commit. `listHash` must be `setupPeopleListHash`
+ * of the package as the owner saw it; otherwise `SetupPeopleInputError`, and
+ * nothing is written.
  */
 export async function confirmSetupPeople(
   db: BusinessDb,
-  input: { knownIndices: readonly number[] },
+  input: { knownIndices: readonly number[]; listHash: string },
 ): Promise<ConfirmPeopleResult> {
   return transaction(db, async (tx) => {
     await tx.query("SELECT pg_advisory_xact_lock(hashtext('charter-install:' || $1))", [tx.businessId]);
@@ -75,11 +96,10 @@ export async function confirmSetupPeople(
     if (pkg === null || (pkg.contacts.length === 0 && pkg.colleagues.length === 0)) {
       return { contacts: 0, colleagues: 0, known: 0 };
     }
+    if (setupPeopleListHash(pkg) !== input.listHash) throw new SetupPeopleInputError(LIST_CHANGED);
 
     for (const i of input.knownIndices) {
-      if (!Number.isInteger(i) || i < 0 || i >= pkg.contacts.length) {
-        throw new SetupPeopleInputError('הרשימה השתנתה או שהבחירה אינה תקינה. לא בוצעה כל פעולה — יש לרענן ולבחור שוב.');
-      }
+      if (!Number.isInteger(i) || i < 0 || i >= pkg.contacts.length) throw new SetupPeopleInputError(LIST_CHANGED);
     }
     const known = new Set(input.knownIndices);
 
@@ -89,23 +109,30 @@ export async function confirmSetupPeople(
     };
 
     const draft = await loadDraft(tx);
-    // A draft that starts now starts from whatever charter is active now — the
-    // rule `handleSetupStepPost` keeps.
-    const options = draft === null ? { baseCharterVersion: await activeCharterVersion(tx) } : {};
+    // Only the first save may create the draft, and only it carries the base
+    // version: a draft that starts now starts from whatever charter is active
+    // now (the rule `handleSetupStepPost` keeps); a later save never moves it.
+    let options: { baseCharterVersion?: string | null } =
+      draft === null ? { baseCharterVersion: await activeCharterVersion(tx) } : {};
 
+    const before = draft?.answers.counterparties ?? { known: [], doNotContact: [] };
+    const section: InterviewAnswers['counterparties'] = structuredClone(before);
+    // Un-ticked: drop the entry this function appended (phone AND label).
+    section.known = section.known.filter(
+      (k) => !snapshot.contacts.some((c) => !c.known && samePhone(k.phone, c.phone) && k.label === knownLabel(c)),
+    );
     const knownContacts = snapshot.contacts.filter((c) => c.known);
-    if (knownContacts.length > 0) {
-      const section: InterviewAnswers['counterparties'] = structuredClone(
-        draft?.answers.counterparties ?? { known: [], doNotContact: [] },
-      );
-      for (const c of knownContacts) {
-        if (section.known.some((k) => samePhone(k.phone, c.phone))) continue;
-        const entry: CounterpartyEntry = { label: `${c.name} — ${c.role}`, phone: c.phone };
-        section.known.push(entry);
-      }
-      await saveSection(tx, 'counterparties', section, options);
+    for (const c of knownContacts) {
+      if (section.known.some((k) => samePhone(k.phone, c.phone))) continue;
+      const entry: CounterpartyEntry = { label: knownLabel(c), phone: c.phone };
+      section.known.push(entry);
     }
-    await saveSection(tx, 'setupPeople', snapshot, knownContacts.length > 0 ? {} : options);
+    // Saved only when it changed: an untouched step 8 stays unsaved.
+    if (canonicalHash(section) !== canonicalHash(before)) {
+      await saveSection(tx, 'counterparties', section, options);
+      options = {};
+    }
+    await saveSection(tx, 'setupPeople', snapshot, options);
 
     return { contacts: snapshot.contacts.length, colleagues: snapshot.colleagues.length, known: knownContacts.length };
   });

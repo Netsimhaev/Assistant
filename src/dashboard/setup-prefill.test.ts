@@ -76,6 +76,13 @@ function csrfOf(html: string): string {
   return match[1];
 }
 
+/** Step 8's people form: its CSRF and the hash of the list it rendered. */
+function formOf(html: string): { csrf: string; listHash: string } {
+  const listHash = /name="listHash" value="([0-9a-f]+)"/.exec(html)?.[1];
+  if (listHash === undefined) throw new Error('no listHash');
+  return { csrf: csrfOf(html), listHash };
+}
+
 async function post(baseUrl: string, cookie: string, path: string, fields: Record<string, string | string[]>) {
   const body = new URLSearchParams();
   for (const [k, v] of Object.entries(fields)) for (const one of Array.isArray(v) ? v : [v]) body.append(k, one);
@@ -139,8 +146,8 @@ describe('the technician\'s setup data in the interview', () => {
   it('POST /setup/people records the snapshot; the summary lists what signing adds', async () => {
     await seed();
     const { baseUrl, cookie } = await start();
-    const csrf = csrfOf(await (await get(baseUrl, cookie, '/setup/step/8')).text());
-    const res = await post(baseUrl, cookie, '/setup/people', { csrf, known: '0' });
+    const { csrf, listHash } = formOf(await (await get(baseUrl, cookie, '/setup/step/8')).text());
+    const res = await post(baseUrl, cookie, '/setup/people', { csrf, listHash, known: '0' });
     expect(res.status).toBe(303);
     expect(res.headers.get('location')).toBe('/setup/step/8');
     const draft = await withBusiness(BUSINESS, (db) => loadDraft(db));
@@ -154,8 +161,8 @@ describe('the technician\'s setup data in the interview', () => {
     await seed();
     await withBusiness(BUSINESS, (db) => replaceDraft(db, completeAnswers(), null));
     const { baseUrl, cookie } = await start();
-    const csrf = csrfOf(await (await get(baseUrl, cookie, '/setup/step/8')).text());
-    await post(baseUrl, cookie, '/setup/people', { csrf, known: '0' });
+    const { csrf, listHash } = formOf(await (await get(baseUrl, cookie, '/setup/step/8')).text());
+    await post(baseUrl, cookie, '/setup/people', { csrf, listHash, known: '0' });
     const summary = await get(baseUrl, cookie, '/setup/summary');
     expect(summary.status).toBe(200);
     const html = await summary.text();
@@ -173,8 +180,8 @@ describe('the technician\'s setup data in the interview', () => {
     // Not confirmed at all.
     expect(await (await get(baseUrl, cookie, '/setup/summary')).text()).toContain(UNCONFIRMED_SETUP_PEOPLE_NOTE);
     // Confirmed, then the technician adds one more.
-    const csrf = csrfOf(await (await get(baseUrl, cookie, '/setup/step/8')).text());
-    await post(baseUrl, cookie, '/setup/people', { csrf });
+    const { csrf, listHash } = formOf(await (await get(baseUrl, cookie, '/setup/step/8')).text());
+    await post(baseUrl, cookie, '/setup/people', { csrf, listHash });
     expect(await (await get(baseUrl, cookie, '/setup/summary')).text()).not.toContain(UNCONFIRMED_SETUP_PEOPLE_NOTE);
     await withBusiness(BUSINESS, (db) =>
       saveSetupPackage(db, { ...PACKAGE, colleagues: [...PACKAGE.colleagues, { name: 'חדש', role: 'עובד', phone: '+972501110010' }] }, 'tech'),
@@ -182,13 +189,26 @@ describe('the technician\'s setup data in the interview', () => {
     expect(await (await get(baseUrl, cookie, '/setup/summary')).text()).toContain(UNCONFIRMED_SETUP_PEOPLE_NOTE);
   });
 
+  it('POST /setup/people refuses a list the technician changed after the page rendered', async () => {
+    await seed();
+    const { baseUrl, cookie } = await start();
+    const { csrf, listHash } = formOf(await (await get(baseUrl, cookie, '/setup/step/8')).text());
+    await withBusiness(BUSINESS, (db) =>
+      saveSetupPackage(db, { ...PACKAGE, contacts: [PACKAGE.contacts[1]!, PACKAGE.contacts[0]!] }, 'tech'),
+    );
+    const res = await post(baseUrl, cookie, '/setup/people', { csrf, listHash, known: '0' });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('הרשימה השתנתה');
+    expect(await withBusiness(BUSINESS, (db) => loadDraft(db))).toBeNull();
+  });
+
   it('POST /setup/people refuses a bad CSRF and bad indices, writing nothing', async () => {
     await seed();
     const { baseUrl, cookie } = await start();
     expect((await post(baseUrl, cookie, '/setup/people', { csrf: 'nope', known: '0' })).status).toBe(403);
-    const csrf = csrfOf(await (await get(baseUrl, cookie, '/setup/step/8')).text());
+    const { csrf, listHash } = formOf(await (await get(baseUrl, cookie, '/setup/step/8')).text());
     for (const bad of ['5', '-1', 'x', '1.5']) {
-      expect((await post(baseUrl, cookie, '/setup/people', { csrf, known: bad })).status).toBe(400);
+      expect((await post(baseUrl, cookie, '/setup/people', { csrf, listHash, known: bad })).status).toBe(400);
     }
     expect(await withBusiness(BUSINESS, (db) => loadDraft(db))).toBeNull();
   });

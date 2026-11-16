@@ -28,7 +28,12 @@ import { InterviewAnswers, INTERVIEW_SECTIONS, type AcceptedRule } from '../char
 import { buildCharterFromInterview, buildConnections, prefillFromCharter } from '../charter/interview/build.js';
 import { freezeDraft, loadDraft, replaceDraft, saveSection, type InterviewDraft } from '../charter/interview/draft-store.js';
 import { previousForDraft, signAndInstallInterview, summaryHash } from '../charter/interview/install.js';
-import { SetupPeopleInputError, confirmSetupPeople, unconfirmedSetupPeople } from '../business/confirm-people.js';
+import {
+  SetupPeopleInputError,
+  confirmSetupPeople,
+  setupPeopleListHash,
+  unconfirmedSetupPeople,
+} from '../business/confirm-people.js';
 import { loadProfile, readLogo } from '../business/profile.js';
 import { loadSetupPackage } from '../business/setup-package.js';
 import type { RuleProposer } from '../charter/interview/rule-proposal.js';
@@ -171,7 +176,7 @@ async function stepView(
       colleagues: pkg?.colleagues ?? [],
       knownPhones: (snapshot?.contacts ?? []).filter((c) => c.known).map((c) => c.phone),
       confirmed: snapshot !== undefined,
-      ...(extra.setupPeople?.error === undefined ? {} : { error: extra.setupPeople.error }),
+      listHash: setupPeopleListHash(pkg),
     };
   }
   // Step 9 preselects the dial as it is now: on an edit, the live position.
@@ -486,11 +491,11 @@ export async function handlePeoplePost(
   const raw = form.getAll('known');
   const draft = await loadDraft(db);
   const refuse = async (message: string) =>
-    sendHtml(res, 400, renderStep(await stepView(db, session, 8, draft, { setupPeople: { contacts: [], colleagues: [], knownPhones: [], confirmed: false, error: message } })));
+    sendHtml(res, 400, renderStep(await stepView(db, session, 8, draft, { setupPeopleError: message })));
   if (!raw.every((v) => /^\d{1,3}$/.test(v))) return refuse(PEOPLE_BAD_INPUT);
   if (await editMustStartFromPrefill(draft, db)) return seeOther(res, '/setup/edit');
   try {
-    await confirmSetupPeople(db, { knownIndices: [...new Set(raw.map(Number))] });
+    await confirmSetupPeople(db, { knownIndices: [...new Set(raw.map(Number))], listHash: form.get('listHash') ?? '' });
   } catch (err) {
     if (err instanceof SetupPeopleInputError) return refuse(err.message);
     throw err;

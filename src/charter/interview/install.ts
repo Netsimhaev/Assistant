@@ -215,8 +215,9 @@ export async function signAndInstallInterview(
       // charter, or replaced by the owner) and every person in it, confirmed
       // or not: from here on the package is locked for the technician and the
       // owner manages people in settings, so a leftover would be stranded,
-      // and the summary told the owner about any (`unconfirmedSetupPeople`). Both join this transaction without a second
-      // lock (`lockedChecks` already holds the install lock), so a failure
+      // and the summary told the owner about any (`unconfirmedSetupPeople`).
+      // Both join this transaction without a second lock (`lockedChecks`
+      // already holds the install lock), so a failure
       // rolls the install back, and a double sign, refused as `stale`, adds
       // nothing twice.
       await applySetupPeople(tx, answers.setupPeople, signed.charterVersion);

@@ -10,7 +10,13 @@ import type { InterviewAnswers } from '../charter/interview/answers.js';
 import { isPrincipalSender } from '../governance/principal-number.js';
 import { setupDataForPanel } from '../tenancy/panel-reads.js';
 import { listColleagues } from './colleagues.js';
-import { CONFIRM_PEOPLE_JOB_TITLE, SetupPeopleInputError, confirmSetupPeople, unconfirmedSetupPeople } from './confirm-people.js';
+import {
+  CONFIRM_PEOPLE_JOB_TITLE,
+  SetupPeopleInputError,
+  confirmSetupPeople,
+  setupPeopleListHash,
+  unconfirmedSetupPeople,
+} from './confirm-people.js';
 import { loadSetupPackage, saveSetupPackage, type SetupPackage } from './setup-package.js';
 
 const TECH = 'tech-1';
@@ -30,6 +36,12 @@ const PACKAGE: SetupPackage = {
 };
 
 const run = <T>(fn: (db: BusinessDb) => Promise<T>): Promise<T> => withBusiness(TEST_BUSINESS, fn);
+
+/** Confirm against the package as it is now — what the owner's page rendered. */
+async function confirmSeen(db: BusinessDb, knownIndices: readonly number[]) {
+  const listHash = setupPeopleListHash(await loadSetupPackage(db));
+  return confirmSetupPeople(db, { knownIndices, listHash });
+}
 
 async function seedPackage(pkg: SetupPackage = PACKAGE): Promise<void> {
   await run((db) => saveSetupPackage(db, pkg, TECH));
@@ -95,7 +107,7 @@ describe('confirmSetupPeople (step 8)', () => {
     await seedPackage();
     await startDraft();
 
-    const result = await run((db) => confirmSetupPeople(db, { knownIndices: [0] }));
+    const result = await run((db) => confirmSeen(db, [0]));
     expect(result).toEqual({ contacts: 2, colleagues: 1, known: 1 });
 
     const draft = await run((db) => loadDraft(db));
@@ -123,7 +135,7 @@ describe('confirmSetupPeople (step 8)', () => {
 
   it('works with no draft yet, creating one', async () => {
     await seedPackage();
-    expect(await run((db) => confirmSetupPeople(db, { knownIndices: [] }))).toEqual({ contacts: 2, colleagues: 1, known: 0 });
+    expect(await run((db) => confirmSeen(db, []))).toEqual({ contacts: 2, colleagues: 1, known: 0 });
     const draft = await run((db) => loadDraft(db));
     expect(draft?.answers.setupPeople?.contacts).toHaveLength(2);
     // No known contact → the counterparties section is not touched.
@@ -131,31 +143,61 @@ describe('confirmSetupPeople (step 8)', () => {
   });
 
   it('returns zeros and writes nothing on an empty package', async () => {
-    expect(await run((db) => confirmSetupPeople(db, { knownIndices: [] }))).toEqual({ contacts: 0, colleagues: 0, known: 0 });
+    expect(await run((db) => confirmSeen(db, []))).toEqual({ contacts: 0, colleagues: 0, known: 0 });
     expect(await run((db) => loadDraft(db))).toBeNull();
   });
 
   it.each([[[2]], [[-1]], [[0.5]], [[Number.NaN]]])('refuses index %j and writes nothing', async (indices) => {
     await seedPackage();
-    await expect(run((db) => confirmSetupPeople(db, { knownIndices: indices }))).rejects.toBeInstanceOf(SetupPeopleInputError);
+    await expect(run((db) => confirmSeen(db, indices))).rejects.toBeInstanceOf(SetupPeopleInputError);
     expect(await run((db) => loadDraft(db))).toBeNull();
   });
 
   it('dedupes indices, and a second confirm does not append a known entry twice', async () => {
     await seedPackage();
     await startDraft();
-    await run((db) => confirmSetupPeople(db, { knownIndices: [0, 0] }));
-    await run((db) => confirmSetupPeople(db, { knownIndices: [0] }));
+    await run((db) => confirmSeen(db, [0, 0]));
+    await run((db) => confirmSeen(db, [0]));
     const known = (await run((db) => loadDraft(db)))?.answers.counterparties?.known ?? [];
     expect(known.filter((k) => k.phone === '+972501110001')).toHaveLength(1);
+  });
+
+  it('refuses when the technician changed the list after the owner saw it, writing nothing', async () => {
+    await seedPackage();
+    await startDraft();
+    const seen = setupPeopleListHash(PACKAGE);
+    // The technician swaps the two contacts: index 0 is now someone else.
+    await seedPackage({ ...PACKAGE, contacts: [PACKAGE.contacts[1]!, PACKAGE.contacts[0]!] });
+    const before = await run((db) => loadDraft(db));
+    await expect(run((db) => confirmSetupPeople(db, { knownIndices: [0], listHash: seen }))).rejects.toBeInstanceOf(
+      SetupPeopleInputError,
+    );
+    const after = await run((db) => loadDraft(db));
+    expect(after?.answers).toEqual(before?.answers);
+    expect(after?.updatedAt.getTime()).toBe(before?.updatedAt.getTime());
+  });
+
+  it('un-ticking on a re-confirm removes the entry it appended, and leaves an owner-typed one', async () => {
+    await seedPackage();
+    const answers = answersWithBoss();
+    // The owner typed this row himself on step 8, with the same phone as contact 1.
+    answers.counterparties.known.push({ label: 'משה הספק', phone: '+972501110002' });
+    await startDraft(answers);
+    await run((db) => confirmSeen(db, [0, 1]));
+    await run((db) => confirmSeen(db, [1]));
+    const known = (await run((db) => loadDraft(db)))?.answers.counterparties?.known ?? [];
+    expect(known.some((k) => k.phone === '+972501110001')).toBe(false);
+    expect(known).toContainEqual({ label: 'משה הספק', phone: '+972501110002' });
+    const draft = await run((db) => loadDraft(db));
+    expect(draft?.answers.setupPeople?.contacts.map((c) => c.known)).toEqual([false, true]);
   });
 
   it('two confirms at once append the known entry once', async () => {
     await seedPackage();
     await startDraft();
     await Promise.all([
-      run((db) => confirmSetupPeople(db, { knownIndices: [0] })),
-      run((db) => confirmSetupPeople(db, { knownIndices: [0] })),
+      run((db) => confirmSeen(db, [0])),
+      run((db) => confirmSeen(db, [0])),
     ]);
     const known = (await run((db) => loadDraft(db)))?.answers.counterparties?.known ?? [];
     expect(known.filter((k) => k.phone === '+972501110001')).toHaveLength(1);
@@ -163,7 +205,7 @@ describe('confirmSetupPeople (step 8)', () => {
 
   it('refuses nothing and writes nothing once the business has no package people', async () => {
     await seedPackage({ bossWhatsapp: BOSS, contacts: [], colleagues: [] });
-    expect(await run((db) => confirmSetupPeople(db, { knownIndices: [] }))).toEqual({ contacts: 0, colleagues: 0, known: 0 });
+    expect(await run((db) => confirmSeen(db, []))).toEqual({ contacts: 0, colleagues: 0, known: 0 });
   });
 });
 
@@ -175,7 +217,7 @@ describe('signing applies the confirmed setup people', () => {
   it('writes the memories, the colleague and the known counterparty, clears the package, and the boss number is the principal', async () => {
     await seedPackage();
     await startDraft();
-    await run((db) => confirmSetupPeople(db, { knownIndices: [0] }));
+    await run((db) => confirmSeen(db, [0]));
 
     const outcome = await freezeAndSign();
     expect(outcome.outcome).toBe('installed');
@@ -208,7 +250,7 @@ describe('signing applies the confirmed setup people', () => {
   it('a double sign adds nothing twice', async () => {
     await seedPackage();
     await startDraft();
-    await run((db) => confirmSetupPeople(db, { knownIndices: [] }));
+    await run((db) => confirmSeen(db, []));
     await run((db) => freezeDraft(db, new Date('2026-11-17T10:00:00.000Z')));
     const draft = await run((db) => loadDraft(db));
     if (draft === null) throw new Error('draft missing');
@@ -223,7 +265,7 @@ describe('signing applies the confirmed setup people', () => {
   it('clears package people the technician added after the owner confirmed — only the snapshot takes effect', async () => {
     await seedPackage();
     await startDraft();
-    await run((db) => confirmSetupPeople(db, { knownIndices: [] }));
+    await run((db) => confirmSeen(db, []));
     const later = { name: 'נוסף אחר כך', role: 'לקוח', phone: '+972501110009' };
     await seedPackage({ ...PACKAGE, contacts: [...PACKAGE.contacts, later] });
 
@@ -250,7 +292,7 @@ describe('signing applies the confirmed setup people', () => {
     const before = await run((db) => loadDraft(db));
     if (before === null) throw new Error('draft missing');
     const hashWithout = shownHashFor(before, TEST_BUSINESS, null);
-    await run((db) => confirmSetupPeople(db, { knownIndices: [] }));
+    await run((db) => confirmSeen(db, []));
     await run((db) => freezeDraft(db, new Date('2026-11-17T10:00:00.000Z')));
     const after = await run((db) => loadDraft(db));
     if (after === null) throw new Error('draft missing');
@@ -266,6 +308,6 @@ describe('signing applies the confirmed setup people', () => {
       [TEST_BUSINESS, JSON.stringify([PACKAGE.contacts[0]])],
     );
     await run((db) => replaceDraft(db, {}, null));
-    expect(await run((db) => confirmSetupPeople(db, { knownIndices: [] }))).toEqual({ contacts: 1, colleagues: 0, known: 0 });
+    expect(await run((db) => confirmSeen(db, []))).toEqual({ contacts: 1, colleagues: 0, known: 0 });
   });
 });

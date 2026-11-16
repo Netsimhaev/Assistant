@@ -111,8 +111,11 @@ export interface StepView {
     colleagues: readonly SetupPersonView[];
     knownPhones: readonly string[];
     confirmed: boolean;
-    error?: string;
+    /** `setupPeopleListHash` of the list rendered here; the POST must carry it back. */
+    listHash: string;
   };
+  /** Step 8: a refused `POST /setup/people`, shown above the list. */
+  setupPeopleError?: string;
 }
 
 function obj(v: unknown): Record<string, unknown> {
@@ -436,10 +439,11 @@ function setupPeopleSection(view: StepView): string {
     .join('');
   const colleagues = people.colleagues.map((c) => `<li>${line(c)}</li>`).join('');
   return `<div class="card"><h3>${esc(SETUP_PEOPLE_TITLE)}</h3>
-${people.error === undefined ? '' : `<p class="error">${esc(people.error)}</p>`}
+${view.setupPeopleError === undefined ? '' : `<p class="error">${esc(view.setupPeopleError)}</p>`}
 ${people.confirmed ? '<p class="note">אישרת את הרשימה. היא תיכנס לתוקף כשתחתום.</p>' : ''}
 <form method="post" action="/setup/people">
   <input type="hidden" name="csrf" value="${esc(view.csrf)}">
+  <input type="hidden" name="listHash" value="${esc(people.listHash)}">
   ${contacts === '' ? '' : `<h4>אנשי קשר — אכיר אותם בשמם</h4><ul>${contacts}</ul>`}
   ${colleagues === '' ? '' : `<h4>קולגות — עובדים איתך, ולא נותנים לי הוראות</h4><ul>${colleagues}</ul>`}
   <button type="submit">${esc(SETUP_PEOPLE_CONFIRM_BUTTON)}</button>
