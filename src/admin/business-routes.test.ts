@@ -1,7 +1,7 @@
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
-import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closePool, withBusiness } from '../db/pool.js';
 import { closePlatformPool } from '../db/platform-pool.js';
 import { registerBusiness, resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
@@ -13,6 +13,25 @@ import { createJob, transition } from '../orchestrator/jobs.js';
 import { saveAddress } from '../business/profile.js';
 import { createHeadStaff, staffBeginEnrolment, staffConfirmEnrolment, startStaffSession } from '../tenancy/staff.js';
 import { createAdminServer } from './server.js';
+
+/**
+ * A switch that makes the route's existence check miss once, to force the
+ * race in which two opens of the same id both pass it before either inserts.
+ */
+const race = vi.hoisted(() => ({ hideNextLookup: false }));
+vi.mock('../tenancy/businesses.js', async (importActual) => {
+  const actual = await importActual<typeof import('../tenancy/businesses.js')>();
+  return {
+    ...actual,
+    getBusiness: async (id: string) => {
+      if (race.hideNextLookup) {
+        race.hideNextLookup = false;
+        return null;
+      }
+      return actual.getBusiness(id);
+    },
+  };
+});
 
 const BASE = 'https://dashboard.example';
 const NEW_ID = 'alpha-shop';
@@ -175,6 +194,47 @@ describe('opening a business', () => {
     expect(links.rowCount).toBe(0);
   });
 
+  it('a losing duplicate open is refused: nothing issued, nothing logged, the winner invite stays live', async () => {
+    const { cookie } = await signedIn();
+    const baseUrl = await startPanel();
+    const won = await openBusiness(baseUrl, cookie);
+    expect(won.status).toBe(200);
+    const winner = /\/invite\/[^.]+\.([0-9a-f]{64})/.exec(await won.text())?.[1];
+    expect(winner).toBeDefined();
+
+    // The loser passed the existence check before the winner's row landed.
+    race.hideNextLookup = true;
+    const lost = await openBusiness(baseUrl, cookie, { email: 'intruder@else.example', name: 'שם אחר' });
+    expect(race.hideNextLookup).toBe(false);
+    expect(lost.status).toBe(400);
+    const html = await lost.text();
+    expect(html).toContain('כבר קיים עסק עם המזהה הזה.');
+    expect(html).not.toMatch(/\/invite\//);
+
+    const links = await testDb().query<{ login: string; used_at: Date | null }>(
+      'SELECT login, used_at FROM owner_links WHERE business_id = $1',
+      [NEW_ID],
+    );
+    expect(links.rows).toEqual([{ login: 'owner@alpha.example', used_at: null }]);
+    const log = await testDb().query<{ action: string }>('SELECT action FROM platform_activity_log');
+    expect(log.rows.map((r) => r.action)).toEqual(['business_open']);
+    const name = await testDb().query<{ display_name: string }>(
+      'SELECT display_name FROM businesses WHERE business_id = $1',
+      [NEW_ID],
+    );
+    expect(name.rows[0]?.display_name).toBe(NEW_NAME);
+  });
+
+  it('refuses an id that is a literal path segment of the panel', async () => {
+    const { cookie } = await signedIn();
+    const baseUrl = await startPanel();
+    const res = await openBusiness(baseUrl, cookie, { id: 'new' });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('המזהה הזה שמור לשימוש המערכת');
+    expect((await testDb().query('SELECT 1 FROM businesses')).rowCount).toBe(0);
+    expect((await testDb().query('SELECT 1 FROM owner_links')).rowCount).toBe(0);
+  });
+
   it('refuses a malformed id in Hebrew', async () => {
     const { cookie } = await signedIn();
     const baseUrl = await startPanel();
@@ -322,6 +382,10 @@ describe('suspend and resume', () => {
     const page = await get(baseUrl, '/businesses/new', cookie);
     const csrf = csrfIn(await page.text());
     expect((await post(baseUrl, '/businesses/no-such-biz/suspend', { csrf }, cookie)).status).toBe(404);
+    expect(
+      (await post(baseUrl, '/businesses/no-such-biz/invite', { csrf, email: 'o@nowhere.example' }, cookie)).status,
+    ).toBe(404);
+    expect((await testDb().query('SELECT 1 FROM owner_links')).rowCount).toBe(0);
     expect((await testDb().query('SELECT 1 FROM platform_activity_log')).rowCount).toBe(0);
   });
 });

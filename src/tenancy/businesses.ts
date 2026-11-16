@@ -23,6 +23,19 @@ export class BusinessIdError extends TenancyError {
   }
 }
 
+/**
+ * The id is already registered — refused before anything was written. Its
+ * own class so a caller can tell it from a refusal raised AFTER the row was
+ * inserted (the save folder): the first means "this business is someone
+ * else's", the second "yours exists, with one thing missing".
+ */
+export class BusinessExistsError extends TenancyError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BusinessExistsError';
+  }
+}
+
 function malformedIdMessage(id: string): string {
   return `מזהה עסק לא תקין "${id}" — אותיות אנגליות קטנות, ספרות ומקפים בלבד, באורך 3 עד 63`;
 }
@@ -64,7 +77,7 @@ export async function createBusiness(id: string, displayName: string): Promise<v
        ON CONFLICT (business_id) DO NOTHING`,
       [id, name],
     );
-    if (rowCount === 0) throw new TenancyError(`העסק ${id} כבר קיים`);
+    if (rowCount === 0) throw new BusinessExistsError(`העסק ${id} כבר קיים`);
   });
   // The business's save folder on the server (spec §5.8). `saveDocumentSettings`
   // accepts a base folder only inside it, so a business without it could

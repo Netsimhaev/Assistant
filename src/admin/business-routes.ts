@@ -31,7 +31,13 @@ import { isValidBusinessId, RESERVED_BUSINESS_IDS, withBusiness, withBusinessTra
 import { ADDRESS_MAX_CHARS, saveAddress } from '../business/profile.js';
 import { issueOwnerLink, retireUnusedOwnerLinks } from '../dashboard/owner-links.js';
 import { EMAIL_SHAPE } from '../governance/typed-recipients.js';
-import { createBusiness, getBusiness, setBusinessStatus, TenancyError } from '../tenancy/businesses.js';
+import {
+  BusinessExistsError,
+  createBusiness,
+  getBusiness,
+  setBusinessStatus,
+  TenancyError,
+} from '../tenancy/businesses.js';
 import { normaliseLogin } from '../tenancy/login.js';
 import { businessDetailForPanel, listBusinessesForPanel, setupDataForPanel } from '../tenancy/panel-reads.js';
 import { resolveLogin } from '../tenancy/platform.js';
@@ -59,6 +65,13 @@ export const ADDRESS_TOO_LONG = `הכתובת ארוכה מדי — עד ${ADDRE
 export const OWNER_ALREADY_EXISTS = 'לבעל העסק כבר יש חשבון — אין צורך בהזמנה.';
 
 const BUSINESS_NAME_MAX = 120;
+
+/**
+ * Literal path segments the panel routes under `/businesses/`. A business
+ * with one of these ids could never be reached — `/businesses/new` always
+ * renders the open form — so the open form refuses them as reserved.
+ */
+export const PANEL_RESERVED_IDS: ReadonlySet<string> = new Set(['new']);
 
 /** What the server hands each route: the request, the signed-in member, and the response helpers. */
 export interface BusinessRouteContext {
@@ -188,7 +201,7 @@ async function handleOpen(ctx: BusinessRouteContext): Promise<void> {
   const refuse = (error: string): void => ctx.sendHtml(400, renderNewBusiness(ctx.viewer, { values, error }));
 
   // Everything is checked before anything is written.
-  if (RESERVED_BUSINESS_IDS.has(values.id)) return refuse(BUSINESS_ID_RESERVED);
+  if (RESERVED_BUSINESS_IDS.has(values.id) || PANEL_RESERVED_IDS.has(values.id)) return refuse(BUSINESS_ID_RESERVED);
   if (!isValidBusinessId(values.id)) return refuse(BUSINESS_ID_INVALID);
   if (values.name.length === 0 || values.name.length > BUSINESS_NAME_MAX) return refuse(BUSINESS_NAME_INVALID);
   if (values.address.length > ADDRESS_MAX_CHARS) return refuse(ADDRESS_TOO_LONG);
@@ -200,9 +213,14 @@ async function handleOpen(ctx: BusinessRouteContext): Promise<void> {
   try {
     await createBusiness(values.id, values.name);
   } catch (err) {
+    // Another open of the same id won the race between our check and our
+    // insert: the business is someone else's. Refuse — nothing issued,
+    // nothing logged, and the winner's invite stays live. Never fall through
+    // to the invite, which would retire it and invite our address instead.
+    if (err instanceof BusinessExistsError) return refuse(BUSINESS_EXISTS);
     if (!(err instanceof TenancyError)) throw err;
-    // A refusal before the row (a racing duplicate) leaves nothing behind; a
-    // refusal after it (the server save folder) leaves a business that works
+    // Any other refusal: one raised before the row leaves nothing behind; one
+    // raised after it (the server save folder) leaves a business that works
     // except for saving, and is said out loud.
     if ((await getBusiness(values.id)) === null) return refuse(err.message);
     warning = err.message;
