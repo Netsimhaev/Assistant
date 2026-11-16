@@ -202,6 +202,21 @@ describe('the grant writer stays behind two files', () => {
   });
 });
 
+describe('key rotation names the Authenticator secret stores', () => {
+  /**
+   * Final review C1. The owners' (070) and technicians' (072) TOTP secrets
+   * are sealed with the master key; a rotation loop that does not name both
+   * tables locks every enrolled owner and technician out.
+   */
+  it('re-seals dashboard_users and platform_staff TOTP columns', async () => {
+    const source = await readFile('src/cli/secret-key.ts', 'utf8');
+    expect(source).toMatch(/FROM dashboard_users[^`]*FOR UPDATE/);
+    expect(source).toMatch(/UPDATE dashboard_users SET totp_ciphertext/);
+    expect(source).toMatch(/FROM platform_staff[^`]*FOR UPDATE/);
+    expect(source).toMatch(/UPDATE platform_staff SET totp_ciphertext/);
+  });
+});
+
 describe('an OAuth refresh token leaves no trace outside its own ciphertext', () => {
   const BUSINESS = 'connector-leak-business';
   const KEY = randomBytes(32);

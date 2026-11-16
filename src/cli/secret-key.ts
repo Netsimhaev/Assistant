@@ -623,6 +623,11 @@ interface PlatformSecretRow {
  * table has no business, and the platform login is the one that reaches every
  * business's rows once row level security is on, so all three loops share one
  * connection and one all-or-nothing commit.
+ *
+ * **The owners' and technicians' Authenticator secrets are the fourth and
+ * fifth** (`dashboard_users.totp_*`, migration 070; `platform_staff.totp_*`,
+ * 072), enrolled and pending alike, under their own AADs. Missing them locked
+ * every enrolled owner and technician out after a rotation (final review C1).
  */
 async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   const oldKey = await loadMasterKey(deps.keyPath);
@@ -727,6 +732,62 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
            WHERE ref = $4`,
         [sealed.ciphertext, sealed.nonce, newKeyId, row.ref],
       );
+    }
+
+    // The fourth and fifth: the owners' and technicians' Authenticator
+    // secrets (migrations 070, 072), enrolled AND pending. Missed, every
+    // enrolled owner and technician answers `bad_code` forever after a
+    // rotation — and the recovery codes these replaced are gone. Same shape,
+    // same refusal: one row that does not open aborts everything.
+    const { rows: ownerTotpRows } = await tx.query<{
+      business_id: string;
+      username: string;
+      totp_ciphertext: Buffer;
+      totp_nonce: Buffer;
+    }>(
+      `SELECT business_id, username, totp_ciphertext, totp_nonce FROM dashboard_users
+        WHERE totp_ciphertext IS NOT NULL FOR UPDATE`,
+    );
+    for (const row of ownerTotpRows) {
+      const aad = { businessId: row.business_id, ref: `totp:${row.username}` };
+      const plain = decryptSecret({ ciphertext: row.totp_ciphertext, nonce: row.totp_nonce }, oldKey, aad);
+      if (plain === null) {
+        throw new Error(
+          `החלפת המפתח בוטלה: סוד ה-Authenticator של (${row.business_id}, ${row.username}) אינו נפתח ` +
+            'במפתח הנוכחי — שום שורה לא שונתה.',
+        );
+      }
+      const sealed = encryptSecret(plain, newKey, aad);
+      await tx.query(
+        `UPDATE dashboard_users SET totp_ciphertext = $1, totp_nonce = $2
+           WHERE business_id = $3 AND username = $4`,
+        [sealed.ciphertext, sealed.nonce, row.business_id, row.username],
+      );
+    }
+
+    const { rows: staffTotpRows } = await tx.query<{
+      staff_id: string;
+      totp_ciphertext: Buffer;
+      totp_nonce: Buffer;
+    }>(
+      `SELECT staff_id, totp_ciphertext, totp_nonce FROM platform_staff
+        WHERE totp_ciphertext IS NOT NULL FOR UPDATE`,
+    );
+    for (const row of staffTotpRows) {
+      const aad = { businessId: '', ref: `staff-totp:${row.staff_id}` };
+      const plain = decryptSecret({ ciphertext: row.totp_ciphertext, nonce: row.totp_nonce }, oldKey, aad);
+      if (plain === null) {
+        throw new Error(
+          `החלפת המפתח בוטלה: סוד ה-Authenticator של איש הצוות ${row.staff_id} אינו נפתח ` +
+            'במפתח הנוכחי — שום שורה לא שונתה.',
+        );
+      }
+      const sealed = encryptSecret(plain, newKey, aad);
+      await tx.query('UPDATE platform_staff SET totp_ciphertext = $1, totp_nonce = $2 WHERE staff_id = $3', [
+        sealed.ciphertext,
+        sealed.nonce,
+        row.staff_id,
+      ]);
     }
 
     await writeKeyState(newKey, newKeyId, tx);

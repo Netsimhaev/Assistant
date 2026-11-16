@@ -11,6 +11,16 @@ import { KEY_BYTES, MasterKeyError, loadMasterKey, verifyKeyState } from '../gov
 import { encryptSecret } from '../governance/secret-cipher.js';
 import { registerBusiness, resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { RotationAuditUnrecordedError, runSecretKeyCli } from './secret-key.js';
+import { createTestOwner } from '../test/owner.js';
+import { currentStep, totpCode } from '../auth/totp.js';
+import { beginEnrolment, confirmEnrolment, verifySecondFactor } from '../dashboard/second-factor.js';
+import {
+  createHeadStaff,
+  inviteStaff,
+  staffBeginEnrolment,
+  staffConfirmEnrolment,
+  staffVerifySecondFactor,
+} from '../tenancy/staff.js';
 import type { SecretKeyCliDeps } from './secret-key.js';
 
 const OPERATOR = 'operator@example.com';
@@ -415,6 +425,63 @@ describe('runSecretKeyCli rotate', () => {
     // The database's own key state agrees with the file that now sits on
     // disk — startup's `verifyKeyState` would accept it.
     await expect(verifyKeyState(newKey, testDb())).resolves.toBeUndefined();
+  });
+
+  /**
+   * Final review C1: the owners' and technicians' Authenticator secrets are
+   * sealed with the master key too (migrations 070 and 072). A rotation that
+   * skipped them left every enrolled owner and technician on `bad_code`
+   * forever — locked out, with no recovery codes any more.
+   */
+  it('re-seals owner and staff Authenticator secrets, enrolled and pending, so codes still verify', async () => {
+    await runSecretKeyCli(['create', OPERATOR], deps());
+    const oldKey = await loadMasterKey(KEY_PATH);
+    const at = new Date('2026-11-16T10:00:00.000Z');
+    const later = new Date(at.getTime() + 120_000);
+
+    await createTestOwner(TEST_BUSINESS, { username: 'owner', password: PASSPHRASE });
+    await createTestOwner(TEST_BUSINESS, { username: 'second', password: PASSPHRASE, login: 'second@example.com' });
+    const ownerSecret = await withBusiness(TEST_BUSINESS, async (db) => {
+      const { secretBase32 } = await beginEnrolment(db, 'owner', oldKey);
+      expect(await confirmEnrolment(db, 'owner', totpCode(secretBase32, currentStep(at)), oldKey, at)).toBe('ok');
+      return secretBase32;
+    });
+    const pendingOwnerSecret = await withBusiness(TEST_BUSINESS, async (db) => (await beginEnrolment(db, 'second', oldKey)).secretBase32);
+
+    const staffId = await createHeadStaff({ login: 'head@company.example', displayName: 'ראש', password: PASSPHRASE });
+    const { secretBase32: staffSecret } = await staffBeginEnrolment(staffId, oldKey);
+    expect(await staffConfirmEnrolment(staffId, totpCode(staffSecret, currentStep(at)), oldKey, at)).toBe('ok');
+    const pendingStaffId = await inviteStaff({ login: 'tech@company.example', displayName: 'טכנאי', issuedBy: staffId }).then(
+      (r) => r.staffId,
+    );
+    const { secretBase32: pendingStaffSecret } = await staffBeginEnrolment(pendingStaffId, oldKey);
+
+    await runSecretKeyCli(['rotate', OPERATOR], deps());
+    const newKey = await loadMasterKey(KEY_PATH);
+
+    await withBusiness(TEST_BUSINESS, async (db) => {
+      expect(await verifySecondFactor(db, 'owner', totpCode(ownerSecret, currentStep(later)), newKey, later)).toBe('ok');
+      expect(
+        await confirmEnrolment(db, 'second', totpCode(pendingOwnerSecret, currentStep(later)), newKey, later),
+      ).toBe('ok');
+    });
+    expect(await staffVerifySecondFactor(staffId, totpCode(staffSecret, currentStep(later)), newKey, later)).toBe('ok');
+    expect(
+      await staffConfirmEnrolment(pendingStaffId, totpCode(pendingStaffSecret, currentStep(later)), newKey, later),
+    ).toBe('ok');
+  });
+
+  it('aborts the whole rotation when an Authenticator secret does not open, changing no row', async () => {
+    await runSecretKeyCli(['create', OPERATOR], deps());
+    const oldKey = await loadMasterKey(KEY_PATH);
+    await withBusiness(TEST_BUSINESS, (bdb) => putSecret(bdb, { ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR }, oldKey));
+    const staffId = await createHeadStaff({ login: 'head@company.example', displayName: 'ראש', password: PASSPHRASE });
+    // Sealed under some other key: rotation must refuse rather than skip it.
+    await staffBeginEnrolment(staffId, randomBytes(32));
+
+    await expect(runSecretKeyCli(['rotate', OPERATOR], deps())).rejects.toThrow(/החלפת המפתח בוטלה/);
+    expect((await loadMasterKey(KEY_PATH)).equals(oldKey)).toBe(true);
+    expect((await storedCredentials(oldKey).resolve('ONE', TEST_BUSINESS))?.value).toBe('first-secret');
   });
 
   it('refuses to rotate when the key file does not match the installation state', async () => {
