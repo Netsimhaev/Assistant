@@ -31,10 +31,10 @@
  */
 import { escapeHtml } from '../util/html.js';
 import type { Block, PdfSpec, StyleTheme } from '../domain/document-spec.js';
-import { stripBidiControls } from '../util/bidi.js';
+import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import { formatCell } from './format-value.js';
 import { SpecRenderError } from './render-error.js';
-import { ACCENT_HEX, numberClause, splitNumberRuns } from './render-shared.js';
+import { ACCENT_HEX, numberClause, splitNumberRuns, type Letterhead } from './render-shared.js';
 import { CONTRACT_DISCLAIMER_EN, CONTRACT_DISCLAIMER_HE } from './validate-spec.js';
 
 export interface PdfFonts {
@@ -53,6 +53,13 @@ export interface PdfAssets {
 
 export interface RenderHtmlOptions {
   currency: string;
+  /**
+   * The business's letterhead: a `<header>` block at the top of the body, in
+   * the page itself and not in Chromium's header template, so check 1's
+   * structural comparison sees exactly what was printed. Used only when the
+   * spec also sets `letterhead: true`.
+   */
+  letterhead?: Letterhead;
 }
 
 const FAMILY_HE = 'DocHebrew';
@@ -131,10 +138,26 @@ function tableHtml(block: Extract<Block, { type: 'table' }>, currency: string, w
   return `<table><thead><tr>${head}</tr></thead><tbody>\n${body}\n</tbody></table>`;
 }
 
+/** The letterhead block. The logo goes through `cssUrl` like every other asset: png/jpeg `data:` only. */
+function letterheadHtml(letterhead: Letterhead): string {
+  const logo = letterhead.logo;
+  const img =
+    logo === null ? '' : `<p class="lh-logo"><img src="${cssUrl(`data:${logo.mediaType};base64,${logo.bytes.toString('base64')}`)}" alt=""></p>`;
+  const address = letterhead.address === null ? '' : toOneLine(letterhead.address);
+  return (
+    `<header class="letterhead">${img}<p class="lh-name">${text(toOneLine(letterhead.name))}</p>` +
+    `${address === '' ? '' : `<p class="lh-address">${text(address)}</p>`}</header>`
+  );
+}
+
 export function renderHtml(spec: PdfSpec, assets: PdfAssets, options: RenderHtmlOptions): string {
   const rtl = spec.language === 'he';
   const accent = `#${ACCENT_HEX[spec.style.accent]}`;
   const parts: string[] = [];
+
+  if (spec.letterhead === true && options.letterhead !== undefined && toOneLine(options.letterhead.name) !== '') {
+    parts.push(letterheadHtml(options.letterhead));
+  }
 
   parts.push(`<h1 class="title">${text(spec.title)}</h1>`);
 
@@ -216,6 +239,10 @@ td, th { padding: 4pt 6pt; vertical-align: top; text-align: ${rtl ? 'right' : 'l
 th { font-weight: 700; }
 table.signatures td { border: none !important; padding-top: 24pt; }
 .page-break { page-break-after: always; break-after: page; }
+header.letterhead { text-align: center; border-bottom: 1px solid ${accent}; padding-bottom: 6pt; margin-bottom: 12pt; }
+header.letterhead img { max-height: 60px; max-width: 200px; }
+p.lh-name { font-weight: 700; font-size: 13pt; color: ${accent}; margin: 0; }
+p.lh-address { font-size: 9pt; color: #595959; margin: 0; }
 ${THEME_CSS[spec.style.theme].replaceAll('{accent}', accent)}
 `;
 

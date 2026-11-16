@@ -301,3 +301,35 @@ describe('createDbImageLoader', () => {
     await expect(withBusiness('biz-1', (db) => createDbImageLoader(db)('DOC-big'))).rejects.toMatchObject({ code: 'image_too_large' });
   });
 });
+
+describe('renderDocx letterhead', () => {
+  const letterhead = { name: 'חנות אלפא', address: 'הרצל 12, תל אביב', logo: { bytes: PNG, mediaType: 'image/png' } };
+
+  it('with letterhead: true adds word/header1.xml carrying the logo, the name and the address', async () => {
+    const buf = await renderDocx(spec({ letterhead: true }), { ...opts, letterhead });
+    const zip = await JSZip.loadAsync(buf);
+    const header = await zip.file('word/header1.xml')!.async('string');
+    expect(header).toContain('חנות אלפא');
+    expect(header).toContain('הרצל');
+    expect(header).toContain('<w:drawing');
+    expect(header).toContain('<w:bidi');
+    expect(Object.keys(zip.files).some((n) => /^word\/media\/image\d+\.png$/.test(n))).toBe(true);
+  });
+
+  it('without the flag there is no header part, even when the data is given', async () => {
+    const zip = await JSZip.loadAsync(await renderDocx(spec(), { ...opts, letterhead }));
+    expect(Object.keys(zip.files).some((n) => /^word\/header\d+\.xml$/.test(n))).toBe(false);
+  });
+
+  it('with the flag but no data there is no header part', async () => {
+    const zip = await JSZip.loadAsync(await renderDocx(spec({ letterhead: true }), opts));
+    expect(Object.keys(zip.files).some((n) => /^word\/header\d+\.xml$/.test(n))).toBe(false);
+  });
+
+  it('without a logo the header carries the name and no drawing', async () => {
+    const buf = await renderDocx(spec({ letterhead: true }), { ...opts, letterhead: { ...letterhead, logo: null, address: null } });
+    const header = await xml(buf, 'word/header1.xml');
+    expect(header).toContain('חנות אלפא');
+    expect(header).not.toContain('<w:drawing');
+  });
+});

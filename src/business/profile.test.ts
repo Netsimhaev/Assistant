@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { LOGO_MAX_BYTES } from './logo.js';
-import { loadProfile, readLogo, saveAddress, saveLogo } from './profile.js';
+import { loadProfile, profileFragment, readLogo, saveAddress, saveLogo } from './profile.js';
 
 const TECH = 'staff-1';
 
@@ -141,5 +141,42 @@ describe('business profile', () => {
       const logo = await withBusiness(TEST_BUSINESS, (db) => readLogo(db, ROOT));
       expect(logo, `round ${round}`).not.toBeNull();
     }
+  });
+  describe('profileFragment', () => {
+    it('is {} when the business has no name on its profile', async () => {
+      expect(await withBusiness(TEST_BUSINESS, (db) => profileFragment(db))).toEqual({});
+    });
+
+    it('carries the name and the address from the business’s own profile row', async () => {
+      await testDb().query(
+        `INSERT INTO business_profiles (business_id, display_name, updated_by) VALUES ($1, 'חנות אלפא', 'test')`,
+        [TEST_BUSINESS],
+      );
+      expect(await withBusiness(TEST_BUSINESS, (db) => profileFragment(db))).toEqual({
+        businessProfile: { name: 'חנות אלפא', address: null },
+      });
+      await withBusiness(TEST_BUSINESS, (db) => saveAddress(db, 'הרצל 2', TECH));
+      expect(await withBusiness(TEST_BUSINESS, (db) => profileFragment(db))).toEqual({
+        businessProfile: { name: 'חנות אלפא', address: 'הרצל 2' },
+      });
+    });
+
+    it('never reads another business’s profile', async () => {
+      await testDb().query(
+        `INSERT INTO business_profiles (business_id, display_name, address, updated_by) VALUES ('other-biz', 'בטא', 'רחוב 1', 'test')`,
+      );
+      expect(await withBusiness(TEST_BUSINESS, (db) => profileFragment(db))).toEqual({});
+    });
+
+    it('swallows a failed read and returns {} — a missing profile only narrows what the model knows', async () => {
+      const broken = {
+        businessId: TEST_BUSINESS,
+        inTransaction: false,
+        query: async () => {
+          throw new Error('boom');
+        },
+      } as unknown as Parameters<typeof profileFragment>[0];
+      expect(await profileFragment(broken)).toEqual({});
+    });
   });
 });

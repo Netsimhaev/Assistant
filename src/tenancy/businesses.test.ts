@@ -27,6 +27,25 @@ describe('businesses registry', () => {
     expect(await listActiveBusinesses()).toEqual(['alpha-shop']);
   });
 
+  it('copies the display name onto the business’s own profile row, where a business connection can read it', async () => {
+    await createBusiness('alpha-shop', 'חנות אלפא');
+    const { rows } = await testDb().query<{ display_name: string }>(
+      'SELECT display_name FROM business_profiles WHERE business_id = $1',
+      ['alpha-shop'],
+    );
+    expect(rows).toEqual([{ display_name: 'חנות אלפא' }]);
+  });
+
+  it('a refused duplicate does not overwrite the profile name', async () => {
+    await createBusiness('alpha-shop', 'חנות אלפא');
+    await expect(createBusiness('alpha-shop', 'שם אחר')).rejects.toBeInstanceOf(TenancyError);
+    const { rows } = await testDb().query<{ display_name: string }>(
+      'SELECT display_name FROM business_profiles WHERE business_id = $1',
+      ['alpha-shop'],
+    );
+    expect(rows).toEqual([{ display_name: 'חנות אלפא' }]);
+  });
+
   it('refuses a malformed id before writing', async () => {
     for (const bad of ['Bad_ID', 'ab', 'a'.repeat(64), '__proto__']) {
       await expect(createBusiness(bad, 'שם')).rejects.toBeInstanceOf(TenancyError);

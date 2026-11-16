@@ -18,6 +18,7 @@ import { ledgerFamilyLabel } from '../domain/labels.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { stripBidiControls } from '../util/bidi.js';
 import { renderDescriptionSection } from '../business/description-prompt.js';
+import { renderProfileSection, type ProfileForPrompt } from '../business/profile-prompt.js';
 import { buildFence, stripFenceMarkers } from '../util/fence.js';
 import { interpretDraft, MAIL_DRAFTER_MODEL, type DraftOutcome } from './mail-drafter.js';
 
@@ -32,6 +33,8 @@ export interface NudgeDraftRequest {
   nudgeNumber: number;
   /** The owner's business description (background only); omit when absent. */
   businessDescription?: string;
+  /** The business's own name and address, for official text; omit when absent. */
+  businessProfile?: ProfileForPrompt;
 }
 export type NudgeDrafter = (request: NudgeDraftRequest) => Promise<DraftOutcome>;
 
@@ -82,6 +85,11 @@ function descriptionBlock(d: string | undefined): string[] {
   return s === '' ? [] : ['', s];
 }
 
+function profileBlock(p: ProfileForPrompt | undefined): string[] {
+  const s = renderProfileSection(p);
+  return s === '' ? [] : ['', s];
+}
+
 export function buildNudgeDraftCall(
   request: NudgeDraftRequest,
   nonce: string = randomBytes(16).toString('hex'),
@@ -92,6 +100,7 @@ export function buildNudgeDraftCall(
       systemPrompt: [
         request.bundle.promptFragments['comms.email'],
         ...descriptionBlock(request.businessDescription),
+        ...profileBlock(request.businessProfile),
         '',
         buildContract(nonce),
       ].join('\n'),

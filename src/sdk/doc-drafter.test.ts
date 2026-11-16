@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DESCRIPTION_HEADING } from '../business/description-prompt.js';
+import { PROFILE_HEADING } from '../business/profile-prompt.js';
 import type { DocumentSpec } from '../domain/document-spec.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { FORMULA_FUNCTIONS } from '../production/formula.js';
@@ -312,5 +313,21 @@ describe('business description in the system prompt', () => {
     expect(withDesc).toContain(DESCRIPTION_HEADING);
     expect(withDesc).toContain('מספרה בחיפה');
     expect(String(buildDraftCall(request(), 'n').options.systemPrompt)).not.toContain(DESCRIPTION_HEADING);
+  });
+});
+
+describe('business profile and letterhead in the doc drafter', () => {
+  it('carries the profile right after the description, and nothing without it', () => {
+    const sys = String(
+      buildDraftCall(request({ businessDescription: 'מספרה בחיפה', businessProfile: { name: 'חנות אלפא', address: 'הרצל 12' } }), 'n').options.systemPrompt,
+    );
+    expect(sys).toContain(PROFILE_HEADING);
+    expect(sys.indexOf(DESCRIPTION_HEADING)).toBeLessThan(sys.indexOf(PROFILE_HEADING));
+    expect(String(buildDraftCall(request(), 'n').options.systemPrompt)).not.toContain(PROFILE_HEADING);
+  });
+
+  it('tells the drafter to set letterhead: true for formal letters, quotes and contracts', () => {
+    const sys = String(buildDraftCall(request(), 'n').options.systemPrompt);
+    expect(sys).toContain('"letterhead": true');
   });
 });

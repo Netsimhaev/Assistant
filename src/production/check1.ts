@@ -189,6 +189,14 @@ interface Check1Common {
   today: string;
   /** The charter currency the renderer formatted money with; table rows are compared as displayed. Required. */
   currency: string;
+  /**
+   * The letterhead the renderer drew, when the spec sets `letterhead: true`:
+   * the business's own name and address, not spec content, so they are
+   * blanked before grounding (a street number is in no source). Omitted
+   * otherwise; a letterhead on the page that is not named here grounds like
+   * any other text and fails.
+   */
+  letterhead?: { name: string; address: string | null };
 }
 
 /**
@@ -224,6 +232,13 @@ type ZipFormat = 'docx' | 'xlsx' | 'pptx';
 const EMBEDDED_CHART_WORKBOOK = /^ppt\/embeddings\/Microsoft_Excel_Worksheet\d+\.xlsx$/;
 
 const exact = (names: string[]): RegExp[] => names.map((n) => new RegExp(`^${n.replace(/[.[\]]/g, '\\$&')}$`));
+
+/**
+ * The page header `render-docx.ts` draws for a letterhead. Allowed ONLY when
+ * the spec sets `letterhead: true` (`loadZip`): a header part in a document
+ * that asked for none is content nobody planned, and stays `unsafe_part`.
+ */
+const DOCX_LETTERHEAD_PARTS: readonly RegExp[] = exact(['word/header1.xml', 'word/_rels/header1.xml.rels']);
 
 /**
  * Every part our renderers emit, per format — listed from real outputs of
@@ -415,7 +430,7 @@ async function checkZipParts(zip: JSZip, allow: readonly RegExp[], label: string
   else if (UNSAFE_CONTENT_TYPE.test(types)) f.add('unsafe_part', `part ${label}[Content_Types].xml`);
 }
 
-async function loadZip(bytes: Buffer, format: ZipFormat, f: Findings): Promise<JSZip | null> {
+async function loadZip(bytes: Buffer, format: ZipFormat, f: Findings, letterhead = false): Promise<JSZip | null> {
   if (!(await guardArchive(bytes, '', f))) return null;
   let zip: JSZip;
   try {
@@ -424,7 +439,8 @@ async function loadZip(bytes: Buffer, format: ZipFormat, f: Findings): Promise<J
     f.add('file_unreadable', 'archive');
     return null;
   }
-  await checkZipParts(zip, PART_ALLOWLIST[format], '', f);
+  const allow = format === 'docx' && letterhead ? [...PART_ALLOWLIST.docx, ...DOCX_LETTERHEAD_PARTS] : PART_ALLOWLIST[format];
+  await checkZipParts(zip, allow, '', f);
   return zip;
 }
 
@@ -736,7 +752,7 @@ function checkContract(spec: DocumentSpec, body: string, footerHasDisclaimer: bo
 }
 
 async function checkDocx(input: Check1Input, f: Findings, own: OwnText[]): Promise<string | null> {
-  const zip = await loadZip(input.bytes, 'docx', f);
+  const zip = await loadZip(input.bytes, 'docx', f, input.spec.letterhead === true);
   if (zip === null) return null;
   await docPropsText(zip, own);
   const rtl = input.spec.language === 'he';
@@ -1269,6 +1285,23 @@ function blankStructure(text: string, s: Structure): string {
     .join('\n');
 }
 
+/**
+ * The letterhead's own name and address, removed wherever they appear whole —
+ * after `blankStructure`, so both sides are whitespace-collapsed lines. Only
+ * the exact strings the renderer drew: a digit beside them still grounds.
+ */
+function blankLetterhead(text: string, letterhead: readonly string[]): string {
+  if (letterhead.length === 0) return text;
+  return text
+    .split('\n')
+    .map((line) => {
+      let out = line;
+      for (const t of letterhead) out = out.split(t).join(' ');
+      return out;
+    })
+    .join('\n');
+}
+
 // ---------------------------------------------------------------- entry
 
 export async function runCheck1(input: Check1Input): Promise<Check1Result> {
@@ -1310,8 +1343,14 @@ export async function runCheck1(input: Check1Input): Promise<Check1Result> {
 
   const structure = structureOf(spec, rendered.pageCount);
   const grounder = createTextGrounder(spec, sources, { today });
+  const letterheadTexts =
+    spec.letterhead === true && (spec.format === 'docx' || spec.format === 'pdf') && input.letterhead !== undefined
+      ? [input.letterhead.name, input.letterhead.address ?? ''].map(normalise).filter((t) => t !== '')
+      : [];
   const ground = (label: string, text: string) => {
-    for (const missing of grounder(blankStructure(text, structure))) f.add('ungrounded_number', `${label}: ${safeWhere(missing)}`);
+    for (const missing of grounder(blankLetterhead(blankStructure(text, structure), letterheadTexts))) {
+      f.add('ungrounded_number', `${label}: ${safeWhere(missing)}`);
+    }
   };
   // The file's own text — including what is never printed (notes, metadata, chart data) — is grounded too.
   for (const o of own) ground(o.part, o.text);

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DESCRIPTION_HEADING } from '../business/description-prompt.js';
+import { PROFILE_HEADING } from '../business/profile-prompt.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { buildFence } from '../util/fence.js';
 import { buildDraftCall, interpretDraft, renderDraftPrompt, runMailDrafter } from './mail-drafter.js';
@@ -49,5 +50,17 @@ describe('business description in the system prompt', () => {
     expect(withDesc).toContain(DESCRIPTION_HEADING);
     expect(withDesc).toContain('מספרה בחיפה');
     expect(String(buildDraftCall(req, 'n').options.systemPrompt)).not.toContain(DESCRIPTION_HEADING);
+  });
+});
+
+describe('business profile in the system prompt', () => {
+  it('carries the profile right after the description, and nothing without it', () => {
+    const sys = String(
+      buildDraftCall({ ...req, businessDescription: 'מספרה בחיפה', businessProfile: { name: 'חנות אלפא', address: 'הרצל 12' } }, 'n').options.systemPrompt,
+    );
+    expect(sys).toContain(PROFILE_HEADING);
+    expect(sys).toContain('הרצל 12');
+    expect(sys.indexOf(DESCRIPTION_HEADING)).toBeLessThan(sys.indexOf(PROFILE_HEADING));
+    expect(String(buildDraftCall(req, 'n').options.systemPrompt)).not.toContain(PROFILE_HEADING);
   });
 });

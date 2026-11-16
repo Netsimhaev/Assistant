@@ -21,6 +21,7 @@ import {
   BorderStyle,
   Document,
   Footer,
+  Header,
   HeadingLevel,
   ImageRun,
   Packer,
@@ -38,7 +39,8 @@ import type { BusinessDb } from '../db/pool.js';
 import type { Block, DocxSpec } from '../domain/document-spec.js';
 import { formatCell } from './format-value.js';
 import { SpecRenderError } from './render-error.js';
-import { ACCENT_HEX, checkImage, numberClause, splitNumberRuns, type ImageLoader } from './render-shared.js';
+import { ACCENT_HEX, checkImage, imageSize, numberClause, splitNumberRuns, type ImageLoader, type Letterhead } from './render-shared.js';
+import { toOneLine } from '../util/bidi.js';
 import { CONTRACT_DISCLAIMER_EN, CONTRACT_DISCLAIMER_HE } from './validate-spec.js';
 
 export type { ImageLoader };
@@ -46,6 +48,12 @@ export type { ImageLoader };
 export interface RenderDocxOptions {
   currency: string;
   images: ImageLoader;
+  /**
+   * The business's letterhead. Drawn in a page header (`word/header1.xml`)
+   * only when the spec also sets `letterhead: true`; check 1 allows that part
+   * only under the same flag.
+   */
+  letterhead?: Letterhead;
 }
 
 const FONT = 'Arial';
@@ -61,6 +69,10 @@ const HEADING_LEVEL = {
 } as const;
 
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+
+/** The letterhead logo's box: at most this tall and this wide, aspect kept. */
+const LOGO_MAX_HEIGHT_PX = 60;
+const LOGO_MAX_WIDTH_PX = 200;
 
 interface Ctx {
   rtl: boolean;
@@ -165,6 +177,42 @@ function signatureTable(ctx: Ctx): Table {
   });
 }
 
+/**
+ * The letterhead header: logo (when there is one and its size reads),
+ * business name, address. Name and address are folded to one line with bidi
+ * controls stripped — check 1 treats any control in the file as a finding.
+ */
+function letterheadHeader(letterhead: Letterhead, ctx: Ctx): Header {
+  const children: Paragraph[] = [];
+  const logo = letterhead.logo;
+  const size = logo !== null && (logo.mediaType === 'image/png' || logo.mediaType === 'image/jpeg')
+    ? imageSize(logo.bytes, logo.mediaType)
+    : null;
+  if (logo !== null && size !== null && size.width > 0 && size.height > 0) {
+    const scale = Math.min(1, LOGO_MAX_HEIGHT_PX / size.height, LOGO_MAX_WIDTH_PX / size.width);
+    children.push(
+      para(
+        [
+          new ImageRun({
+            type: logo.mediaType === 'image/png' ? 'png' : 'jpg',
+            data: logo.bytes,
+            transformation: {
+              width: Math.max(1, Math.round(size.width * scale)),
+              height: Math.max(1, Math.round(size.height * scale)),
+            },
+          }),
+        ],
+        ctx,
+        { center: true, spacingAfter: 60 },
+      ),
+    );
+  }
+  children.push(para(textRuns(toOneLine(letterhead.name), ctx, { bold: true, size: 26, color: ctx.accent }), ctx, { center: true, spacingAfter: 40 }));
+  const address = letterhead.address === null ? '' : toOneLine(letterhead.address);
+  if (address !== '') children.push(para(textRuns(address, ctx, { size: 18, color: '595959' }), ctx, { center: true, spacingAfter: 120 }));
+  return new Header({ children });
+}
+
 export async function renderDocx(spec: DocxSpec, options: RenderDocxOptions): Promise<Buffer> {
   const ctx: Ctx = {
     rtl: spec.language === 'he',
@@ -250,6 +298,9 @@ export async function renderDocx(spec: DocxSpec, options: RenderDocxOptions): Pr
     sections: [
       {
         properties: { page: { margin: { top: 1134, bottom: 1134, left: 1134, right: 1134 } } },
+        ...(spec.letterhead === true && options.letterhead !== undefined && toOneLine(options.letterhead.name) !== ''
+          ? { headers: { default: letterheadHeader(options.letterhead, ctx) } }
+          : {}),
         ...(isContract
           ? {
               footers: {

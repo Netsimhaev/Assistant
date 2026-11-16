@@ -48,7 +48,7 @@
  *
  * **A pdf's HTML is re-derived, not persisted** (controller ruling, T9
  * carry): `renderHtml` is deterministic given the spec and the assets, and
- * `renderPdfWithHtml` prints exactly `renderHtml(spec, assets, {currency})`.
+ * `renderPdfWithHtml` prints exactly `renderHtml(spec, assets, {currency, letterhead})`.
  * Check 1 calls the same function on the stored spec with assets loaded the
  * same way. Persisting it was rejected: the HTML carries every font and image
  * as a `data:` URL (megabytes per version). The cost: a font file or image
@@ -96,6 +96,7 @@ import { dirname, join } from 'node:path';
 import { loadActiveCharter, type ActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import { descriptionFragment } from '../business/description-store.js';
+import { profileFragment, readLogo } from '../business/profile.js';
 import type { BusinessDb } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { renderArtifactFull } from '../documents/brief.js';
@@ -118,7 +119,7 @@ import { PRODUCTION_TOOLS_MISSING_REASON, renderErrorReason, RENDER_ERROR_HE } f
 import { renderHtml, type PdfAssets } from './render-html.js';
 import { loadPdfAssets, renderPdfWithHtml, type PdfPrinter } from './render-pdf.js';
 import { renderPptx } from './render-pptx.js';
-import type { ImageLoader } from './render-shared.js';
+import type { ImageLoader, Letterhead } from './render-shared.js';
 import { renderXlsx } from './render-xlsx.js';
 import {
   advanceStage,
@@ -456,6 +457,7 @@ async function stepDrafting(ctx: Ctx, p: Production): Promise<StepOutcome> {
   const sources = await loadSources(p, p.work.memoryIds ?? [], ctx.db);
   const today = ctx.today();
   const descriptionFrag = await descriptionFragment(ctx.db);
+  const profileFrag = await profileFragment(ctx.db);
   const previousSpec = p.work.previous === null ? null : DocumentSpec.safeParse(p.work.previous.spec);
   let outcome: Awaited<ReturnType<Drafter>>;
   try {
@@ -474,6 +476,7 @@ async function stepDrafting(ctx: Ctx, p: Production): Promise<StepOutcome> {
             ? { previous: { spec: previousSpec.data, findings: p.work.previous.findings } }
             : {}),
           ...descriptionFrag,
+          ...profileFrag,
         },
         signal,
       ),
@@ -491,6 +494,32 @@ async function stepDrafting(ctx: Ctx, p: Production): Promise<StepOutcome> {
   return move(ctx, p, 'building', { work: { ...p.work, draft: spec }, findings: [] });
 }
 
+/**
+ * The letterhead for a Word or PDF spec that sets `letterhead: true`: the
+ * business's own name and address (`profileFragment`) and logo (`readLogo`,
+ * re-hashed on read). `undefined` when the spec asks for none, the format
+ * has none, or the profile has no name — the document is then built without
+ * one, which check 1 accepts (a header part is allowed under the flag, never
+ * required). A logo that cannot be read leaves the name and address.
+ *
+ * Read again at check 1, not stored: a profile edited between build and
+ * check makes check 1 blank the new text while the pages carry the old — a
+ * fix round, never a pass of a wrong file (the same trade as the re-derived
+ * pdf HTML above).
+ */
+async function letterheadFor(ctx: Ctx, spec: DocumentSpec): Promise<Letterhead | undefined> {
+  if (spec.letterhead !== true || (spec.format !== 'docx' && spec.format !== 'pdf')) return undefined;
+  const { businessProfile } = await profileFragment(ctx.db);
+  if (businessProfile === undefined) return undefined;
+  let logo: Letterhead['logo'] = null;
+  try {
+    logo = await readLogo(ctx.db, ctx.documentRoot);
+  } catch (err) {
+    console.error(`letterhead logo read failed: ${err instanceof Error ? err.message : 'unknown error'}`);
+  }
+  return { name: businessProfile.name, address: businessProfile.address, logo };
+}
+
 function relativeFilePath(p: Production, versionId: string, ext: string): string {
   return join('produced', p.businessId, p.productionId, `${versionId}.${ext}`);
 }
@@ -503,6 +532,8 @@ async function stepBuilding(ctx: Ctx, p: Production): Promise<StepOutcome> {
   const parsed = DocumentSpec.safeParse(p.work.draft);
   if (!parsed.success) throw new InvariantBroken(`production ${p.productionId} is in building with no stored draft`);
   const spec = parsed.data;
+  const letterhead = await letterheadFor(ctx, spec);
+  const withLetterhead = letterhead === undefined ? {} : { letterhead };
   let bytes: Buffer;
   try {
     bytes = await timed('render', ctx.deadlines.render, async () => {
@@ -510,12 +541,12 @@ async function stepBuilding(ctx: Ctx, p: Production): Promise<StepOutcome> {
         case 'xlsx':
           return renderXlsx(spec, { currency: ctx.currency });
         case 'docx':
-          return renderDocx(spec, { currency: ctx.currency, images: ctx.images });
+          return renderDocx(spec, { currency: ctx.currency, images: ctx.images, ...withLetterhead });
         case 'pptx':
           return (await renderPptx(spec, { currency: ctx.currency, images: ctx.images })).buffer;
         case 'pdf': {
           const assets = await ctx.pdfAssets(spec);
-          return (await renderPdfWithHtml(spec, { printer: ctx.printer, assets, currency: ctx.currency })).pdf;
+          return (await renderPdfWithHtml(spec, { printer: ctx.printer, assets, currency: ctx.currency, ...withLetterhead })).pdf;
         }
       }
     });
@@ -615,13 +646,18 @@ async function stepCheck1(ctx: Ctx, p: Production): Promise<StepOutcome> {
   if ('failed' in pages) return fail(ctx, p, pages.failed);
   const rendered = { text: pages.text, pageCount: pages.pageCount, textTruncated: pages.textTruncated };
 
+  const letterhead = await letterheadFor(ctx, spec);
+  const checkLetterhead = letterhead === undefined ? {} : { letterhead: { name: letterhead.name, address: letterhead.address } };
   let result: Check1Result;
   if (spec.format === 'pdf') {
     // Re-derived: the same `renderHtml` call `renderPdfWithHtml` printed.
-    const html = renderHtml(spec, await ctx.pdfAssets(spec), { currency: ctx.currency });
-    result = await ctx.check1({ spec, bytes, sources: sources.grounding, rendered, today, currency: ctx.currency, html });
+    const html = renderHtml(spec, await ctx.pdfAssets(spec), {
+      currency: ctx.currency,
+      ...(letterhead === undefined ? {} : { letterhead }),
+    });
+    result = await ctx.check1({ spec, bytes, sources: sources.grounding, rendered, today, currency: ctx.currency, html, ...checkLetterhead });
   } else {
-    result = await ctx.check1({ spec, bytes, sources: sources.grounding, rendered, today, currency: ctx.currency });
+    result = await ctx.check1({ spec, bytes, sources: sources.grounding, rendered, today, currency: ctx.currency, ...checkLetterhead });
   }
   await saveVersionCheck(
     ctx.db,

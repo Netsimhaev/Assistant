@@ -910,3 +910,74 @@ describe('runCheck1', () => {
     });
   });
 });
+
+describe('letterhead', () => {
+  const PNG = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+    'base64',
+  );
+  // An address with digits no source carries: the letterhead is the business's own data, not spec content.
+  const letterhead = { name: 'חנות אלפא 2000', address: 'הרצל 77, תל אביב', logo: { bytes: PNG, mediaType: 'image/png' } };
+  const headerText = `${letterhead.name}\n${letterhead.address}`;
+  const letterDocx: DocxSpec = { ...contractDocx, letterhead: true };
+
+  it('a docx with letterhead: true and its header part passes', async () => {
+    const bytes = await renderDocx(letterDocx, { currency: 'ILS', images: noImages, letterhead });
+    const r = await runCheck1({
+      spec: letterDocx,
+      bytes,
+      sources,
+      rendered: rendered(`${headerText}\n${await docxText(bytes)}`),
+      today: TODAY,
+      currency: 'ILS',
+      letterhead: { name: letterhead.name, address: letterhead.address },
+    });
+    expect(r.findings).toEqual([]);
+  });
+
+  it('a header part injected into a docx without the flag → unsafe_part', async () => {
+    const withHeader = await renderDocx(letterDocx, { currency: 'ILS', images: noImages, letterhead });
+    const plain = await renderDocx(contractDocx, { currency: 'ILS', images: noImages });
+    const r = await runCheck1({
+      spec: contractDocx,
+      bytes: withHeader,
+      sources,
+      rendered: rendered(await docxText(plain)),
+      today: TODAY,
+      currency: 'ILS',
+    });
+    expect(r.findings).toContainEqual({ code: 'unsafe_part', where: 'part word/header1.xml', he: CHECK1_HE.unsafe_part });
+  });
+
+  it('letterhead digits on the page without the letterhead given to check 1 → ungrounded_number', async () => {
+    const bytes = await renderDocx(letterDocx, { currency: 'ILS', images: noImages, letterhead });
+    const r = await runCheck1({
+      spec: letterDocx,
+      bytes,
+      sources,
+      rendered: rendered(`${headerText}\n${await docxText(bytes)}`),
+      today: TODAY,
+      currency: 'ILS',
+    });
+    expect(codes(r)).toContain('ungrounded_number');
+  });
+
+  it('a pdf with letterhead: true passes, the header block in the printed HTML', async () => {
+    const pdfSpec: PdfSpec = { ...contractPdf, letterhead: true };
+    const html = renderHtml(pdfSpec, assets, { currency: 'ILS', letterhead });
+    expect(html).toContain('<header');
+    const footer = htmlText(`<body>${renderFooterTemplate(pdfSpec, assets)}</body>`).replace(/\s*\/\s*$/, ' 1 / 1');
+    const body = htmlText(html).replace(/\n\s*\n/g, '\n').trim();
+    const r = await runCheck1({
+      spec: pdfSpec,
+      html,
+      bytes: FIXTURE_PDF,
+      sources,
+      rendered: rendered(`${body}\n${footer.trim()}`),
+      today: TODAY,
+      currency: 'ILS',
+      letterhead: { name: letterhead.name, address: letterhead.address },
+    });
+    expect(r.findings).toEqual([]);
+  });
+});

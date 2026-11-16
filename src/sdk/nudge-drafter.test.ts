@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DESCRIPTION_HEADING } from '../business/description-prompt.js';
+import { PROFILE_HEADING } from '../business/profile-prompt.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { buildNudgeDraftCall, type NudgeDraftRequest } from './nudge-drafter.js';
 
@@ -20,5 +21,17 @@ describe('nudge drafter prompt', () => {
     expect(withDesc).toContain(DESCRIPTION_HEADING);
     expect(withDesc).toContain('מספרה בחיפה');
     expect(String(buildNudgeDraftCall(req, 'n').options.systemPrompt)).not.toContain(DESCRIPTION_HEADING);
+  });
+});
+
+describe('business profile in the nudge system prompt', () => {
+  it('carries the profile right after the description, and nothing without it', () => {
+    const sys = String(
+      buildNudgeDraftCall({ ...req, businessDescription: 'מספרה בחיפה', businessProfile: { name: 'חנות אלפא', address: 'הרצל 12' } }, 'n').options.systemPrompt,
+    );
+    expect(sys).toContain(PROFILE_HEADING);
+    expect(sys).toContain('חנות אלפא');
+    expect(sys.indexOf(DESCRIPTION_HEADING)).toBeLessThan(sys.indexOf(PROFILE_HEADING));
+    expect(String(buildNudgeDraftCall(req, 'n').options.systemPrompt)).not.toContain(PROFILE_HEADING);
   });
 });

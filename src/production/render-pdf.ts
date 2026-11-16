@@ -21,7 +21,7 @@ import { config } from '../config.js';
 import type { PdfSpec } from '../domain/document-spec.js';
 import { renderFooterTemplate, renderHtml, type PdfAssets, type PdfFonts } from './render-html.js';
 import { SpecRenderError } from './render-error.js';
-import { checkImage, type ImageLoader } from './render-shared.js';
+import { checkImage, type ImageLoader, type Letterhead } from './render-shared.js';
 
 export interface PrintOptions {
   /** Static footer markup (page numbers, contract disclaimer); see `renderFooterTemplate`. */
@@ -104,6 +104,8 @@ export interface RenderPdfDeps {
   printer: PdfPrinter;
   assets: PdfAssets;
   currency: string;
+  /** Printed only when the spec sets `letterhead: true` (`renderHtml`). */
+  letterhead?: Letterhead;
 }
 
 export async function renderPdf(spec: PdfSpec, deps: RenderPdfDeps): Promise<Buffer> {
@@ -116,7 +118,10 @@ export async function renderPdf(spec: PdfSpec, deps: RenderPdfDeps): Promise<Buf
  * order, where text read back from the pages is in visual order.
  */
 export async function renderPdfWithHtml(spec: PdfSpec, deps: RenderPdfDeps): Promise<{ pdf: Buffer; html: string }> {
-  const html = renderHtml(spec, deps.assets, { currency: deps.currency });
+  const html = renderHtml(spec, deps.assets, {
+    currency: deps.currency,
+    ...(deps.letterhead !== undefined ? { letterhead: deps.letterhead } : {}),
+  });
   const bytes = Buffer.byteLength(html, 'utf8');
   if (bytes > MAX_PDF_HTML_BYTES) throw new SpecRenderError('pdf_too_large', `html ${bytes} bytes`);
   const footerTemplate = renderFooterTemplate(spec, deps.assets);

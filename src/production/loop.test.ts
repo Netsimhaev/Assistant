@@ -644,3 +644,64 @@ describe('business description', () => {
     expect('businessDescription' in drafter.calls[0]!).toBe(false);
   });
 });
+
+describe('letterhead', () => {
+  async function seedProfile(): Promise<void> {
+    await testDb().query(
+      `INSERT INTO business_profiles (business_id, display_name, address, updated_by) VALUES ($1, 'חנות אלפא', 'הרצל 77, תל אביב', 'test')`,
+      [B],
+    );
+  }
+
+  it('the drafter sees the profile, and a docx with letterhead: true is built with the header and passes check 1', async () => {
+    await seedProfile();
+    const { id } = await produce();
+    const drafter = drafterOf([{ ...letter(), letterhead: true }]);
+    const result = await run({ drafter: drafter.fn }).promise;
+    expect(result).toMatchObject({ ready: 1, errored: [] });
+    expect(drafter.calls[0]!.businessProfile).toEqual({ name: 'חנות אלפא', address: 'הרצל 77, תל אביב' });
+    const version = await withBusiness(B, (db) => latestVersion(db, id));
+    expect(version!.check1).toMatchObject({ passed: true, findings: [] });
+    const JSZip = (await import('jszip')).default;
+    const zip = await JSZip.loadAsync(await readFile(join(root, version!.storedPath)));
+    const header = await zip.file('word/header1.xml')!.async('string');
+    expect(header).toContain('חנות אלפא');
+    expect(header).toContain('77');
+  });
+
+  it('a pdf with letterhead: true prints the header block, and check 1 is told the letterhead', async () => {
+    await seedProfile();
+    await produce({ format: 'pdf' });
+    const FONT = 'data:font/ttf;base64,AAEAAA==';
+    const assets: PdfAssets = {
+      fonts: { hebrewRegular: FONT, hebrewBold: FONT, latinRegular: FONT, latinBold: FONT },
+      images: new Map(),
+    };
+    const printed: string[] = [];
+    const printer: PdfPrinter = async (html) => {
+      printed.push(html);
+      return Buffer.from('%PDF-1.4\n%%EOF\n', 'latin1');
+    };
+    const seen: Check1Input[] = [];
+    const check1 = async (input: Check1Input) => {
+      seen.push(input);
+      return { passed: true, findings: [] };
+    };
+    const drafter = drafterOf([{ ...letter(), format: 'pdf', letterhead: true } as PdfSpec]);
+    await run({ drafter: drafter.fn, printer, pdfAssets: async () => assets, check1 }).promise;
+    expect(printed[0]).toContain('<header class="letterhead">');
+    expect(printed[0]).toContain('הרצל');
+    expect(seen[0]!.html).toBe(printed[0]);
+    expect(seen[0]!.letterhead).toEqual({ name: 'חנות אלפא', address: 'הרצל 77, תל אביב' });
+  });
+
+  it('without letterhead in the spec there is no header, even with a profile', async () => {
+    await seedProfile();
+    const { id } = await produce();
+    await run({ drafter: drafterOf([letter()]).fn }).promise;
+    const version = await withBusiness(B, (db) => latestVersion(db, id));
+    const JSZip = (await import('jszip')).default;
+    const zip = await JSZip.loadAsync(await readFile(join(root, version!.storedPath)));
+    expect(zip.file('word/header1.xml')).toBeNull();
+  });
+});

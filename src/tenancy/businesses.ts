@@ -72,12 +72,23 @@ export async function createBusiness(id: string, displayName: string): Promise<v
     throw new TenancyError('שם העסק חייב להכיל בין 1 ל-120 תווים');
   }
   await withPlatform(async (db) => {
-    const { rowCount } = await db.query(
-      `INSERT INTO businesses (business_id, display_name) VALUES ($1, $2)
-       ON CONFLICT (business_id) DO NOTHING`,
+    // One statement, so the registry row and the profile copy of the name
+    // (migration 075 — what a business connection reads for its letterhead
+    // and official messages) are written together or not at all. A refused
+    // duplicate inserts nothing in `b`, so the existing profile is untouched.
+    const { rows } = await db.query<{ business_id: string }>(
+      `WITH b AS (
+         INSERT INTO businesses (business_id, display_name) VALUES ($1, $2)
+         ON CONFLICT (business_id) DO NOTHING
+         RETURNING business_id
+       )
+       INSERT INTO business_profiles (business_id, display_name, updated_by)
+       SELECT business_id, $2, 'platform' FROM b
+       ON CONFLICT (business_id) DO UPDATE SET display_name = EXCLUDED.display_name
+       RETURNING business_id`,
       [id, name],
     );
-    if (rowCount === 0) throw new BusinessExistsError(`העסק ${id} כבר קיים`);
+    if (rows.length === 0) throw new BusinessExistsError(`העסק ${id} כבר קיים`);
   });
   // The business's save folder on the server (spec §5.8). `saveDocumentSettings`
   // accepts a base folder only inside it, so a business without it could

@@ -10,6 +10,7 @@ import { config } from '../config.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { stripBidiControls } from '../util/bidi.js';
 import { renderDescriptionSection } from '../business/description-prompt.js';
+import { renderProfileSection, type ProfileForPrompt } from '../business/profile-prompt.js';
 import { buildFence, stripFenceMarkers } from '../util/fence.js';
 
 export const MAIL_DRAFTER_MODEL = 'sonnet';
@@ -23,6 +24,8 @@ export interface DraftRequest {
   subject: string;
   /** The owner's business description (background only); omit when absent. */
   businessDescription?: string;
+  /** The business's own name and address, for official text; omit when absent. */
+  businessProfile?: ProfileForPrompt;
 }
 export type Drafter = (request: DraftRequest) => Promise<DraftOutcome>;
 
@@ -66,6 +69,11 @@ function descriptionBlock(d: string | undefined): string[] {
   return s === '' ? [] : ['', s];
 }
 
+function profileBlock(p: ProfileForPrompt | undefined): string[] {
+  const s = renderProfileSection(p);
+  return s === '' ? [] : ['', s];
+}
+
 export function buildDraftCall(
   request: DraftRequest,
   nonce: string = randomBytes(16).toString('hex'),
@@ -76,6 +84,7 @@ export function buildDraftCall(
       systemPrompt: [
         request.bundle.promptFragments['comms.email'],
         ...descriptionBlock(request.businessDescription),
+        ...profileBlock(request.businessProfile),
         '',
         buildContract(nonce),
       ].join('\n'),

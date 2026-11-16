@@ -42,6 +42,17 @@ export function numberClause(n: number, title: string, text: string): NumberedCl
   };
 }
 
+/**
+ * The business's letterhead for a Word or PDF document whose spec sets
+ * `letterhead: true`. Filled by the production loop from the business's own
+ * profile (`profileFragment`, `readLogo`), never from the spec.
+ */
+export interface Letterhead {
+  name: string;
+  address: string | null;
+  logo: { bytes: Buffer; mediaType: string } | null;
+}
+
 export type ImageLoader = (documentId: string) => Promise<{ bytes: Buffer; mediaType: string } | null>;
 
 /** Currency prefix + digits with inner separators + optional percent. */

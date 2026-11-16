@@ -5,6 +5,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { DESCRIPTION_HEADING } from '../business/description-prompt.js';
+import { PROFILE_HEADING } from '../business/profile-prompt.js';
 import { buildPlannerPrompt, parsePlan, type PlanRequest } from './planner.js';
 
 const BUSINESS = 'test-business';
@@ -128,6 +129,16 @@ describe('the planner prompt', () => {
     expect(withDesc.indexOf(DESCRIPTION_HEADING)).toBeLessThan(withDesc.indexOf('# מה כל סוכן יכול לעשות עכשיו'));
     expect(withDesc).toContain('מספרה בחיפה');
     expect(buildPlannerPrompt(base)).not.toContain(DESCRIPTION_HEADING);
+  });
+
+  it('places the business profile right after the description and before the catalogue', async () => {
+    const b = await bundle();
+    const base = { bundle: b, intents: { id: 'A' }, provenance: 'boss', rampLevel: 'auto' } as const;
+    const withBoth = buildPlannerPrompt({ ...base, businessDescription: 'מספרה בחיפה', businessProfile: { name: 'חנות אלפא', address: 'הרצל 12' } });
+    expect(withBoth.indexOf(DESCRIPTION_HEADING)).toBeLessThan(withBoth.indexOf(PROFILE_HEADING));
+    expect(withBoth.indexOf(PROFILE_HEADING)).toBeLessThan(withBoth.indexOf('# מה כל סוכן יכול לעשות עכשיו'));
+    expect(withBoth).toContain('הרצל 12');
+    expect(buildPlannerPrompt(base)).not.toContain(PROFILE_HEADING);
   });
 
   it('tells the planner what it will actually be allowed to do', async () => {

@@ -8,6 +8,7 @@ import { READ_ONLY_CLASS_LABEL, capabilityCatalogue, renderCatalogue } from '../
 import { REFINEMENT_RULES } from '../policy/classify.js';
 import { renderLocalToolContracts } from '../orchestrator/local-tools.js';
 import { renderDescriptionSection } from '../business/description-prompt.js';
+import { renderProfileSection, type ProfileForPrompt } from '../business/profile-prompt.js';
 import { toOneLine } from '../util/bidi.js';
 import { buildFence, stripFenceMarkers } from '../util/fence.js';
 import { extractJsonObjects } from '../util/json-extract.js';
@@ -38,6 +39,11 @@ export interface PlanRequest {
    * prompt without one is byte-identical to before.
    */
   businessDescription?: string;
+  /**
+   * The business's own name and address (for official text), rendered right
+   * after the description; omitted when absent.
+   */
+  businessProfile?: ProfileForPrompt;
   /**
    * Who a name in the instruction was resolved to, when the owner's words fit
    * more than one contact and each candidate is planned separately (boss
@@ -131,6 +137,11 @@ function descriptionLines(description: string | undefined): string[] {
   return section === '' ? [] : [section, ''];
 }
 
+function profileLines(profile: ProfileForPrompt | undefined): string[] {
+  const section = renderProfileSection(profile);
+  return section === '' ? [] : [section, ''];
+}
+
 export function buildPlannerPrompt(
   request: PlanRequest,
   nonce: string = randomBytes(16).toString('hex'),
@@ -146,6 +157,7 @@ export function buildPlannerPrompt(
     request.bundle.plainLanguage,
     '',
     ...descriptionLines(request.businessDescription),
+    ...profileLines(request.businessProfile),
     '# מה כל סוכן יכול לעשות עכשיו',
     'הרשימה כבר לוקחת בחשבון את מקור השרשרת ואת רמת האוטונומיה. כלי שאינו ברשימה ייענה בסירוב.',
     catalogue,

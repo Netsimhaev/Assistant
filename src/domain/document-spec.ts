@@ -211,6 +211,13 @@ const common = {
   style: z.object({ theme: StyleTheme, accent: AccentColor }).strict(),
   sources: z.array(SourceRef),
   legalBasis: LegalBasis.optional(),
+  /**
+   * A letterhead (logo, business name, address) at the top of a Word or PDF
+   * document — formal letters, quotes, contracts. Optional, so every spec
+   * written before it stays valid. The renderers fill it from the business's
+   * own profile, never from the spec; xlsx and pptx ignore it.
+   */
+  letterhead: z.boolean().optional(),
 };
 
 export const XlsxSpec = z

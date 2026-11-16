@@ -160,3 +160,28 @@ describe('renderFooterTemplate', () => {
     expect(contract).toContain('box-sizing: border-box');
   });
 });
+
+describe('renderHtml letterhead', () => {
+  const PNG_BYTES = Buffer.from('iVBORw0KGgo=', 'base64');
+  const letterhead = { name: 'חנות <אלפא>', address: 'הרצל 12, תל אביב', logo: { bytes: PNG_BYTES, mediaType: 'image/png' } };
+
+  it('with letterhead: true opens the body with a <header> carrying the logo as a data: URL, the name and the address', () => {
+    const html = renderHtml(spec({ letterhead: true }), assets, { ...opts, letterhead });
+    const header = /<header class="letterhead">[\s\S]*?<\/header>/.exec(html)?.[0] ?? '';
+    expect(header).toContain('<img src="data:image/png;base64,');
+    expect(header).toContain('חנות &lt;אלפא&gt;');
+    expect(header).toContain('הרצל');
+    expect(html.indexOf('<header')).toBeLessThan(html.indexOf('<h1 class="title">'));
+    expect(html).not.toMatch(/<script/i);
+  });
+
+  it('without the flag there is no <header>, even when the data is given', () => {
+    expect(renderHtml(spec(), assets, { ...opts, letterhead })).not.toContain('<header');
+  });
+
+  it('the logo is refused unless it is png or jpeg', () => {
+    expect(() =>
+      renderHtml(spec({ letterhead: true }), assets, { ...opts, letterhead: { ...letterhead, logo: { bytes: PNG_BYTES, mediaType: 'image/svg+xml' } } }),
+    ).toThrow();
+  });
+});

@@ -34,6 +34,7 @@
  * a parse failure, not an override — and so is another format or kind.
  */
 import { renderDescriptionSection } from '../business/description-prompt.js';
+import { renderProfileSection, type ProfileForPrompt } from '../business/profile-prompt.js';
 import { randomBytes } from 'node:crypto';
 import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
@@ -89,6 +90,8 @@ export interface DraftRequest {
   memories: DraftMemory[];
   /** The owner's business description (background only); omit when absent. */
   businessDescription?: string;
+  /** The business's own name and address, for official text; omit when absent. */
+  businessProfile?: ProfileForPrompt;
   /** The previous attempt and the check's findings, on a fix round. */
   previous?: { spec: DocumentSpec; findings: { he: string }[] };
   /**
@@ -144,6 +147,7 @@ export function renderFormatCatalogue(): string {
     'הערכים של format, kind ו-language נקבעים בבקשה, ויש להעתיק אותם כפי שהם. אין שדה כיוון: הכיוון, היישור והגופן נגזרים בקוד מ-language.',
     'filename — שם קובץ בלי סיומת: אותיות, ספרות, רווח, מקף, קו תחתון ונקודה בלבד; לא מתחיל בנקודה, לא מסתיים בנקודה או ברווח, בלי "..".',
     'sources — רשימת המצביעים למקורות שהשתמשת בהם.',
+    'letterhead — כתוב/י "letterhead": true במכתב רשמי, בהצעת מחיר ובחוזה: הקוד מוסיף נייר מכתבים — הלוגו, שם העסק והכתובת בראש המסמך (ב-Word וב-PDF; גיליון ומצגת מתעלמים ממנו). בשאר המסמכים השמט/י את השדה. אל תעתיק/י את שם העסק או את הכתובת לגוף המסמך — הם כבר בנייר.',
     `תקרות: עד ${CAPS.sheets} גיליונות, עד ${CAPS.rowsPerSheet} שורות בגיליון, עד ${CAPS.slides} שקפים, עד ${CAPS.pages} עמודים.`,
     '',
     '# מספרים — אף מספר אינו מומצא',
@@ -303,6 +307,11 @@ function descriptionBlock(d: string | undefined): string[] {
   return s === '' ? [] : ['', s];
 }
 
+function profileBlock(p: ProfileForPrompt | undefined): string[] {
+  const s = renderProfileSection(p);
+  return s === '' ? [] : ['', s];
+}
+
 export function buildDraftCall(
   request: DraftRequest,
   nonce: string = randomBytes(16).toString('hex'),
@@ -315,6 +324,7 @@ export function buildDraftCall(
         '',
         request.bundle.promptFragments['prod.docs'],
         ...descriptionBlock(request.businessDescription),
+        ...profileBlock(request.businessProfile),
       ].join('\n'),
       tools: [],
       model: pickDrafterModel(request),

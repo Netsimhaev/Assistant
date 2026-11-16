@@ -59,6 +59,30 @@ export async function loadProfile(db: BusinessDb): Promise<BusinessProfile> {
   return toProfile(rows[0]);
 }
 
+/**
+ * The request fragment a drafter or the planner spreads in: the business's
+ * name (copied from `businesses.display_name` at creation, migration 075) and
+ * address, or `{}` when the row has no name. A failed read degrades to `{}`
+ * like `descriptionFragment`: a missing profile only narrows what the model
+ * knows, never widens authority.
+ */
+export async function profileFragment(
+  db: BusinessDb,
+): Promise<{ businessProfile?: { name: string; address: string | null } }> {
+  try {
+    const { rows } = await db.query<{ display_name: string | null; address: string | null }>(
+      'SELECT display_name, address FROM business_profiles WHERE business_id = $1',
+      [db.businessId],
+    );
+    const row = rows[0];
+    if (!row || row.display_name === null || row.display_name.trim() === '') return {};
+    return { businessProfile: { name: row.display_name, address: row.address } };
+  } catch (err) {
+    console.error(`business profile load failed: ${err instanceof Error ? err.message : 'unknown error'}`);
+    return {};
+  }
+}
+
 /** Save or clear the address. Blank is cleared; more than 300 characters is refused. */
 export async function saveAddress(db: BusinessDb, address: string | null, updatedBy: string): Promise<void> {
   const trimmed = address === null ? null : address.trim();

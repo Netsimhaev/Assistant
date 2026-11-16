@@ -115,6 +115,7 @@ import { readEmails, readPhones } from '../policy/facts.js';
 import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import { nameCarriesCancelWord } from './command-confirm.js';
 import { descriptionFragment } from '../business/description-store.js';
+import { profileFragment } from '../business/profile.js';
 import { makePlan, type PlanOutcome, type PlanRequest } from '../sdk/planner.js';
 import { planStepIsFeasible } from './catalogue.js';
 import { renderConfirmationQuestion } from './command-echo.js';
@@ -693,6 +694,7 @@ async function planAndCheck(
   }
 
   const descriptionFrag = await descriptionFragment(door.db);
+  const profileFrag = await profileFragment(door.db);
 
   let outcome: PlanOutcome;
   try {
@@ -714,6 +716,7 @@ async function planAndCheck(
       ...(memoryBlock === '' ? {} : { memoryBlock }),
       ...(ledgerBlock === '' ? {} : { ledgerBlock }),
       ...descriptionFrag,
+      ...profileFrag,
     });
   } catch (err) {
     // `makePlan` returns `{status:'unparseable'}` for bad model OUTPUT, but it
