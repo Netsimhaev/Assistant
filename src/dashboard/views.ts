@@ -200,6 +200,43 @@ ${logoutForm(options.csrf)}`,
   );
 }
 
+/** A link that is unknown, already used or expired — one message for all three. */
+export const OWNER_LINK_INVALID = 'הקישור אינו תקף. בקש קישור חדש מאיש התמיכה.';
+/** The typed address is not the one the link was issued for. */
+export const OWNER_LINK_LOGIN_MISMATCH = 'כתובת המייל אינה תואמת את הקישור.';
+
+/**
+ * The invite or reset form, served before any session exists. `form` is
+ * absent when the link is not usable: the page then says so and offers
+ * nothing to submit. `action` is the path the page was served at, built by
+ * the server from a token it already validated.
+ */
+export function renderOwnerLink(options: {
+  kind: 'invite' | 'password_reset';
+  form?: { action: string; csrf: string };
+  error?: string;
+}): string {
+  const title = options.kind === 'invite' ? 'הגדרת חשבון' : 'איפוס סיסמה';
+  const intro =
+    options.kind === 'invite'
+      ? 'הקלד את כתובת המייל שאליה נשלח הקישור, ובחר סיסמה. בשלב הבא תחבר את Google Authenticator.'
+      : 'הקלד את כתובת המייל של החשבון, ובחר סיסמה חדשה.';
+  const errorBlock = options.error ? `<p class="error">${esc(options.error)}</p>` : '';
+  const formBlock = options.form
+    ? `<p>${esc(intro)}</p>
+<div class="card">
+<form method="post" action="${esc(options.form.action)}">
+  <input type="hidden" name="csrf" value="${esc(options.form.csrf)}">
+  <label>כתובת מייל<input type="email" name="email" autocomplete="username" required></label>
+  <label>סיסמה<input type="password" name="password" autocomplete="new-password" required></label>
+  <label>הקלד את הסיסמה שוב<input type="password" name="confirm" autocomplete="new-password" required></label>
+  <button type="submit">שמירה</button>
+</form>
+</div>`
+    : '';
+  return page(title, `<h1>${esc(title)}</h1>\n${errorBlock}\n${formBlock}`);
+}
+
 /**
  * `requireCurrent` is false on exactly one path: the forced change on a
  * session minted with `mustChangePassword`, where by definition the owner

@@ -104,6 +104,36 @@ describe('enrol and confirm', () => {
     expect(stale).toBe('bad_code');
   });
 
+  it('beginning again (a page reload) does not lift an active lock', async () => {
+    const { secretBase32 } = await withBusiness(BUSINESS, (db) => beginEnrolment(db, USERNAME, KEY));
+    const wrong = wrongCode(secretBase32, NOW);
+    for (let i = 0; i < MAX_FAILED; i += 1) {
+      expect(await withBusiness(BUSINESS, (db) => confirmEnrolment(db, USERNAME, wrong, KEY, NOW))).toBe('bad_code');
+    }
+    const { secretBase32: fresh } = await withBusiness(BUSINESS, (db) => beginEnrolment(db, USERNAME, KEY));
+    const { rows } = await testDb().query<{ totp_failed_attempts: number; totp_locked_until: Date | null }>(
+      'SELECT totp_failed_attempts, totp_locked_until FROM dashboard_users WHERE business_id = $1 AND username = $2',
+      [BUSINESS, USERNAME],
+    );
+    expect(rows[0]?.totp_failed_attempts).toBe(MAX_FAILED);
+    expect(rows[0]?.totp_locked_until).not.toBeNull();
+    const right = totpCode(fresh, currentStep(NOW));
+    expect(await withBusiness(BUSINESS, (db) => confirmEnrolment(db, USERNAME, right, KEY, NOW))).toBe('locked');
+  });
+
+  it('beginning again does not reset the count of wrong codes either', async () => {
+    const { secretBase32 } = await withBusiness(BUSINESS, (db) => beginEnrolment(db, USERNAME, KEY));
+    for (let i = 0; i < MAX_FAILED - 1; i += 1) {
+      await withBusiness(BUSINESS, (db) => confirmEnrolment(db, USERNAME, wrongCode(secretBase32, NOW), KEY, NOW));
+    }
+    const { secretBase32: fresh } = await withBusiness(BUSINESS, (db) => beginEnrolment(db, USERNAME, KEY));
+    expect(
+      await withBusiness(BUSINESS, (db) => confirmEnrolment(db, USERNAME, wrongCode(fresh, NOW), KEY, NOW)),
+    ).toBe('bad_code');
+    const right = totpCode(fresh, currentStep(NOW));
+    expect(await withBusiness(BUSINESS, (db) => confirmEnrolment(db, USERNAME, right, KEY, NOW))).toBe('locked');
+  });
+
   it('confirm without a pending secret is a bad code, not an exception', async () => {
     expect(await withBusiness(BUSINESS, (db) => confirmEnrolment(db, USERNAME, '123456', KEY, NOW))).toBe(
       'bad_code',
@@ -255,6 +285,16 @@ describe('trusted devices', () => {
     expect(await withBusiness(BUSINESS, (db) => isTrustedDevice(db, USERNAME, token, later))).toBe(false);
   });
 
+  it("one account's device does not satisfy another account of the same business", async () => {
+    await createTestOwner(BUSINESS, { username: 'second', password: PASSWORD });
+    const ofOwner = await withBusiness(BUSINESS, (db) => issueTrustedDevice(db, USERNAME, NOW));
+    const ofSecond = await withBusiness(BUSINESS, (db) => issueTrustedDevice(db, 'second', NOW));
+    expect(await withBusiness(BUSINESS, (db) => isTrustedDevice(db, 'second', ofOwner, NOW))).toBe(false);
+    expect(await withBusiness(BUSINESS, (db) => isTrustedDevice(db, USERNAME, ofSecond, NOW))).toBe(false);
+    expect(await withBusiness(BUSINESS, (db) => isTrustedDevice(db, USERNAME, ofOwner, NOW))).toBe(true);
+    expect(await withBusiness(BUSINESS, (db) => isTrustedDevice(db, 'second', ofSecond, NOW))).toBe(true);
+  });
+
   it('revokeTrustedDevices returns how many it revoked', async () => {
     await withBusiness(BUSINESS, (db) => issueTrustedDevice(db, USERNAME, NOW));
     await withBusiness(BUSINESS, (db) => issueTrustedDevice(db, USERNAME, NOW));
@@ -306,9 +346,19 @@ describe('the pending factor on a session', () => {
     expect((await withBusiness(BUSINESS, (db) => verifySessionDetails(db, token)))?.pendingFactor).toBeNull();
   });
 
-  it('defaults to none', async () => {
-    const token = await withBusiness(BUSINESS, (db) => startSession(db, USERNAME));
+  it('has no default: a session that owes nothing must say so, and a call without it mints nothing', async () => {
+    const token = await withBusiness(BUSINESS, (db) => startSession(db, USERNAME, { pendingFactor: null }));
     expect((await withBusiness(BUSINESS, (db) => verifySessionDetails(db, token)))?.pendingFactor).toBeNull();
+
+    await testDb().query('DELETE FROM dashboard_sessions WHERE business_id = $1', [BUSINESS]);
+    await expect(
+      withBusiness(BUSINESS, (db) =>
+        // @ts-expect-error — pendingFactor is required; omitting it must not compile.
+        startSession(db, USERNAME, {}),
+      ),
+    ).rejects.toThrow(/pendingFactor is required/);
+    const { rows } = await testDb().query('SELECT 1 FROM dashboard_sessions WHERE business_id = $1', [BUSINESS]);
+    expect(rows).toHaveLength(0);
   });
 });
 

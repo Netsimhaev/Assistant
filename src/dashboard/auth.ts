@@ -26,6 +26,12 @@ export const LOCK_MINUTES = 15;
  * drift.
  */
 export const SESSION_HOURS = 12;
+/**
+ * The shortest password the dashboard accepts — when the owner changes it
+ * (`POST /password`) and when an invite or reset link sets it
+ * (`owner-links.ts`). Defined once, here, so the two cannot drift.
+ */
+export const MIN_PASSWORD_LENGTH = 10;
 /** Raw session token size. 256 bits — comfortably more than a browser cookie needs to resist guessing. */
 const TOKEN_BYTES = 32;
 
@@ -415,16 +421,26 @@ export async function verifySessionDetails(
 /**
  * Mint a session without a password check.
  *
- * The dashboard calls this right after `setPassword` completes, so the owner
- * who just changed the password lands back in the app instead of at a login
- * form. `pendingFactor` marks a session that still owes its second factor.
+ * Callers: the password change (the owner already passed both factors in the
+ * session being replaced), a second factor just settled (a fresh token
+ * replaces the pre-factor one), and an invite or reset link.
+ *
+ * `pendingFactor` is required, with no default — the same fail-closed rule as
+ * `login`'s `pendingFactorFor`: a default would pick "owes nothing" for a
+ * caller that never thought about it, and that is a password-only session. A
+ * session that owes nothing says `null` out loud. A call without it is refused
+ * at compile time and, past a cast, at run time before any row is written.
  */
 export async function startSession(
   db: BusinessDb,
   username: string,
-  options: { now?: Date; mustChangePassword?: boolean; pendingFactor?: PendingFactor } = {},
+  options: { now?: Date; mustChangePassword?: boolean; pendingFactor: PendingFactor | null },
 ): Promise<string> {
   const businessId = db.businessId;
+  // Fail closed even past a cast: `undefined` is not a decision, `null` is.
+  if ((options as { pendingFactor?: unknown } | undefined)?.pendingFactor === undefined) {
+    throw new TypeError('startSession: pendingFactor is required');
+  }
   const now = options.now ?? new Date();
   const token = randomBytes(TOKEN_BYTES).toString('hex');
   const expiresAt = new Date(now.getTime() + SESSION_HOURS * 3600_000);
@@ -440,7 +456,7 @@ export async function startSession(
       now,
       expiresAt,
       options.mustChangePassword ?? false,
-      options.pendingFactor ?? null,
+      options.pendingFactor,
     ],
   );
 

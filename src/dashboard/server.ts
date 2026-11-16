@@ -16,7 +16,7 @@ import { createServer as createHttpServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { z } from 'zod';
 import { ulid } from 'ulid';
-import { withBusiness, withNoBusiness, type BusinessDb } from '../db/pool.js';
+import { transaction, withBusiness, withNoBusiness, type BusinessDb } from '../db/pool.js';
 import { ApprovalNotDecidableError, getApproval, pendingApprovals } from '../governance/approvals.js';
 import type { ApprovalRequest } from '../governance/approvals.js';
 import { DocumentAlreadySignedError, loadSignature } from '../governance/signatures.js';
@@ -145,6 +145,7 @@ import { canonicalHash } from '../util/canonical.js';
 import {
   login,
   loginUnknown,
+  MIN_PASSWORD_LENGTH,
   parseSessionCookie,
   revokeAllSessions,
   revokeSession,
@@ -161,7 +162,6 @@ import {
   confirmEnrolment,
   isTrustedDevice,
   issueTrustedDevice,
-  setPendingFactor,
   totpStatus,
   TotpAlreadyEnrolledError,
   TRUSTED_DEVICE_DAYS,
@@ -172,6 +172,7 @@ import { qrSvg } from '../auth/qr.js';
 import type { PendingFactor } from './auth.js';
 import { withSessionLockOn } from '../orchestrator/session-lock.js';
 import { getBusiness } from '../tenancy/businesses.js';
+import { ownerLinkState, redeemOwnerLink, type OwnerLinkKind } from './owner-links.js';
 import { issueCsrfToken, verifyCsrfToken } from './csrf.js';
 import {
   handleDocumentAddress,
@@ -204,6 +205,7 @@ import {
   renderInstruct,
   renderLogin,
   renderMemory,
+  renderOwnerLink,
   renderNotFound,
   renderPasswordChange,
   renderPendingList,
@@ -212,6 +214,8 @@ import {
   renderSuspended,
   renderTotpEnrol,
   renderTotpVerify,
+  OWNER_LINK_INVALID,
+  OWNER_LINK_LOGIN_MISMATCH,
   SUSPENDED_MESSAGE,
   TOTP_BAD_CODE,
   TOTP_LOCKED,
@@ -230,7 +234,6 @@ const TRUSTED_DEVICE_MAX_AGE_SECONDS = TRUSTED_DEVICE_DAYS * 86_400;
 /** What Google Authenticator shows above the account name. */
 const TOTP_ISSUER = 'העוזרת';
 const SESSION_MAX_AGE_SECONDS = SESSION_HOURS * 3600;
-const MIN_PASSWORD_LENGTH = 10;
 /** Refuses a form body past this size before it is ever parsed. */
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -646,7 +649,7 @@ async function screenForSession(db: BusinessDb, session: Session): Promise<'/2fa
   return enrolled ? '/2fa' : '/2fa/enrol';
 }
 
-function seeOtherWith(res: ServerResponse, location: string, headers: Record<string, string> = {}): void {
+function seeOtherWith(res: ServerResponse, location: string, headers: Record<string, string | string[]> = {}): void {
   res.writeHead(303, { Location: location, ...SECURITY_HEADERS, ...headers });
   res.end();
 }
@@ -665,13 +668,25 @@ async function loginAddressOf(db: BusinessDb, username: string): Promise<string>
 }
 
 /**
- * The second factor is settled: the session owes nothing, and this browser
- * becomes a trusted device for `TRUSTED_DEVICE_DAYS`.
+ * The second factor is settled: this browser becomes a trusted device for
+ * `TRUSTED_DEVICE_DAYS`, and the session is **replaced**, not upgraded in
+ * place. The pre-factor token is revoked and a fresh one that owes nothing is
+ * issued, in one transaction: a token someone planted or saw before the
+ * factor (session fixation) must not become a full session the moment the
+ * owner types the code.
  */
 async function finishSecondFactor(res: ServerResponse, db: BusinessDb, session: Session): Promise<void> {
-  await setPendingFactor(db, session.token, null);
-  const device = await issueTrustedDevice(db, session.username);
-  seeOtherWith(res, '/', { 'Set-Cookie': trustedDeviceCookie(db.businessId, device) });
+  const { token, device } = await transaction(db, async (tx) => {
+    await revokeSession(tx, session.token);
+    const fresh = await startSession(tx, session.username, {
+      pendingFactor: null,
+      mustChangePassword: session.mustChangePassword,
+    });
+    return { token: fresh, device: await issueTrustedDevice(tx, session.username) };
+  });
+  seeOtherWith(res, '/', {
+    'Set-Cookie': [sessionCookie(db.businessId, token), trustedDeviceCookie(db.businessId, device)],
+  });
 }
 
 async function handleTotpEnrolGet(res: ServerResponse, db: BusinessDb, session: Session, key: Buffer): Promise<void> {
@@ -726,6 +741,102 @@ async function handleTotpVerifyPost(
   if (result === 'not_enrolled') return seeOther(res, '/2fa/enrol');
   const csrf = issueCsrfToken(session.sessionId);
   sendHtml(res, 401, renderTotpVerify({ csrf, error: result === 'locked' ? TOTP_LOCKED : TOTP_BAD_CODE }));
+}
+
+type OwnerLinkPath = { kind: OwnerLinkKind; token: string; action: string };
+
+/** `/invite/<token>` or `/reset/<token>`, or `null`. The token is validated later. */
+function ownerLinkPath(pathname: string): OwnerLinkPath | null {
+  const match = /^\/(invite|reset)\/([^/]+)$/.exec(pathname);
+  if (!match?.[1] || match[2] === undefined) return null;
+  return {
+    kind: match[1] === 'invite' ? 'invite' : 'password_reset',
+    token: match[2],
+    action: `/${match[1]}/${match[2]}`,
+  };
+}
+
+/**
+ * What the CSRF token of a link form is bound to. Not a session value: a
+ * session cookie value is `<businessId>.<token>`, and a business id cannot
+ * hold a `:`, so the two never collide.
+ */
+function linkCsrfBinding(link: OwnerLinkPath): string {
+  return `owner-link:${link.token}`;
+}
+
+type LinkTarget = { businessId: string; raw: string } | { refused: 'invalid' | 'suspended' };
+
+/** The business and raw token of a link; refused for a malformed token or a business that is not active. */
+async function linkTarget(link: OwnerLinkPath): Promise<LinkTarget> {
+  const parsed = parseSessionCookie(link.token);
+  if (parsed === null) return { refused: 'invalid' };
+  const business = await getBusiness(parsed.businessId);
+  if (business === null) return { refused: 'invalid' };
+  if (business.status !== 'active') return { refused: 'suspended' };
+  return { businessId: parsed.businessId, raw: parsed.token };
+}
+
+function sendLinkRefusal(res: ServerResponse, link: OwnerLinkPath, refused: 'invalid' | 'suspended'): void {
+  if (refused === 'suspended') return sendHtml(res, 403, renderOwnerLink({ kind: link.kind, error: SUSPENDED_MESSAGE }));
+  sendHtml(res, 400, renderOwnerLink({ kind: link.kind, error: OWNER_LINK_INVALID }));
+}
+
+async function handleOwnerLinkGet(res: ServerResponse, link: OwnerLinkPath): Promise<void> {
+  const target = await linkTarget(link);
+  if ('refused' in target) return sendLinkRefusal(res, link, target.refused);
+  const state = await withBusiness(target.businessId, (db) => ownerLinkState(db, target.raw));
+  // A token presented on the other kind's path is not a link here.
+  if (!state.ok || state.kind !== link.kind) return sendLinkRefusal(res, link, 'invalid');
+  sendHtml(
+    res,
+    200,
+    renderOwnerLink({ kind: link.kind, form: { action: link.action, csrf: issueCsrfToken(linkCsrfBinding(link)) } }),
+  );
+}
+
+type LinkOutcome =
+  | { refused: 'invalid' }
+  | { retry: string }
+  | { token: string; owed: PendingFactor };
+
+/**
+ * Redeem a link. On success the new session is born owing its second factor:
+ * enrolment for an owner who never enrolled (always, after an invite), the
+ * code otherwise. A password reset never skips the code: it proves the
+ * address, not the authenticator.
+ */
+async function handleOwnerLinkPost(req: IncomingMessage, res: ServerResponse, link: OwnerLinkPath): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(linkCsrfBinding(link), form.get('csrf'))) return sendHtml(res, 403, renderForbidden());
+  const target = await linkTarget(link);
+  if ('refused' in target) return sendLinkRefusal(res, link, target.refused);
+
+  const outcome = await withBusiness(target.businessId, async (db): Promise<LinkOutcome> => {
+    const state = await ownerLinkState(db, target.raw);
+    if (!state.ok || state.kind !== link.kind) return { refused: 'invalid' };
+    const password = form.get('password') ?? '';
+    if (password !== (form.get('confirm') ?? '')) return { retry: 'הסיסמאות אינן תואמות.' };
+    const result = await redeemOwnerLink(db, { rawToken: target.raw, typedLogin: form.get('email') ?? '', password });
+    if (!result.ok) {
+      if (result.code === 'login_mismatch') return { retry: OWNER_LINK_LOGIN_MISMATCH };
+      if (result.code === 'weak_password') {
+        return { retry: `הסיסמה קצרה מדי — נדרשים לפחות ${MIN_PASSWORD_LENGTH} תווים.` };
+      }
+      return { refused: 'invalid' };
+    }
+    const owed: PendingFactor = (await totpStatus(db, result.username)) === 'enrolled' ? 'verify' : 'enroll';
+    return { token: await startSession(db, result.username, { pendingFactor: owed }), owed };
+  });
+
+  if ('refused' in outcome) return sendLinkRefusal(res, link, outcome.refused);
+  if ('retry' in outcome) {
+    const csrf = issueCsrfToken(linkCsrfBinding(link));
+    return sendHtml(res, 400, renderOwnerLink({ kind: link.kind, form: { action: link.action, csrf }, error: outcome.retry }));
+  }
+  seeOtherWith(res, outcome.owed === 'enroll' ? '/2fa/enrol' : '/2fa', {
+    'Set-Cookie': sessionCookie(target.businessId, outcome.token),
+  });
 }
 
 /**
@@ -792,7 +903,9 @@ async function handlePasswordPost(
   // session (mustChangePassword: false) replaces it right after, so the
   // owner lands back in the app instead of at a login form.
   await setPassword(db, { username: session.username, password });
-  const token = await startSession(db, session.username, { mustChangePassword: false });
+  // The session being replaced already passed both factors (the gate sits
+  // before this route), so the fresh one owes nothing, said out loud.
+  const token = await startSession(db, session.username, { mustChangePassword: false, pendingFactor: null });
   redirect(res, '/', { 'Set-Cookie': sessionCookie(businessId, token) });
 }
 
@@ -3205,6 +3318,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
   // which point the attacker already has direct access and gains nothing by
   // routing it through the victim's browser.
   if (method === 'POST' && pathname === '/login') return handleLoginPost(req, res);
+
+  // Invite and reset links: before any session exists. The link token is the
+  // credential, and the POST's CSRF token is bound to it.
+  const link = ownerLinkPath(pathname);
+  if (link !== null) {
+    if (method === 'GET') return handleOwnerLinkGet(res, link);
+    if (method === 'POST') return handleOwnerLinkPost(req, res, link);
+  }
 
   // Everything past this point requires a session.
   const cookie = sessionCookieFrom(req);

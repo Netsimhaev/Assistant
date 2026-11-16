@@ -2434,7 +2434,7 @@ async function mustChangeCookie(): Promise<string> {
   // Past the second factor (the gate before this one), so what is under test
   // is the must-change gate alone.
   await enrolTestOwner(BUSINESS, USERNAME);
-  const token = await withBusiness(BUSINESS, (db) => startSession(db, USERNAME, { mustChangePassword: true }));
+  const token = await withBusiness(BUSINESS, (db) => startSession(db, USERNAME, { mustChangePassword: true, pendingFactor: null }));
   return `sid=${sessionCookieValue(BUSINESS, token)}`;
 }
 

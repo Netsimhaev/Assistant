@@ -190,8 +190,11 @@ export async function totpStatus(db: BusinessDb, username: string): Promise<'enr
  * Write a fresh *pending* secret and return it for the QR. Calling it again
  * replaces the pending secret (the owner scanned nothing, or reloaded); it
  * refuses an enrolled account — re-enrolling is `resetSecondFactor`'s job,
- * never a page reload's. The replacement also resets the step and the
- * counters, which belong to the secret.
+ * never a page reload's. The replacement resets the step, which belongs to
+ * the secret, but **not** the failure counter or the lock: those belong to
+ * whoever is guessing, and a reload that cleared them would turn the lockout
+ * into four guesses per page load, without end. An expired lock is cleared
+ * lazily by the next confirm, as on the password.
  */
 export async function beginEnrolment(
   db: BusinessDb,
@@ -202,8 +205,7 @@ export async function beginEnrolment(
   const sealed = encryptSecret(secretBase32, key, aadFor(db, username));
   const result = await db.query(
     `UPDATE dashboard_users
-        SET totp_ciphertext = $3, totp_nonce = $4, totp_last_step = NULL,
-            totp_failed_attempts = 0, totp_locked_until = NULL
+        SET totp_ciphertext = $3, totp_nonce = $4, totp_last_step = NULL
       WHERE business_id = $1 AND username = $2 AND totp_enrolled_at IS NULL`,
     [db.businessId, username, sealed.ciphertext, sealed.nonce],
   );
