@@ -40,7 +40,7 @@ import {
 import { DIGEST_DEFAULTS, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
 import { loadActionUpdateSettings, saveActionUpdateSettings } from '../governance/action-update-settings.js';
 import { login, sessionCookieValue, startSession } from './auth.js';
-import { createTestOwner, enrolTestOwner, loginWithSecondFactor, ownerLogin, TEST_MASTER_KEY } from '../test/owner.js';
+import { createTestOwner, enrolTestOwner, loginWithSecondFactor, ownerLogin, TEST_MASTER_KEY, owesVerify } from '../test/owner.js';
 import {
   assertBindableHost,
   createServer,
@@ -444,7 +444,7 @@ describe('GET /', () => {
   it('expires a session past its lifetime', async () => {
     const baseUrl = await startServer();
     const farPast = new Date('2000-01-01T00:00:00.000Z');
-    const result = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD, now: farPast }));
+    const result = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD, now: farPast }));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
@@ -2543,8 +2543,8 @@ describe('changing the password', () => {
     expect(res.status).toBe(403);
 
     // Unchanged: the old password still works, the new one does not.
-    expect((await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }))).ok).toBe(true);
-    expect((await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: NEW_PASSWORD }))).ok).toBe(false);
+    expect((await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }))).ok).toBe(true);
+    expect((await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: NEW_PASSWORD }))).ok).toBe(false);
   });
 
   it('refuses with the wrong current password', async () => {
@@ -2561,7 +2561,7 @@ describe('changing the password', () => {
       redirect: 'manual',
     });
     expect(res.status).toBe(403);
-    expect((await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }))).ok).toBe(true);
+    expect((await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }))).ok).toBe(true);
   });
 
   it('accepts with the current password', async () => {
@@ -2578,7 +2578,7 @@ describe('changing the password', () => {
       redirect: 'manual',
     });
     expect(res.status).toBe(302);
-    expect((await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: NEW_PASSWORD }))).ok).toBe(true);
+    expect((await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: NEW_PASSWORD }))).ok).toBe(true);
   });
 
   // The one path where there is no current password to ask for: a session
@@ -2600,7 +2600,7 @@ describe('changing the password', () => {
       redirect: 'manual',
     });
     expect(res.status).toBe(302);
-    expect((await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: NEW_PASSWORD }))).ok).toBe(true);
+    expect((await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: NEW_PASSWORD }))).ok).toBe(true);
   });
 });
 

@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { withBusiness } from '../db/pool.js';
-import { createOwner, sessionCookieValue } from '../dashboard/auth.js';
+import { createOwner, sessionCookieValue, type PendingFactor } from '../dashboard/auth.js';
 import { beginEnrolment, confirmEnrolment, issueTrustedDevice, totpStatus } from '../dashboard/second-factor.js';
 import { currentStep, totpCode } from '../auth/totp.js';
 import { registerBusiness } from './db.js';
@@ -11,6 +11,13 @@ import { registerBusiness } from './db.js';
  * owner's second factor under. One per test process; never on disk.
  */
 export const TEST_MASTER_KEY: Buffer = randomBytes(32);
+
+/**
+ * The `pendingFactorFor` a test passes to `login(db, …)` when the second
+ * factor is not what it is testing: the session owes a code, the fail-closed
+ * answer. `login` has no default, so a test must say this out loud.
+ */
+export const owesVerify = async (): Promise<PendingFactor> => 'verify';
 
 /** The trusted-device cookie the dashboard reads (`tdev`). */
 export const TRUSTED_DEVICE_COOKIE = 'tdev';

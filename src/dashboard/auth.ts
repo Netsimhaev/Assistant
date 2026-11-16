@@ -223,17 +223,23 @@ export async function login(
     /**
      * The second factor the new session owes, decided once the password is
      * known to be right and before the session row exists — so the row is
-     * born with it, never patched afterwards. The dashboard always passes
-     * this; without it the session owes nothing (callers outside the HTTP
-     * path, i.e. tests).
+     * born with it, never patched afterwards. Required, with no default:
+     * a default would have to pick a factor for the caller, and the only
+     * default that ever slipped in here was "owes nothing" — a password-only
+     * session. A caller that does not pass it is refused at compile time and,
+     * should it get through a cast, at run time before any session exists.
      */
-    pendingFactorFor?: (username: string) => Promise<PendingFactor | null>;
+    pendingFactorFor: (username: string) => Promise<PendingFactor | null>;
   },
 ): Promise<
   { ok: true; sessionId: string; username: string } | { ok: false; code: 'bad_credentials' | 'locked' }
 > {
   const businessId = db.businessId;
   const now = input.now ?? new Date();
+  // Fail closed even past a cast: no decider, no session.
+  if (typeof input.pendingFactorFor !== 'function') {
+    throw new TypeError('login: pendingFactorFor is required');
+  }
 
   const { rows } = await db.query<UserRow>(
     `SELECT username, password_hash, password_salt, locked_until
@@ -317,7 +323,7 @@ export async function login(
     return { ok: false, code: 'bad_credentials' };
   }
 
-  const pendingFactor = input.pendingFactorFor ? await input.pendingFactorFor(username) : null;
+  const pendingFactor = await input.pendingFactorFor(username);
   const token = randomBytes(TOKEN_BYTES).toString('hex');
   const tokenHash = hashToken(token);
   const expiresAt = new Date(now.getTime() + SESSION_HOURS * 3600_000);

@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, withBusiness } from '../db/pool.js';
-import { createTestOwner, ownerLogin } from '../test/owner.js';
+import { createTestOwner, ownerLogin, owesVerify } from '../test/owner.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import {
   hashPassword,
@@ -48,7 +48,7 @@ describe('login', () => {
   });
 
   it('logs in with the correct password', async () => {
-    const result = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
+    const result = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(typeof result.sessionId).toBe('string');
@@ -56,13 +56,50 @@ describe('login', () => {
     }
   });
 
+  it('has no default second factor: without a decider it refuses, and mints no session', async () => {
+    // Compile time: omitting it must stay a type error. If `pendingFactorFor`
+    // ever becomes optional again, this directive is unused and tsc fails.
+    const missing = withBusiness(BUSINESS, (db) =>
+      // @ts-expect-error pendingFactorFor is required — there is no default
+      login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
+    );
+    // Run time: refused before any session exists, even past a cast.
+    await expect(missing).rejects.toThrow(/pendingFactorFor is required/);
+    const { rows } = await testDb().query('SELECT 1 FROM dashboard_sessions WHERE business_id = $1', [BUSINESS]);
+    expect(rows).toHaveLength(0);
+  });
+
+  it('the session is born owing the factor the decider names, and the decider runs only on a right password', async () => {
+    const asked: string[] = [];
+    const decider = async (username: string): Promise<'enroll'> => {
+      asked.push(username);
+      return 'enroll';
+    };
+    const wrong = await withBusiness(BUSINESS, (db) =>
+      login(db, { pendingFactorFor: decider, login: ownerLogin(BUSINESS, USERNAME), password: 'wrong password' }),
+    );
+    expect(wrong.ok).toBe(false);
+    expect(asked).toEqual([]);
+
+    const right = await withBusiness(BUSINESS, (db) =>
+      login(db, { pendingFactorFor: decider, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
+    );
+    expect(right.ok).toBe(true);
+    expect(asked).toEqual([USERNAME]);
+    const { rows } = await testDb().query<{ pending_factor: string | null }>(
+      'SELECT pending_factor FROM dashboard_sessions WHERE business_id = $1',
+      [BUSINESS],
+    );
+    expect(rows.map((r) => r.pending_factor)).toEqual(['enroll']);
+  });
+
   it('does not log in with the wrong password', async () => {
-    const result = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: 'wrong password' }));
+    const result = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: 'wrong password' }));
     expect(result).toEqual({ ok: false, code: 'bad_credentials' });
   });
 
   it('does not log in for a username that does not exist', async () => {
-    const result = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, 'nobody'), password: PASSWORD }));
+    const result = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, 'nobody'), password: PASSWORD }));
     expect(result).toEqual({ ok: false, code: 'bad_credentials' });
   });
 
@@ -72,7 +109,7 @@ describe('login', () => {
     // reach the port. Its failures now land in
     // dashboard_unknown_user_throttle instead.
     for (let i = 0; i < 5; i += 1) {
-      const result = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, 'nobody'), password: PASSWORD }));
+      const result = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, 'nobody'), password: PASSWORD }));
       expect(result).toEqual({ ok: false, code: 'bad_credentials' });
     }
 
@@ -85,41 +122,41 @@ describe('login', () => {
 
     // Still `bad_credentials`, never a distinct code: whether a username
     // exists must not become readable from the reply.
-    expect(await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, 'nobody'), password: PASSWORD }))).toEqual({
+    expect(await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, 'nobody'), password: PASSWORD }))).toEqual({
       ok: false,
       code: 'bad_credentials',
     });
 
     // And the real account is untouched by all of it.
-    const real = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
+    const real = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
     expect(real.ok).toBe(true);
   });
 
   it('locks the account after five wrong attempts', async () => {
     for (let i = 0; i < 5; i += 1) {
-      await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: 'wrong password' }));
+      await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: 'wrong password' }));
     }
-    const result = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: 'wrong password' }));
+    const result = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: 'wrong password' }));
     expect(result).toEqual({ ok: false, code: 'locked' });
   });
 
   it('a locked account refuses even the correct password', async () => {
     for (let i = 0; i < 5; i += 1) {
-      await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: 'wrong password' }));
+      await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: 'wrong password' }));
     }
-    const result = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
+    const result = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
     expect(result).toEqual({ ok: false, code: 'locked' });
   });
 
   it('the lock expires', async () => {
     const start = new Date('2026-01-01T00:00:00.000Z');
     for (let i = 0; i < 5; i += 1) {
-      await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: 'wrong password', now: start }));
+      await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: 'wrong password', now: start }));
     }
-    const stillLocked = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD, now: new Date(start.getTime() + 5 * 60_000) }));
+    const stillLocked = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD, now: new Date(start.getTime() + 5 * 60_000) }));
     expect(stillLocked).toEqual({ ok: false, code: 'locked' });
 
-    const afterCooldown = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD, now: new Date(start.getTime() + 16 * 60_000) }));
+    const afterCooldown = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD, now: new Date(start.getTime() + 16 * 60_000) }));
     expect(afterCooldown.ok).toBe(true);
   });
 
@@ -132,10 +169,10 @@ describe('login', () => {
     // UPDATE so Postgres's row lock serialises the five attempts.
     await Promise.all(
       Array.from({ length: 5 }, () =>
-        withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: 'wrong password' })),
+        withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: 'wrong password' })),
       ),
     );
-    const result = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
+    const result = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
     expect(result).toEqual({ ok: false, code: 'locked' });
   });
 });
@@ -146,7 +183,7 @@ describe('sessions', () => {
   });
 
   it('verifies a fresh session', async () => {
-    const result = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
+    const result = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
@@ -155,7 +192,7 @@ describe('sessions', () => {
   });
 
   it('does not verify a revoked session', async () => {
-    const result = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
+    const result = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
@@ -168,7 +205,7 @@ describe('sessions', () => {
 
   it('does not verify an expired session', async () => {
     const start = new Date('2026-01-01T00:00:00.000Z');
-    const result = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD, now: start }));
+    const result = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD, now: start }));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
@@ -188,7 +225,7 @@ describe('tenant isolation', () => {
   it('a user in one business is invisible to a login under another', async () => {
     await createTestOwner(OTHER_BUSINESS, { username: USERNAME, password: PASSWORD });
 
-    const result = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(OTHER_BUSINESS, USERNAME), password: PASSWORD }));
+    const result = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(OTHER_BUSINESS, USERNAME), password: PASSWORD }));
     expect(result).toEqual({ ok: false, code: 'bad_credentials' });
   });
 
@@ -196,7 +233,7 @@ describe('tenant isolation', () => {
     await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
     await createTestOwner(OTHER_BUSINESS, { username: USERNAME, password: PASSWORD });
 
-    const result = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
+    const result = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
@@ -215,8 +252,8 @@ describe('setPassword', () => {
   });
 
   it('revokes every open session', async () => {
-    const first = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
-    const second = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
+    const first = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
+    const second = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
     expect(first.ok).toBe(true);
     expect(second.ok).toBe(true);
     if (!first.ok || !second.ok) return;
@@ -230,10 +267,10 @@ describe('setPassword', () => {
   it('lets a subsequent login use the new password and rejects the old one', async () => {
     await withBusiness(BUSINESS, (db) => setPassword(db, { username: USERNAME, password: 'a brand new password' }));
 
-    const withOld = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
+    const withOld = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }));
     expect(withOld).toEqual({ ok: false, code: 'bad_credentials' });
 
-    const withNew = await withBusiness(BUSINESS, (db) => login(db, { login: ownerLogin(BUSINESS, USERNAME), password: 'a brand new password' }));
+    const withNew = await withBusiness(BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: 'a brand new password' }));
     expect(withNew.ok).toBe(true);
   });
 });

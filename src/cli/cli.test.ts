@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { login, verifySession } from '../dashboard/auth.js';
 import { isTrustedDevice, issueTrustedDevice } from '../dashboard/second-factor.js';
 import { closePool, withBusiness } from '../db/pool.js';
-import { ownerLogin } from '../test/owner.js';
+import { ownerLogin, owesVerify } from '../test/owner.js';
 import { createBusiness } from '../tenancy/businesses.js';
 import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { main as businessMain } from './business.js';
@@ -80,7 +80,7 @@ describe('owner:create', () => {
     const code = await createOwnerRun([USERNAME, ...BIZ, ...EMAIL], io);
     expect(code).toBe(0);
 
-    const result = await withBusiness(TEST_BUSINESS, (db) => login(db, { login: ownerLogin(TEST_BUSINESS, USERNAME), password: PASSWORD }));
+    const result = await withBusiness(TEST_BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(TEST_BUSINESS, USERNAME), password: PASSWORD }));
     expect(result.ok).toBe(true);
   });
 
@@ -99,7 +99,7 @@ describe('owner:create', () => {
     const code = await createOwnerRun([USERNAME, ...BIZ, ...EMAIL], io);
     expect(code).toBe(1);
 
-    const result = await withBusiness(TEST_BUSINESS, (db) => login(db, { login: ownerLogin(TEST_BUSINESS, USERNAME), password: 'first password' }));
+    const result = await withBusiness(TEST_BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(TEST_BUSINESS, USERNAME), password: 'first password' }));
     expect(result).toEqual({ ok: false, code: 'bad_credentials' });
   });
 
@@ -127,7 +127,7 @@ describe('owner:password', () => {
   });
 
   it('changes the password and revokes every open session', async () => {
-    const session = await withBusiness(TEST_BUSINESS, (db) => login(db, { login: ownerLogin(TEST_BUSINESS, USERNAME), password: PASSWORD }));
+    const session = await withBusiness(TEST_BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(TEST_BUSINESS, USERNAME), password: PASSWORD }));
     expect(session.ok).toBe(true);
     if (!session.ok) return;
 
@@ -138,10 +138,10 @@ describe('owner:password', () => {
 
     expect(await withBusiness(TEST_BUSINESS, (db) => verifySession(db, session.sessionId))).toBeNull();
 
-    const withOld = await withBusiness(TEST_BUSINESS, (db) => login(db, { login: ownerLogin(TEST_BUSINESS, USERNAME), password: PASSWORD }));
+    const withOld = await withBusiness(TEST_BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(TEST_BUSINESS, USERNAME), password: PASSWORD }));
     expect(withOld).toEqual({ ok: false, code: 'bad_credentials' });
 
-    const withNew = await withBusiness(TEST_BUSINESS, (db) => login(db, { login: ownerLogin(TEST_BUSINESS, USERNAME), password: newPassword }));
+    const withNew = await withBusiness(TEST_BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(TEST_BUSINESS, USERNAME), password: newPassword }));
     expect(withNew.ok).toBe(true);
   });
 
@@ -192,9 +192,9 @@ describe('owner:email', () => {
     expect(io.errors).toEqual([]);
     expect(code).toBe(0);
     expect(await loginOf(TEST_BUSINESS, USERNAME)).toBe(NEW_EMAIL);
-    const withNew = await withBusiness(TEST_BUSINESS, (db) => login(db, { login: NEW_EMAIL, password: PASSWORD }));
+    const withNew = await withBusiness(TEST_BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: NEW_EMAIL, password: PASSWORD }));
     expect(withNew.ok).toBe(true);
-    const withOld = await withBusiness(TEST_BUSINESS, (db) => login(db, { login: ownerLogin(TEST_BUSINESS, USERNAME), password: PASSWORD }));
+    const withOld = await withBusiness(TEST_BUSINESS, (db) => login(db, { pendingFactorFor: owesVerify, login: ownerLogin(TEST_BUSINESS, USERNAME), password: PASSWORD }));
     expect(withOld.ok).toBe(false);
   });
 

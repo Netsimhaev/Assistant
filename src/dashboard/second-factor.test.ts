@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, withBusiness } from '../db/pool.js';
-import { createTestOwner, ownerLogin } from '../test/owner.js';
+import { createTestOwner, ownerLogin, owesVerify } from '../test/owner.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { currentStep, totpCode } from '../auth/totp.js';
 import { decryptSecret, encryptSecret } from '../governance/secret-cipher.js';
@@ -267,7 +267,7 @@ describe('resetSecondFactor', () => {
   it('clears enrolment and revokes an open session', async () => {
     await enrol();
     const result = await withBusiness(BUSINESS, (db) =>
-      login(db, { login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
+      login(db, { pendingFactorFor: owesVerify, login: ownerLogin(BUSINESS, USERNAME), password: PASSWORD }),
     );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
