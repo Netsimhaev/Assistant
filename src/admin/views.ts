@@ -10,7 +10,7 @@
  */
 import { escapeHtml } from '../util/html.js';
 import { formatMinor } from '../util/money.js';
-import type { PanelBusinessDetail, PanelBusinessRow } from '../tenancy/panel-reads.js';
+import type { PanelBusinessDetail, PanelBusinessRow, PanelSetupData } from '../tenancy/panel-reads.js';
 
 const esc = escapeHtml;
 
@@ -280,12 +280,100 @@ function formatWhen(at: Date | null): string {
   return at.toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem', dateStyle: 'short', timeStyle: 'short' });
 }
 
+/** The copy beside a freshly issued owner reset link, verbatim. */
+export const RESET_LINK_COPY =
+  'העתק את הקישור ושלח אותו לבעל העסק. הקישור מאפשר לבחור סיסמה חדשה, תקף ל-72 שעות ולשימוש אחד.';
+
+/** The one page that ever shows a reset link — the response to the POST that issued it. */
+export function renderResetIssued(viewer: PanelViewer, options: { businessId: string; link: string }): string {
+  return page(
+    'קישור לאיפוס סיסמה',
+    `<h1>קישור לאיפוס סיסמה של בעל העסק</h1>
+<div class="card">
+<p>${esc(RESET_LINK_COPY)}</p>
+<p><code dir="ltr" class="invite-link">${esc(options.link)}</code></p>
+</div>
+<p><a href="/businesses/${esc(options.businessId)}">לדף העסק</a></p>`,
+    viewer,
+  );
+}
+
+/** An upload refused before its form could be read (too large, unreadable): the reason and a way back. */
+export function renderUploadRefused(viewer: PanelViewer, businessId: string, message: string): string {
+  return page(
+    'ההעלאה נדחתה',
+    `<h1>ההעלאה נדחתה</h1>
+${errorBlock(message)}
+<p><a href="/businesses/${esc(businessId)}">לדף העסק</a></p>`,
+    viewer,
+  );
+}
+
+/** Up to how many empty rows each repeatable group offers below the saved ones (no script on the panel). */
+const BLANK_PERSON_ROWS = 3;
+
+function personTable(prefix: 'contact' | 'colleague', rows: PanelSetupData['contacts']): string {
+  const filled = rows.map(
+    (r) =>
+      `<tr><td><input type="text" name="${prefix}_name" value="${esc(r.name)}"></td><td><input type="text" name="${prefix}_role" value="${esc(r.role)}"></td><td><input type="text" name="${prefix}_phone" value="${esc(r.phone)}" dir="ltr"></td></tr>`,
+  );
+  const blank = Array.from(
+    { length: BLANK_PERSON_ROWS },
+    () =>
+      `<tr><td><input type="text" name="${prefix}_name"></td><td><input type="text" name="${prefix}_role"></td><td><input type="text" name="${prefix}_phone" dir="ltr" placeholder="+972..."></td></tr>`,
+  );
+  return `<table>
+<thead><tr><th>שם</th><th>תפקיד</th><th>טלפון</th></tr></thead>
+<tbody>
+${[...filled, ...blank].join('\n')}
+</tbody>
+</table>`;
+}
+
+/**
+ * The technician's setup package. Before handover: a form with the saved
+ * values (the data the technician typed). After it: counts only — from the
+ * first signature on, the owner decides who the assistant knows.
+ */
+function setupSection(viewer: PanelViewer, d: PanelBusinessDetail, setup: PanelSetupData | 'locked'): string {
+  const id = esc(d.businessId);
+  if (setup === 'locked') {
+    return `<section class="card">
+<h2>פרטי הקמה</h2>
+<dl>
+<dt>מספר הוואטסאפ של בעל העסק</dt>
+<dd>${d.bossNumberSet ? 'מוגדר' : 'חסר'}</dd>
+<dt>אנשי קשר שאושרו</dt>
+<dd>${d.contactsConfirmed}</dd>
+<dt>עמיתים שאושרו</dt>
+<dd>${d.colleaguesConfirmed}</dd>
+</dl>
+<p class="muted">העסק נחתם — מעכשיו בעל העסק מעדכן את הפרטים האלה.</p>
+</section>`;
+  }
+  return `<section class="card">
+<h2>פרטי הקמה</h2>
+<form method="post" action="/businesses/${id}/setup">
+  <input type="hidden" name="csrf" value="${esc(viewer.csrf)}">
+  <label>מספר הוואטסאפ של בעל העסק<input type="text" name="boss" value="${esc(setup.bossWhatsapp ?? '')}" dir="ltr" placeholder="+972..."></label>
+  <h3>אנשי קשר</h3>
+  ${personTable('contact', setup.contacts)}
+  <h3>עמיתים</h3>
+  ${personTable('colleague', setup.colleagues)}
+  <p class="muted">שורה ריקה לא נשמרת. לשורות נוספות — שמור, והטופס יציג שורות ריקות חדשות.</p>
+  <button type="submit">שמירת פרטי ההקמה</button>
+</form>
+</section>`;
+}
+
 export interface BusinessPageExtras {
   /**
-   * The address the technician typed, while the business has not signed;
-   * `'locked'` once it has (then only set/missing is shown).
+   * What the technician typed, while the business has not signed; `'locked'`
+   * once it has (then only set/missing and counts are shown).
    */
-  address: string | null | 'locked';
+  setup: PanelSetupData | 'locked';
+  /** The owner dashboard's public base URL, for the mailbox row's link. */
+  dashboardBaseUrl: string;
   /** The active charter's currency, or `null` without a (readable) charter. */
   currency: string | null;
   /** A refusal or note to show at the top (an invite or status action). */
@@ -294,14 +382,47 @@ export interface BusinessPageExtras {
 
 export function renderBusinessPage(viewer: PanelViewer, d: PanelBusinessDetail, extras: BusinessPageExtras): string {
   const id = esc(d.businessId);
+  const unsigned = extras.setup !== 'locked';
   const addressLine =
-    extras.address === 'locked'
+    extras.setup === 'locked'
       ? d.addressSet
         ? 'מוגדרת'
         : 'חסרה'
-      : extras.address === null
+      : extras.setup.address === null
         ? 'חסרה'
-        : esc(extras.address);
+        : esc(extras.setup.address);
+  const csrfField = `<input type="hidden" name="csrf" value="${esc(viewer.csrf)}">`;
+  // Address and logo are the technician's to set only until the owner signs.
+  const profileForms = !unsigned
+    ? ''
+    : `<form method="post" action="/businesses/${id}/profile">
+  ${csrfField}
+  <label>כתובת<input type="text" name="address" value="${esc(extras.setup === 'locked' ? '' : (extras.setup.address ?? ''))}"></label>
+  <button type="submit">שמירת הכתובת</button>
+</form>
+<form method="post" action="/businesses/${id}/logo" enctype="multipart/form-data">
+  ${csrfField}
+  <label>לוגו (PNG או JPEG, עד 1MB)<input type="file" name="logo" accept="image/png,image/jpeg"></label>
+  <button type="submit">העלאת הלוגו</button>
+</form>`;
+  const ownerActions = !d.ownerExists
+    ? ''
+    : `<form method="post" action="/businesses/${id}/reset-link">
+  ${csrfField}
+  <button type="submit">קישור לאיפוס סיסמה</button>
+</form>
+<form method="post" action="/businesses/${id}/totp-reset">
+  ${csrfField}
+  <button type="submit">איפוס Google Authenticator של בעל העסק</button>
+  <p class="muted">בעל העסק ינותק מכל המכשירים ויחבר את האפליקציה מחדש בכניסה הבאה.</p>
+</form>`;
+  const whatsappForm = `<form method="post" action="/businesses/${id}/whatsapp">
+  ${csrfField}
+  <label>מזהה החשבון<input type="text" name="instanceId" autocomplete="off" dir="ltr" required></label>
+  <label>אסימון<input type="password" name="token" autocomplete="off" dir="ltr" required></label>
+  <button type="submit">שמירה</button>
+</form>`;
+  const connectionsLink = `${extras.dashboardBaseUrl.replace(/\/+$/, '')}/connections`;
   const owner = d.ownerExists
     ? `בעל העסק נכנס · Google Authenticator ${d.ownerEnrolled ? 'מחובר' : 'עדיין לא מחובר'}`
     : 'בעל העסק עדיין לא נכנס';
@@ -337,18 +458,23 @@ ${errorBlock(extras.error)}
 <dt>בעל העסק</dt>
 <dd>${esc(owner)}</dd>
 </dl>
+${profileForms}
 ${inviteForm}
+${ownerActions}
 </section>
 <section class="card">
 <h2>2 · חיבורים בסיסיים (נדרשים כדי להתחיל לעבוד)</h2>
 <table>
-<tr><td>וואטסאפ</td><td>${tick(d.whatsappSaved)}</td></tr>
+<tr><td>וואטסאפ</td><td>${d.whatsappSaved ? '✓ שמור' : '—'}</td></tr>
 <tr><td>מספר הוואטסאפ של בעל העסק</td><td>${tick(d.bossNumberSet)}</td></tr>
-<tr><td>תיבת המייל</td><td>${tick(d.mailboxConnected)}</td></tr>
+<tr><td>תיבת המייל</td><td>${d.mailboxConnected ? 'מחובר' : 'לא מחובר'} · <span class="muted">${esc(`שלח לבעל העסק את הקישור: ${connectionsLink}`)}</span></td></tr>
 <tr><td>אנשי קשר ועמיתים</td><td>${tick(people > 0)}</td></tr>
 </table>
 <p class="muted">${d.basicDone}/${d.basicTotal}</p>
+<h3>וואטסאפ</h3>
+${whatsappForm}
 </section>
+${setupSection(viewer, d, extras.setup)}
 <section class="card">
 <h2>3 · חיבור למערכות (פותח עבודה מלאה)</h2>
 <p class="muted">ייבנה בשלב הבא</p>

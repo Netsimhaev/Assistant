@@ -2,8 +2,9 @@
  * The business's own profile: its address and its logo (admin-panel spec).
  *
  * Not a counterparty's data, so not wired into contact erasure. The panel
- * enforces the charter lock itself before calling these; the owner's own
- * settings call them with no lock.
+ * enforces the charter lock itself: it calls these inside a transaction that
+ * holds the install lock and re-checked the charter (`assertSetupUnlocked`).
+ * The owner's own settings call them with no charter lock.
  *
  * The logo is judged by its bytes (`sniffImage`), capped at `LOGO_MAX_BYTES`,
  * and written to `<documentRoot>/<businessId>/profile/logo.png|jpg`. The row
@@ -89,7 +90,9 @@ function sha256(bytes: Buffer): string {
 /**
  * Store a new logo, replacing the old one. The file is written to a temporary
  * name and renamed into place, then the row is updated; a logo of the other
- * format is removed after the row points at the new one.
+ * format is removed after the row points at the new one. The whole sequence
+ * runs under a per-business advisory lock (`business-logo:<id>`), so two
+ * saves never interleave.
  */
 export async function saveLogo(
   db: BusinessDb,
@@ -101,20 +104,26 @@ export async function saveLogo(
   const mediaType = sniffImage(bytes);
   if (mediaType === null) return 'not_image';
 
-  const paths = logoPathsFor(db.businessId);
-  const relative = paths[mediaType];
-  const absolute = join(documentRoot, relative);
-  await mkdir(dirname(absolute), { recursive: true });
-  const temporary = `${absolute}.${ulid()}.tmp`;
-  try {
-    await writeFile(temporary, bytes, { flag: 'wx' });
-    await rename(temporary, absolute);
-  } catch (err) {
-    await rm(temporary, { force: true });
-    throw err;
-  }
-
+  // One save at a time per business, for the whole write → upsert →
+  // remove-other sequence: without it a PNG save and a JPEG save interleave
+  // so that the row names one format after the other save already removed
+  // that file, and the logo is silently lost. The lock is transaction-scoped
+  // and this transaction joins a caller's (the panel holds the charter
+  // install lock around it), so it is released at that caller's commit.
   await transaction(db, async (tx) => {
+    await tx.query("SELECT pg_advisory_xact_lock(hashtext('business-logo:' || $1))", [tx.businessId]);
+    const paths = logoPathsFor(tx.businessId);
+    const relative = paths[mediaType];
+    const absolute = join(documentRoot, relative);
+    await mkdir(dirname(absolute), { recursive: true });
+    const temporary = `${absolute}.${ulid()}.tmp`;
+    try {
+      await writeFile(temporary, bytes, { flag: 'wx' });
+      await rename(temporary, absolute);
+    } catch (err) {
+      await rm(temporary, { force: true });
+      throw err;
+    }
     await tx.query(
       `INSERT INTO business_profiles (business_id, logo_path, logo_media_type, logo_sha256, updated_at, updated_by)
        VALUES ($1, $2, $3, $4, now(), $5)
@@ -126,10 +135,9 @@ export async function saveLogo(
              updated_by = EXCLUDED.updated_by`,
       [tx.businessId, relative, mediaType, sha256(bytes), updatedBy],
     );
+    const other: LogoMediaType = mediaType === 'image/png' ? 'image/jpeg' : 'image/png';
+    await rm(join(documentRoot, paths[other]), { force: true });
   });
-
-  const other: LogoMediaType = mediaType === 'image/png' ? 'image/jpeg' : 'image/png';
-  await rm(join(documentRoot, paths[other]), { force: true });
   return 'ok';
 }
 

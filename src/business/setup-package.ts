@@ -87,6 +87,19 @@ export async function loadSetupPackage(db: BusinessDb): Promise<SetupPackage | n
 }
 
 /**
+ * Inside the caller's transaction: take the advisory lock the interview's
+ * install takes (`charter-install:<businessId>`) and refuse with
+ * `SetupLockedError` when a charter is already active. Held to the caller's
+ * commit, so no install can land between this check and the caller's write.
+ * The panel's profile and logo saves take it too.
+ */
+export async function assertSetupUnlocked(tx: BusinessDb): Promise<void> {
+  if (!tx.inTransaction) throw new Error('assertSetupUnlocked: must run inside a transaction');
+  await tx.query("SELECT pg_advisory_xact_lock(hashtext('charter-install:' || $1))", [tx.businessId]);
+  if ((await activeCharterVersion(tx)) !== null) throw new SetupLockedError();
+}
+
+/**
  * Replace the package. Refuses with `SetupLockedError` once a charter is
  * active, under the same advisory lock the interview's install takes, so a
  * save cannot land between that install's check and its commit. An empty
@@ -95,8 +108,7 @@ export async function loadSetupPackage(db: BusinessDb): Promise<SetupPackage | n
 export async function saveSetupPackage(db: BusinessDb, pkg: SetupPackage, updatedBy: string): Promise<void> {
   const parsed = SetupPackage.parse(pkg);
   await transaction(db, async (tx) => {
-    await tx.query("SELECT pg_advisory_xact_lock(hashtext('charter-install:' || $1))", [tx.businessId]);
-    if ((await activeCharterVersion(tx)) !== null) throw new SetupLockedError();
+    await assertSetupUnlocked(tx);
     if (parsed.bossWhatsapp === null && parsed.contacts.length === 0 && parsed.colleagues.length === 0) {
       await tx.query('DELETE FROM setup_packages WHERE business_id = $1', [tx.businessId]);
       return;

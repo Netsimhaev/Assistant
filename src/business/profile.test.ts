@@ -127,4 +127,19 @@ describe('business profile', () => {
     expect(profile.address).toBe('הרצל 2');
     expect(profile.logo?.mediaType).toBe('image/png');
   });
+
+  it('serialises concurrent saves: after PNG and JPEG saves race, the stored logo still reads back', async () => {
+    // Without a lock around write → upsert → remove-other, a PNG save and a
+    // JPEG save interleave so that the row names one format while the other
+    // save has already removed that file — the logo is silently lost.
+    for (let round = 0; round < 5; round += 1) {
+      await Promise.all(
+        Array.from({ length: 8 }, (_, i) =>
+          withBusiness(TEST_BUSINESS, (db) => saveLogo(db, i % 2 === 0 ? pngBytes() : jpegBytes(), ROOT, TECH)),
+        ),
+      );
+      const logo = await withBusiness(TEST_BUSINESS, (db) => readLogo(db, ROOT));
+      expect(logo, `round ${round}`).not.toBeNull();
+    }
+  });
 });

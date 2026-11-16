@@ -70,7 +70,8 @@ import {
   TOTP_LOCKED,
   type PanelViewer,
 } from './views.js';
-import { handleBusinessRoute } from './business-routes.js';
+import { handleBusinessRoute, type UploadBody } from './business-routes.js';
+import { parseMultipart } from '../dashboard/multipart.js';
 
 export interface AdminOptions {
   /** Loopback by default; anything else is refused unless `allowNonLoopbackBind`. */
@@ -170,6 +171,53 @@ async function readFormBody(req: IncomingMessage): Promise<URLSearchParams> {
     chunks.push(chunk);
   }
   return new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+}
+
+/** Room for the form fields and multipart framing beside the one file (the dashboard's `/instruct` allowance). */
+const UPLOAD_FRAMING_BYTES = 64 * 1024;
+
+/**
+ * A multipart body with at most one file, bounded before it is parsed: the
+ * file cap plus the framing. The same reader the dashboard's `/instruct`
+ * upload uses (`parseMultipart`), behind the same bounded read. Past the cap
+ * nothing more is buffered, the rest of the body is discarded and the
+ * response closes the connection.
+ */
+async function readUploadBody(req: IncomingMessage, res: ServerResponse, maxFileBytes: number): Promise<UploadBody> {
+  const limit = maxFileBytes + UPLOAD_FRAMING_BYTES;
+  const overCap = (): UploadBody => {
+    res.setHeader('Connection', 'close');
+    return { ok: false, code: 'too_large' };
+  };
+  const declared = Number(req.headers['content-length']);
+  if (Number.isFinite(declared) && declared > limit) return overCap();
+  // Events rather than `for await`: leaving a `for await` early destroys the
+  // socket before the refusal can be sent.
+  const chunks: Buffer[] = [];
+  const within = await new Promise<boolean>((resolveRead, rejectRead) => {
+    let total = 0;
+    const onData = (chunk: Buffer): void => {
+      total += chunk.length;
+      if (total > limit) {
+        req.off('data', onData);
+        req.off('end', onEnd);
+        req.resume();
+        resolveRead(false);
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = (): void => resolveRead(true);
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.once('error', rejectRead);
+  });
+  if (!within) return overCap();
+  const parsed = parseMultipart(Buffer.concat(chunks), req.headers['content-type'], { maxFileBytes });
+  if (!parsed.ok) return { ok: false, code: parsed.code === 'file_too_large' ? 'too_large' : 'malformed' };
+  const form = new URLSearchParams();
+  for (const [key, value] of parsed.fields) form.set(key, value);
+  return { ok: true, form, file: parsed.file?.bytes ?? null };
 }
 
 /** A signed-in request: the raw token, the CSRF binding and what the session row says. */
@@ -356,6 +404,7 @@ async function handleJoinPost(req: IncomingMessage, res: ServerResponse, token: 
 
 interface RouteOptions {
   masterKey: Buffer;
+  documentRoot: string;
   dashboardBaseUrl: string;
 }
 
@@ -408,7 +457,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
     staff: { staffId: session.staffId, displayName: session.displayName },
     viewer: viewerOf(session),
     dashboardBaseUrl: options.dashboardBaseUrl,
+    masterKey: options.masterKey,
+    documentRoot: options.documentRoot,
     readForm: () => readFormBody(req),
+    readUpload: (maxFileBytes) => readUploadBody(req, res, maxFileBytes),
     csrfOk: (form) => verifyCsrfToken(session.token, form.get('csrf')),
     sendHtml: (status, html) => sendHtml(res, status, html),
     seeOther: (location) => seeOther(res, location),
@@ -425,7 +477,11 @@ export function createAdminServer(options: AdminOptions): Server {
   assertBindableHost(host, options.allowNonLoopbackBind ?? false, ADMIN_BIND);
 
   const server = createHttpServer((req, res) => {
-    handleRequest(req, res, { masterKey: options.masterKey, dashboardBaseUrl: options.dashboardBaseUrl }).catch((err: unknown) => {
+    handleRequest(req, res, {
+      masterKey: options.masterKey,
+      documentRoot: options.documentRoot,
+      dashboardBaseUrl: options.dashboardBaseUrl,
+    }).catch((err: unknown) => {
       if (err instanceof FormBodyTooLargeError) {
         if (!res.headersSent) sendHtml(res, 413, renderTooLarge());
         else res.end();
