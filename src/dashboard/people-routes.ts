@@ -19,6 +19,7 @@ import type { ServerResponse } from 'node:http';
 import { addColleague, listColleagues, removeColleague, updateColleague } from '../business/colleagues.js';
 import {
   addManagedContact,
+  ContactPhoneTakenError,
   listManagedContacts,
   removeManagedContact,
   updateManagedContact,
@@ -186,16 +187,27 @@ export async function handlePeopleAction(
   const person = personFrom(form);
   if (!person.ok) return renderPeople(res, 400, db, session, person.error);
 
-  if (action === 'add') {
-    if (list === 'colleague') await addColleague(db, person.entry);
-    else await addManagedContact(db, person.entry);
-    return seeOther(res, PEOPLE_SETTINGS_PATH);
+  try {
+    if (action === 'add') {
+      if (list === 'colleague') await addColleague(db, person.entry);
+      else await addManagedContact(db, person.entry);
+      return seeOther(res, PEOPLE_SETTINGS_PATH);
+    }
+  } catch (err) {
+    if (err instanceof ContactPhoneTakenError) return renderPeople(res, 400, db, session, err.message);
+    throw err;
   }
 
-  const updated =
-    list === 'colleague'
-      ? await updateColleague(db, form.get('id') ?? '', person.entry)
-      : await updateManagedContact(db, form.get('key') ?? '', person.entry);
+  let updated: boolean;
+  try {
+    updated =
+      list === 'colleague'
+        ? await updateColleague(db, form.get('id') ?? '', person.entry)
+        : await updateManagedContact(db, form.get('key') ?? '', person.entry);
+  } catch (err) {
+    if (err instanceof ContactPhoneTakenError) return renderPeople(res, 400, db, session, err.message);
+    throw err;
+  }
   if (!updated) return renderPeople(res, 404, db, session, PERSON_NOT_FOUND);
   seeOther(res, PEOPLE_SETTINGS_PATH);
 }

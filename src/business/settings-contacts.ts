@@ -16,8 +16,13 @@
  * `writeMemory` reads the provenance from the job, never from its input — in
  * one transaction with the job's transitions to `closed`. The key is the
  * canonical `+<digits>` phone, the same derivation `applySetupPeople` uses,
- * and the body is `{name, role, phone}`. Writing the same key supersedes the
- * previous live row (soft retire, `writeMemory`); a removal goes through
+ * and the body is `{name, role, phone}`. Writing a key supersedes the live
+ * row on it (soft retire, `writeMemory`) — but only a LEARNED entity (one
+ * this screen does not manage) may be superseded that way: a write onto a
+ * phone that a DIFFERENT managed contact (`setup_package`/`settings_people`)
+ * holds is refused with `ContactPhoneTakenError`, before any job or write
+ * (final review I3 — it used to retire that contact silently). Re-saving a
+ * contact on its own key is an edit, not a conflict. A removal goes through
  * `retireMemories`, the function the `memory.retire` tool handler calls, so
  * the row stays with `retired_at` set.
  */
@@ -29,6 +34,17 @@ import { SETUP_PACKAGE_SOURCE_REF } from './confirm-people.js';
 import type { PersonEntry } from './setup-package.js';
 
 export const SETTINGS_PEOPLE_SOURCE_REF = 'settings_people';
+
+/** Shown when the phone typed belongs to another contact on this screen. */
+export const CONTACT_PHONE_TAKEN = 'כבר יש איש קשר עם המספר הזה.';
+
+/** A write onto a phone another managed contact holds. Carries the Hebrew sentence. */
+export class ContactPhoneTakenError extends Error {
+  constructor() {
+    super(CONTACT_PHONE_TAKEN);
+    this.name = 'ContactPhoneTakenError';
+  }
+}
 
 /** The source refs this screen lists and may change. Closed. */
 export const MANAGED_CONTACT_SOURCES = [SETUP_PACKAGE_SOURCE_REF, SETTINGS_PEOPLE_SOURCE_REF] as const;
@@ -103,19 +119,28 @@ function writeContact(tx: BusinessDb, jobId: string, entry: PersonEntry) {
   });
 }
 
-/** `entry` must already be parsed with `PersonEntry` (canonical phone). */
+/**
+ * `entry` must already be parsed with `PersonEntry` (canonical phone).
+ * Throws `ContactPhoneTakenError` — no job, no write — when a managed contact
+ * already holds that phone.
+ */
 export async function addManagedContact(db: BusinessDb, entry: PersonEntry): Promise<void> {
-  await asOwner(db, 'הוספת איש קשר בהגדרות', (tx, jobId) => writeContact(tx, jobId, entry));
+  await transaction(db, async (tx) => {
+    if (await isManaged(tx, entry.phone)) throw new ContactPhoneTakenError();
+    await asOwner(tx, 'הוספת איש קשר בהגדרות', (owner, jobId) => writeContact(owner, jobId, entry));
+  });
 }
 
 /**
  * Replace the managed contact at `subjectKey` with `entry`. A changed phone
  * retires the old key and writes the new one. `false` — and no job, no write —
- * when no managed live contact has that key.
+ * when no managed live contact has that key; `ContactPhoneTakenError` when the
+ * new phone belongs to another managed contact.
  */
 export async function updateManagedContact(db: BusinessDb, subjectKey: string, entry: PersonEntry): Promise<boolean> {
   return transaction(db, async (tx) => {
     if (!(await isManaged(tx, subjectKey))) return false;
+    if (entry.phone !== subjectKey && (await isManaged(tx, entry.phone))) throw new ContactPhoneTakenError();
     await asOwner(tx, 'עדכון איש קשר בהגדרות', async (owner, jobId) => {
       if (entry.phone !== subjectKey) {
         await retireMemories(owner, { kind: 'entity', subjectKey, reason: 'phone changed by owner' });

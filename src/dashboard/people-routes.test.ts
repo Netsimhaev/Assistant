@@ -12,6 +12,7 @@ import { createJob } from '../orchestrator/jobs.js';
 import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { createServer } from './server.js';
 import { PEOPLE_INTRO } from './people-routes.js';
+import { CONTACT_PHONE_TAKEN } from '../business/settings-contacts.js';
 import { escapeHtml } from './views.js';
 
 const BUSINESS = 'people-business';
@@ -239,6 +240,55 @@ describe('/settings/people', () => {
       { provenance: 'boss', phase: 'closed' },
     ]);
     expect(await (await get(baseUrl, cookie, PEOPLE)).text()).not.toContain('רונית');
+  });
+
+  /** Final review I3: a write on a phone another managed contact holds would silently retire it. */
+  it('refuses to add, or move a phone onto, a number another managed contact holds — writing nothing', async () => {
+    await seedEntity('+972501110001', { name: 'רונית', role: 'לקוחה', phone: '+972501110001' }, 'setup_package');
+    await seedEntity('+972501110002', { name: 'משה', role: 'ספק', phone: '+972501110002' }, 'settings_people');
+    const before = await entities();
+    const { baseUrl, cookie } = await start();
+
+    const add = await post(baseUrl, cookie, `${PEOPLE}/contact/add`, {
+      csrf: await csrf(baseUrl, cookie),
+      name: 'מישהו אחר',
+      role: 'לקוח',
+      phone: '+972-50-111-0001',
+    });
+    expect(add.status).toBe(400);
+    expect(await add.text()).toContain(escapeHtml(CONTACT_PHONE_TAKEN));
+
+    const move = await post(baseUrl, cookie, `${PEOPLE}/contact/edit`, {
+      csrf: await csrf(baseUrl, cookie),
+      key: '+972501110002',
+      name: 'משה',
+      role: 'ספק',
+      phone: '+972501110001',
+    });
+    expect(move.status).toBe(400);
+    expect(CONTACT_PHONE_TAKEN).toBe('כבר יש איש קשר עם המספר הזה.');
+
+    const after = await entities();
+    expect(after).toEqual(before);
+    const { rows: jobs } = await testDb().query("SELECT 1 FROM jobs WHERE business_id = $1 AND provenance = 'boss'", [
+      BUSINESS,
+    ]);
+    expect(jobs).toEqual([]);
+  });
+
+  it('a contact add on the phone of a learned (not managed) entity still supersedes it', async () => {
+    await seedEntity('+972501110001', { name: 'רונית מהמייל', phone: '+972501110001' }, null);
+    const { baseUrl, cookie } = await start();
+    const add = await post(baseUrl, cookie, `${PEOPLE}/contact/add`, {
+      csrf: await csrf(baseUrl, cookie),
+      name: 'רונית כהן',
+      role: 'לקוחה',
+      phone: '+972501110001',
+    });
+    expect(add.status).toBe(303);
+    const live = (await entities()).filter((r) => r.retired_at === null);
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ source_ref: 'settings_people', provenance: 'boss' });
   });
 
   it('does not list or touch an entity this screen or the setup did not write', async () => {
