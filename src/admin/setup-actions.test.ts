@@ -3,7 +3,7 @@ import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
-import type { Server } from 'node:http';
+import { request, type Server } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, withBusiness } from '../db/pool.js';
 import { closePlatformPool } from '../db/platform-pool.js';
@@ -372,6 +372,68 @@ describe('profile and logo before handover', () => {
     expect((await activity()).map((r) => r.action)).toEqual(['logo_saved']);
   });
 
+  it('cuts off an upload past the bounded read (declared and streamed), writing nothing', async () => {
+    const { cookie } = await signedIn();
+    const baseUrl = await startPanel();
+    const csrf = await pageCsrf(baseUrl, cookie);
+    const boundary = 'panelboundary7781';
+    // Past LOGO_MAX_BYTES + 64 KiB: refused by the bounded read, never handed to the parser.
+    const file = pngBytes(LOGO_MAX_BYTES + 128 * 1024);
+    const body = Buffer.concat([
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="csrf"\r\n\r\n${csrf}\r\n` +
+          `--${boundary}\r\nContent-Disposition: form-data; name="logo"; filename="logo.png"\r\nContent-Type: image/png\r\n\r\n`,
+      ),
+      file,
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+    const url = new URL(`${baseUrl}/businesses/${TEST_BUSINESS}/logo`);
+    // The client stops writing as soon as the refusal arrives: the server answers
+    // with Connection: close, and a socket closed over a large unread backlog is
+    // reset by the OS before the client could read the 413.
+    for (const declared of [true, false]) {
+      const { status, text } = await new Promise<{ status: number; text: string }>((resolveIt, reject) => {
+        let answered = false;
+        const req = request(
+          {
+            host: url.hostname,
+            port: url.port,
+            path: url.pathname,
+            method: 'POST',
+            headers: {
+              cookie,
+              'content-type': `multipart/form-data; boundary=${boundary}`,
+              ...(declared ? { 'content-length': String(body.length) } : {}),
+            },
+          },
+          (res) => {
+            answered = true;
+            const chunks: Buffer[] = [];
+            res.on('data', (c: Buffer) => chunks.push(c));
+            res.on('end', () => resolveIt({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString('utf8') }));
+            res.on('error', reject);
+          },
+        );
+        req.on('error', () => undefined); // the server closes the upload mid-body, on purpose
+        // Declared: the length alone is refused before a byte is read, so one
+        // small piece is enough. Streamed (chunked, no length): write just past
+        // the bound and wait — the reader must count the bytes to refuse.
+        const step = declared ? 4 * 1024 : 32 * 1024;
+        const writeFrom = (at: number): void => {
+          if (answered || at >= (declared ? body.length : LOGO_MAX_BYTES + 64 * 1024 + step)) return;
+          req.write(body.subarray(at, at + step), () => setTimeout(() => writeFrom(at + step), declared ? 50 : 0));
+        };
+        writeFrom(0);
+      });
+      expect(status, `declared=${declared}`).toBe(413);
+      expect(text).toContain(TOO_LARGE_COPY);
+    }
+    const none = await testDb().query('SELECT 1 FROM business_profiles WHERE business_id = $1', [TEST_BUSINESS]);
+    expect(none.rows).toHaveLength(0);
+    expect(await readdir(ROOT)).toEqual([]);
+    expect(await activity()).toEqual([]);
+  });
+
   it('refuses an upload with a forged CSRF token', async () => {
     const { cookie } = await signedIn();
     const baseUrl = await startPanel();
@@ -440,6 +502,14 @@ describe('owner reset link and Authenticator reset', () => {
     expect((await activity()).map((r) => r.action)).toEqual(['totp_reset']);
 
     expect(await withBusiness(TEST_BUSINESS, (db) => totpStatus(db, 'owner'))).toBe('not_enrolled');
+    const devices = await testDb().query<{ live: string; total: string }>(
+      `SELECT count(*) FILTER (WHERE revoked_at IS NULL) AS live, count(*) AS total
+         FROM dashboard_trusted_devices WHERE business_id = $1 AND username = 'owner'`,
+      [TEST_BUSINESS],
+    );
+    // The device the login used existed, and is revoked now.
+    expect(Number(devices.rows[0]?.total)).toBeGreaterThan(0);
+    expect(Number(devices.rows[0]?.live)).toBe(0);
     expect((await get(dashboardUrl, '/', sid)).headers.get('location')).toBe('/login');
     const login = await fetch(`${dashboardUrl}/login`, {
       method: 'POST',

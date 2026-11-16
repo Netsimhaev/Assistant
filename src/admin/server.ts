@@ -71,7 +71,7 @@ import {
   type PanelViewer,
 } from './views.js';
 import { handleBusinessRoute, type UploadBody } from './business-routes.js';
-import { parseMultipart } from '../dashboard/multipart.js';
+import { readBoundedMultipart } from '../dashboard/multipart.js';
 
 export interface AdminOptions {
   /** Loopback by default; anything else is refused unless `allowNonLoopbackBind`. */
@@ -173,48 +173,19 @@ async function readFormBody(req: IncomingMessage): Promise<URLSearchParams> {
   return new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
 }
 
-/** Room for the form fields and multipart framing beside the one file (the dashboard's `/instruct` allowance). */
-const UPLOAD_FRAMING_BYTES = 64 * 1024;
-
 /**
  * A multipart body with at most one file, bounded before it is parsed: the
- * file cap plus the framing. The same reader the dashboard's `/instruct`
- * upload uses (`parseMultipart`), behind the same bounded read. Past the cap
- * nothing more is buffered, the rest of the body is discarded and the
- * response closes the connection.
+ * file cap plus the framing. The same bounded read the dashboard's
+ * `/instruct` upload uses (`readBoundedMultipart`). Past the cap nothing
+ * more is buffered, the rest of the body is discarded and the response
+ * closes the connection.
  */
 async function readUploadBody(req: IncomingMessage, res: ServerResponse, maxFileBytes: number): Promise<UploadBody> {
-  const limit = maxFileBytes + UPLOAD_FRAMING_BYTES;
-  const overCap = (): UploadBody => {
-    res.setHeader('Connection', 'close');
-    return { ok: false, code: 'too_large' };
-  };
-  const declared = Number(req.headers['content-length']);
-  if (Number.isFinite(declared) && declared > limit) return overCap();
-  // Events rather than `for await`: leaving a `for await` early destroys the
-  // socket before the refusal can be sent.
-  const chunks: Buffer[] = [];
-  const within = await new Promise<boolean>((resolveRead, rejectRead) => {
-    let total = 0;
-    const onData = (chunk: Buffer): void => {
-      total += chunk.length;
-      if (total > limit) {
-        req.off('data', onData);
-        req.off('end', onEnd);
-        req.resume();
-        resolveRead(false);
-        return;
-      }
-      chunks.push(chunk);
-    };
-    const onEnd = (): void => resolveRead(true);
-    req.on('data', onData);
-    req.on('end', onEnd);
-    req.once('error', rejectRead);
-  });
-  if (!within) return overCap();
-  const parsed = parseMultipart(Buffer.concat(chunks), req.headers['content-type'], { maxFileBytes });
-  if (!parsed.ok) return { ok: false, code: parsed.code === 'file_too_large' ? 'too_large' : 'malformed' };
+  const parsed = await readBoundedMultipart(req, maxFileBytes);
+  if (!parsed.ok) {
+    if (parsed.code === 'over_cap') res.setHeader('Connection', 'close');
+    return { ok: false, code: parsed.code === 'over_cap' || parsed.code === 'file_too_large' ? 'too_large' : 'malformed' };
+  }
   const form = new URLSearchParams();
   for (const [key, value] of parsed.fields) form.set(key, value);
   return { ok: true, form, file: parsed.file?.bytes ?? null };

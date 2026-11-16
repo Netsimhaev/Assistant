@@ -188,7 +188,7 @@ import {
   productionToolsFromEnv,
   type DocumentRouteOptions,
 } from './document-routes.js';
-import { boundaryOf, parseMultipart, type MultipartFile } from './multipart.js';
+import { boundaryOf, readBoundedMultipart, type MultipartFile } from './multipart.js';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1462,7 +1462,7 @@ async function handleInstructPost(
   let form: URLSearchParams;
   let upload: MultipartFile | null = null;
   if (multipart) {
-    const read = await readUploadBody(req, req.headers['content-type'], doorOptions.uploadMaxBytes ?? MAX_ORIGINAL_BYTES);
+    const read = await readUploadBody(req, doorOptions.uploadMaxBytes ?? MAX_ORIGINAL_BYTES);
     if (!read.ok) {
       // CSRF cannot be checked on a body that could not be read; nothing was written.
       if (read.overCap) {
@@ -1569,9 +1569,6 @@ async function handleInstructPost(
   await renderInstructionOutcome(res, session, outcome, db);
 }
 
-/** Room for the form fields and multipart framing beside the one file. */
-const UPLOAD_FRAMING_BYTES = MAX_BODY_BYTES;
-
 type UploadBody =
   | { ok: true; form: URLSearchParams; file: MultipartFile | null }
   /** `overCap`: the body was abandoned mid-stream — the caller must not read the request again. */
@@ -1579,46 +1576,15 @@ type UploadBody =
 
 /**
  * The multipart body of `POST /instruct`, bounded before it is parsed: the
- * ingest's own size cap plus the form's framing. One file at most, refused
+ * ingest's own size cap plus the form's framing (`readBoundedMultipart`, the
+ * one bounded read the panel's logo upload shares). One file at most, refused
  * past the cap — never truncated.
  */
-async function readUploadBody(
-  req: IncomingMessage,
-  contentType: string | undefined,
-  maxFileBytes: number,
-): Promise<UploadBody> {
+async function readUploadBody(req: IncomingMessage, maxFileBytes: number): Promise<UploadBody> {
   const tooLarge = `הקובץ גדול מ-${Math.max(1, Math.round(maxFileBytes / (1024 * 1024)))}MB.`;
-  // A declared length past the cap is refused before a byte is buffered.
-  const declared = Number(req.headers['content-length']);
-  if (Number.isFinite(declared) && declared > maxFileBytes + UPLOAD_FRAMING_BYTES) {
-    return { ok: false, reason: tooLarge, overCap: true };
-  }
-  // Read with events rather than `for await`: leaving a `for await` early
-  // destroys the request — and its socket — before the refusal can be sent.
-  // Past the cap nothing more is buffered; the caller answers with
-  // `Connection: close` and the rest is discarded.
-  const chunks: Buffer[] = [];
-  const within = await new Promise<boolean>((resolveRead, rejectRead) => {
-    let total = 0;
-    const onData = (chunk: Buffer): void => {
-      total += chunk.length;
-      if (total > maxFileBytes + UPLOAD_FRAMING_BYTES) {
-        req.off('data', onData);
-        req.off('end', onEnd);
-        req.resume();
-        resolveRead(false);
-        return;
-      }
-      chunks.push(chunk);
-    };
-    const onEnd = (): void => resolveRead(true);
-    req.on('data', onData);
-    req.on('end', onEnd);
-    req.once('error', rejectRead);
-  });
-  if (!within) return { ok: false, reason: tooLarge, overCap: true };
-  const parsed = parseMultipart(Buffer.concat(chunks), contentType, { maxFileBytes });
+  const parsed = await readBoundedMultipart(req, maxFileBytes);
   if (!parsed.ok) {
+    if (parsed.code === 'over_cap') return { ok: false, reason: tooLarge, overCap: true };
     const reason =
       parsed.code === 'too_many_files'
         ? 'אפשר לצרף קובץ אחד בלבד להוראה.'

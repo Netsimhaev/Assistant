@@ -21,6 +21,8 @@
  * as a whole. The body is already bounded by the caller before it gets here.
  */
 
+import type { IncomingMessage } from 'node:http';
+
 export interface MultipartFile {
   /** The form field name the file came in under. */
   field: string;
@@ -113,4 +115,56 @@ export function parseMultipart(
     }
     at = next + 2;
   }
+}
+
+/** Room for the form fields and multipart framing beside the one file. */
+export const UPLOAD_FRAMING_BYTES = 64 * 1024;
+
+export type BoundedMultipartResult = MultipartResult | { ok: false; code: 'over_cap' };
+
+/**
+ * Read a multipart request body bounded to `maxFileBytes + UPLOAD_FRAMING_BYTES`,
+ * then `parseMultipart` it. The one bounded read both servers use (the
+ * dashboard's `/instruct` upload, the panel's logo).
+ *
+ * `over_cap` — a declared `Content-Length` past the bound (refused before a
+ * byte is buffered) or a body that grew past it mid-stream. In both cases
+ * nothing more is buffered and the request is set flowing (`req.resume()`),
+ * so the rest is discarded; the caller must answer with `Connection: close`
+ * and never read the request again.
+ *
+ * Read with events rather than `for await`: leaving a `for await` early
+ * destroys the request — and its socket — before the refusal can be sent.
+ */
+export async function readBoundedMultipart(
+  req: IncomingMessage,
+  maxFileBytes: number,
+): Promise<BoundedMultipartResult> {
+  const limit = maxFileBytes + UPLOAD_FRAMING_BYTES;
+  const declared = Number(req.headers['content-length']);
+  if (Number.isFinite(declared) && declared > limit) {
+    req.resume();
+    return { ok: false, code: 'over_cap' };
+  }
+  const chunks: Buffer[] = [];
+  const within = await new Promise<boolean>((resolveRead, rejectRead) => {
+    let total = 0;
+    const onData = (chunk: Buffer): void => {
+      total += chunk.length;
+      if (total > limit) {
+        req.off('data', onData);
+        req.off('end', onEnd);
+        req.resume();
+        resolveRead(false);
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = (): void => resolveRead(true);
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.once('error', rejectRead);
+  });
+  if (!within) return { ok: false, code: 'over_cap' };
+  return parseMultipart(Buffer.concat(chunks), req.headers['content-type'], { maxFileBytes });
 }
