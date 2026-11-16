@@ -372,6 +372,17 @@ export interface ErasurePlan {
   ledgerRuleIds: string[];
   /** `document_productions` rows to erase — see this module's header (migrations 053–058). */
   productionIds: string[];
+  /**
+   * `business_colleagues` rows whose name or phone names the contact
+   * (migration 073, contact anchor only) — see `BUSINESS_COLLEAGUES_ERASED_PREDICATE`.
+   */
+  colleagueIds: string[];
+  /**
+   * True when this business's `setup_packages` row names the contact in its
+   * contacts, colleagues or boss number (migration 073, contact anchor only).
+   * The row is deleted whole — see `SETUP_PACKAGES_ERASED_PREDICATE`.
+   */
+  setupPackageMatched: boolean;
   filePaths: string[];
   /**
    * Copies of an erased production that `doc.save` wrote into the owner's
@@ -974,6 +985,40 @@ const MEETING_CONTENT_MATCHES = `(client_name ILIKE $2 ${LIKE_ESCAPE}
 export const LEDGER_CRITICAL_RULES_ERASED_PREDICATE = `business_id = $1 AND rule_id = ANY ($2)`;
 
 /**
+ * Setup data (migration 073). Both are found by a contact anchor only, by
+ * their own content — no job or document leads to either — and neither has a
+ * closure for a window or document anchor: they record who the business
+ * works with, not an event a window brackets.
+ *
+ * `business_colleagues`: a confirmed colleague whose `name` or `phone`
+ * matches is deleted. Parameters, in both places: `$1` businessId, `$2`
+ * colleagueIds.
+ */
+export const BUSINESS_COLLEAGUES_ERASED_PREDICATE = `business_id = $1 AND colleague_id = ANY ($2)`;
+
+/**
+ * `setup_packages`: the technician's pending package, deleted WHOLE when its
+ * contacts, colleagues or boss number name the contact. It is
+ * pre-confirmation data; scrubbing one entry out of a JSON array would buy
+ * nothing the owner can see. Parameters, in both places: `$1` businessId,
+ * `$2` the plan's `setupPackageMatched` boolean.
+ */
+export const SETUP_PACKAGES_ERASED_PREDICATE = `business_id = $1 AND $2::boolean`;
+
+/** A colleague row's identifying columns against a contact pattern (`$2`). */
+const COLLEAGUE_CONTENT_MATCHES = `(name ILIKE $2 ${LIKE_ESCAPE}
+      OR phone ILIKE $2 ${LIKE_ESCAPE})`;
+
+/**
+ * A setup package's content against a contact pattern (`$2`). The JSONB
+ * arrays go through `jsonbContentMatches`, so a name with `"` or a line
+ * break — escaped in the JSONB text form — is still found.
+ */
+const SETUP_PACKAGE_CONTENT_MATCHES = `(${jsonbContentMatches('contacts', '$2')}
+      OR ${jsonbContentMatches('colleagues', '$2')}
+      OR coalesce(boss_whatsapp, '') ILIKE $2 ${LIKE_ESCAPE})`;
+
+/**
  * A ledger item's own content, matched against a contact pattern (`$2`).
  * `stages`/`proposed_stages` go through `jsonbContentMatches`, so a name with
  * `"` or a line break — escaped in the JSONB text form — is still found.
@@ -1153,6 +1198,8 @@ export async function buildErasurePlan(
   const ledgerItemIds = new Set<string>();
   const ledgerRuleIds = new Set<string>();
   const productionIds = new Set<string>();
+  const colleagueIds = new Set<string>();
+  let setupPackageMatched = false;
 
   if (anchor.kind === 'contact') {
     const pattern = `%${likeLiteral(anchor.identifier)}%`;
@@ -1436,6 +1483,26 @@ export async function buildErasurePlan(
       [businessId, pattern],
       'production_id',
     )) productionIds.add(productionId);
+
+    // Setup data (migration 073), by its own content: a confirmed colleague
+    // by name or phone, and the technician's pending package by any of its
+    // three fields. See `BUSINESS_COLLEAGUES_ERASED_PREDICATE`.
+    for (const colleagueId of await idsFrom(
+      db,
+      `SELECT colleague_id FROM business_colleagues
+        WHERE business_id = $1 AND ${COLLEAGUE_CONTENT_MATCHES}`,
+      [businessId, pattern],
+      'colleague_id',
+    )) colleagueIds.add(colleagueId);
+
+    const setupHit = await db.query<{ hit: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM setup_packages
+          WHERE business_id = $1 AND ${SETUP_PACKAGE_CONTENT_MATCHES}
+       ) AS hit`,
+      [businessId, pattern],
+    );
+    setupPackageMatched = setupHit.rows[0]?.hit === true;
   }
 
   if (anchor.kind === 'window') {
@@ -1962,9 +2029,10 @@ export async function buildErasurePlan(
   const mailList = [...mailIds];
   const ledgerItemList = [...ledgerItemIds];
   const ledgerRuleList = [...ledgerRuleIds];
+  const colleagueList = [...colleagueIds].sort();
   const items = await countItems(
     db, anchor, jobList, documentList, memoryIds, digestList, draftList, mailList,
-    ledgerItemList, ledgerRuleList, productionList,
+    ledgerItemList, ledgerRuleList, productionList, colleagueList, setupPackageMatched,
   );
 
   return {
@@ -1978,6 +2046,8 @@ export async function buildErasurePlan(
     ledgerItemIds: ledgerItemList,
     ledgerRuleIds: ledgerRuleList,
     productionIds: productionList,
+    colleagueIds: colleagueList,
+    setupPackageMatched,
     filePaths,
     savedCopies,
     filesNotDeleted,
@@ -2008,6 +2078,8 @@ async function countItems(
   ledgerItemIds: string[],
   ledgerRuleIds: string[],
   productionIds: string[],
+  colleagueIds: string[],
+  setupPackageMatched: boolean,
 ): Promise<ErasureItem[]> {
   const businessId = db.businessId;
   const one = async (
@@ -2181,6 +2253,19 @@ async function countItems(
       'delete',
       `SELECT count(*)::text AS n FROM ledger_critical_rules WHERE ${LEDGER_CRITICAL_RULES_ERASED_PREDICATE}`,
       [businessId, ledgerRuleIds],
+    ),
+    // Setup data (migration 073): no job or document, no ordering constraint.
+    await one(
+      'business_colleagues',
+      'delete',
+      `SELECT count(*)::text AS n FROM business_colleagues WHERE ${BUSINESS_COLLEAGUES_ERASED_PREDICATE}`,
+      [businessId, colleagueIds],
+    ),
+    await one(
+      'setup_packages',
+      'delete',
+      `SELECT count(*)::text AS n FROM setup_packages WHERE ${SETUP_PACKAGES_ERASED_PREDICATE}`,
+      [businessId, setupPackageMatched],
     ),
     // Document production (migrations 053–058): cards, then versions, then
     // productions, matching the executor's order — see

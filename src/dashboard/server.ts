@@ -2226,6 +2226,8 @@ function planFingerprint(plan: ErasurePlan): string {
     ledgerItemIds: [...plan.ledgerItemIds].sort(),
     ledgerRuleIds: [...plan.ledgerRuleIds].sort(),
     productionIds: [...plan.productionIds].sort(),
+    colleagueIds: [...plan.colleagueIds].sort(),
+    setupPackageMatched: plan.setupPackageMatched,
     filePaths: [...plan.filePaths].sort(),
     // Display-only to the executor (never deleted), but what the owner was
     // told stays on his disk: a copy saved between the preview and the

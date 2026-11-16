@@ -49,6 +49,8 @@ import {
   JOBS_SCRUBBED_PREDICATE,
   JOBS_SCRUB_SET,
   LEDGER_CRITICAL_RULES_ERASED_PREDICATE,
+  BUSINESS_COLLEAGUES_ERASED_PREDICATE,
+  SETUP_PACKAGES_ERASED_PREDICATE,
   LEDGER_EVENTS_ERASED_PREDICATE,
   LEDGER_ITEMS_ERASED_PREDICATE,
   LEDGER_REMINDERS_ERASED_PREDICATE,
@@ -181,7 +183,10 @@ export async function executeErasure(
     );
   }
 
-  const { jobIds, documentIds, memoryIds, digestIds, draftIds, mailIds, ledgerItemIds, ledgerRuleIds, productionIds } = plan;
+  const {
+    jobIds, documentIds, memoryIds, digestIds, draftIds, mailIds, ledgerItemIds, ledgerRuleIds, productionIds,
+    colleagueIds, setupPackageMatched,
+  } = plan;
   const results: ErasureItem[] = [];
   await transaction(db, async (client) => {
 
@@ -423,6 +428,18 @@ export async function executeErasure(
       'ledger_critical_rules',
       `DELETE FROM ledger_critical_rules WHERE ${LEDGER_CRITICAL_RULES_ERASED_PREDICATE}`,
       [businessId, ledgerRuleIds],
+    );
+    // Setup data (migration 073): same predicates, same parameters as
+    // `countItems`. No job or document, so no ordering constraint.
+    await del(
+      'business_colleagues',
+      `DELETE FROM business_colleagues WHERE ${BUSINESS_COLLEAGUES_ERASED_PREDICATE}`,
+      [businessId, colleagueIds],
+    );
+    await del(
+      'setup_packages',
+      `DELETE FROM setup_packages WHERE ${SETUP_PACKAGES_ERASED_PREDICATE}`,
+      [businessId, setupPackageMatched],
     );
     // Document production (migrations 053–058). Leaf first — cards, then
     // versions, then productions: each cascades from the next, and a cascade

@@ -137,6 +137,13 @@ describe('what an erasure leaves behind', () => {
    * `meeting_holds` holds no content and is asserted deleted directly; the
    * calendar events are never deleted and are asserted listed.
    *
+   * **A twenty-third, also outside spec §5.1: setup data (migration 073)**
+   * — `business_colleagues` (name, role, phone) and `setup_packages` (the
+   * technician's pending boss number, contacts and colleagues), counted as one
+   * store. Neither has a job or document; both are found by their own
+   * content. `business_profiles` holds the business's own address and logo,
+   * not a counterparty, and is not wired.
+   *
    * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen, then twenty, then twenty-one, then twenty-two" count is spec §5.1's own
    * original content-store enumeration, growing as new content-bearing
    * tables were added to it — it is a DIFFERENT number from "how many
@@ -647,7 +654,28 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS, `אנחנו עובדים עם ${PROBE} כבר שנים`],
     );
 
+    // --- Migration 073: setup data. -------------------------------------
+    //
+    // A confirmed colleague named by the probe, and the technician's pending
+    // setup package carrying it among its contacts. Neither has a job or a
+    // document: only their own discovery can reach them. `business_profiles`
+    // is the business's own address and logo, not a counterparty, and is not
+    // seeded — nothing writes a counterparty there.
+    await db.query(
+      `INSERT INTO business_colleagues (business_id, colleague_id, name, role, phone)
+       VALUES ($1, 'COL-probe', $2, 'עובד', '+972501112222')`,
+      [BUSINESS, PROBE],
+    );
+    await db.query(
+      `INSERT INTO setup_packages (business_id, boss_whatsapp, contacts, colleagues, updated_by)
+       VALUES ($1, '+972520001111', $2::jsonb, '[]'::jsonb, 'staff-1')`,
+      [BUSINESS, JSON.stringify([{ name: `לקוח "ותיק" ${PROBE}`, role: 'לקוח', phone: '+972503334444' }])],
+    );
+
     const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PROBE }));
+    for (const table of ['business_colleagues', 'setup_packages']) {
+      expect(plan.items.find((item) => item.table === table && item.action === 'delete')?.count, table).toBe(1);
+    }
     for (const table of ['meetings', 'meeting_holds']) {
       expect(plan.items.find((item) => item.table === table && item.action === 'delete')?.count, table).toBe(1);
     }

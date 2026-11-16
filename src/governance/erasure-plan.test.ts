@@ -1611,3 +1611,101 @@ describe('the business description notice', () => {
     expect(plain).not.toContain('גרסאות קודמות של התיאור');
   });
 });
+
+describe('setup data: colleagues and the setup package (migration 073)', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+  });
+
+  const planFor = (anchor: Parameters<typeof buildErasurePlan>[1]) =>
+    withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, anchor));
+  const countOf = (plan: Awaited<ReturnType<typeof planFor>>, table: string): number =>
+    plan.items.find((item) => item.table === table && item.action === 'delete')?.count ?? -1;
+
+  const aColleague = async (id: string, name: string, phone: string, business = BUSINESS): Promise<void> => {
+    await testDb().query(
+      `INSERT INTO business_colleagues (business_id, colleague_id, name, role, phone)
+       VALUES ($1, $2, $3, 'עובד', $4)`,
+      [business, id, name, phone],
+    );
+  };
+  const aPackage = async (
+    contacts: unknown[],
+    colleagues: unknown[],
+    boss: string | null = null,
+    business = BUSINESS,
+  ): Promise<void> => {
+    await testDb().query(
+      `INSERT INTO setup_packages (business_id, boss_whatsapp, contacts, colleagues, updated_by)
+       VALUES ($1, $2, $3::jsonb, $4::jsonb, 'staff-1')`,
+      [business, boss, JSON.stringify(contacts), JSON.stringify(colleagues)],
+    );
+  };
+
+  it('finds a colleague by name or by phone, and no other', async () => {
+    await aColleague('C-ronit', 'רונית אלון', '+972501110000');
+    await aColleague('C-phone', 'משה', '+972509998888');
+    await aColleague('C-other', 'דנה', '+972507776666');
+    await aColleague('C-elsewhere', 'רונית אלון', '+972501110000', 'other-business');
+
+    expect((await planFor({ kind: 'contact', identifier: 'רונית אלון' })).colleagueIds).toEqual(['C-ronit']);
+    const byPhone = await planFor({ kind: 'contact', identifier: '+972509998888' });
+    expect(byPhone.colleagueIds).toEqual(['C-phone']);
+    expect(countOf(byPhone, 'business_colleagues')).toBe(1);
+  });
+
+  it('matches a name containing _ literally, never as a wildcard', async () => {
+    await aColleague('C-q', 'danaQx', '+972501110000');
+    expect((await planFor({ kind: 'contact', identifier: 'dana_x' })).colleagueIds).toEqual([]);
+  });
+
+  it('finds the setup package by contacts, colleagues or boss number — JSON-escaped names too', async () => {
+    await aPackage([{ name: 'אלפא בע"מ', role: 'ספק', phone: '+972501110000' }], []);
+    const plan = await planFor({ kind: 'contact', identifier: 'אלפא בע"מ' });
+    expect(plan.setupPackageMatched).toBe(true);
+    expect(countOf(plan, 'setup_packages')).toBe(1);
+
+    await resetDatabase();
+    await aPackage([], [{ name: 'יוסי', role: 'עובד', phone: '+972502220000' }]);
+    expect((await planFor({ kind: 'contact', identifier: '+972502220000' })).setupPackageMatched).toBe(true);
+
+    await resetDatabase();
+    await aPackage([], [], '+972503330000');
+    expect((await planFor({ kind: 'contact', identifier: '+972503330000' })).setupPackageMatched).toBe(true);
+  });
+
+  it('does not match the package for an unnamed contact, another business, or a non-contact anchor', async () => {
+    await aPackage([{ name: 'דנה', role: 'לקוחה', phone: '+972501110000' }], []);
+    await aPackage([{ name: 'רונית', role: 'לקוחה', phone: '+972501110000' }], [], null, 'other-business');
+    const plan = await planFor({ kind: 'contact', identifier: 'רונית' });
+    expect(plan.setupPackageMatched).toBe(false);
+    expect(countOf(plan, 'setup_packages')).toBe(0);
+    const window = await planFor({ kind: 'window', fromIso: '2020-01-01T00:00:00Z', toIso: '2100-01-01T00:00:00Z' });
+    expect(window.setupPackageMatched).toBe(false);
+    expect(window.colleagueIds).toEqual([]);
+  });
+
+  it('the executor deletes the colleague and the whole package, leaving the profile and the other business', async () => {
+    await aColleague('C-ronit', 'רונית', '+972501110000');
+    await aColleague('C-dana', 'דנה', '+972502220000');
+    await aPackage([{ name: 'רונית', role: 'לקוחה', phone: '+972501110000' }, { name: 'דנה', role: 'ספקית', phone: '+972502220000' }], []);
+    await aPackage([{ name: 'רונית', role: 'לקוחה', phone: '+972501110000' }], [], null, 'other-business');
+    await testDb().query(
+      `INSERT INTO business_profiles (business_id, address, updated_by) VALUES ($1, 'רחוב רונית 1', 'owner')`,
+      [BUSINESS],
+    );
+
+    const plan = await planFor({ kind: 'contact', identifier: 'רונית' });
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
+
+    const colleagues = await testDb().query<{ colleague_id: string }>(
+      'SELECT colleague_id FROM business_colleagues ORDER BY colleague_id',
+    );
+    expect(colleagues.rows.map((r) => r.colleague_id)).toEqual(['C-dana']);
+    const packages = await testDb().query<{ business_id: string }>('SELECT business_id FROM setup_packages');
+    expect(packages.rows.map((r) => r.business_id)).toEqual(['other-business']);
+    // The business's own address is not a counterparty and is never touched.
+    const profile = await testDb().query('SELECT 1 FROM business_profiles WHERE business_id = $1', [BUSINESS]);
+    expect(profile.rows).toHaveLength(1);
+  });
+});
