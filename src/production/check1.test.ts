@@ -962,6 +962,23 @@ describe('letterhead', () => {
     expect(codes(r)).toContain('ungrounded_number');
   });
 
+  /** Final review T14: the letterhead name ending in 2000 must not blank the 2000 of 20001. */
+  it('blanks the letterhead only at digit boundaries: a number that extends it still grounds', async () => {
+    const bytes = await renderDocx(letterDocx, { currency: 'ILS', images: noImages, letterhead });
+    const r = await runCheck1({
+      spec: letterDocx,
+      bytes,
+      sources,
+      rendered: rendered(`${headerText}
+${letterhead.name}1
+${await docxText(bytes)}`),
+      today: TODAY,
+      currency: 'ILS',
+      letterhead: { name: letterhead.name, address: letterhead.address },
+    });
+    expect(r.findings.filter((x) => x.code === 'ungrounded_number').map((x) => x.where).join(' ')).toContain('20001');
+  });
+
   it('a pdf with letterhead: true passes, the header block in the printed HTML', async () => {
     const pdfSpec: PdfSpec = { ...contractPdf, letterhead: true };
     const html = renderHtml(pdfSpec, assets, { currency: 'ILS', letterhead });

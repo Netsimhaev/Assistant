@@ -1288,15 +1288,24 @@ function blankStructure(text: string, s: Structure): string {
 /**
  * The letterhead's own name and address, removed wherever they appear whole —
  * after `blankStructure`, so both sides are whitespace-collapsed lines. Only
- * the exact strings the renderer drew: a digit beside them still grounds.
+ * the exact strings the renderer drew, and only at a digit boundary (final
+ * review T14): a name ending in `2000` does not blank the `2000` of `20001`,
+ * and an address starting with `77` does not blank the `77` of `177` — the
+ * longer number still has to ground.
  */
 function blankLetterhead(text: string, letterhead: readonly string[]): string {
   if (letterhead.length === 0) return text;
+  const patterns = letterhead.map((t) => {
+    const escaped = t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const before = /^\d/.test(t) ? '(?<!\\d)' : '';
+    const after = /\d$/.test(t) ? '(?!\\d)' : '';
+    return new RegExp(`${before}${escaped}${after}`, 'g');
+  });
   return text
     .split('\n')
     .map((line) => {
       let out = line;
-      for (const t of letterhead) out = out.split(t).join(' ');
+      for (const p of patterns) out = out.replace(p, ' ');
       return out;
     })
     .join('\n');

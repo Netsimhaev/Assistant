@@ -11,9 +11,9 @@ function pngBytes(extra = 0): Buffer {
   return Buffer.concat([signature, length, type, data, crc, Buffer.alloc(extra, 0)]);
 }
 
-/** A minimal JPEG: SOI, an APP0 marker, a few bytes, EOI. */
+/** A minimal JPEG: SOI, an APP0 marker, a few bytes, a baseline SOF0 frame header, EOI. */
 function jpegBytes(): Buffer {
-  return Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0xff, 0xd9]);
+  return Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x01, 0x00, 0x01, 0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, 0xff, 0xd9]);
 }
 
 describe('sniffImage — judged by bytes, never by name', () => {
@@ -41,6 +41,13 @@ describe('sniffImage — judged by bytes, never by name', () => {
 
   it('rejects a JPEG that does not end with the end-of-image marker', () => {
     expect(sniffImage(jpegBytes().subarray(0, 11))).toBeNull();
+  });
+
+  /** Final review M6: four bytes that start and end like a JPEG are not an image. */
+  it('rejects FFD8FFD9 alone, and JPEG framing with no frame header (SOF)', () => {
+    expect(sniffImage(Buffer.from([0xff, 0xd8, 0xff, 0xd9]))).toBeNull();
+    const noFrame = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(64, 1), Buffer.from([0xff, 0xd9])]);
+    expect(sniffImage(noFrame)).toBeNull();
   });
 
   it('rejects empty and random bytes', () => {

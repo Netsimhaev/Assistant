@@ -20,6 +20,24 @@ const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] as const;
  */
 const PNG_MIN_BYTES = 33;
 
+/**
+ * SOI (2) + the smallest frame header, SOF (19) + EOI (2). A JPEG shorter than
+ * that, or with no frame header at all, is not an image (final review M6:
+ * `FFD8FFD9` alone passed).
+ */
+const JPEG_MIN_BYTES = 23;
+
+/** Any start-of-frame marker after SOI: FFC0–FFCF except DHT (C4), JPG (C8) and DAC (CC). */
+function hasJpegFrameHeader(bytes: Buffer): boolean {
+  for (let i = 2; i + 1 < bytes.length - 2; i += 1) {
+    const marker = bytes[i + 1] ?? 0;
+    if (bytes[i] === 0xff && marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function sniffImage(bytes: Buffer): LogoMediaType | null {
   if (
     bytes.length >= PNG_MIN_BYTES &&
@@ -29,12 +47,13 @@ export function sniffImage(bytes: Buffer): LogoMediaType | null {
     return 'image/png';
   }
   if (
-    bytes.length >= 4 &&
+    bytes.length >= JPEG_MIN_BYTES &&
     bytes[0] === 0xff &&
     bytes[1] === 0xd8 &&
     bytes[2] === 0xff &&
     bytes[bytes.length - 2] === 0xff &&
-    bytes[bytes.length - 1] === 0xd9
+    bytes[bytes.length - 1] === 0xd9 &&
+    hasJpegFrameHeader(bytes)
   ) {
     return 'image/jpeg';
   }
