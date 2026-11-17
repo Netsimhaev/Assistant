@@ -37,8 +37,8 @@ export interface StaffRouteContext {
   pathname: string;
   staff: RecordingStaff;
   viewer: PanelViewer;
-  /** The panel's public base URL for join links: `ADMIN_BASE_URL`, else derived from the Host header. */
-  adminBaseUrl: string;
+  /** The panel's public base URL for join links; `null` when unknown (see `adminBaseUrlFor`). */
+  adminBaseUrl: string | null;
   readForm(): Promise<URLSearchParams>;
   csrfOk(form: URLSearchParams): boolean;
   sendHtml(status: number, html: string): void;
@@ -48,13 +48,22 @@ export interface StaffRouteContext {
 const LOG_LIMIT = 200;
 const FIELD_MAX = 200;
 
+/** The invite link's origin is unknown: the head is told what to set. */
+export const ADMIN_BASE_URL_MISSING =
+  'לא ניתן להציג קישור הזמנה: כתובת הפאנל אינה מוגדרת. יש להגדיר את ADMIN_BASE_URL בשרת ולנסות שוב.';
+
 /**
  * The panel's base URL for the link it shows. `ADMIN_BASE_URL` wins when set
- * (it must be an http(s) origin); otherwise the Host header, accepted only in
- * host[:port] shape — an odd Host never reaches a link. Loopback is http,
- * anything else https (the panel's cookies are Secure, so it sits behind TLS).
+ * (it must be an http(s) origin). Otherwise only a LOOPBACK Host is believed
+ * (`localhost`, `127.0.0.1`, `[::1]`, with an optional port) and served as
+ * http. Any other Host — a header the client sets — never becomes a link
+ * origin: `null`, and the invite is refused (final review T11), because a
+ * link minted on an attacker's Host sends the invitee's token to them.
  */
-export function adminBaseUrlFor(req: IncomingMessage, env: string | undefined = process.env['ADMIN_BASE_URL']): string {
+export function adminBaseUrlFor(
+  req: IncomingMessage,
+  env: string | undefined = process.env['ADMIN_BASE_URL'],
+): string | null {
   if (env !== undefined && env.trim().length > 0) {
     try {
       const url = new URL(env.trim());
@@ -64,10 +73,8 @@ export function adminBaseUrlFor(req: IncomingMessage, env: string | undefined = 
     }
   }
   const host = req.headers.host ?? '';
-  if (!/^[A-Za-z0-9.-]+(:\d{1,5})?$/.test(host)) return 'https://localhost';
-  const name = host.replace(/:\d+$/, '');
-  const loopback = name === 'localhost' || name === '127.0.0.1';
-  return `${loopback ? 'http' : 'https'}://${host}`;
+  if (/^(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$/.test(host)) return `http://${host}`;
+  return null;
 }
 
 /** `/staff/<id>/<action>`, or `null`. */
@@ -106,6 +113,11 @@ export async function handleStaffRoute(ctx: StaffRouteContext): Promise<boolean>
   if (isInvite) {
     const name = (form.get('name') ?? '').trim().slice(0, FIELD_MAX);
     const email = (form.get('email') ?? '').trim().slice(0, FIELD_MAX);
+    // Before anything is issued: a link with no trusted origin is never minted.
+    if (ctx.adminBaseUrl === null) {
+      ctx.sendHtml(400, renderStaffPage(viewer, await listStaff(), { error: ADMIN_BASE_URL_MISSING, values: { name, email } }));
+      return true;
+    }
     try {
       const { token } = await inviteStaff({ login: email, displayName: name, issuedBy: ctx.staff.staffId });
       await recordStaffAction(ctx.staff, 'staff_invited', null);

@@ -9,12 +9,15 @@
  * comes from mail, memory, jobs or instructions.
  */
 import { escapeHtml } from '../util/html.js';
+import { stripBidiControls } from '../util/bidi.js';
 import { formatMinor } from '../util/money.js';
 import type { StaffAction, StaffActionRow } from '../tenancy/activity-log.js';
 import type { StaffListing } from '../tenancy/staff.js';
 import type { PanelBusinessDetail, PanelBusinessRow, PanelSetupData } from '../tenancy/panel-reads.js';
 
 const esc = escapeHtml;
+/** A staff name is typed text: bidi controls are stripped before escaping (final review M5). */
+const escLabel = (value: string): string => esc(stripBidiControls(value));
 
 const STYLE = `
   :root { color-scheme: light dark; }
@@ -51,7 +54,7 @@ export function page(title: string, body: string, viewer?: PanelViewer): string 
     viewer === undefined
       ? ''
       : `<nav><a href="/">עסקים</a> · <a href="/staff">צוות</a> · <a href="/log">יומן פעולות</a></nav>
-<div><span class="muted">${esc(viewer.displayName)}${viewer.isHead ? ' (מנהל ראשי)' : ''}</span>
+<div><span class="muted">${escLabel(viewer.displayName)}${viewer.isHead ? ' (מנהל ראשי)' : ''}</span>
 <form method="post" action="/logout" style="display:inline">
   <input type="hidden" name="csrf" value="${esc(viewer.csrf)}">
   <button type="submit">התנתקות</button>
@@ -562,7 +565,7 @@ export function renderStaffPage(viewer: PanelViewer, staff: StaffListing[], opti
         viewer.isHead && !s.removed
           ? `${form(`/staff/${s.staffId}/reset-factor`, 'איפוס Authenticator')} ${form(`/staff/${s.staffId}/remove`, 'הסרה')}`
           : '';
-      return `<tr><td>${esc(s.displayName)}</td><td dir="ltr">${esc(s.login)}</td><td>${s.isHead ? 'מנהל ראשי' : 'צוות'}</td><td>${s.enrolled ? '✓' : '—'}</td><td>${s.removed ? 'הוסר' : ''}</td><td>${actions}</td></tr>`;
+      return `<tr><td>${escLabel(s.displayName)}</td><td dir="ltr">${esc(s.login)}</td><td>${s.isHead ? 'מנהל ראשי' : 'צוות'}</td><td>${s.enrolled ? '✓' : '—'}</td><td>${s.removed ? 'הוסר' : ''}</td><td>${actions}</td></tr>`;
     })
     .join('\n');
   const link =
@@ -609,7 +612,7 @@ export function renderActivityLog(viewer: PanelViewer, rows: StaffActionRow[]): 
 ${rows
   .map(
     (r) =>
-      `<tr><td>${esc(formatWhen(r.at))}</td><td>${esc(r.staffDisplayName)}</td><td>${esc(STAFF_ACTION_LABELS[r.action])}</td><td>${r.businessId === null ? '—' : esc(r.businessId)}</td></tr>`,
+      `<tr><td>${esc(formatWhen(r.at))}</td><td>${escLabel(r.staffDisplayName)}</td><td>${esc(STAFF_ACTION_LABELS[r.action])}</td><td>${r.businessId === null ? '—' : esc(r.businessId)}</td></tr>`,
   )
   .join('\n')}
 </tbody>

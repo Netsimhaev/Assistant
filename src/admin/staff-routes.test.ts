@@ -18,6 +18,9 @@ import {
   startStaffSession,
 } from '../tenancy/staff.js';
 import { createAdminServer } from './server.js';
+import { request as httpRequest, type IncomingMessage } from 'node:http';
+import { escapeHtml } from '../util/html.js';
+import { ADMIN_BASE_URL_MISSING, adminBaseUrlFor } from './staff-routes.js';
 import { STAFF_ACTION_LABELS } from './views.js';
 
 const NOT_HEAD = 'רק מנהל ראשי יכול לנהל את הצוות.';
@@ -183,6 +186,50 @@ describe('staff management', () => {
     expect(await staffPage.text()).toContain('דנה');
   });
 
+  /** Final review T11: a Host header the attacker may set never becomes a link origin. */
+  it('adminBaseUrlFor: loopback hosts (including [::1]) are http; any other Host without ADMIN_BASE_URL is null', () => {
+    const req = (host: string) => ({ headers: { host } }) as unknown as IncomingMessage;
+    expect(adminBaseUrlFor(req('127.0.0.1:8788'), undefined)).toBe('http://127.0.0.1:8788');
+    expect(adminBaseUrlFor(req('localhost'), undefined)).toBe('http://localhost');
+    expect(adminBaseUrlFor(req('[::1]:8788'), undefined)).toBe('http://[::1]:8788');
+    expect(adminBaseUrlFor(req('panel.company.example'), undefined)).toBeNull();
+    expect(adminBaseUrlFor(req('evil.example'), '')).toBeNull();
+    expect(adminBaseUrlFor(req('evil.example'), 'https://panel.example/x')).toBe('https://panel.example');
+  });
+
+  it('refuses to issue an invite when the link origin is unknown, in Hebrew, issuing nothing', async () => {
+    const h = await head();
+    const baseUrl = await startPanel();
+    const csrf = csrfIn(await (await get(baseUrl, '/staff', h.cookie)).text());
+    // `fetch` will not send a custom Host; node:http will.
+    const body = new URLSearchParams({ csrf, name: 'דנה', email: 'd@company.example' }).toString();
+    const res = await new Promise<{ status: number; text: string }>((resolve, reject) => {
+      const r = httpRequest(
+        `${baseUrl}/staff/invite`,
+        {
+          method: 'POST',
+          headers: {
+            cookie: h.cookie,
+            host: 'panel.company.example',
+            'content-type': 'application/x-www-form-urlencoded',
+            'content-length': Buffer.byteLength(body),
+          },
+        },
+        (response) => {
+          let text = '';
+          response.setEncoding('utf8');
+          response.on('data', (chunk: string) => (text += chunk));
+          response.on('end', () => resolve({ status: response.statusCode ?? 0, text }));
+        },
+      );
+      r.on('error', reject);
+      r.end(body);
+    });
+    expect(res.status).toBe(400);
+    expect(res.text).toContain(escapeHtml(ADMIN_BASE_URL_MISSING));
+    expect((await listStaff()).map((s) => s.login)).toEqual(['head@company.example']);
+  });
+
   it('prefers ADMIN_BASE_URL when it is set', async () => {
     const h = await head();
     const baseUrl = await startPanel();
@@ -209,6 +256,20 @@ describe('staff management', () => {
     expect(await bad.text()).toContain('כתובת מייל לא תקינה.');
     expect(await activity()).toEqual([]);
     expect((await listStaff()).length).toBe(1);
+  });
+
+  /** Final review M5: a staff name is typed text; bidi controls never reach the page. */
+  it('renders staff names with bidi controls stripped — on the team list, the header and the log', async () => {
+    const h = await head();
+    const { staffId } = await inviteStaff({ login: 'rlo@company.example', displayName: 'דנה‮טכנאית', issuedBy: h.staffId });
+    await logStaffAction({ staffId, action: 'business_open', businessId: 'biz-one' });
+    const baseUrl = await startPanel();
+    const team = await (await get(baseUrl, '/staff', h.cookie)).text();
+    expect(team).toContain('דנהטכנאית');
+    expect(team).not.toContain('‮');
+    const log = await (await get(baseUrl, '/log', h.cookie)).text();
+    expect(log).toContain('דנהטכנאית');
+    expect(log).not.toContain('‮');
   });
 
   it('refuses removing the last head, in Hebrew, and logs nothing', async () => {
