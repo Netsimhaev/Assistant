@@ -22,7 +22,7 @@ import { ActionClass } from './action.js';
 export const EXTERNAL_SYSTEM_ID = /^[a-z][a-z0-9_]{1,30}$/;
 
 const OPERATION_NAME = /^[a-z][a-z0-9_]{1,40}$/;
-const PARAM_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,40}$/;
+const PARAM_NAME_SHAPE = /^[A-Za-z_][A-Za-z0-9_]{0,40}$/;
 /** An HTTP header name (RFC 9110 token, restricted to the characters real headers use). */
 const HEADER_NAME = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
 /** A query-string parameter name for a handshake — Meta's are dotted (`hub.mode`). */
@@ -30,6 +30,55 @@ const QUERY_NAME = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/;
 const FIELD_SEGMENT = /^[A-Za-z0-9_]{1,64}$/;
 /** Segments that would walk the prototype chain if a path were followed into an object. */
 const UNSAFE_SEGMENTS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * A parameter name: an identifier that is not one of the prototype-chain
+ * names, since a request builder may key an object by it.
+ */
+function isParamName(name: string): boolean {
+  return PARAM_NAME_SHAPE.test(name) && !UNSAFE_SEGMENTS.has(name);
+}
+
+/**
+ * Header names no definition may set, compared case-insensitively. Each one
+ * is set by the HTTP client itself (framing, connection, host, body type) or
+ * carries the client's own session — a definition that could set one could
+ * smuggle a request, redirect it, or ride a cookie it was never given.
+ * Positive and closed: a header is accepted only when it is not on this list
+ * and does not start with one of the prefixes below.
+ */
+export const RESERVED_HEADER_NAMES: readonly string[] = [
+  'host',
+  'content-length',
+  'transfer-encoding',
+  'connection',
+  'upgrade',
+  'te',
+  'trailer',
+  'cookie',
+  'content-type',
+];
+/** Header-name prefixes no definition may set (`Proxy-Authorization` and its family). */
+export const RESERVED_HEADER_PREFIXES: readonly string[] = ['proxy-'];
+
+export function isReservedHeaderName(name: string): boolean {
+  const lower = name.toLowerCase();
+  return RESERVED_HEADER_NAMES.includes(lower) || RESERVED_HEADER_PREFIXES.some((p) => lower.startsWith(p));
+}
+
+/**
+ * A URL path with no `.`/`..` segment and no `//` anywhere — so a joined
+ * request URL can never climb out of the base path or become
+ * protocol-relative. Encoded dots (`%2e`) count as dots.
+ */
+function pathEscapes(path: string): boolean {
+  if (path.includes('//')) return true;
+  return path
+    .toLowerCase()
+    .replaceAll('%2e', '.')
+    .split('/')
+    .some((segment) => segment === '.' || segment === '..');
+}
 
 /**
  * The classes a `change` operation may be judged as. Named, never derived:
@@ -72,7 +121,12 @@ const FieldPath = z
     { message: 'expected a dotted field path of letters, digits and underscores' },
   );
 
-const HeaderName = z.string().regex(HEADER_NAME, 'expected an HTTP header name');
+const HeaderName = z
+  .string()
+  .regex(HEADER_NAME, 'expected an HTTP header name')
+  .refine((name) => !isReservedHeaderName(name), {
+    message: 'כותרת שמורה — אסור להגדיר אותה (Host, Content-Length, Cookie, Content-Type, Proxy-* ועוד)',
+  });
 
 export const ExternalField = z.object({
   path: FieldPath,
@@ -81,7 +135,7 @@ export const ExternalField = z.object({
 export type ExternalField = z.infer<typeof ExternalField>;
 
 const ExternalParam = z.object({
-  name: z.string().regex(PARAM_NAME, 'expected a parameter name'),
+  name: z.string().refine(isParamName, { message: 'expected a parameter name' }),
   in: z.enum(['path', 'query', 'body']),
   required: z.boolean(),
 });
@@ -99,7 +153,7 @@ function pathPlaceholders(path: string): { names: string[]; malformed: boolean }
     names.push(name);
     return '';
   });
-  const malformed = /[{}]/.test(stripped) || names.some((n) => !PARAM_NAME.test(n));
+  const malformed = /[{}]/.test(stripped) || names.some((n) => !isParamName(n));
   return { names, malformed };
 }
 
@@ -112,7 +166,8 @@ const OperationShape = z.object({
   path: z
     .string()
     .max(300)
-    .regex(/^\/[A-Za-z0-9\-._~/{}]*$/, 'expected a path that starts with "/"'),
+    .regex(/^\/[A-Za-z0-9\-._~/{}]*$/, 'expected a path that starts with "/"')
+    .refine((path) => !pathEscapes(path), { message: 'path must not contain "." or ".." segments or "//"' }),
   params: z.array(ExternalParam).max(30).default([]),
   bodyEncoding: z.enum(['json', 'form']).default('json'),
   fields: z.array(ExternalField).max(20).default([]),
@@ -141,6 +196,11 @@ export const ExternalOperation = OperationShape.superRefine((op, ctx) => {
       path: ['actionClass'],
       message: `action class "${op.actionClass}" is not allowed for a "${op.kind}" operation`,
     });
+  }
+
+  // A read must not change anything; POST is allowed for search endpoints.
+  if (op.kind === 'read' && op.method !== 'GET' && op.method !== 'POST') {
+    ctx.addIssue({ code: 'custom', path: ['method'], message: 'a read operation must use GET or POST' });
   }
 
   if (op.kind === 'money' && op.amount === null) {
@@ -282,6 +342,15 @@ const ExternalWebhook = z
       }
       seen.add(event.type);
     }
+    // Without a type path every delivery is the same event, which is
+    // meaningful only when exactly one event is declared.
+    if (hook.typePath === null && hook.events.length !== 1) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['typePath'],
+        message: 'typePath may be null only when exactly one event is declared',
+      });
+    }
     // A body challenge is recognised by its type value, so there must be a
     // path to read the type from.
     if (hook.handshake?.kind === 'body_challenge' && hook.typePath === null) {
@@ -291,7 +360,7 @@ const ExternalWebhook = z
 
 const ExternalScan = z.object({
   operation: z.string().regex(OPERATION_NAME),
-  sinceParam: z.string().regex(PARAM_NAME).nullable().default(null),
+  sinceParam: z.string().refine(isParamName).nullable().default(null),
   itemsPath: FieldPath.nullable().default(null),
   everyHours: z.number().int().min(1).max(168),
 });
@@ -303,6 +372,11 @@ const BaseUrl = z
   .refine(
     (raw) => {
       if (raw.includes('?') || raw.includes('#') || raw.includes('@')) return false;
+      // The path part, read from the raw string: `URL` would already have
+      // collapsed the dot segments this check exists to refuse.
+      const afterScheme = raw.replace(/^https:\/\//i, '');
+      const slash = afterScheme.indexOf('/');
+      if (slash !== -1 && pathEscapes(afterScheme.slice(slash))) return false;
       let url: URL;
       try {
         url = new URL(raw);
@@ -311,7 +385,7 @@ const BaseUrl = z
       }
       return url.protocol === 'https:' && url.username === '' && url.password === '' && url.hostname !== '';
     },
-    { message: 'baseUrl must be an https: URL with no credentials, query or fragment' },
+    { message: 'baseUrl must be an https: URL with no credentials, query, fragment, dot segments or "//" in its path' },
   );
 
 export const ExternalSystem = z
@@ -335,11 +409,23 @@ export const ExternalSystem = z
     }
     if (system.scan !== null) {
       const target = system.operations.find((op) => op.name === system.scan?.operation);
-      if (target === undefined || target.kind !== 'read') {
+      if (target === undefined || target.kind !== 'read' || target.method !== 'GET') {
         ctx.addIssue({
           code: 'custom',
           path: ['scan', 'operation'],
-          message: `scan operation "${system.scan.operation}" must be a read operation of this system`,
+          message: `scan operation "${system.scan.operation}" must be a GET read operation of this system`,
+        });
+      }
+      const since = system.scan.sinceParam;
+      if (
+        target !== undefined &&
+        since !== null &&
+        !target.params.some((p) => p.name === since && p.in === 'query')
+      ) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['scan', 'sinceParam'],
+          message: `הפרמטר "${since}" אינו פרמטר שאילתה (query) מוצהר של פעולת הסריקה "${target.name}"`,
         });
       }
     }
