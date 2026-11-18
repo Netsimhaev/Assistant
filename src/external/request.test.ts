@@ -233,7 +233,7 @@ describe('buildExternalRequest', () => {
     });
     it('schema refuses an optional path param', () => {
       expect(() => sys({}, [
-        { name: 'g', label: 'x', kind: 'read', actionClass: 'external.read', method: 'GET', path: '/c/{id}',
+        { name: 'get_x', label: 'x', kind: 'read', actionClass: 'external.read', method: 'GET', path: '/c/{id}',
           params: [{ name: 'id', in: 'path', required: false }] },
       ])).toThrow(/חייב להיות חובה/);
     });
@@ -250,6 +250,45 @@ describe('buildExternalRequest', () => {
       const s = sys();
       const r = good(buildExternalRequest(s, op(s, 'pay'), { params: { ref: { note: 'x' } }, amountMinor: 100 }, 'k'));
       expect(JSON.parse(r.body ?? '{}')).toEqual({ ref: { note: 'x' }, amount: 1 });
+    });
+  });
+
+  describe('round 2 hardening', () => {
+    it('refuses mixed placeholder segments at signing, accepts a whole segment', () => {
+      for (const path of ['/files/{id}.json', '/x/{a}-{b}']) {
+        expect(() => sys({}, [
+          { name: 'get_x', label: 'x', kind: 'read', actionClass: 'external.read', method: 'GET', path,
+            params: [{ name: 'id', in: 'path', required: true }, { name: 'a', in: 'path', required: true }, { name: 'b', in: 'path', required: true }] },
+        ])).toThrow(/מקטע שלם/);
+      }
+      expect(() => sys({}, [
+        { name: 'get_x', label: 'x', kind: 'read', actionClass: 'external.read', method: 'GET', path: '/files/{id}',
+          params: [{ name: 'id', in: 'path', required: true }] },
+      ])).not.toThrow();
+    });
+    it('refuses a param named like the amount field in another case', () => {
+      expect(() => sys({}, [
+        { name: 'pay', label: 'x', kind: 'money', actionClass: 'payment.make', method: 'POST', path: '/pay',
+          params: [{ name: 'Amount_Cents', in: 'body', required: false }],
+          amount: { field: 'amount_cents', unit: 'minor', currency: 'ILS' } },
+      ])).toThrow(/must not also be a parameter/);
+    });
+    it('refuses a nested key that differs from the amount field only by case', () => {
+      const s = sys();
+      const r = buildExternalRequest(s, op(s, 'pay'), { params: { ref: { AMOUNT: 5 } }, amountMinor: 100 }, 'k');
+      expect(r.ok).toBe(false);
+    });
+    it('returns bad_params instead of throwing on a lone surrogate', () => {
+      const s = sys();
+      let r: ReturnType<typeof buildExternalRequest> | undefined;
+      expect(() => { r = buildExternalRequest(s, op(s, 'get_customer'), { params: { id: String.fromCharCode(0xd800) } }, 'k'); }).not.toThrow();
+      expect(r?.ok).toBe(false);
+      expect(!r?.ok && r?.code).toBe('bad_params');
+    });
+    it('refuses an amount above 10^15 and accepts the limit', () => {
+      const s = sys();
+      expect(buildExternalRequest(s, op(s, 'pay'), { amountMinor: 1_000_000_000_000_001 }, 'k').ok).toBe(false);
+      expect(buildExternalRequest(s, op(s, 'pay'), { amountMinor: 1_000_000_000_000_000 }, 'k').ok).toBe(true);
     });
   });
 });

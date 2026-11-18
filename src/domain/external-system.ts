@@ -227,7 +227,8 @@ export const ExternalOperation = OperationShape.superRefine((op, ctx) => {
 
   // The amount travels in its own declared field, never as a free parameter
   // the plan could fill in beside it.
-  if (op.amount !== null && paramNames.has(op.amount.field)) {
+  const amountLower = op.amount?.field.toLowerCase();
+  if (op.amount !== null && [...paramNames].some((n) => n.toLowerCase() === amountLower)) {
     ctx.addIssue({
       code: 'custom',
       path: ['amount', 'field'],
@@ -236,6 +237,14 @@ export const ExternalOperation = OperationShape.superRefine((op, ctx) => {
   }
 
   const { names: placeholders, malformed } = pathPlaceholders(op.path);
+  // A placeholder fills a whole segment: `/files/{id}`, never `/files/{id}.json` or `/x/{a}-{b}`.
+  if (op.path.split('/').some((seg) => seg.includes('{') && !/^\{[^{}]*\}$/.test(seg))) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['path'],
+      message: 'פרמטר בנתיב חייב למלא מקטע שלם (למשל ‎/files/{id}‎)',
+    });
+  }
   if (malformed) {
     ctx.addIssue({ code: 'custom', path: ['path'], message: 'path placeholders must be of the form {param}' });
   }

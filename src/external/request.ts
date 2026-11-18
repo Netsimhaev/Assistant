@@ -11,6 +11,9 @@ import { toOneLine } from '../util/bidi.js';
 /** Money is carried in minor units; a `major` operation divides by this. */
 export const MAJOR_DIVISOR = 100;
 
+/** Above this, major-unit formatting can lose a cent; refuse rather than round. */
+export const MAX_AMOUNT_MINOR = 1_000_000_000_000_000;
+
 export type ExternalRequestResult =
   | { ok: true; method: string; url: URL; headers: Record<string, string>; body: string | null }
   | { ok: false; code: 'bad_params'; message: string };
@@ -47,12 +50,17 @@ function isUsablePathValue(value: string): boolean {
 
 /** Does a key equal to `key` occur at any depth inside `value`? Too deep counts as yes. */
 function containsKey(value: unknown, key: string, depth = 0): boolean {
+  const wanted = key.toLowerCase();
+  return containsKeyLower(value, wanted, depth);
+}
+
+function containsKeyLower(value: unknown, key: string, depth: number): boolean {
   if (depth > 50) return true;
   if (value === null || typeof value !== 'object') return false;
-  if (Array.isArray(value)) return value.some((v) => containsKey(v, key, depth + 1));
+  if (Array.isArray(value)) return value.some((v) => containsKeyLower(v, key, depth + 1));
   for (const k of Object.keys(value)) {
-    if (k === key) return true;
-    if (containsKey((value as Record<string, unknown>)[k], key, depth + 1)) return true;
+    if (k.toLowerCase() === key) return true;
+    if (containsKeyLower((value as Record<string, unknown>)[k], key, depth + 1)) return true;
   }
   return false;
 }
@@ -99,7 +107,7 @@ export function buildExternalRequest(
   let amountValue: number | null = null;
   if (op.amount !== null) {
     const minor = input.amountMinor;
-    if (typeof minor !== 'number' || !Number.isSafeInteger(minor) || minor < 0) {
+    if (typeof minor !== 'number' || !Number.isSafeInteger(minor) || minor < 0 || minor > MAX_AMOUNT_MINOR) {
       return bad('פעולת כסף דורשת סכום תקין (מספר שלם אי-שלילי)');
     }
     if (op.amount.unit === 'major') {
@@ -147,7 +155,12 @@ export function buildExternalRequest(
   const base = new URL(system.baseUrl);
   const basePath = base.pathname.replace(/\/+$/, '');
   const encoded = new Map<string, string>();
-  for (const [k, v] of pathValues) encoded.set(k, encodeURIComponent(v));
+  try {
+    for (const [k, v] of pathValues) encoded.set(k, encodeURIComponent(v));
+  } catch (e) {
+    if (e instanceof URIError) return bad('אחד מערכי הנתיב מכיל תו שאי אפשר לקודד');
+    throw e;
+  }
   const path = op.path.replace(/\{([^{}]*)\}/g, (_m, name: string) => encoded.get(name) ?? '');
   const query = new URLSearchParams();
   for (const [k, v] of queryPairs) query.append(k, v);
