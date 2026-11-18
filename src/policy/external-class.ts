@@ -5,6 +5,7 @@ import {
   type ExternalOperation,
   type ExternalSystem,
 } from '../domain/external-system.js';
+import { toOneLine } from '../util/bidi.js';
 import { classifyAction, refineActionClass } from './classify.js';
 
 /**
@@ -58,6 +59,19 @@ function ownString(input: Record<string, unknown>, key: string): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
+/** Longest slice of a payload string a refusal reason may quote. */
+export const QUOTED_PAYLOAD_MAX_CHARS = 80;
+
+/**
+ * A payload string as a refusal reason may quote it: one line, no bidi
+ * controls (`toOneLine` strips them), at most 80 characters. The `system`
+ * and `operation` values are written by whoever shaped the payload, and the
+ * reason travels to the caller, the job record and the owner's screen.
+ */
+function quoted(value: string): string {
+  return toOneLine(value).slice(0, QUOTED_PAYLOAD_MAX_CHARS);
+}
+
 /** May this tool perform an operation of this kind? Positive, per tool. */
 function toolPerformsKind(toolName: string, kind: ExternalOperation['kind']): boolean {
   if (toolName === 'ext.read') return kind === 'read';
@@ -85,7 +99,7 @@ export function resolveExternalCall(
   input: Record<string, unknown>,
 ): ExternalResolution {
   if (!isExternalTool(toolName)) {
-    return { ok: false, reason: `"${toolName}" is not an external-system tool` };
+    return { ok: false, reason: `"${quoted(toolName)}" is not an external-system tool` };
   }
   const systemId = ownString(input, 'system');
   if (systemId === null) return { ok: false, reason: 'no readable "system" in the call' };
@@ -93,11 +107,11 @@ export function resolveExternalCall(
   if (operationName === null) return { ok: false, reason: 'no readable "operation" in the call' };
 
   const system = systems.find((s) => s.id === systemId);
-  if (system === undefined) return { ok: false, reason: `no signed system "${systemId}"` };
+  if (system === undefined) return { ok: false, reason: `no signed system "${quoted(systemId)}"` };
 
   const op = system.operations.find((o) => o.name === operationName);
   if (op === undefined) {
-    return { ok: false, reason: `system "${systemId}" has no signed operation "${operationName}"` };
+    return { ok: false, reason: `system "${quoted(systemId)}" has no signed operation "${quoted(operationName)}"` };
   }
   if (!toolPerformsKind(toolName, op.kind)) {
     return { ok: false, reason: `${toolName} may not perform the "${op.kind}" operation "${operationName}"` };
