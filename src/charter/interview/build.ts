@@ -358,6 +358,9 @@ export function buildCharterFromInterview(answers: InterviewAnswers, ctx: BuildC
     people: [buildPrincipal(answers, principalBefore), ...structuredClone(others)],
     counterparties,
     connections,
+    // Not asked in the interview: an edit keeps the definitions the owner
+    // signed (their `ext:` connections are kept by `buildConnections`).
+    externalSystems: structuredClone(previous?.externalSystems ?? []),
 
     money: {
       currency: previous?.money.currency ?? DEFAULT_CURRENCY,

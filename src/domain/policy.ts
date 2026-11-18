@@ -4,6 +4,7 @@ import { AutonomyLevel, TrustLevel } from './trust.js';
 import { AgentId } from './audit.js';
 import { DataClass } from './charter.js';
 import { CharterConnection } from './connection.js';
+import { ExternalSystem } from './external-system.js';
 
 /**
  * The canonical fact object a tool call is reduced to before any policy runs.
@@ -218,6 +219,13 @@ export const PolicyBundle = z.object({
    * bundle resolves channels from the same stale policy it is judged against.
    */
   connections: z.array(CharterConnection),
+
+  /**
+   * External systems the owner signed for (charter schema 1.4), carried for
+   * the same reason as `connections`: whatever resolves an external call
+   * reads the same artefact the gate is judged against.
+   */
+  externalSystems: z.array(ExternalSystem),
 
   allowlists: z.record(AgentId, z.array(z.string())),
   denylists: z.record(AgentId, z.array(z.string())),

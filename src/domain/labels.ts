@@ -46,6 +46,8 @@ export const ACTION_CLASS_HE: Readonly<Record<ActionClass, string>> = Object.fre
   'memory.write_longterm': 'רישום בזיכרון',
   'charter.amend': 'שינוי התקנון',
   'agent.delegate': 'בקשת עזרה מסוכן אחר',
+  'external.read': 'קריאה ממערכת חיצונית',
+  'external.delete': 'מחיקה במערכת חיצונית',
 });
 
 export const AUTONOMY_LEVEL_HE: Readonly<Record<AutonomyLevel, string>> = Object.freeze({

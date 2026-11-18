@@ -71,6 +71,14 @@ const TOOL_ACTION_CLASS: Record<string, ActionClass> = {
   // has no side effect, while this one plainly does — it just carries no
   // outbound authority of its own (see `CEILING_EXEMPT_TOOLS`).
   'agent.request_help': 'agent.delegate',
+  // External systems (Stage D). A read brings another system's data in.
+  'ext.read': 'external.read',
+  // A deliberate placeholder, and the strictest class there is: the real
+  // class of an `ext.call` is the one the owner signed for the named
+  // operation (`ExternalOperation.actionClass`), which the gate resolves from
+  // the charter in a later task. Until then a call is judged as an
+  // irreversible, never-fully-autonomous delete — never as something milder.
+  'ext.call': 'external.delete',
 };
 
 /**
@@ -184,6 +192,8 @@ const INGESTS_EXTERNAL_CONTENT: Record<string, boolean> = {
   // It reads the source documents it is pointed at — attachments and inbox
   // files whose authors are not the business (spec §5.2).
   'doc.produce': true,
+  // An external system's response is data someone else wrote.
+  'ext.read': true,
 
   // — local composition, owner-authored data, and outbound writes —
   'mail.draft': false,
@@ -231,6 +241,7 @@ const INGESTS_EXTERNAL_CONTENT: Record<string, boolean> = {
   'memory.upsert_preference': false,
   'memory.retire': false,
   'charter.apply_amendment': false,
+  'ext.call': false,
 };
 
 /**
@@ -373,6 +384,10 @@ const OUTBOUND_TOOLS: ReadonlySet<string> = new Set([
   'doc.deliver',
   'media.generate_image',
   'media.generate_video',
+  // Both reach a third party's server: redacted, held out of quiet hours and
+  // inside the outbound kill-switch scope.
+  'ext.read',
+  'ext.call',
 ]);
 
 export function isOutbound(toolName: string): boolean {

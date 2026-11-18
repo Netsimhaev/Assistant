@@ -42,7 +42,7 @@ import { TrustLevel } from '../domain/trust.js';
  * when `CURRENT_SCHEMA_VERSION` was last bumped.
  */
 const FROZEN_AT_CURRENT_SCHEMA = {
-  schemaVersion: '1.3',
+  schemaVersion: '1.4',
   /** `CharterAutonomy.base` — one entry per member, no implicit default. */
   actionClasses: [
     'email.reply',
@@ -71,6 +71,8 @@ const FROZEN_AT_CURRENT_SCHEMA = {
     'memory.write_longterm',
     'charter.amend',
     'agent.delegate',
+    'external.read',
+    'external.delete',
   ],
   /** `CharterAutonomy.provenanceCeiling` — the provenance ladder. */
   trustLevels: ['boss', 'staff', 'known_counterparty', 'unknown_external', 'open_web'],

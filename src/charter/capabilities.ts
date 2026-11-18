@@ -123,6 +123,9 @@ export const AGENT_ALLOWLISTS: Record<AgentId, string[]> = {
     'schema.map',
     'memory.recall',
     'agent.request_help',
+    // External systems the owner signed for (Stage D).
+    'ext.read',
+    'ext.call',
   ],
 
   // --- Production ---------------------------------------------------------

@@ -55,6 +55,10 @@ export const FIXED_BASE: Record<Exclude<ActionClass, InterviewRow>, AutonomyLeve
   'memory.write_longterm': 'auto',
   'charter.amend': 'draft_only',
   'agent.delegate': 'auto',
+  // External systems (charter schema 1.4): reading asks nobody; deleting a
+  // record in someone else's system always asks.
+  'external.read': 'auto',
+  'external.delete': 'approve_required',
 };
 
 /**

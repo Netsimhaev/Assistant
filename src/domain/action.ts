@@ -52,6 +52,13 @@ export const ActionClass = z.enum([
   // delegation does not leave the installation, so it is not redacted, not
   // subject to quiet hours, and not in the kill switch's `outbound` scope.
   'agent.delegate',
+  // External systems the owner signed for (Stage D, charter schema 1.4). A
+  // read brings someone else's data in; a delete removes a record in a system
+  // the business does not own the code of, which no undo here can restore.
+  // Changes and money on an external system are judged as the existing
+  // classes (`CHANGE_CLASSES`/`MONEY_CLASSES` in `domain/external-system.ts`).
+  'external.read',
+  'external.delete',
 ]);
 export type ActionClass = z.infer<typeof ActionClass>;
 
@@ -108,6 +115,10 @@ export const BASELINE_REVERSIBILITY: Record<ActionClass, Reversibility> = {
   // Asking for help has no effect of its own to undo — whatever the child job
   // does carries its own reversibility, scored when it acts.
   'agent.delegate': 'trivial',
+  // A read changes nothing on the other side.
+  'external.read': 'trivial',
+  // A record deleted in someone else's system has no compensation path here.
+  'external.delete': 'irreversible',
 };
 
 /**
@@ -145,6 +156,9 @@ const NEVER_FULLY_AUTONOMOUS_TABLE: Record<ActionClass, boolean> = {
   // `policy/classify.ts` for why the tool this class covers needs no ceiling
   // at all, let alone a permanent one.
   'agent.delegate': false,
+  'external.read': false,
+  // Deleting a record in an external system is irreversible from here.
+  'external.delete': true,
 };
 
 /**
@@ -240,6 +254,9 @@ const ACTION_ADDRESSEE: Record<ActionClass, Addressee> = {
   // A delegation does not leave the installation, so it is not redacted, not
   // subject to quiet hours, and not in the kill switch's `outbound` scope.
   'agent.delegate': 'internal',
+  // A system of record the business uses, like `crm.write` — not a person.
+  'external.read': 'internal',
+  'external.delete': 'internal',
 };
 
 /** Look up who or what a single action class reaches. */
