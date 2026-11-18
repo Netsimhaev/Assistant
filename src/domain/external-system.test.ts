@@ -169,9 +169,28 @@ describe('ExternalSystem — base URL', () => {
     ['https://api.crm.example.com/./v1'],
     ['https://api.crm.example.com//evil.example'],
     ['https://api.crm.example.com/v1/%2e%2e/admin'],
-  ])('refuses %s', (baseUrl) => {
+    // Bypasses of a raw-string check: backslash is "/" for https:, and the
+    // parser drops tabs and newlines.
+    ['https://h.example/v1\\..\\admin'],
+    ['https://h.example\\v1\\..\\admin'],
+    ['https://h.example/v1/.\t./admin'],
+    ['https://h.example/v1/\n../admin'],
+    ['https://h.example\\\\evil.example/x'],
+    ['https://h.example/v1\\\\x'],
+    ['https://h.example/v1 x'],
+    ['https://H.example/v1'],
+  ])('refuses %j', (baseUrl) => {
     expectRefusedBy(withEdit((s) => { s.baseUrl = baseUrl; }), 'baseUrl', 'baseUrl must be an https: URL');
   });
+});
+
+describe('ExternalSystem — base URL accepted forms', () => {
+  it.each(['https://api.crm.example.com', 'https://api.crm.example.com/', 'https://api.crm.example.com/v1/'])(
+    'accepts %s',
+    (baseUrl) => {
+      expectAccepted(withEdit((s) => { s.baseUrl = baseUrl; }));
+    },
+  );
 });
 
 describe('ExternalSystem — path and parameters', () => {
@@ -252,6 +271,9 @@ describe('ExternalSystem — path and parameters', () => {
       'scan.sinceParam',
       'אינו פרמטר שאילתה',
     );
+  });
+  it('refuses a sinceParam that is not a parameter name, in Hebrew', () => {
+    expectRefusedBy(withEdit((s) => { if (s.scan) s.scan.sinceParam = '__proto__'; }), 'scan.sinceParam', 'שם פרמטר לא תקין');
   });
   it('accepts a null sinceParam', () => {
     expectAccepted(withEdit((s) => { if (s.scan) s.scan.sinceParam = null; }));

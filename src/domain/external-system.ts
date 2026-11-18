@@ -360,7 +360,11 @@ const ExternalWebhook = z
 
 const ExternalScan = z.object({
   operation: z.string().regex(OPERATION_NAME),
-  sinceParam: z.string().refine(isParamName).nullable().default(null),
+  sinceParam: z
+    .string()
+    .refine(isParamName, { message: 'שם פרמטר לא תקין לפרמטר "מאז" של הסריקה' })
+    .nullable()
+    .default(null),
   itemsPath: FieldPath.nullable().default(null),
   everyHours: z.number().int().min(1).max(168),
 });
@@ -372,17 +376,21 @@ const BaseUrl = z
   .refine(
     (raw) => {
       if (raw.includes('?') || raw.includes('#') || raw.includes('@')) return false;
-      // The path part, read from the raw string: `URL` would already have
-      // collapsed the dot segments this check exists to refuse.
-      const afterScheme = raw.replace(/^https:\/\//i, '');
-      const slash = afterScheme.indexOf('/');
-      if (slash !== -1 && pathEscapes(afterScheme.slice(slash))) return false;
+      // The WHATWG parser reads `\` as `/` for https: and silently drops
+      // tabs and newlines, so a raw string can hide a dot segment or a `//`
+      // that appears only once parsed. None of these belongs in a base URL.
+      if (/[\\\s\u0000-\u001F\u007F-\u009F]/.test(raw)) return false;
       let url: URL;
       try {
         url = new URL(raw);
       } catch {
         return false;
       }
+      // What is validated must be what gets used: the parsed form equals the
+      // raw string (up to the one trailing slash an empty path gets), so no
+      // normalisation the parser does can differ from what the owner signed.
+      if (url.href !== raw && url.href !== `${raw}/`) return false;
+      if (pathEscapes(url.pathname)) return false;
       return url.protocol === 'https:' && url.username === '' && url.password === '' && url.hostname !== '';
     },
     { message: 'baseUrl must be an https: URL with no credentials, query, fragment, dot segments or "//" in its path' },
