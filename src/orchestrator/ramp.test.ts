@@ -73,7 +73,7 @@ describe('autonomy ramp', () => {
     await withBusiness(BUSINESS, (db) => setRampLevel(db, 'email.initiate', 'auto'));
     await withBusiness(BUSINESS, (db) => setRampLevel(db, 'crm.write', 'approve_required'));
     const plan = planWith(['email.initiate', 'crm.write']);
-    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan))).toBe('approve_required');
+    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan, []))).toBe('approve_required');
   });
 
   it('treats a step that declares no class as draft_only', async () => {
@@ -81,7 +81,7 @@ describe('autonomy ramp', () => {
     // Every step here is `mail.send` — a tool that HAS a class. A `null` on
     // one of those is the planner declining to say, and still floors the plan.
     const plan = planWith(['email.initiate', null]);
-    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan))).toBe('draft_only');
+    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan, []))).toBe('draft_only');
   });
 
   /**
@@ -118,7 +118,7 @@ describe('autonomy ramp', () => {
       ],
     });
 
-    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan))).toBe('auto_notify');
+    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan, []))).toBe('auto_notify');
   });
 
   /**
@@ -139,7 +139,7 @@ describe('autonomy ramp', () => {
       ],
     });
 
-    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan))).toBe('draft_only');
+    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan, []))).toBe('draft_only');
   });
 
   it('falls to the floor for a plan that is entirely read-only', async () => {
@@ -154,7 +154,7 @@ describe('autonomy ramp', () => {
     // No step carries a ceiling, so there is nothing to combine. The floor is
     // the safe answer and costs nothing: every step here short-circuits at the
     // gate before the autonomy stage reads this value at all.
-    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan))).toBe('draft_only');
+    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan, []))).toBe('draft_only');
   });
 
   /**
@@ -178,7 +178,7 @@ describe('autonomy ramp', () => {
       ],
     });
 
-    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan))).toBe('auto_notify');
+    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan, []))).toBe('auto_notify');
   });
 
   /**
@@ -204,6 +204,6 @@ describe('autonomy ramp', () => {
       ],
     });
 
-    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan))).toBe('auto');
+    expect(await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, plan, []))).toBe('auto');
   });
 });

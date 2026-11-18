@@ -293,15 +293,6 @@ describe('compiled policy has a reader', () => {
       // so the claim doesn't rest on prose alone.
       'allowlists',
       'denylists',
-
-      // TEMPORARY, Stage D Task 1 → Task 3. Charter schema 1.4 carries the
-      // signed external-system definitions into the bundle now, but the gate
-      // starts reading them only when Task 3 resolves an `ext.call` to the
-      // class of its signed operation. Until then `ext.call` is classified as
-      // the strictest class (`external.delete`), so nothing is permitted on
-      // the strength of an unread field. Task 3 removes this entry and puts
-      // the count back to 6.
-      'externalSystems',
     ]);
     // `charterVersion` was excluded here originally on the theory that stage
     // 2 compares it "by value rather than by name lookup" — true, but stage 2
@@ -315,15 +306,15 @@ describe('compiled policy has a reader', () => {
     // its size is asserted directly rather than as a loose lower bound on
     // survivors — growing it should be a deliberate, reviewed edit, not
     // something that quietly fits under a stale slack number.
-    expect(NOT_READ_BY_GATE.size).toBe(7);
+    expect(NOT_READ_BY_GATE.size).toBe(6);
     const compiled = compileCharter(buildCharter()) as Record<string, unknown>;
     const fields = Object.keys(compiled).filter((f) => !NOT_READ_BY_GATE.has(f));
     // Both properties pinned, not just the exclusion set: 19 top-level fields
-    // total, minus the 7 excluded above, is 12. A refactor that nested some of
+    // total, minus the 6 excluded above, is 13. A refactor that nested some of
     // these fields under a sub-object would shrink `fields` and pass this
     // invariant more vacuously than ever — a floor on the exclusion set alone
     // does not catch that.
-    expect(fields.length).toBe(12);
+    expect(fields.length).toBe(13);
     const unread = fields.filter((field) => !GATE_SOURCES.some((src) => readsField(src, field)));
     expect(unread).toEqual([]);
   });

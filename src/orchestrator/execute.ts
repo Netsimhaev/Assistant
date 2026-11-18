@@ -2,7 +2,8 @@ import type { AgentId } from '../domain/audit.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { isMoneyBearing } from '../domain/action.js';
 import type { AutonomyLevel } from '../domain/trust.js';
-import { classifyAction, ingestsExternalContent, refineActionClass } from '../policy/classify.js';
+import { ingestsExternalContent } from '../policy/classify.js';
+import { classifyCall } from '../policy/external-class.js';
 import { evaluateToolCall } from '../policy/engine.js';
 import { getApproval } from '../governance/approvals.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
@@ -482,10 +483,12 @@ async function recordStepSpend(
   request: StepRequest,
   effectiveInput: Record<string, unknown>,
 ): Promise<boolean> {
-  const base = classifyAction(request.toolName);
-  if (base === null) return false;
-
-  const actionClass = refineActionClass(base, effectiveInput);
+  // The class the gate judged this call as — for an `ext.call`, the class
+  // the owner signed for its operation (a money op is `refund.issue` or
+  // `payment.make`, never the `external.delete` placeholder, which would
+  // keep a refund out of the ledger the daily ceiling sums).
+  const actionClass = classifyCall(request.bundle.externalSystems, request.toolName, effectiveInput);
+  if (actionClass === null) return false;
 
   const amountMinor = effectiveInput['amountMinor'];
   if (typeof amountMinor !== 'number' || amountMinor <= 0) return false;

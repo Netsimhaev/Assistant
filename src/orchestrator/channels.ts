@@ -2,6 +2,7 @@ import type { PolicyBundle } from '../domain/policy.js';
 import type { CharterConnection, ConnectionBinding } from '../domain/connection.js';
 import { addresseeOf } from '../domain/action.js';
 import type { ActionClass } from '../domain/action.js';
+import { isExternalTool } from '../policy/external-class.js';
 
 export type ChannelResolution =
   | { status: 'resolved'; system: string; channel: 'api' | 'browser' }
@@ -119,6 +120,21 @@ export function deriveTargetId(
   input: Record<string, unknown>,
   actionClass: ActionClass | null,
 ): string | null {
+  // An external-system call is addressed to the system it names, and to
+  // nothing else: its connection is the signed `ext:<id>` one whose `target`
+  // is that id. Decided by the TOOL and before the class, because the class
+  // of an `ext.call` is whatever the owner signed for the operation —
+  // `crm.write`, say — and the class rule below would then route it by a
+  // `counterpartyId` riding in the payload. Own key only, and a string only:
+  // an absent, inherited or non-string `system` targets nothing, and
+  // `resolveChannel` then finds no catch-all to fall back on, because every
+  // `ext:` connection carries a target.
+  if (isExternalTool(toolName)) {
+    if (!Object.hasOwn(input, 'system')) return null;
+    const system = input['system'];
+    return typeof system === 'string' && system.length > 0 ? system : null;
+  }
+
   const supplierId = readString(input, 'supplierId');
   const counterpartyId = readString(input, 'counterpartyId') ?? readString(input, 'entityId');
 

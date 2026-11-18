@@ -128,6 +128,7 @@ import type { Runtime } from './runtime.js';
 import { createJob, transition } from './jobs.js';
 import { bindPlanToJob, planHashOf } from './plan-store.js';
 import { classMismatch } from './run-plan.js';
+import { isExternalTool, resolveExternalCall } from '../policy/external-class.js';
 import { DocProduceInput } from '../production/produce-input.js';
 import { resolveSourceDocuments, type SourceResolution } from '../production/source-resolver.js';
 
@@ -774,7 +775,21 @@ async function planAndCheck(
       };
     }
 
-    const mismatch = classMismatch(step);
+    // An external-system step must name an operation the owner signed. The
+    // same resolver the gate and `runPlan` call, so a step refused there is
+    // refused here first, before anything is bound or granted.
+    if (isExternalTool(step.toolName)) {
+      const resolved = resolveExternalCall(door.bundle.externalSystems, step.toolName, step.input);
+      if (!resolved.ok) {
+        return {
+          kind: 'refused',
+          reason: 'התוכנית מבקשת פעולה במערכת חיצונית שאינה פעולה שנחתמה בתקנון.',
+          audit: `instruction door: step ${step.id} external operation unknown (${resolved.reason})`,
+        };
+      }
+    }
+
+    const mismatch = classMismatch(step, door.bundle.externalSystems);
     if (mismatch !== null) {
       return {
         kind: 'refused',

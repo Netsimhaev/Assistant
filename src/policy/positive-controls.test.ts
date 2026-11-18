@@ -635,3 +635,22 @@ describe('the graph check in the gate is keyed on every agent.delegate tool, not
     }
   });
 });
+
+describe('the two external-system tools are outbound, classified and known', () => {
+  // Every call to another system leaves the instance: kill-switch `outbound`
+  // scope, redaction and quiet hours must all apply. And neither may be
+  // read-only — a read-only tool skips stages 5–10 and writes no audit row,
+  // which for an `ext.call` would skip the class the owner signed outright.
+  it.each(['ext.read', 'ext.call'])('%s is outbound, not read-only, and known', (tool) => {
+    expect(isOutbound(tool)).toBe(true);
+    expect(READ_ONLY_TOOLS.has(tool)).toBe(false);
+    expect(KNOWN_TOOL_NAMES.has(tool)).toBe(true);
+    expect(classifyAction(tool)).not.toBeNull();
+  });
+
+  it('the gate resolves the signed operation for both tools (engine.ts names the resolver)', async () => {
+    const engineSource = await readFile('src/policy/engine.ts', 'utf8');
+    expect(engineSource).toContain('resolveExternalCall(');
+    expect(engineSource).toContain('ctx.bundle.externalSystems');
+  });
+});

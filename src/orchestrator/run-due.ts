@@ -239,7 +239,7 @@ export async function runDueJobs(
           return;
         }
 
-        const rampLevel = await rampLevelForPlan(jobDb, stored.plan);
+        const rampLevel = await rampLevelForPlan(jobDb, stored.plan, active.bundle.externalSystems);
 
         // A hard cap this job inherited from the envelope that opened it as a
         // delegation's child — `null` for an ordinary root job nothing ever

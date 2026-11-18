@@ -1,5 +1,5 @@
 import { domainMatches, extractDomain } from '../util/address.js';
-import { AMOUNT_REQUIRED_CLASSES, NEVER_FULLY_AUTONOMOUS } from '../domain/action.js';
+import { AMOUNT_REQUIRED_CLASSES, NEVER_FULLY_AUTONOMOUS, type ActionClass } from '../domain/action.js';
 import { coveredByAuthorization, loadAuthorization } from '../governance/authorization.js';
 // `AgentId` is both a value (the zod enum, used below for `.safeParse`) and a
 // type (`GateContext.agent`'s type) exported from the same declaration in
@@ -26,6 +26,7 @@ import { isOutbound, isKnownTool } from './classify.js';
 import { assessRisk, type NormsLookup } from './risk.js';
 import { inQuietHours, redactPayload } from './redact.js';
 import { mayDelegate } from '../governance/delegation.js';
+import { isExternalTool, resolveExternalCall } from './external-class.js';
 import { APPROVED_REPLY_EXEMPTION_MARKER, approvedReplyCovers } from './approved-reply.js';
 import { LEARNED_REPLY_EXEMPTION_MARKER, learnedReplyCovers } from './learned-reply.js';
 import { CONFIRMED_COMMAND_EXEMPTION_MARKER, confirmedCommandCovers } from './confirmed-command.js';
@@ -219,8 +220,40 @@ export async function evaluateToolCall(
     }
   }
 
+  // Still stage 3, for the same reason as the delegation check above: "which
+  // signed operation is this" is a permission question. An `ext.read` or
+  // `ext.call` is judged as the class the owner signed for the operation it
+  // names (`resolveExternalCall`), never as the static placeholder in
+  // `TOOL_ACTION_CLASS` and never as anything the payload declares. A call
+  // that names no signed operation — an unknown system, an unknown operation,
+  // a kind the tool may not perform — is refused here, and like every
+  // refusal before stage 5 it writes no audit row; the returned decision is
+  // the record. `ctx.bundle.externalSystems` is the signed list, carried
+  // through `compileCharter`; reading it here is what makes the definitions
+  // the owner signed bind the gate.
+  let externalClass: ActionClass | null = null;
+  if (isExternalTool(toolName)) {
+    const resolved = resolveExternalCall(
+      ctx.bundle.externalSystems,
+      toolName,
+      isRecord(toolInput) ? toolInput : {},
+    );
+    if (!resolved.ok) {
+      return deny(
+        DENY_CODES.externalOperationUnknown,
+        `הפעולה במערכת החיצונית אינה פעולה שנחתמה בתקנון — ${resolved.reason}`,
+      );
+    }
+    externalClass = resolved.actionClass;
+  }
+
   // 4. Read-only short-circuit --------------------------------------------
-  const facts = buildFacts(toolName, toolInput, ctx);
+  const builtFacts = buildFacts(toolName, toolInput, ctx);
+  // The signed class replaces the placeholder BEFORE anything reads the facts,
+  // so stages 5–10, both reply exemptions and `confirmedCommandCovers` all
+  // see the class the owner signed and nothing else.
+  const facts: ActionFacts =
+    externalClass === null ? builtFacts : { ...builtFacts, actionClass: externalClass };
   if (facts.actionClass === null) {
     // Three tools are in READ_ONLY_TOOLS *and* OUTBOUND_TOOLS —
     // `browser.navigate`, `media.generate_image`, `media.generate_video`. They

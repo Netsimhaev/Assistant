@@ -279,4 +279,5 @@ export const DENY_CODES = {
   notAllowlisted: 'tool_not_allowlisted',
   delegationNotPermitted: 'delegation_not_permitted',
   confirmedStepAlreadyClaimed: 'confirmed_step_already_claimed',
+  externalOperationUnknown: 'external_operation_unknown',
 } as const;
