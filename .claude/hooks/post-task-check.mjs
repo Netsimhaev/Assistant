@@ -20,7 +20,18 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+/**
+ * The drive letter is upper-cased on purpose. Claude Code starts this hook
+ * from a cwd spelled `c:\…`, and a vitest run launched from there loads the
+ * `vitest` module twice — once under `c:` and once under `C:` — so every test
+ * file's `describe` reads a runner that does not exist and fails at import
+ * ("Cannot read properties of undefined (reading 'config')"), 342 of 342,
+ * with no test ever run. The same suite from `C:\…` is green.
+ */
+const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..').replace(
+  /^([a-z]):/,
+  (_, drive) => `${drive.toUpperCase()}:`,
+);
 const STAMP = join(PROJECT_ROOT, 'node_modules', '.cache', 'claude-task-check.stamp');
 
 /** Files whose change should trigger a re-check, beyond src/. */
