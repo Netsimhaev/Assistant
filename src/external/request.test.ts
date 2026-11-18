@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { ExternalSystem } from '../domain/external-system.js';
-import { buildExternalRequest } from './request.js';
+import { buildExternalRequest, pathShapeProblem } from './request.js';
+
+function good(r: ReturnType<typeof buildExternalRequest>) {
+  if (!r.ok) throw new Error(`expected ok, got ${r.code}: ${r.message}`);
+  return r;
+}
 
 function sys(over: Record<string, unknown> = {}, ops?: unknown[]): ExternalSystem {
   return ExternalSystem.parse({
@@ -50,14 +55,14 @@ describe('buildExternalRequest', () => {
   it('never yields a double slash and keeps the host for a hostile value', () => {
     const s = sys();
     const r = buildExternalRequest(s, op(s, 'get_customer'), { params: { id: '//evil.example' } }, 'k');
-    expect(r.ok && r.url.host).toBe('api.acme.example');
-    expect(r.ok && r.url.pathname.includes('//')).toBe(false);
+    expect(good(r).url.host).toBe('api.acme.example');
+    expect(good(r).url.pathname.includes('//')).toBe(false);
   });
 
   it('builds the query', () => {
     const s = sys();
     const r = buildExternalRequest(s, op(s, 'get_customer'), { params: { id: '1', q: 'a b&c' } }, 'k');
-    expect(r.ok && r.url.search).toBe('?q=a+b%26c');
+    expect(good(r).url.search).toBe('?q=a+b%26c');
   });
 
   it('refuses missing, unknown and non-scalar params', () => {
@@ -87,20 +92,20 @@ describe('buildExternalRequest', () => {
   it('sends a json body', () => {
     const s = sys();
     const r = buildExternalRequest(s, op(s, 'create_note'), { params: { text: { deep: [1] } } }, 'k');
-    expect(r.ok && r.body).toBe('{"text":{"deep":[1]}}');
-    expect(r.ok && r.headers['Content-Type']).toBe('application/json');
+    expect(good(r).body).toBe('{"text":{"deep":[1]}}');
+    expect(good(r).headers['Content-Type']).toBe('application/json');
   });
 
   it('money: major divides by 100, minor keeps', () => {
     const s = sys();
     const r = buildExternalRequest(s, op(s, 'pay'), { params: {}, amountMinor: 12345 }, 'k');
-    expect(r.ok && JSON.parse(r.body ?? '{}')).toEqual({ amount: 123.45 });
+    expect(JSON.parse(good(r).body ?? "{}")).toEqual({ amount: 123.45 });
     const s2 = sys({}, [
       { name: 'pay', label: 'x', kind: 'money', actionClass: 'payment.make', method: 'POST', path: '/pay',
         amount: { field: 'amount', unit: 'minor', currency: 'ILS' } },
     ]);
     const r2 = buildExternalRequest(s2, op(s2, 'pay'), { amountMinor: 12345 }, 'k');
-    expect(r2.ok && JSON.parse(r2.body ?? '{}')).toEqual({ amount: 12345 });
+    expect(JSON.parse(good(r2).body ?? "{}")).toEqual({ amount: 12345 });
   });
 
   it('money: requires amountMinor, refuses the amount field in params, bad amounts', () => {
@@ -125,8 +130,8 @@ describe('buildExternalRequest', () => {
     ]);
     const o = op(s, 'pay');
     const r = buildExternalRequest(s, o, { params: { ref: 'a b' }, amountMinor: 12345 }, 'k');
-    expect(r.ok && r.body).toBe('ref=a+b&amount=123.45');
-    expect(r.ok && r.headers['Content-Type']).toBe('application/x-www-form-urlencoded');
+    expect(good(r).body).toBe('ref=a+b&amount=123.45');
+    expect(good(r).headers['Content-Type']).toBe('application/x-www-form-urlencoded');
     expect(buildExternalRequest(s, o, { params: { ref: { a: 1 } }, amountMinor: 1 }, 'k').ok).toBe(false);
     expect(buildExternalRequest(s, o, { params: { ref: [1] }, amountMinor: 1 }, 'k').ok).toBe(false);
   });
@@ -138,14 +143,14 @@ describe('buildExternalRequest', () => {
     ]);
     expect(buildExternalRequest(s, op(s, 'list'), { params: { b: 1 } }, 'k').ok).toBe(false);
     const r2 = buildExternalRequest(s, op(s, 'list'), { params: {} }, 'k');
-    expect(r2.ok && r2.body).toBeNull();
+    expect(good(r2).body).toBeNull();
   });
 
   it('omits the idempotency header when null', () => {
     const s = sys({ idempotencyHeader: null });
     const r = buildExternalRequest(s, op(s, 'get_customer'), { params: { id: '1' } }, 'k');
     expect(r.ok).toBe(true);
-    expect(r.ok && Object.keys(r.headers)).not.toContain('Idempotency-Key');
+    expect(Object.keys(good(r).headers)).not.toContain('Idempotency-Key');
   });
 
   it('messages are Hebrew, one line and short', () => {
@@ -156,5 +161,95 @@ describe('buildExternalRequest', () => {
     expect(/[א-ת]/.test(r.message)).toBe(true);
     expect(r.message).not.toContain('\n');
     expect(r.message.length).toBeLessThan(200);
+  });
+
+  it('keeps ? and # in query values encoded', () => {
+    const s = sys();
+    const r = good(buildExternalRequest(s, op(s, 'get_customer'), { params: { id: '1', q: 'a?b#c' } }, 'k'));
+    expect(r.url.search).toBe('?q=a%3Fb%23c');
+    expect(r.url.hash).toBe('');
+  });
+
+  it('sends no body and no Content-Type when a non-money POST has no body params', () => {
+    const s = sys({}, [
+      { name: 'ping', label: 'x', kind: 'change', actionClass: 'crm.write', method: 'POST', path: '/ping',
+        params: [{ name: 'a', in: 'body', required: false }] },
+    ]);
+    const r = good(buildExternalRequest(s, op(s, 'ping'), { params: {} }, 'k'));
+    expect(r.body).toBeNull();
+    expect(Object.keys(r.headers)).not.toContain('Content-Type');
+  });
+
+  it('refuses a missing path param even if the (unsigned-shape) definition made it optional', () => {
+    const s = sys();
+    const o = { ...op(s, 'get_customer'), params: [{ name: 'id', in: 'path' as const, required: false }] };
+    const r = buildExternalRequest(s, o, { params: {} }, 'k');
+    expect(r.ok).toBe(false);
+  });
+
+  describe('dot-segment and empty path values', () => {
+    const two = () => sys({ baseUrl: 'https://api.x.com/v1' }, [
+      { name: 'refund', label: 'x', kind: 'change', actionClass: 'crm.write', method: 'DELETE',
+        path: '/customers/{cid}/orders/{oid}/refund',
+        params: [{ name: 'cid', in: 'path', required: true }, { name: 'oid', in: 'path', required: true }] },
+    ]);
+    for (const bad of ['..', '.', '', '%2e%2e', '.%2E', '%2E', '%2e.']) {
+      it('refuses ' + JSON.stringify(bad), () => {
+        const s = two();
+        for (const params of [{ cid: 'x', oid: bad }, { cid: bad, oid: 'y' }]) {
+          const r = buildExternalRequest(s, op(s, 'refund'), { params }, 'k');
+          expect(r.ok).toBe(false);
+          expect(!r.ok && r.code).toBe('bad_params');
+        }
+      });
+    }
+    it('accepts an ordinary value', () => {
+      const s = two();
+      const r = good(buildExternalRequest(s, op(s, 'refund'), { params: { cid: 'a.b', oid: '...' } }, 'k'));
+      expect(r.url.pathname).toBe('/v1/customers/a.b/orders/.../refund');
+    });
+  });
+
+  describe('pathShapeProblem (second layer, on its own)', () => {
+    const values = new Map([['cid', '..'], ['oid', 'y']]);
+    it('catches a normalised-away segment', () => {
+      // What new URL() does to /v1/customers/../orders/y/refund
+      const url = new URL('https://api.x.com/v1/customers/../orders/y/refund');
+      expect(pathShapeProblem(url.pathname, '/v1', '/customers/{cid}/orders/{oid}/refund', values)).not.toBeNull();
+    });
+    it('catches a replaced literal and accepts the exact shape', () => {
+      const v = new Map([['cid', 'x'], ['oid', 'y']]);
+      expect(pathShapeProblem('/v1/customers/x/orders/y/other', '/v1', '/customers/{cid}/orders/{oid}/refund', v)).not.toBeNull();
+      expect(pathShapeProblem('/v1/customers/x/orders/y/refund', '/v1', '/customers/{cid}/orders/{oid}/refund', v)).toBeNull();
+    });
+  });
+
+  describe('the amount field', () => {
+    it('schema refuses a dotted amount field', () => {
+      expect(() => sys({}, [
+        { name: 'pay', label: 'x', kind: 'money', actionClass: 'payment.make', method: 'POST', path: '/pay',
+          amount: { field: 'data.amount', unit: 'minor', currency: 'ILS' } },
+      ])).toThrow(/ללא נקודות/);
+    });
+    it('schema refuses an optional path param', () => {
+      expect(() => sys({}, [
+        { name: 'g', label: 'x', kind: 'read', actionClass: 'external.read', method: 'GET', path: '/c/{id}',
+          params: [{ name: 'id', in: 'path', required: false }] },
+      ])).toThrow(/חייב להיות חובה/);
+    });
+    it('refuses a body param that carries the amount key nested, at any depth', () => {
+      const s = sys();
+      const o = op(s, 'pay');
+      for (const ref of [{ amount: 99999 }, [{ x: { amount: 1 } }], { a: [{ b: { amount: 2 } }] }]) {
+        const r = buildExternalRequest(s, o, { params: { ref }, amountMinor: 100 }, 'k');
+        expect(r.ok).toBe(false);
+        expect(!r.ok && r.code).toBe('bad_params');
+      }
+    });
+    it('still writes exactly one amount, the gated one', () => {
+      const s = sys();
+      const r = good(buildExternalRequest(s, op(s, 'pay'), { params: { ref: { note: 'x' } }, amountMinor: 100 }, 'k'));
+      expect(JSON.parse(r.body ?? '{}')).toEqual({ ref: { note: 'x' }, amount: 1 });
+    });
   });
 });

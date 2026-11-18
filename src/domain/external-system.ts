@@ -134,14 +134,24 @@ export const ExternalField = z.object({
 });
 export type ExternalField = z.infer<typeof ExternalField>;
 
-const ExternalParam = z.object({
-  name: z.string().refine(isParamName, { message: 'expected a parameter name' }),
-  in: z.enum(['path', 'query', 'body']),
-  required: z.boolean(),
-});
+const ExternalParam = z
+  .object({
+    name: z.string().refine(isParamName, { message: 'expected a parameter name' }),
+    in: z.enum(['path', 'query', 'body']),
+    required: z.boolean(),
+  })
+  .refine((p) => p.in !== 'path' || p.required, {
+    path: ['required'],
+    message: 'פרמטר נתיב חייב להיות חובה — נתיב בלי ערך אינו כתובת תקינה',
+  });
 
 const ExternalAmount = z.object({
-  field: FieldPath,
+  // One top-level key, no dots: a dotted field would be written as a literal
+  // key while a body param could carry the same path nested, and the amount
+  // the gate judged could differ from the one the provider reads.
+  field: FieldPath.refine((f) => !f.includes('.'), {
+    message: 'שדה הסכום חייב להיות שם בודד ללא נקודות (סכום מקונן אינו נתמך)',
+  }),
   unit: z.enum(['minor', 'major']),
   currency: z.enum(EXTERNAL_CURRENCIES),
 });

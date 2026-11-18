@@ -33,6 +33,53 @@ function isScalar(value: unknown): value is string | number | boolean {
   );
 }
 
+/** A path value must be a real segment: not empty, not `.` or `..` in any encoding. */
+function isUsablePathValue(value: string): boolean {
+  let decoded = value;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    // Not valid percent-encoding: it is sent encoded as-is, so judge the raw text.
+  }
+  const lower = decoded.toLowerCase();
+  return value !== '' && lower !== '' && lower !== '.' && lower !== '..';
+}
+
+/** Does a key equal to `key` occur at any depth inside `value`? Too deep counts as yes. */
+function containsKey(value: unknown, key: string, depth = 0): boolean {
+  if (depth > 50) return true;
+  if (value === null || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some((v) => containsKey(v, key, depth + 1));
+  for (const k of Object.keys(value)) {
+    if (k === key) return true;
+    if (containsKey((value as Record<string, unknown>)[k], key, depth + 1)) return true;
+  }
+  return false;
+}
+
+/**
+ * The built pathname must have exactly the shape of the signed template:
+ * base segments, then the template's segments, literals equal and each
+ * placeholder holding exactly its encoded value. Returns a problem or null.
+ */
+export function pathShapeProblem(
+  pathname: string,
+  basePath: string,
+  templatePath: string,
+  encodedValues: ReadonlyMap<string, string>,
+): string | null {
+  const problem = 'מבנה הכתובת שונה מהפעולה שנחתמה';
+  const expected = `${basePath}${templatePath}`.split('/');
+  const actual = pathname.split('/');
+  if (expected.length !== actual.length) return problem;
+  for (const [i, want] of expected.entries()) {
+    const m = /^\{([^{}]*)\}$/.exec(want);
+    const wanted = m ? encodedValues.get(m[1] ?? '') : want;
+    if (wanted === undefined || actual[i] !== wanted) return problem;
+  }
+  return null;
+}
+
 export function buildExternalRequest(
   system: ExternalSystem,
   op: ExternalOperation,
@@ -73,7 +120,7 @@ export function buildExternalRequest(
   for (const param of op.params) {
     const present = Object.hasOwn(params, param.name);
     if (!present) {
-      if (param.required) return bad(`חסר פרמטר חובה "${quote(param.name)}"`);
+      if (param.required || param.in === 'path') return bad(`חסר פרמטר חובה "${quote(param.name)}"`);
       continue;
     }
     const value = params[param.name];
@@ -82,18 +129,26 @@ export function buildExternalRequest(
       if (op.bodyEncoding === 'form' && !isScalar(value)) {
         return bad(`הפרמטר "${quote(param.name)}" חייב להיות ערך פשוט בקידוד טופס`);
       }
+      if (op.amount !== null && containsKey(value, op.amount.field)) {
+        return bad(`הפרמטר "${quote(param.name)}" מכיל את שדה הסכום — הסכום נקבע רק מהסכום שאושר`);
+      }
       bodyPairs.push([param.name, value]);
       continue;
     }
     if (!isScalar(value)) return bad(`הפרמטר "${quote(param.name)}" חייב להיות מחרוזת, מספר או ערך בוליאני`);
-    if (param.in === 'path') pathValues.set(param.name, String(value));
+    if (param.in === 'path') {
+      if (!isUsablePathValue(String(value))) return bad(`ערך הפרמטר "${quote(param.name)}" אינו קטע נתיב תקין`);
+      pathValues.set(param.name, String(value));
+    }
     else queryPairs.push([param.name, String(value)]);
   }
 
   // Build the URL by joining strings; never resolve a path against the base.
   const base = new URL(system.baseUrl);
   const basePath = base.pathname.replace(/\/+$/, '');
-  const path = op.path.replace(/\{([^{}]*)\}/g, (_m, name: string) => encodeURIComponent(pathValues.get(name) ?? ''));
+  const encoded = new Map<string, string>();
+  for (const [k, v] of pathValues) encoded.set(k, encodeURIComponent(v));
+  const path = op.path.replace(/\{([^{}]*)\}/g, (_m, name: string) => encoded.get(name) ?? '');
   const query = new URLSearchParams();
   for (const [k, v] of queryPairs) query.append(k, v);
   const qs = query.toString();
@@ -106,12 +161,14 @@ export function buildExternalRequest(
   if (url.origin !== base.origin || !url.pathname.startsWith(`${basePath}/`)) {
     return bad('הכתובת שנבנתה חורגת מכתובת הבסיס של המערכת');
   }
+  const shape = pathShapeProblem(url.pathname, basePath, op.path, encoded);
+  if (shape !== null) return bad(shape);
 
   const headers: Record<string, string> = {};
   if (system.idempotencyHeader !== null) headers[system.idempotencyHeader] = idempotencyKey;
 
   let body: string | null = null;
-  if (op.method !== 'GET') {
+  if (op.method !== 'GET' && (bodyPairs.length > 0 || op.amount !== null)) {
     if (op.bodyEncoding === 'form') {
       const form = new URLSearchParams();
       for (const [k, v] of bodyPairs) form.append(k, String(v));
