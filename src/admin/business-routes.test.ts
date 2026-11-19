@@ -434,7 +434,8 @@ describe('the business page shows states and counts, never content', () => {
     ].map((s) => html.indexOf(s));
     expect(order.every((i) => i >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
-    expect(html).toContain('ייבנה בשלב הבא');
+    expect(html).toContain('עדיין לא הוגדרה מערכת.');
+    expect(html).toContain('/external">ניהול מערכות חיצוניות</a>');
     for (const label of ['משימות ב-7 ימים', 'אישורים ממתינים', 'עלות היום', 'פעילות אחרונה', 'כשלים ב-7 ימים']) {
       expect(html).toContain(label);
     }

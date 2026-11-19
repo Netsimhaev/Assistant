@@ -24,6 +24,9 @@ export const STAFF_ACTIONS = [
   'staff_invited',
   'staff_removed',
   'staff_link_reissued',
+  'external_draft_saved',
+  'external_draft_deleted',
+  'external_secret_saved',
 ] as const;
 
 /**

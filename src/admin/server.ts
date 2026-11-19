@@ -72,6 +72,7 @@ import {
   type PanelViewer,
 } from './views.js';
 import { handleBusinessRoute, type UploadBody } from './business-routes.js';
+import { handleExternalRoute } from './external-routes.js';
 import { adminBaseUrlFor, handleStaffRoute } from './staff-routes.js';
 import { readBoundedMultipart } from '../dashboard/multipart.js';
 
@@ -444,6 +445,20 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
     seeOther: (location) => seeOther(res, location),
   });
   if (staffHandled) return;
+
+  const externalHandled = await handleExternalRoute({
+    req,
+    method,
+    pathname,
+    staff: { staffId: session.staffId, displayName: session.displayName },
+    viewer: viewerOf(session),
+    masterKey: options.masterKey,
+    readForm: () => readFormBody(req),
+    csrfOk: (form) => verifyCsrfToken(session.token, form.get('csrf')),
+    sendHtml: (status, html) => sendHtml(res, status, html),
+    seeOther: (location) => seeOther(res, location),
+  });
+  if (externalHandled) return;
 
   const handled = await handleBusinessRoute({
     req,

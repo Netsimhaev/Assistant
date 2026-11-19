@@ -13,7 +13,13 @@ import { stripBidiControls } from '../util/bidi.js';
 import { formatMinor } from '../util/money.js';
 import type { StaffAction, StaffActionRow } from '../tenancy/activity-log.js';
 import type { StaffListing } from '../tenancy/staff.js';
-import type { PanelBusinessDetail, PanelBusinessRow, PanelSetupData } from '../tenancy/panel-reads.js';
+import type {
+  ExternalSystemPanelState,
+  ExternalSystemPanelStatus,
+  PanelBusinessDetail,
+  PanelBusinessRow,
+  PanelSetupData,
+} from '../tenancy/panel-reads.js';
 
 const esc = escapeHtml;
 /** A staff name is typed text: bidi controls are stripped before escaping (final review M5). */
@@ -482,8 +488,8 @@ ${whatsappForm}
 ${setupSection(viewer, d, extras.setup)}
 <section class="card">
 <h2>3 · חיבור למערכות (פותח עבודה מלאה)</h2>
-<p class="muted">ייבנה בשלב הבא</p>
-<p>${systemsCell(d.systems)}</p>
+${renderExternalStatusTable(d.businessId, d.externalSystems)}
+<p><a href="/businesses/${id}/external">ניהול מערכות חיצוניות</a></p>
 </section>
 <section class="card">
 <h2>תמונת מצב</h2>
@@ -505,6 +511,43 @@ ${statusForm}
 </section>`,
     viewer,
   );
+}
+
+// ---------------------------------------------------------------------------
+// External systems (Stage D) — status only
+// ---------------------------------------------------------------------------
+
+/** One Hebrew label per state; a new state is a compile error until it is named here. */
+export const EXTERNAL_STATE_LABELS: Record<ExternalSystemPanelState, string> = {
+  draft: 'טיוטה',
+  awaiting_signature: 'ממתין לחתימה',
+  signed: 'חתום',
+  unsigned_changes: 'שינויים לא חתומים',
+};
+
+/** `✓ שמור` / `חסר`, or `—` where the definition does not need the secret. */
+export function secretCell(saved: boolean | null): string {
+  return saved === null ? '—' : saved ? '✓ שמור' : 'חסר';
+}
+
+/**
+ * Per system: its id, its state and which secrets are saved — flags from
+ * `businessDetailForPanel`, never a label or anything a system returned.
+ */
+export function renderExternalStatusTable(businessId: string, systems: ExternalSystemPanelStatus[]): string {
+  if (systems.length === 0) return '<p class="muted">עדיין לא הוגדרה מערכת.</p>';
+  const rows = systems
+    .map(
+      (s) =>
+        `<tr><td dir="ltr"><a href="/businesses/${esc(businessId)}/external/${esc(s.systemId)}">${esc(s.systemId)}</a></td><td>${esc(EXTERNAL_STATE_LABELS[s.state])}</td><td>${secretCell(s.keySaved)}</td><td>${secretCell(s.hookSaved)}</td><td>${secretCell(s.verifySaved)}</td></tr>`,
+    )
+    .join('\n');
+  return `<table>
+<thead><tr><th>מערכת</th><th>מצב</th><th>סוד</th><th>חתימת התראות</th><th>אסימון אימות</th></tr></thead>
+<tbody>
+${rows}
+</tbody>
+</table>`;
 }
 
 export function renderForbidden(): string {
@@ -547,6 +590,9 @@ export const STAFF_ACTION_LABELS: Record<StaffAction, string> = {
   staff_invited: 'הזמנת איש צוות',
   staff_removed: 'הסרת איש צוות',
   staff_link_reissued: 'הנפקת קישור סיסמה לאיש צוות',
+  external_draft_saved: 'שמירת טיוטת מערכת חיצונית',
+  external_draft_deleted: 'מחיקת טיוטת מערכת חיצונית',
+  external_secret_saved: 'שמירת סוד של מערכת חיצונית',
 };
 
 export interface StaffPageOptions {
