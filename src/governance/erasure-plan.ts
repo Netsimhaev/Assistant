@@ -281,6 +281,8 @@ import type { BusinessDb, Queryable } from '../db/pool.js';
 import { keptIds, type KeptItemKind } from './kept-items.js';
 import { LIKE_ESCAPE, likeLiteral } from '../util/like.js';
 import { TERMINAL_STAGES } from '../production/store.js';
+import { signedSystemNames } from '../external/store.js';
+import { toOneLine } from '../util/bidi.js';
 
 export { LIKE_ESCAPE };
 
@@ -406,6 +408,16 @@ export interface ErasurePlan {
    * instant or null. Included in `planFingerprint`.
    */
   calendarEventsKept: CalendarEventKept[];
+  /** `external_events` rows to erase — see `EXTERNAL_EVENTS_ERASED_PREDICATE`. */
+  externalEventIds: string[];
+  /**
+   * The external systems that held an erased read or event, by their signed
+   * label (the system id when it is no longer signed), cleaned to one line
+   * and sorted. Their own records at the provider are NEVER deleted — this
+   * module has no client for them — and the preview says so, one line per
+   * system. Included in `planFingerprint`.
+   */
+  externalSystemsKept: string[];
   /**
    * True only for a `contact` anchor whose identifier appears in the ACTIVE
    * (latest) business description. The description is the owner's own text and
@@ -977,6 +989,69 @@ const MEETING_CONTENT_MATCHES = `(client_name ILIKE $2 ${LIKE_ESCAPE}
       OR coalesce(internal_note, '') ILIKE $2 ${LIKE_ESCAPE})`;
 
 /**
+ * External systems (Stage D, migrations 077–079). What an external system
+ * told us is content about a person:
+ *
+ * - `external_reads.fields` — the fields an `ext.*` read step returned, kept
+ *   for the job that read them. A discovery source by its own `fields`
+ *   (through `jsonbContentMatches`), and deleted by `job_id`: every read
+ *   belongs to a job, so a matched read puts its job in `jobIds` and the job
+ *   carries the row out — and a job the owner KEPT keeps its reads, the same
+ *   rule every other job-anchored row here follows.
+ * - `external_events.fields` — what a webhook or a scan delivered. A
+ *   discovery source of its own (no job writes it), deleted by its own
+ *   `event_id`. A matched event pulls its `curation_job_id` (the learning job
+ *   that curated it) into `jobIds`, so that job's trail and the
+ *   `ext:<systemId>` memory chunks it wrote (`written_by_job`) follow.
+ * - `external_learning_jobs` — ids and a failure time only, never a discovery
+ *   source; deleted with its job.
+ *
+ * `external_system_drafts`, `external_calls` and `external_system_state` hold
+ * the technician's configuration, call outcomes and counters — no person —
+ * and are not wired.
+ *
+ * A window anchor brackets both content tables by their own `created_at`. A
+ * document anchor has no closure into either: neither references a document,
+ * and a predicate pretending otherwise would be a lie (the same position
+ * `approval_requests` takes).
+ *
+ * No foreign keys between these tables, or to `jobs`: no cascade to order
+ * against. The records at the provider are NEVER deleted — this module has no
+ * client for any external system — and the preview names each system they
+ * stay in (`ErasurePlan.externalSystemsKept`).
+ *
+ * Parameters: reads and learning jobs `$1` businessId, `$2` jobIds; events
+ * `$1` businessId, `$2` externalEventIds. The same text in `countItems` and
+ * in the executor.
+ */
+export const EXTERNAL_READS_ERASED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)`;
+export const EXTERNAL_EVENTS_ERASED_PREDICATE = `business_id = $1 AND event_id = ANY ($2)`;
+export const EXTERNAL_LEARNING_JOBS_ERASED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)`;
+
+/**
+ * A learning job that is still open counts as live, beside `LIVE_PHASES`.
+ *
+ * `learn.ts` moves a learning job `intake → understand → closed|failed`, and
+ * the curator runs while it sits in `understand` — on a brief it has ALREADY
+ * built from the events it claimed. Erasing those events under it would not
+ * stop the chunks it is about to write: the name would come back into
+ * `memories` a moment after the erasure reported it gone. So an open learning
+ * job refuses, at plan time and again under the executor's row lock.
+ *
+ * Scoped to learning jobs (a row in `external_learning_jobs`) rather than
+ * adding `understand` to `LIVE_PHASES`: other jobs pass through `understand`
+ * in moments, and one stranded there by a crash is inert (nothing picks it
+ * up) — making it unerasable forever would buy nothing. A crashed learning
+ * job does not stay open: `releaseStaleClaims` fails it after 30 minutes.
+ *
+ * Interpolated into a `SELECT ... FROM jobs` (unaliased): it reads the outer
+ * row as `jobs`.
+ */
+export const LEARNING_JOB_OPEN_CONDITION = `(jobs.phase IN ('intake', 'understand')
+    AND EXISTS (SELECT 1 FROM external_learning_jobs l
+                 WHERE l.business_id = jobs.business_id AND l.job_id = jobs.job_id))`;
+
+/**
  * `ledger_critical_rules` of kind `counterparty`: the `match` is a person's
  * name, address or domain. Found by a contact anchor only (a rule is the
  * owner's configuration, not an event a window brackets). Parameters: `$1`
@@ -1199,6 +1274,7 @@ export async function buildErasurePlan(
   const ledgerRuleIds = new Set<string>();
   const productionIds = new Set<string>();
   const colleagueIds = new Set<string>();
+  const externalEventIds = new Set<string>();
   let setupPackageMatched = false;
 
   if (anchor.kind === 'contact') {
@@ -1495,6 +1571,24 @@ export async function buildErasurePlan(
       'colleague_id',
     )) colleagueIds.add(colleagueId);
 
+    // External systems (migrations 077–079), by their own `fields`. A read
+    // brings its job (which deletes it); an event is erased by its own id.
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT job_id FROM external_reads
+        WHERE business_id = $1 AND ${jsonbContentMatches('fields', '$2')}`,
+      [businessId, pattern],
+      'job_id',
+    )) jobIds.add(jobId);
+
+    for (const eventId of await idsFrom(
+      db,
+      `SELECT event_id FROM external_events
+        WHERE business_id = $1 AND ${jsonbContentMatches('fields', '$2')}`,
+      [businessId, pattern],
+      'event_id',
+    )) externalEventIds.add(eventId);
+
     const setupHit = await db.query<{ hit: boolean }>(
       `SELECT EXISTS (
          SELECT 1 FROM setup_packages
@@ -1551,6 +1645,24 @@ export async function buildErasurePlan(
       if (row.reminder_job_id !== null) jobIds.add(row.reminder_job_id);
     }
 
+    // External reads and events by their own `created_at`. (No document
+    // anchor reaches either: neither references a document.)
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT job_id FROM external_reads
+        WHERE business_id = $1 AND created_at >= $2 AND created_at < $3`,
+      [businessId, anchor.fromIso, anchor.toIso],
+      'job_id',
+    )) jobIds.add(jobId);
+
+    for (const eventId of await idsFrom(
+      db,
+      `SELECT event_id FROM external_events
+        WHERE business_id = $1 AND created_at >= $2 AND created_at < $3`,
+      [businessId, anchor.fromIso, anchor.toIso],
+      'event_id',
+    )) externalEventIds.add(eventId);
+
     // A production's own `created_at` — when the owner asked for it.
     for (const productionId of await idsFrom(
       db,
@@ -1574,6 +1686,19 @@ export async function buildErasurePlan(
       [businessId, anchor.documentId],
       'production_id',
     )) productionIds.add(productionId);
+  }
+
+  // The learning job of every matched event. Before the job→document and
+  // memory closures below: the `ext:<systemId>` chunks it curated are
+  // `written_by_job` = that job.
+  if (externalEventIds.size > 0) {
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT curation_job_id AS job_id FROM external_events
+        WHERE business_id = $1 AND event_id = ANY ($2) AND curation_job_id IS NOT NULL`,
+      [businessId, [...externalEventIds]],
+      'job_id',
+    )) jobIds.add(jobId);
   }
 
   // What every mail found above produced. Runs BEFORE the job→document and
@@ -1868,7 +1993,9 @@ export async function buildErasurePlan(
 
   if (jobList.length > 0) {
     const { rows } = await db.query<{ job_id: string; phase: string }>(
-      'SELECT job_id, phase FROM jobs WHERE business_id = $1 AND job_id = ANY ($2) AND phase = ANY ($3)',
+      `SELECT job_id, phase FROM jobs
+        WHERE business_id = $1 AND job_id = ANY ($2)
+          AND (phase = ANY ($3) OR ${LEARNING_JOB_OPEN_CONDITION})`,
       [businessId, jobList, LIVE_PHASES],
     );
     for (const row of rows) {
@@ -2006,6 +2133,32 @@ export async function buildErasurePlan(
     calendarEventsKept.sort((a, b) => cmp(a.calendarId, b.calendarId) || cmp(a.eventId, b.eventId));
   }
 
+  // External systems whose records outlive the erasure (never deleted): every
+  // system that held an erased read (from the final `jobList`, so a kept
+  // job's reads are not counted) or an erased event. Shown by signed label;
+  // an id no longer signed stands in for it. Both are cleaned to one line —
+  // the label is free text the technician typed.
+  const externalEventList = [...externalEventIds].sort();
+  const externalSystemsKept: string[] = [];
+  if (jobList.length > 0 || externalEventList.length > 0) {
+    const { rows } = await db.query<{ system_id: string }>(
+      `SELECT system_id FROM external_reads WHERE ${EXTERNAL_READS_ERASED_PREDICATE}
+       UNION
+       SELECT system_id FROM external_events WHERE business_id = $1 AND event_id = ANY ($3)`,
+      [businessId, jobList, externalEventList],
+    );
+    if (rows.length > 0) {
+      const names = await signedSystemNames(db);
+      const labels = new Set<string>();
+      for (const row of rows) {
+        const signed = names.get(row.system_id)?.label;
+        labels.add(toOneLine(signed ?? row.system_id));
+      }
+      // Plain code-unit order, the same as the fingerprint's sort.
+      externalSystemsKept.push(...[...labels].sort());
+    }
+  }
+
   // The business description survives erasure by name; the owner is told when
   // the contact appears in ANY version of it. Versions are append-only, so an
   // older one that still names the contact persists even after the owner
@@ -2032,7 +2185,7 @@ export async function buildErasurePlan(
   const colleagueList = [...colleagueIds].sort();
   const items = await countItems(
     db, anchor, jobList, documentList, memoryIds, digestList, draftList, mailList,
-    ledgerItemList, ledgerRuleList, productionList, colleagueList, setupPackageMatched,
+    ledgerItemList, ledgerRuleList, productionList, colleagueList, setupPackageMatched, externalEventList,
   );
 
   return {
@@ -2052,6 +2205,8 @@ export async function buildErasurePlan(
     savedCopies,
     filesNotDeleted,
     calendarEventsKept,
+    externalEventIds: externalEventList,
+    externalSystemsKept,
     descriptionMentionsContact,
     items,
     excluded,
@@ -2080,6 +2235,7 @@ async function countItems(
   productionIds: string[],
   colleagueIds: string[],
   setupPackageMatched: boolean,
+  externalEventIds: string[],
 ): Promise<ErasureItem[]> {
   const businessId = db.businessId;
   const one = async (
@@ -2305,6 +2461,26 @@ async function countItems(
       'meetings',
       'delete',
       `SELECT count(*)::text AS n FROM meetings WHERE ${MEETINGS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    ),
+    // External systems (migrations 077–079): no foreign keys, so no order.
+    // See `EXTERNAL_READS_ERASED_PREDICATE`.
+    await one(
+      'external_reads',
+      'delete',
+      `SELECT count(*)::text AS n FROM external_reads WHERE ${EXTERNAL_READS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    ),
+    await one(
+      'external_events',
+      'delete',
+      `SELECT count(*)::text AS n FROM external_events WHERE ${EXTERNAL_EVENTS_ERASED_PREDICATE}`,
+      [businessId, externalEventIds],
+    ),
+    await one(
+      'external_learning_jobs',
+      'delete',
+      `SELECT count(*)::text AS n FROM external_learning_jobs WHERE ${EXTERNAL_LEARNING_JOBS_ERASED_PREDICATE}`,
       [businessId, jobIds],
     ),
     await one(

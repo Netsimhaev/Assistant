@@ -44,6 +44,10 @@ import {
   DOCUMENT_DELIVERIES_ERASED_PREDICATE,
   DOCUMENT_PRODUCTIONS_ERASED_PREDICATE,
   DOCUMENT_VERSIONS_ERASED_PREDICATE,
+  EXTERNAL_EVENTS_ERASED_PREDICATE,
+  EXTERNAL_LEARNING_JOBS_ERASED_PREDICATE,
+  EXTERNAL_READS_ERASED_PREDICATE,
+  LEARNING_JOB_OPEN_CONDITION,
   PRODUCTION_LIVE_CONDITION,
   CHARTER_INTERVIEW_DRAFTS_ERASED_PREDICATE,
   JOBS_SCRUBBED_PREDICATE,
@@ -185,7 +189,7 @@ export async function executeErasure(
 
   const {
     jobIds, documentIds, memoryIds, digestIds, draftIds, mailIds, ledgerItemIds, ledgerRuleIds, productionIds,
-    colleagueIds, setupPackageMatched,
+    colleagueIds, setupPackageMatched, externalEventIds,
   } = plan;
   const results: ErasureItem[] = [];
   await transaction(db, async (client) => {
@@ -213,12 +217,15 @@ export async function executeErasure(
         phase: string;
         awaiting_envelope_id: string | null;
         stranded: boolean;
+        learning_open: boolean;
       }>(
-        `SELECT job_id, phase, awaiting_envelope_id, (${STRANDED_PARENT_PREDICATE}) AS stranded
+        `SELECT job_id, phase, awaiting_envelope_id, (${STRANDED_PARENT_PREDICATE}) AS stranded,
+                (${LEARNING_JOB_OPEN_CONDITION}) AS learning_open
            FROM jobs WHERE business_id = $1 AND job_id = ANY ($2) FOR UPDATE`,
         [businessId, jobIds],
       );
-      const stillLive = lockedJobs.filter((row) => LIVE_PHASES.includes(row.phase));
+      // An open learning job is live too — see `LEARNING_JOB_OPEN_CONDITION`.
+      const stillLive = lockedJobs.filter((row) => LIVE_PHASES.includes(row.phase) || row.learning_open);
       if (stillLive.length > 0) {
         throw new ErasureRefusedError(
           stillLive
@@ -480,6 +487,25 @@ export async function executeErasure(
     await del(
       'meetings',
       `DELETE FROM meetings WHERE ${MEETINGS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    );
+    // External systems (migrations 077–079). No foreign keys between them or
+    // to `jobs`, so no cascade can run ahead of these. The records at the
+    // provider are never touched — `plan.externalSystemsKept` names them.
+    // Same predicates, same parameters, as `countItems` in `erasure-plan.ts`.
+    await del(
+      'external_reads',
+      `DELETE FROM external_reads WHERE ${EXTERNAL_READS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    );
+    await del(
+      'external_events',
+      `DELETE FROM external_events WHERE ${EXTERNAL_EVENTS_ERASED_PREDICATE}`,
+      [businessId, externalEventIds],
+    );
+    await del(
+      'external_learning_jobs',
+      `DELETE FROM external_learning_jobs WHERE ${EXTERNAL_LEARNING_JOBS_ERASED_PREDICATE}`,
       [businessId, jobIds],
     );
     await del('job_plans', 'DELETE FROM job_plans WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);

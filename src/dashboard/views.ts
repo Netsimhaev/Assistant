@@ -1670,6 +1670,11 @@ export const TABLE_LABELS: Record<string, string> = {
   // the owner's note on each meeting, and the tentative holds.
   meetings: 'פגישות',
   meeting_holds: 'שמירות מקום ביומן',
+  // Migrations 077–079: external systems — what a read step returned, what
+  // a webhook or a scan delivered, and the record of a learning job.
+  external_reads: 'נתונים שנקראו ממערכות חיצוניות',
+  external_events: 'אירועים ממערכות חיצוניות',
+  external_learning_jobs: 'רישומי למידה ממערכות חיצוניות',
 };
 
 /**
@@ -1924,6 +1929,17 @@ function calendarEventsKeptSection(events: readonly CalendarEventKept[], timeZon
      <ul>${events.map((e) => `<li>${escLabel(e.eventId)}${when(e.start)}${e.kind === 'hold' ? holdNote : ''}</li>`).join('')}</ul>`;
 }
 
+/**
+ * External systems that held an erased read or event: their own records at
+ * the provider are NOT deleted — this erasure has no client for them. One
+ * line per system, by signed label (already cleaned to one line in the plan).
+ */
+function externalSystemsKeptSection(labels: readonly string[]): string {
+  if (labels.length === 0) return '';
+  return `<p class="muted">הרשומות במערכות החיצוניות עצמן אינן נמחקות — המחיקה מסירה רק את מה שנשמר כאן. אם צריך, מחק אותן במערכת עצמה.</p>
+     <ul>${labels.map((label) => `<li>נשארים במערכת ${escLabel(label)}</li>`).join('')}</ul>`;
+}
+
 /** The contact's name sits in some version of the owner's business description: told, never edited. */
 function descriptionNoticeSection(mentioned: boolean): string {
   if (!mentioned) return '';
@@ -2011,6 +2027,7 @@ export function renderErasure(model: ErasureViewModel): string {
      ${plan.filePaths.length > 0 ? `<p>${plan.filePaths.length} קבצים יימחקו מהדיסק.</p>` : ''}
      ${savedCopiesSection(plan.savedCopies)}
      ${calendarEventsKeptSection(plan.calendarEventsKept, model.timeZone ?? null)}
+     ${externalSystemsKeptSection(plan.externalSystemsKept)}
      ${descriptionNoticeSection(plan.descriptionMentionsContact)}
      ${plan.filesNotDeleted.length > 0
        ? `<p class="error">${plan.filesNotDeleted.length} קבצים שנרשמו להפקה נמצאים מחוץ לתיקיית ההפקה שלה, ולכן לא יימחקו:</p><ul>${plan.filesNotDeleted.map((path) => `<li>${escLabel(path)}</li>`).join('')}</ul>`
