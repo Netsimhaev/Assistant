@@ -138,6 +138,7 @@ describe('the sign page', () => {
     expect(html).toContain('העוזרת תוכל: החזר כספי (כסף) — רק אחרי &quot;כן&quot; שלך');
     expect(html).toContain('התראות נכנסות (webhook)');
     expect(html).toContain('לקוח חדש');
+    expect(html).toContain('אם אין לאירוע שדה מזהה, שתי התראות זהות יישמרו כאחת');
     expect(html).toContain('תקרא אוטומטית');
     expect(html).toContain('כל 24 שעות, בלי לשאול אותך בכל פעם');
     expect(html).toContain('api.crm.example.com');

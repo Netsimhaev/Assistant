@@ -16,8 +16,10 @@
  * and signatures are compared in constant time (`timingSafeEqual`, over
  * fixed-length digests where the lengths could differ). A failure is
  * counted (`recordRejectedHook`) only once a real business and a real
- * signed system were resolved — a request naming a business that does not
- * exist writes nothing anywhere.
+ * signed system were resolved AND the request presented the credential the
+ * definition names (ruling T11-c) — a request naming a business that does
+ * not exist writes nothing anywhere, and a bare probe is not counted. An
+ * aborted or broken body stream ends with an empty 400.
  *
  * **The HMAC is over the raw bytes.** The body is read with a 256 KB cap
  * (413 past it) and inserted, as bytes, into the signed `signedPayload`
@@ -132,6 +134,11 @@ async function readBoundedBody(req: IncomingMessage, limit: number): Promise<Buf
     req.on('data', onData);
     req.on('end', onEnd);
     req.once('error', rejectRead);
+    // A client that aborts mid-body may close without an 'error'; a stream
+    // that closed before it completed is a failed read, never a hang.
+    req.once('close', () => {
+      if (!req.complete) rejectRead(new Error('request closed before its body completed'));
+    });
   });
   return within ? Buffer.concat(chunks) : null;
 }
@@ -284,6 +291,22 @@ async function signedWebhook(db: BusinessDb, systemId: string): Promise<Webhook>
   return system.webhook;
 }
 
+/**
+ * Whether the request carried the credential the signed definition names: a
+ * POST with the signature (or shared-secret) header, non-empty; a GET with the
+ * `query_challenge` token parameter. Only such a request is an authentication
+ * attempt worth counting when it fails. Presence only — never its value.
+ */
+function presentedCredential(webhook: Webhook, method: string, req: IncomingMessage, params: URLSearchParams): boolean {
+  if (method === 'GET') {
+    return webhook.handshake?.kind === 'query_challenge' && params.has(webhook.handshake.tokenParam);
+  }
+  const scheme = webhook.scheme;
+  const header = scheme.kind === 'shared-secret' ? scheme.header : scheme.signature.header;
+  const value = singleHeader(req, header);
+  return value !== null && value.length > 0;
+}
+
 /** The query parameter, when it appears exactly once. */
 function onlyParam(params: URLSearchParams, name: string): string | null {
   const values = params.getAll(name);
@@ -386,7 +409,17 @@ export async function handleExternalWebhook(req: IncomingMessage, res: ServerRes
   // The body first, bounded, before anything is parsed or looked up.
   let body: Buffer = Buffer.alloc(0);
   if (method === 'POST') {
-    const read = await readBoundedBody(req, EXTERNAL_HOOK_MAX_BYTES);
+    let read: Buffer | null;
+    try {
+      read = await readBoundedBody(req, EXTERNAL_HOOK_MAX_BYTES);
+    } catch {
+      // An aborted or broken request stream: an empty 400 (or nothing, when
+      // the socket is already gone) — never the dashboard's generic handler.
+      console.warn('external webhook refused: reason=body_stream');
+      if (!res.headersSent && !res.destroyed) sendEmpty(res, 400, { Connection: 'close' });
+      req.destroy();
+      return;
+    }
     if (read === null) return sendEmpty(res, 413, { Connection: 'close' });
     body = read;
   } else {
@@ -395,6 +428,7 @@ export async function handleExternalWebhook(req: IncomingMessage, res: ServerRes
 
   const businessId = match[1] ?? '';
   const systemId = match[2] ?? '';
+  let recorded = false;
   try {
     if (!EXTERNAL_SYSTEM_ID.test(systemId)) throw new Refusal('bad_system_id', false);
     const business = await resolveBusinessForHook(businessId);
@@ -406,13 +440,19 @@ export async function handleExternalWebhook(req: IncomingMessage, res: ServerRes
         if (method === 'GET') await handleQueryChallenge(deps, db, systemId, webhook, url.searchParams, res);
         else await handleSignedPost(deps, db, systemId, webhook, req, body, res);
       } catch (err) {
-        if (err instanceof Refusal && err.counted) await recordRejectedHook(db, systemId, err.reason);
+        // Ruling T11-c: counted only when the request presented the
+        // credential the definition names — a bare probe is refused the
+        // same way but leaves the counter a signal of failed authentication.
+        if (err instanceof Refusal && err.counted && presentedCredential(webhook, method, req, url.searchParams)) {
+          await recordRejectedHook(db, systemId, err.reason);
+          recorded = true;
+        }
         throw err;
       }
     });
   } catch (err) {
     if (err instanceof Refusal) {
-      if (err.counted) console.warn(`external webhook refused: system=${systemId} reason=${err.reason}`);
+      if (recorded) console.warn(`external webhook refused: system=${systemId} reason=${err.reason}`);
       if (!res.headersSent) sendEmpty(res, 401);
       return;
     }

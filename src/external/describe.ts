@@ -32,6 +32,15 @@ function operationLine(op: Operation, audience: Audience, currency: string | nul
   return line;
 }
 
+/** Shown when some event declares no id field: deliveries are deduplicated on the declared fields. */
+export const WEBHOOK_DEDUP_HINT = 'אם אין לאירוע שדה מזהה, שתי התראות זהות יישמרו כאחת';
+
+/** A field path whose last segment is `id` or ends in `_id` — positive and simple. */
+function isIdPath(path: string): boolean {
+  const last = path.split('.').at(-1) ?? '';
+  return last === 'id' || last.endsWith('_id');
+}
+
 function describe(def: ExternalSystem, audience: Audience, currency: string | null): string[] {
   const lines = def.operations.map((op) => operationLine(op, audience, currency));
   if (def.webhook !== null) {
@@ -49,6 +58,7 @@ function describe(def: ExternalSystem, audience: Audience, currency: string | nu
           : `התראות נכנסות (webhook): המערכת תוכל לשלוח לעוזרת התראות על: ${events.join(', ')}`,
       );
     }
+    if (def.webhook.events.some((e) => !e.fields.some((f) => isIdPath(f.path)))) lines.push(WEBHOOK_DEDUP_HINT);
   }
   if (def.scan !== null) {
     const op = def.operations.find((o) => o.name === def.scan?.operation);

@@ -29,6 +29,8 @@ const VERIFY = 'verify-token-1';
 let server: Server | null = null;
 let base = '';
 let clock = new Date('2026-11-19T10:00:00Z');
+/** Every handler call of the test server, so a test can await one and see it never rejected. */
+let handled: Promise<void>[] = [];
 
 const nowSeconds = (): number => Math.floor(clock.getTime() / 1000);
 
@@ -49,7 +51,7 @@ async function storeSecret(businessId: string, ref: string, value: string): Prom
 async function startHandler(): Promise<void> {
   const secrets = storedCredentials(TEST_MASTER_KEY);
   server = createHttpServer((req, res) => {
-    void handleExternalWebhook(req, res, { secrets, now: () => clock });
+    handled.push(handleExternalWebhook(req, res, { secrets, now: () => clock }));
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -59,6 +61,7 @@ async function startHandler(): Promise<void> {
 beforeEach(async () => {
   await resetDatabase();
   clock = new Date('2026-11-19T10:00:00Z');
+  handled = [];
   await writeKeyState(TEST_MASTER_KEY, 'KEY-test', testDb());
   await install(BUSINESS, crmFixture());
   await storeSecret(BUSINESS, 'EXT_CRM_HOOK', SECRET);
@@ -422,10 +425,56 @@ describe('query_challenge handshake (Meta)', () => {
 });
 
 describe('a GET on a system without a query_challenge handshake', () => {
-  it('is a 401 and counted', async () => {
+  it('is a 401, and not counted: it presented no credential (ruling T11-c)', async () => {
     const res = await fetch(`${base}${HOOK}?hub.mode=subscribe&hub.challenge=1`);
     expect(res.status).toBe(401);
+    expect(await rejected()).toBe(0);
+  });
+});
+
+describe('the reject counter counts failed authentication only (ruling T11-c)', () => {
+  it('a bare POST with no signature header is refused and not counted', async () => {
+    const res = await post(HOOK, CREATED);
+    expect(res.status).toBe(401);
+    expect(res.text).toBe('');
+    const empty = await post(HOOK, CREATED, { 'Stripe-Signature': '' });
+    expect(empty.status).toBe(401);
+    expect(await rejected()).toBe(0);
+  });
+
+  it('a request that presented a bad signature is refused and counted', async () => {
+    const ts = nowSeconds();
+    const res = await post(HOOK, CREATED, { 'Stripe-Signature': `t=${ts},v1=${'0'.repeat(64)}` });
+    expect(res.status).toBe(401);
     expect(await rejected()).toBe(1);
+  });
+});
+
+describe('a broken request stream', () => {
+  it('an aborted body never rejects the handler, and stores nothing', async () => {
+    const { connect } = await import('node:net');
+    const url = new URL(base);
+    const socket = connect(Number(url.port), url.hostname);
+    await once(socket, 'connect');
+    const CRLF = String.fromCharCode(13, 10);
+    socket.write(
+      [
+        `POST ${HOOK} HTTP/1.1`,
+        'Host: x',
+        'Content-Type: application/json',
+        'Content-Length: 1000',
+        `Stripe-Signature: t=${nowSeconds()},v1=${'0'.repeat(64)}`,
+        '',
+        '{"type":',
+      ].join(CRLF),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    socket.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(handled).toHaveLength(1);
+    await expect(handled[0]).resolves.toBeUndefined();
+    expect(await eventRows()).toHaveLength(0);
+    expect(await rejected()).toBe(0);
   });
 });
 

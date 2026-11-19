@@ -231,6 +231,7 @@ describe('editing a draft', () => {
     expect(page).toContain('רשימת לקוחות (קריאה)');
     expect(page).toContain('החזר כספי (כסף)');
     expect(page).toContain('התראות נכנסות (webhook): לקוח חדש, תשלום נכשל');
+    expect(page).toContain('אם אין לאירוע שדה מזהה, שתי התראות זהות יישמרו כאחת');
     expect(page).toContain('סריקה כל 24 שעות: רשימת לקוחות');
     // The technician's own draft comes back in the textarea.
     expect(page).toContain('https://api.crm.example.com/v1');
