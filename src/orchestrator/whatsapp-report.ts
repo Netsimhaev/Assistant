@@ -98,6 +98,7 @@ import { pendingApprovalForJob } from '../governance/approvals.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { claimForReport } from '../whatsapp/store.js';
 import { loadActiveCharter } from '../charter/store.js';
+import type { ExternalSystem } from '../domain/external-system.js';
 import { renderReadsForOwner } from '../external/render-reads.js';
 import { loadReadsForJob } from '../external/store.js';
 import { WHATSAPP_MESSAGE_MAX_CHARS } from './command-confirm.js';
@@ -709,9 +710,17 @@ async function withReads(
   if (verdict.outcome !== 'performed' && verdict.outcome !== 'performed_on_confirmation') return text;
   const reads = await loadReadsForJob(db, jobId);
   if (reads.length === 0) return text;
-  const active = await loadActiveCharter(db);
+  // An unreadable charter must not cost the owner the report: the labels fall
+  // back to the system and operation ids (`renderReadsForOwner` with no
+  // systems), and the sentence and the values still go out.
+  let systems: readonly ExternalSystem[] = [];
+  try {
+    systems = (await loadActiveCharter(db))?.bundle.externalSystems ?? [];
+  } catch {
+    systems = [];
+  }
   // The sentence plus the block must fit one message: the block gets what is left.
-  const block = renderReadsForOwner(reads, active?.bundle.externalSystems ?? [], {
+  const block = renderReadsForOwner(reads, systems, {
     maxChars: WHATSAPP_MESSAGE_MAX_CHARS - text.length - 2,
   });
   return `${text}

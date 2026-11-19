@@ -1334,6 +1334,30 @@ describe('reportWhatsAppJobs — boss commands (spec §4.6)', () => {
 שם: דנה`]);
   });
 
+  it('an unreadable charter still sends the report, with ids for labels (M-b)', async () => {
+    const jobId = await seed({ instruction: true, confirm: true });
+    await withBusiness(BUSINESS, (db) =>
+      recordExternalRead(db, {
+        jobId, stepId: 's1', systemId: 'crm', operation: 'lookup',
+        fields: [{ label: 'שם', value: 'דנה' }],
+      }),
+    );
+    await close(jobId);
+    await linkToWhatsApp(jobId);
+    await testDb().query(
+      `UPDATE charter_versions SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb('0'::text))
+        WHERE business_id = $1`,
+      [BUSINESS],
+    );
+    const messenger = fakeMessenger();
+    const out = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
+    expect(out.errored).toEqual([]);
+    expect(messenger.sentTexts).toEqual([`${PERFORMED_ON_CONFIRMATION_TEXT}
+
+מcrm — lookup:
+שם: דנה`]);
+  });
+
   it('the dashboard query returns reads of instruction jobs only', async () => {
     const owned = await seed({ instruction: true, confirm: true });
     const other = await seed({ instruction: false, confirm: true });
