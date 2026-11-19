@@ -68,6 +68,8 @@ import type { ActiveCharter } from '../charter/store.js';
 import { localParts } from '../util/local-time.js';
 import { readHeader, renderReadsForOwner } from '../external/render-reads.js';
 import { loadRecentOwnerReads } from '../external/store.js';
+import { EXTERNAL_HOOK_PATH, handleExternalWebhook } from '../external/webhook.js';
+import { storedCredentials } from '../governance/credential-store.js';
 import { config } from '../config.js';
 import { DigestSchedule, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
 import type { DigestSettings } from '../governance/digest-settings.js';
@@ -3335,6 +3337,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
   // which point the attacker already has direct access and gains nothing by
   // routing it through the victim's browser.
   if (method === 'POST' && pathname === '/login') return handleLoginPost(req, res);
+
+  // A signed external system's webhook: no session, no CSRF — the system's
+  // secret is the credential, and the business and system come only from
+  // the path (`external/webhook.ts`). Before the session and no-charter
+  // gates, and matched by one anchored pattern so it serves nothing else.
+  if (EXTERNAL_HOOK_PATH.test(pathname)) {
+    return handleExternalWebhook(req, res, { secrets: storedCredentials(options.masterKey), now: () => new Date() });
+  }
 
   // Invite and reset links: before any session exists. The link token is the
   // credential, and the POST's CSRF token is bound to it.
