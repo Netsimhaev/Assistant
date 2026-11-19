@@ -218,7 +218,10 @@ export function externalRedactionProblem(step: PlanStep, redactPatterns: readonl
     return EXTERNAL_REDACTED_HE;
   }
   const after = redacted !== null && typeof redacted === 'object' ? (redacted as Record<string, unknown>) : {};
-  for (const key of ['params', 'amountMinor'] as const) {
+  // `system` and `operation` too: a pattern matching a system or operation
+  // name would make the adapter resolve the marker instead of the signed
+  // name, and the step would fail only after the owner's "כן".
+  for (const key of ['system', 'operation', 'params', 'amountMinor'] as const) {
     const before = canonicalOrNull(step.input[key]);
     const now = canonicalOrNull(after[key]);
     if (before === null || before !== now) return EXTERNAL_REDACTED_HE;

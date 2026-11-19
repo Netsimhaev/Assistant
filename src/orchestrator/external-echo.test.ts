@@ -15,7 +15,13 @@ import {
   renderCatalogue,
   renderExternalCatalogue,
 } from './catalogue.js';
-import { EXTERNAL_PARAMS_DECODED_NOTE, renderConfirmationQuestion, renderStepEcho } from './command-echo.js';
+import {
+  EXTERNAL_PARAMS_DECODED_NOTE,
+  EXTERNAL_REDACTED_HE,
+  externalRedactionProblem,
+  renderConfirmationQuestion,
+  renderStepEcho,
+} from './command-echo.js';
 import { classMismatch } from './run-plan.js';
 
 /**
@@ -246,5 +252,17 @@ describe('the planner sees the signed operations with their real classes', () =>
       rampLevel: 'auto',
     });
     expect(prompt).not.toContain('# פעולות במערכות חיצוניות');
+  });
+});
+
+describe('externalRedactionProblem compares the system and operation names too (T7)', () => {
+  it('passes a step no pattern touches', () => {
+    expect(externalRedactionProblem(CHARGE, ['\b05\d-?\d{7}\b'])).toBeNull();
+  });
+  it('refuses a step whose system name a pattern matches', () => {
+    expect(externalRedactionProblem(CHARGE, ['^billing$'])).toBe(EXTERNAL_REDACTED_HE);
+  });
+  it('refuses a step whose operation name a pattern matches', () => {
+    expect(externalRedactionProblem(CHARGE, ['charge_customer'])).toBe(EXTERNAL_REDACTED_HE);
   });
 });
