@@ -25,6 +25,7 @@ import { canonicalHash } from '../util/canonical.js';
 import { buildCharter } from '../test/fixtures.js';
 import { recordExternalRead } from '../external/store.js';
 import { cutLine } from '../external/render-reads.js';
+import { localParts } from '../util/local-time.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { insertOrGetDocument } from '../documents/store.js';
 import { saveReading } from '../documents/reading-store.js';
@@ -3790,8 +3791,11 @@ describe('recentReadsBlock (Stage D, task 8)', () => {
         fields: Array.from({ length: fieldCount }, (_, i) => ({ label: `f${i}`, value: 'v' })),
       }),
     );
-    // 09:00Z in November is 11:00 in Asia/Jerusalem (the fixture charter's zone).
-    await testDb().query(`UPDATE external_reads SET created_at = $2 WHERE job_id = $1`, [job.jobId, '2026-11-18T09:00:00Z']);
+    // Relative to now: the 24h "recent" window must always contain it.
+    await testDb().query(
+      `UPDATE external_reads SET created_at = date_trunc('hour', now()) - interval '1 hour' WHERE job_id = $1`,
+      [job.jobId],
+    );
     return job.jobId;
   }
 
@@ -3800,8 +3804,10 @@ describe('recentReadsBlock (Stage D, task 8)', () => {
     await jobWithRead(1, false);
     const block = await withBusiness(BUSINESS, (db) => recentReadsBlock(db));
     // Neither read is in the signed charter, so ids stand in for labels.
-    expect(block).toContain('מcrm — lookup: (נקרא 2026-11-18 11:00, הושלם)');
-    expect(block).toContain('מcrm — lookup: (נקרא 2026-11-18 11:00, לא הושלם)');
+    const { rows } = await testDb().query<{ created_at: Date }>('SELECT created_at FROM external_reads LIMIT 1');
+    const when = localParts(rows[0]!.created_at, 'Asia/Jerusalem'); // the fixture charter's zone
+    expect(block).toContain(`מcrm — lookup: (נקרא ${when.date} ${when.time}, הושלם)`);
+    expect(block).toContain(`מcrm — lookup: (נקרא ${when.date} ${when.time}, לא הושלם)`);
     // The 60-field read is cut on its own; the small read is whole.
     expect(block).toContain(cutLine(22));
     expect(block).toContain('f0: v');
