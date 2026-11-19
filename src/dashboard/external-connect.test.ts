@@ -27,6 +27,7 @@ import { resetDatabase, testDb } from '../test/db.js';
 import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { issueCsrfToken } from './csrf.js';
 import { createServer } from './server.js';
+import { EXTERNAL_READD_FROM_DRAFT, EXTERNAL_READD_NEEDS_TECHNICIAN } from './external-connect.js';
 
 const BUSINESS = 'test-business';
 const USERNAME = 'owner';
@@ -299,6 +300,7 @@ describe('POST /connections/external/:system/remove', () => {
     const res = await postForm(baseUrl, cookie, '/connections/external/crm/remove', {
       csrf: csrfFor(cookie),
       base: await activeVersion(),
+      confirm: 'yes',
     });
     expect(res.status).toBe(303);
     const location = res.headers.get('location') ?? '';
@@ -314,6 +316,9 @@ describe('POST /connections/external/:system/remove', () => {
 
     const after = await (await fetch(`${baseUrl}${location}`, { headers: { cookie } })).text();
     expect(after).toContain('הסודות של המערכת נשארו שמורים');
+    // No draft is left: re-adding needs the technician.
+    expect(after).toContain(EXTERNAL_READD_NEEDS_TECHNICIAN);
+    expect(after).not.toContain(EXTERNAL_READD_FROM_DRAFT);
   });
 
   it('refuses a stale base and a system that is not signed', async () => {
@@ -321,24 +326,23 @@ describe('POST /connections/external/:system/remove', () => {
     const baseUrl = await startServer();
     const cookie = await login(baseUrl);
     const notSigned = await postForm(baseUrl, cookie, '/connections/external/crm/remove', {
-      csrf: csrfFor(cookie), base: await activeVersion(),
+      csrf: csrfFor(cookie), base: await activeVersion(), confirm: 'yes',
     });
     expect(notSigned.status).toBe(409);
     expect((await signCrm(baseUrl, cookie)).status).toBe(303);
-    const stale = await postForm(baseUrl, cookie, '/connections/external/crm/remove', { csrf: csrfFor(cookie), base: 'old' });
+    const stale = await postForm(baseUrl, cookie, '/connections/external/crm/remove', { csrf: csrfFor(cookie), base: 'old', confirm: 'yes' });
     expect(stale.status).toBe(409);
     expect((await withBusiness(BUSINESS, (db) => loadActiveCharter(db)))?.charter.externalSystems).toHaveLength(1);
   });
 });
 
-describe('the gate before signing', () => {
-  it('a definition that exists only as a draft is denied external_operation_unknown', async () => {
-    await saveCrmDraft();
+describe('the gate before and after signing', () => {
+  async function gateCall(): Promise<Awaited<ReturnType<typeof evaluateFor>>> {
     const active = await withBusiness(BUSINESS, (db) => loadActiveCharter(db));
     if (active === null) throw new Error('no charter');
     const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: active.bundle.charterVersion, provenance: 'boss' }));
     const rampLevel = await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'crm.write'));
-    const decision = await evaluateFor(
+    return evaluateFor(
       'ext.call',
       { system: 'crm', operation: 'update_customer', params: { customer_id: 'c1' } },
       {
@@ -354,7 +358,183 @@ describe('the gate before signing', () => {
         now: new Date('2026-08-18T09:00:00.000Z'),
       },
     );
-    expect(decision.outcome).toBe('deny');
-    expect(decision.outcome === 'deny' && decision.code).toBe(DENY_CODES.externalOperationUnknown);
+  }
+
+  it('a definition that exists only as a draft is denied external_operation_unknown; once signed it is not', async () => {
+    await saveCrmDraft();
+    const before = await gateCall();
+    expect(before.outcome).toBe('deny');
+    expect(before.outcome === 'deny' && before.code).toBe(DENY_CODES.externalOperationUnknown);
+
+    const baseUrl = await startServer();
+    const cookie = await login(baseUrl);
+    expect((await signCrm(baseUrl, cookie)).status).toBe(303);
+
+    const after = await gateCall();
+    // Judged as the signed operation now (stopped later, at the dial's floor) — not unknown.
+    expect(after.outcome === 'deny' ? after.code : after.outcome).not.toBe(DENY_CODES.externalOperationUnknown);
+    expect(after.outcome === 'deny' && after.code).toBe(DENY_CODES.draftOnly);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rollback: one transaction, proven by a failure injected at each later write
+// ---------------------------------------------------------------------------
+
+async function withFailingTrigger(table: string, event: 'INSERT' | 'UPDATE' | 'DELETE', fn: () => Promise<void>): Promise<void> {
+  await testDb().query(
+    `CREATE OR REPLACE FUNCTION t10_injected_failure() RETURNS trigger LANGUAGE plpgsql AS
+     $fn$ BEGIN RAISE EXCEPTION 'injected failure'; END $fn$`,
+  );
+  await testDb().query(
+    `CREATE TRIGGER t10_injected_failure BEFORE ${event} ON ${table} FOR EACH ROW EXECUTE FUNCTION t10_injected_failure()`,
+  );
+  try {
+    await fn();
+  } finally {
+    await testDb().query(`DROP TRIGGER IF EXISTS t10_injected_failure ON ${table}`);
+    await testDb().query('DROP FUNCTION IF EXISTS t10_injected_failure()');
+  }
+}
+
+async function auditCounts(): Promise<{ charter: number; binding: number }> {
+  const { rows } = await testDb().query<{ kind: string; n: string }>(
+    `SELECT kind, count(*)::text AS n FROM audit_log WHERE business_id = $1
+      AND kind IN ('charter_change', 'connection_binding') GROUP BY kind`,
+    [BUSINESS],
+  );
+  const of = (kind: string): number => Number(rows.find((r) => r.kind === kind)?.n ?? 0);
+  return { charter: of('charter_change'), binding: of('connection_binding') };
+}
+
+describe('signing rolls back as one transaction', () => {
+  it.each([
+    ['the draft delete', 'external_system_drafts', 'DELETE'],
+    ['the binding insert', 'connection_bindings', 'INSERT'],
+  ] as const)('a failure at %s leaves the charter, bindings, draft and audit as they were', async (_label, table, event) => {
+    await saveCrmDraft();
+    const baseUrl = await startServer();
+    const cookie = await login(baseUrl);
+    const html = await (await fetch(`${baseUrl}/connections/external/crm/sign`, { headers: { cookie } })).text();
+    const version = await activeVersion();
+    const audit = await auditCounts();
+
+    await withFailingTrigger(table, event, async () => {
+      const res = await postForm(baseUrl, cookie, '/connections/external/crm/sign', {
+        csrf: csrfFor(cookie),
+        base: hiddenField(html, 'base'),
+        draftHash: hiddenField(html, 'draftHash'),
+      });
+      expect(res.status).toBe(500);
+    });
+
+    expect(await activeVersion()).toBe(version);
+    expect((await withBusiness(BUSINESS, (db) => loadBindings(db))).some((b) => b.system === 'ext:crm')).toBe(false);
+    expect(await withBusiness(BUSINESS, (db) => loadDrafts(db))).toHaveLength(1);
+    expect(await auditCounts()).toEqual(audit);
+  });
+
+  it('a failure at the binding update during removal leaves the system signed and its binding live', async () => {
+    await saveCrmDraft();
+    const baseUrl = await startServer();
+    const cookie = await login(baseUrl);
+    expect((await signCrm(baseUrl, cookie)).status).toBe(303);
+    const version = await activeVersion();
+    const audit = await auditCounts();
+
+    await withFailingTrigger('connection_bindings', 'UPDATE', async () => {
+      const res = await postForm(baseUrl, cookie, '/connections/external/crm/remove', {
+        csrf: csrfFor(cookie), base: version, confirm: 'yes',
+      });
+      expect(res.status).toBe(500);
+    });
+
+    expect(await activeVersion()).toBe(version);
+    expect((await withBusiness(BUSINESS, (db) => loadActiveCharter(db)))?.charter.externalSystems).toHaveLength(1);
+    expect((await withBusiness(BUSINESS, (db) => loadBindings(db))).find((b) => b.system === 'ext:crm')?.status).toBe('live');
+    expect(await auditCounts()).toEqual(audit);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wording: removal, re-adding, the subprocessor and identical drafts
+// ---------------------------------------------------------------------------
+
+describe('removal and re-adding wording', () => {
+  it('removal needs the confirm checkbox; without it nothing is removed', async () => {
+    await saveCrmDraft();
+    const baseUrl = await startServer();
+    const cookie = await login(baseUrl);
+    expect((await signCrm(baseUrl, cookie)).status).toBe(303);
+    const status = await (await fetch(`${baseUrl}/connections/external`, { headers: { cookie } })).text();
+    expect(status).toContain('name="confirm" value="yes" required');
+    expect(status).not.toContain('<script');
+    const res = await postForm(baseUrl, cookie, '/connections/external/crm/remove', { csrf: csrfFor(cookie), base: await activeVersion() });
+    expect(res.status).toBe(400);
+    expect((await withBusiness(BUSINESS, (db) => loadActiveCharter(db)))?.charter.externalSystems).toHaveLength(1);
+  });
+
+  it('a draft left after removal: the notice says signing it brings the system back, and the sign page says re-add', async () => {
+    await saveCrmDraft();
+    const baseUrl = await startServer();
+    const cookie = await login(baseUrl);
+    expect((await signCrm(baseUrl, cookie)).status).toBe(303);
+    await saveCrmDraft();
+    const res = await postForm(baseUrl, cookie, '/connections/external/crm/remove', {
+      csrf: csrfFor(cookie), base: await activeVersion(), confirm: 'yes',
+    });
+    expect(res.status).toBe(303);
+    const notice = await (await fetch(`${baseUrl}${res.headers.get('location') ?? ''}`, { headers: { cookie } })).text();
+    expect(notice).toContain(EXTERNAL_READD_FROM_DRAFT);
+    expect(notice).not.toContain(EXTERNAL_READD_NEEDS_TECHNICIAN);
+
+    const sign = await (await fetch(`${baseUrl}/connections/external/crm/sign`, { headers: { cookie } })).text();
+    expect(sign).toContain('החזרת מערכת שהסרת');
+    expect(sign).not.toContain('הוספת מערכת חיצונית');
+  });
+
+  it('a brand-new system is not called a re-add', async () => {
+    await saveCrmDraft();
+    const baseUrl = await startServer();
+    const cookie = await login(baseUrl);
+    const sign = await (await fetch(`${baseUrl}/connections/external/crm/sign`, { headers: { cookie } })).text();
+    expect(sign).toContain('הוספת מערכת חיצונית');
+    expect(sign).not.toContain('החזרת מערכת שהסרת');
+  });
+
+  it('the subprocessor sentence appears only while ext:<id> is not yet allowed; a host change is named', async () => {
+    await saveCrmDraft();
+    const baseUrl = await startServer();
+    const cookie = await login(baseUrl);
+    const first = await (await fetch(`${baseUrl}/connections/external/crm/sign`, { headers: { cookie } })).text();
+    expect(first).toContain('תתווסף לרשימת הגורמים');
+    expect(first).not.toContain('החברה שהנתונים יוצאים אליה משתנה');
+    expect((await signCrm(baseUrl, cookie)).status).toBe(303);
+
+    const changed = crmFixture();
+    changed.baseUrl = 'https://api.other-crm.example.net/v1';
+    await saveCrmDraft(changed);
+    const second = await (await fetch(`${baseUrl}/connections/external/crm/sign`, { headers: { cookie } })).text();
+    expect(second).not.toContain('תתווסף לרשימת הגורמים');
+    expect(second).toContain(
+      'החברה שהנתונים יוצאים אליה משתנה: <code>api.crm.example.com</code> → <code>api.other-crm.example.net</code>',
+    );
+  });
+
+  it('a draft identical to the signed definition is not shown as a pending change', async () => {
+    await saveCrmDraft();
+    const baseUrl = await startServer();
+    const cookie = await login(baseUrl);
+    expect((await signCrm(baseUrl, cookie)).status).toBe(303);
+    await saveCrmDraft();
+    const status = await (await fetch(`${baseUrl}/connections/external`, { headers: { cookie } })).text();
+    expect(status).not.toContain('טיוטת שינוי ממתינה');
+    expect(status).toContain('חתומה בתקנון');
+
+    const changed = crmFixture();
+    changed.label = 'מערכת הלקוחות החדשה';
+    await saveCrmDraft(changed);
+    const pending = await (await fetch(`${baseUrl}/connections/external`, { headers: { cookie } })).text();
+    expect(pending).toContain('טיוטת שינוי ממתינה');
   });
 });

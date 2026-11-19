@@ -38,6 +38,12 @@
  * draft, if any, is left too — it is the technician's work, and signing it
  * again is a fresh signature.
  *
+ * Removal asks for a confirm checkbox (plain HTML `required`, and checked
+ * again on the server). The notice after it says whether a draft is left
+ * (signing it brings the system back) or re-adding needs the technician; the
+ * sign page for a draft whose system the owner removed says it re-adds one
+ * (`wasRemoved`: a `disconnected` `ext:<id>` binding and no signed system).
+ *
  * The gate needs none of this to deny: an operation of a system that is only
  * drafted is not in the active charter's `externalSystems`, so stage 3 refuses
  * it (`external_operation_unknown`) whatever the bindings say.
@@ -48,6 +54,7 @@ import {
   buildExternalRemoval,
   describeExternalAmendment,
   externalHost,
+  externalSubprocessor,
   type ExternalAmendmentDiff,
 } from '../charter/amend-external.js';
 import { signCharter } from '../charter/sign.js';
@@ -64,7 +71,7 @@ import {
 import { describeExternalSystem } from '../external/describe.js';
 import { deleteDraft, loadDrafts, lockDraft, type DraftRecord } from '../external/store.js';
 import { listSecretRefs } from '../governance/credential-store.js';
-import { upsertBinding } from '../orchestrator/bindings.js';
+import { loadBindings, upsertBinding } from '../orchestrator/bindings.js';
 import { canonicalHash } from '../util/canonical.js';
 import { verifyCsrfToken } from './csrf.js';
 import {
@@ -88,6 +95,12 @@ export const EXTERNAL_SECRETS_KEPT =
 const REMOVE_NOTE =
   'הסרה מוציאה את המערכת מהתקנון: מאותו רגע העוזרת לא תפנה אליה ולא תקבל ממנה התראות. ' +
   'גם ההסרה נחתמת בשמך. הסודות של המערכת נשארים שמורים — הטכנאי יכול למחוק אותם בפאנל.';
+export const EXTERNAL_READD_FROM_DRAFT = 'נשארה טיוטה של הטכנאי — חתימה עליה תחזיר את המערכת.';
+export const EXTERNAL_READD_NEEDS_TECHNICIAN =
+  'כדי להחזיר את המערכת בעתיד, הטכנאי צריך להכין לה טיוטה חדשה בפאנל, ואז לחתום עליה כאן.';
+export const EXTERNAL_READD_HEADING = 'החזרת מערכת שהסרת';
+const REMOVE_CONFIRM_LABEL = 'אני מבין/ה שהמערכת תוסר מהתקנון והעוזרת תפסיק לפנות אליה';
+const REMOVE_NOT_CONFIRMED = 'כדי להסיר את המערכת יש לסמן את תיבת האישור ולשלוח שוב. לא בוצעה כל פעולה.';
 const CHARTER_UNREADABLE = 'לא ניתן לקרוא את התקנון הפעיל של העסק — יש לפנות למי שמחזיק את ההתקנה. לא בוצעה כל פעולה.';
 const CHARTER_MISSING = 'לא הותקן עדיין תקנון פעיל לעסק הזה, ולכן אין לאן להוסיף מערכת.';
 const CSRF_REFUSAL = 'הטופס פג תוקף. רענן/י ונסה/י שוב. לא בוצעה כל פעולה.';
@@ -150,6 +163,17 @@ function amendmentProblems(unsigned: UnsignedCharter): string[] {
   }
 }
 
+/**
+ * Whether the owner removed this system earlier: its `ext:<id>` binding is
+ * `disconnected` (what removal writes) and the active charter does not
+ * declare it. Wording only — it grants nothing.
+ */
+async function wasRemoved(db: BusinessDb, charter: BusinessCharter, systemId: string): Promise<boolean> {
+  if (charter.externalSystems.some((s) => s.id === systemId)) return false;
+  const name = externalConnectionSystem(systemId);
+  return (await loadBindings(db)).some((b) => b.system === name && b.status === 'disconnected');
+}
+
 async function hasKeySecret(db: BusinessDb, systemId: string): Promise<boolean> {
   const { key } = externalSecretRefs(systemId);
   return (await listSecretRefs(db)).some((s) => s.ref === key);
@@ -179,7 +203,9 @@ export async function handleExternalStatus(
   const removed = query.get('removed');
   const removedNotice =
     removed !== null && EXTERNAL_SYSTEM_ID.test(removed)
-      ? `<div class="card"><p>המערכת <code>${esc(removed)}</code> הוסרה מהתקנון.</p><p>${esc(EXTERNAL_SECRETS_KEPT)}</p></div>`
+      ? `<div class="card"><p>המערכת <code>${esc(removed)}</code> הוסרה מהתקנון.</p><p>${esc(EXTERNAL_SECRETS_KEPT)}</p><p>${esc(
+          drafted.has(removed) ? EXTERNAL_READD_FROM_DRAFT : EXTERNAL_READD_NEEDS_TECHNICIAN,
+        )}</p></div>`
       : '';
 
   const cards = ids.map((id) => {
@@ -187,14 +213,18 @@ export async function handleExternalStatus(
     const draft = drafted.get(id);
     const draftCheck = draft === undefined ? null : checkDraft(id, draft);
     const label = def?.label ?? (draftCheck?.ok === true ? draftCheck.def.label : id);
+    // A draft identical to the signed definition is not a pending change.
+    const draftDiffers =
+      draft !== undefined &&
+      !(def !== undefined && draftCheck?.ok === true && canonicalHash(draftCheck.def) === canonicalHash(def));
     const state =
-      def !== undefined && draft !== undefined
+      def !== undefined && draftDiffers
         ? 'חתומה בתקנון — טיוטת שינוי ממתינה לחתימה'
         : def !== undefined
           ? 'חתומה בתקנון'
           : 'טיוטה ממתינה לחתימה';
     const key = secrets.has(externalSecretRefs(id).key) ? '✓ שמור' : EXTERNAL_MISSING_SECRET;
-    const signLink = draft === undefined ? '' : `<p><a href="/connections/external/${esc(id)}/sign">לקריאה ולחתימה</a></p>`;
+    const signLink = !draftDiffers ? '' : `<p><a href="/connections/external/${esc(id)}/sign">לקריאה ולחתימה</a></p>`;
     const removeForm =
       def === undefined
         ? ''
@@ -202,6 +232,7 @@ export async function handleExternalStatus(
   <input type="hidden" name="csrf" value="${esc(csrf)}">
   <input type="hidden" name="base" value="${esc(charter.charterVersion)}">
   <p class="muted">${esc(REMOVE_NOTE)}</p>
+  <p><label><input type="checkbox" name="confirm" value="yes" required> ${esc(REMOVE_CONFIRM_LABEL)}</label></p>
   <button type="submit">הסרת המערכת מהתקנון</button>
 </form>`;
     return `<div class="card">
@@ -256,6 +287,8 @@ export function renderExternalSignPage(options: {
   draftHash: string;
   csrf: string;
   keyStored: boolean;
+  /** The owner removed this system earlier (a `disconnected` `ext:<id>` binding, not in the active charter). */
+  previouslyRemoved: boolean;
   notice?: string;
 }): { status: number; html: string } {
   const { charter, def, draftHash, csrf } = options;
@@ -263,6 +296,15 @@ export function renderExternalSignPage(options: {
   const lines = describeExternalSystem(def, charter.money.currency);
   const problems = amendmentProblems(buildExternalAmendment(charter, def, new Date()));
   const host = externalHost(def);
+  const subprocessorAdded = !charter.data.subprocessorsAllowed.includes(externalSubprocessor(def.id));
+  const readd =
+    !diff.replaces && options.previouslyRemoved
+      ? `<div class="card"><h2>${esc(EXTERNAL_READD_HEADING)}</h2><p>הסרת את המערכת הזו מהתקנון בעבר. החתימה הזו מחזירה אותה לפי הטיוטה שהטכנאי הכין — קרא/י את התיאור המלא למטה.</p></div>`
+      : '';
+  const hostLine =
+    diff.host !== null
+      ? `<p>החברה שהנתונים יוצאים אליה משתנה: <code>${escLabel(diff.host.before)}</code> → <code>${escLabel(diff.host.after)}</code></p>`
+      : '';
 
   const form =
     problems.length > 0
@@ -276,8 +318,9 @@ export function renderExternalSignPage(options: {
 
   const html = page(
     'חתימה: מערכת חיצונית',
-    `<h1>${diff.replaces ? 'שינוי' : 'הוספת'} מערכת חיצונית: ${escLabel(def.label)}</h1>
+    `<h1>${diff.replaces ? 'שינוי' : options.previouslyRemoved ? 'החזרת' : 'הוספת'} מערכת חיצונית: ${escLabel(def.label)}</h1>
 ${options.notice === undefined ? '' : `<p class="error">${esc(options.notice)}</p>`}
+${readd}
 ${diffCard(diff)}
 <div class="card">
 <h2>מה החתימה מתירה</h2>
@@ -286,7 +329,10 @@ ${diffCard(diff)}
 </div>
 <div class="card">
 <h2>לאן המידע עובר</h2>
-<p>המידע עובר אל: <b><code>${escLabel(host)}</code></b> — החברה שמפעילה את המערכת. היא תתווסף לרשימת הגורמים שמותר להם לעבד את המידע של העסק.</p>
+${hostLine}
+<p>המידע עובר אל: <b><code>${escLabel(host)}</code></b> — החברה שמפעילה את המערכת.${
+    subprocessorAdded ? ' היא תתווסף לרשימת הגורמים שמותר להם לעבד את המידע של העסק.' : ''
+  }</p>
 </div>
 ${options.keyStored ? '' : `<p class="error">${esc(EXTERNAL_MISSING_SECRET)}</p><p class="muted">אפשר לחתום כבר עכשיו; העוזרת לא תוכל לפנות למערכת עד שהסוד יישמר.</p>`}
 <p>שאר התקנון נשאר בדיוק כפי שנחתם.</p>
@@ -311,7 +357,10 @@ export async function handleExternalSignGet(
   const check = checkDraft(systemId, draft);
   if (!check.ok) return sendHtml(res, 409, errorPage('הטיוטה אינה תקינה', DRAFT_INVALID));
   const keyStored = await hasKeySecret(db, systemId);
-  const rendered = renderExternalSignPage({ charter: read.charter, def: check.def, draftHash: check.hash, csrf, keyStored });
+  const previouslyRemoved = await wasRemoved(db, read.charter, systemId);
+  const rendered = renderExternalSignPage({
+    charter: read.charter, def: check.def, draftHash: check.hash, csrf, keyStored, previouslyRemoved,
+  });
   sendHtml(res, rendered.status, rendered.html);
 }
 
@@ -333,6 +382,7 @@ export async function handleExternalSignPost(
   if (!read.ok) return sendHtml(res, 409, errorPage('לא ניתן לחתום', read.message));
   const active = read.charter;
   const keyStored = await hasKeySecret(db, systemId);
+  const previouslyRemoved = await wasRemoved(db, active, systemId);
 
   try {
     await transaction(db, async (tx) => {
@@ -342,7 +392,7 @@ export async function handleExternalSignPost(
       if (!check.ok) throw new Refusal(409, errorPage('הטיוטה אינה תקינה', DRAFT_INVALID));
       if (check.hash !== form.get('draftHash')) {
         const rendered = renderExternalSignPage({
-          charter: active, def: check.def, draftHash: check.hash, csrf, keyStored, notice: DRAFT_CHANGED,
+          charter: active, def: check.def, draftHash: check.hash, csrf, keyStored, previouslyRemoved, notice: DRAFT_CHANGED,
         });
         throw new Refusal(409, rendered.html);
       }
@@ -405,6 +455,8 @@ export async function handleExternalRemovePost(
   if (!active.externalSystems.some((s) => s.id === systemId)) {
     return sendHtml(res, 409, errorPage('אין מה להסיר', NOT_SIGNED));
   }
+  // The confirm step, enforced here and not only by the checkbox's `required`.
+  if (form.get('confirm') !== 'yes') return sendHtml(res, 400, errorPage('לא אושר', REMOVE_NOT_CONFIRMED));
   const base = form.get('base');
   if (base !== active.charterVersion) return sendHtml(res, 409, errorPage('התקנון השתנה', STALE_MESSAGE));
 
