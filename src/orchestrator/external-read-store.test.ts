@@ -67,12 +67,13 @@ function registry(reply: ExternalResult): AdapterRegistry {
     createExternalAdapter(
       // The compiled bundle's definition, as the runtime registers it.
       crmSystem,
-      { http, callsToday: async () => 0, recordCall: async () => {}, capPerDay: 200 },
+      { http, callsToday: async () => 0, recordCall: async () => {}, capPerDay: 200, charterVersion: crmVersion },
     ),
   ]);
 }
 
 let crmSystem: PolicyBundle['externalSystems'][number];
+let crmVersion: string;
 
 async function setup(): Promise<{ bundle: PolicyBundle; jobId: string }> {
   const bundle = await withBusiness(BUSINESS, (bdb) =>
@@ -81,6 +82,7 @@ async function setup(): Promise<{ bundle: PolicyBundle; jobId: string }> {
   const system = bundle.externalSystems[0];
   if (system === undefined) throw new Error('no external system in the bundle');
   crmSystem = system;
+  crmVersion = bundle.charterVersion;
   const job = await withBusiness(BUSINESS, (db) =>
     createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }),
   );
@@ -189,6 +191,18 @@ describe('a write that may have gone out', () => {
     if (result.status === 'rejected') throw new Error('plan rejected before any step ran');
     expect(result.steps[0]?.outcome).toMatchObject({ status: 'deferred', code: 'adapter_timeout' });
     const { rows } = await testDb().query('SELECT 1 FROM job_step_results WHERE job_id = $1', [jobId]);
+    expect(rows).toHaveLength(0);
+  });
+});
+
+describe('a re-signed charter', () => {
+  it('an adapter built from another charter version refuses the step — nothing stored', async () => {
+    const { bundle, jobId } = await setup();
+    crmVersion = 'some-older-version';
+    const result = await run(bundle, jobId, { kind: 'response', status: 200, body: '{"data":{"name":"x"}}' });
+    if (result.status === 'rejected') throw new Error('plan rejected before any step ran');
+    expect(result.steps[0]?.outcome).toMatchObject({ status: 'deferred', code: 'external_definition_stale' });
+    const { rows } = await testDb().query('SELECT 1 FROM external_reads');
     expect(rows).toHaveLength(0);
   });
 });

@@ -869,6 +869,7 @@ export async function businessRuntime(server: ServerRuntime, db: BusinessDb): Pr
           callsToday: (systemId) => withBusiness(businessId, (bdb) => countCallsToday(bdb, systemId, timeZone)),
           recordCall: (call) => withBusiness(businessId, (bdb) => recordCall(bdb, call)),
           capPerDay: config.externalCallsPerDay,
+          charterVersion: charter.bundle.charterVersion,
         }),
       );
     }

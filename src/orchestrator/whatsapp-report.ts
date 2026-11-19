@@ -332,6 +332,9 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
   external_network: 'לא ניתן היה להגיע למערכת החיצונית', // retryable
   external_response_too_large: 'התשובה מהמערכת החיצונית גדולה מדי',
   external_request_failed: 'אירעה תקלה בשליחת הבקשה למערכת החיצונית',
+  external_definition_stale: 'הגדרת המערכת החיצונית התעדכנה בזמן הביצוע', // retryable
+  external_bad_url: 'כתובת המערכת החיצונית אינה כתובת מאובטחת — לא נשלח דבר',
+  external_disabled: 'החיבור למערכות חיצוניות כבוי',
 
   // Attachments on mail.send (document production §8.2): performStep's own
   // refusals (run-plan.ts, production/attachments.ts) and the mailbox

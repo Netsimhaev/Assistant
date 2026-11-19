@@ -744,6 +744,9 @@ async function performStep(
       }),
       // Resolved from the effective payload above; `[]` when the step has none.
       attachments,
+      // The bundle the gate judged with, so an adapter built from a charter
+      // version can refuse a step judged under another (`external.ts`).
+      judgedCharterVersion: request.bundle.charterVersion,
       signal: AbortSignal.timeout(request.adapterTimeoutMs ?? ADAPTER_TIMEOUT_MS),
     },
     request.adapterTimeoutMs ?? ADAPTER_TIMEOUT_MS,

@@ -6,6 +6,7 @@ import { createExternalAdapter } from './external.js';
 import { createCredentialHandle, type AdapterCall, type AdapterResult } from './types.js';
 
 const SECRET = 'sk_live_TOPSECRET_9f8e7d';
+const VERSION = 'charter-v7';
 
 function system(auth: Record<string, unknown> = { kind: 'bearer' }): ExternalSystem {
   return ExternalSystem.parse({
@@ -64,6 +65,7 @@ function harness(
       rec.calls.push(call);
     },
     capPerDay: opts.cap ?? 200,
+    charterVersion: VERSION,
   });
   return { adapter, rec };
 }
@@ -80,6 +82,7 @@ function call(toolName: string, input: unknown, credential: AdapterCall['credent
     businessId: 'test-business',
     idempotencyKey: 'idem-123',
     attachments: [],
+    judgedCharterVersion: VERSION,
     signal: new AbortController().signal,
   };
 }
@@ -340,5 +343,60 @@ describe('every external code has a Hebrew failure sentence', () => {
     for (const code of [...Object.keys(EXTERNAL_MESSAGES_HE), 'bad_params']) {
       expect(failedText(`${code} — x`), code).not.toBe(FAILED_GENERIC_TEXT);
     }
+  });
+});
+
+describe('fix round 1 hardenings', () => {
+  it('refuses a step judged under another charter version — nothing sent, nothing counted', async () => {
+    const h = harness(resp(200));
+    for (const judged of ['charter-v8', undefined]) {
+      const c = call('ext.read', READ_INPUT);
+      const r = failure(await h.adapter.execute(
+        judged === undefined ? (({ judgedCharterVersion: _v, ...rest }) => rest)(c) : { ...c, judgedCharterVersion: judged },
+      ));
+      expect(r).toMatchObject({ code: 'external_definition_stale', retryable: true });
+    }
+    expect(h.rec.sent).toHaveLength(0);
+    expect(h.rec.calls).toHaveLength(0);
+  });
+
+  it('drops a declared field or id that echoes the secret', async () => {
+    const body = JSON.stringify({ data: { name: `Bearer ${SECRET}`, id: SECRET }, items: [{ name: 'כיסא' }] });
+    const r = await read(harness(resp(200, body)));
+    expect(r).toEqual({ ok: true, output: { fields: [{ label: 'פריט', value: 'כיסא' }] }, externalId: null });
+    expect(canonicalJson(r)).not.toContain(SECRET);
+  });
+
+  it('drops a field that echoes the base64 form of a basic secret', async () => {
+    const b64 = Buffer.from('user:pass').toString('base64');
+    const h = harness(resp(200, JSON.stringify({ data: { name: `Basic ${b64}`, id: 'x' } })), { auth: { kind: 'basic' } });
+    const r = await h.adapter.execute(call('ext.read', READ_INPUT, createCredentialHandle('EXT_ACME_KEY', 'user:pass')));
+    expect(r).toEqual({ ok: true, output: { fields: [] }, externalId: 'x' });
+  });
+
+  it('a non-https TypeError on a write is a final external_bad_url, not delivery_unknown', async () => {
+    const http: ExternalHttp = {
+      async send(req) {
+        // The guarded client's own refusal, reproduced: it throws before any socket.
+        if (req.url.protocol !== 'https:') throw new TypeError('external requests must use https:');
+        return resp(200);
+      },
+    };
+    const plain = ExternalSystem.parse({ ...system(), id: 'acme' });
+    // Simulate a definition whose URL is not https by mutating the parsed copy
+    // (the schema refuses it at signing; this is the adapter's own backstop).
+    (plain as { baseUrl: string }).baseUrl = 'http://api.acme.example/v1';
+    const adapter = createExternalAdapter(plain, {
+      http, callsToday: async () => 0, recordCall: async () => {}, capPerDay: 200, charterVersion: VERSION,
+    });
+    const r = failure(await adapter.execute(call('ext.call', WRITE_INPUT)));
+    expect(r).toMatchObject({ code: 'external_bad_url', retryable: false });
+  });
+
+  it('a cap of 0 means switched off — final external_disabled, nothing sent', async () => {
+    const h = harness(resp(200), { cap: 0 });
+    const r = failure(await read(h));
+    expect(r).toEqual({ ok: false, code: 'external_disabled', retryable: false, message: 'החיבור למערכות חיצוניות כבוי' });
+    expect(h.rec.sent).toHaveLength(0);
   });
 });

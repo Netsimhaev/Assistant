@@ -1048,14 +1048,15 @@ describe('buildServerRuntime + businessRuntime', () => {
 });
 
 describe('businessRuntime — external systems (Stage D)', () => {
-  async function installCrm(): Promise<void> {
-    await withBusiness(BUSINESS, (bdb) =>
+  async function installCrm(): Promise<string> {
+    const bundle = await withBusiness(BUSINESS, (bdb) =>
       installCharter(bdb, buildCharter({ externalSystems: [crmFixture()], connections: [crmConnection()] })),
     );
+    return bundle.charterVersion;
   }
 
   it('registers one ext:<id> adapter per signed system, through the injected guarded client', async () => {
-    await installCrm();
+    const version = await installCrm();
     const sent: ExternalRequest[] = [];
     const http: ExternalHttp = {
       async send(req) {
@@ -1077,6 +1078,7 @@ describe('businessRuntime — external systems (Stage D)', () => {
       businessId: BUSINESS,
       idempotencyKey: 'k',
       attachments: [],
+      judgedCharterVersion: version,
       signal: new AbortController().signal,
     });
     expect(result).toEqual({ ok: true, output: { fields: [{ label: 'שם', value: 'Dana' }] }, externalId: 'c-9' });

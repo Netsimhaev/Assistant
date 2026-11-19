@@ -65,16 +65,26 @@ export const EXTERNAL_MESSAGES_HE = {
   external_request_failed: 'אירעה תקלה בשליחת הבקשה למערכת החיצונית',
   adapter_timeout: 'המערכת החיצונית לא הגיבה בזמן',
   delivery_unknown: 'לא ניתן לדעת אם הפעולה בוצעה במערכת החיצונית — כדאי לבדוק שם',
+  external_definition_stale: 'הגדרת המערכת החיצונית התעדכנה בזמן הביצוע — ננסה שוב בסבב הבא',
+  external_bad_url: 'כתובת המערכת החיצונית אינה כתובת מאובטחת — לא נשלח דבר',
+  external_disabled: 'החיבור למערכות חיצוניות כבוי',
 } as const;
 
 type ExternalCode = keyof typeof EXTERNAL_MESSAGES_HE;
 
 export interface ExternalAdapterDeps {
   http: ExternalHttp;
+  /**
+   * The charter version `system` was read from. A call judged under any other
+   * version (`AdapterCall.judgedCharterVersion`) is refused, retryable: the
+   * next pass rebuilds the runtime from the charter the gate now reads.
+   */
+  charterVersion: string;
   /** Calls already made today to this system, in the charter's time zone. */
   callsToday: (systemId: string) => Promise<number>;
   /** Counts one attempt that reached `http.send`. `outcome` is a fixed code. */
   recordCall: (call: { systemId: string; outcome: string }) => Promise<void>;
+  /** 0 means external calls are switched off: a final `external_disabled`. */
   capPerDay: number;
 }
 
@@ -152,7 +162,24 @@ const RETRYABLE: ReadonlySet<ExternalCode> = new Set<ExternalCode>([
   'external_unavailable',
   'external_network',
   'adapter_timeout',
+  'external_definition_stale',
 ]);
+
+/**
+ * The secret in every form this adapter sends it: raw, and for basic auth its
+ * base64. A field value that contains any of them is dropped — a provider
+ * echoing the Authorization header must never land the key in `output` or
+ * `external_reads`.
+ */
+function secretForms(system: ExternalSystem, secret: string): string[] {
+  const forms = [secret];
+  if (system.auth.kind === 'basic') forms.push(Buffer.from(secret, 'utf8').toString('base64'));
+  return forms;
+}
+
+function carriesSecret(value: string, forms: readonly string[]): boolean {
+  return forms.some((form) => value.includes(form));
+}
 
 export function createExternalAdapter(system: ExternalSystem, deps: ExternalAdapterDeps): ExternalAdapter {
   const systemName = `ext:${system.id}`;
@@ -166,6 +193,8 @@ export function createExternalAdapter(system: ExternalSystem, deps: ExternalAdap
   }
 
   async function execute(call: AdapterCall): Promise<AdapterResult> {
+    // Same definition as the gate, or nothing: see `ExternalAdapterDeps.charterVersion`.
+    if (call.judgedCharterVersion !== deps.charterVersion) return fail('external_definition_stale', true);
     if (call.credential === null) return fail('credential_unavailable', false);
     const secret = call.credential.value;
     if (typeof secret !== 'string' || !headerSafe(secret)) return fail('credential_unavailable', false);
@@ -198,6 +227,7 @@ export function createExternalAdapter(system: ExternalSystem, deps: ExternalAdap
       return { ok: false, retryable: false, code: 'bad_params', message: built.message };
     }
 
+    if (deps.capPerDay <= 0) return fail('external_disabled', false);
     let today: number;
     try {
       today = await deps.callsToday(system.id);
@@ -219,9 +249,17 @@ export function createExternalAdapter(system: ExternalSystem, deps: ExternalAdap
         deadlineMs: EXTERNAL_DEADLINE_MS,
         maxBytes: EXTERNAL_MAX_BYTES,
       });
-    } catch {
-      // Nothing from the thrown error is kept — it may quote a header.
-      const code: ExternalCode = isWrite ? 'delivery_unknown' : 'external_request_failed';
+    } catch (error) {
+      // Nothing from the thrown error is kept — it may quote a header. The one
+      // throw placed BEFORE any send is the client's refusal of a non-https
+      // URL (a TypeError): a final refusal, never "maybe done". Any other
+      // throw cannot be placed, so a write is `delivery_unknown`.
+      const beforeSend = error instanceof TypeError && built.url.protocol !== 'https:';
+      const code: ExternalCode = beforeSend
+        ? 'external_bad_url'
+        : isWrite
+          ? 'delivery_unknown'
+          : 'external_request_failed';
       await count(code);
       return fail(code, false);
     }
@@ -230,8 +268,10 @@ export function createExternalAdapter(system: ExternalSystem, deps: ExternalAdap
     if (outcome === 'ok' && result.kind === 'response') {
       await count('ok');
       const json = parseJson(result.body);
-      const fields = extractFields(json, op.fields);
-      const externalId = op.idPath === null ? null : displayValue(readFieldPath(json, op.idPath));
+      const forms = secretForms(system, secret);
+      const fields = extractFields(json, op.fields).filter((f) => !carriesSecret(f.value, forms));
+      const rawId = op.idPath === null ? null : displayValue(readFieldPath(json, op.idPath));
+      const externalId = rawId !== null && carriesSecret(rawId, forms) ? null : rawId;
       return { ok: true, output: { fields }, externalId };
     }
     if (outcome === 'timeout' || outcome === 'timeout_unknown') {
