@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { ExternalSystem } from '../../domain/external-system.js';
 import type { ExternalHttp, ExternalRequest, ExternalResult } from '../../external/http.js';
 import { canonicalJson } from '../../util/canonical.js';
-import { createExternalAdapter } from './external.js';
+import { EXTERNAL_MESSAGES_HE, createExternalAdapter } from './external.js';
+import { REDACTED } from '../../policy/redact.js';
 import { createCredentialHandle, type AdapterCall, type AdapterResult } from './types.js';
 
 const SECRET = 'sk_live_TOPSECRET_9f8e7d';
@@ -398,5 +399,41 @@ describe('fix round 1 hardenings', () => {
     const r = failure(await read(h));
     expect(r).toEqual({ ok: false, code: 'external_disabled', retryable: false, message: 'החיבור למערכות חיצוניות כבוי' });
     expect(h.rec.sent).toHaveLength(0);
+  });
+});
+
+/**
+ * Ruling T7-b, layer (b): a write must never carry the redaction marker in
+ * place of a value the owner approved. The plan-time refusal is layer (a);
+ * this is the backstop if a redacted payload reaches the adapter anyway.
+ */
+describe('createExternalAdapter — redacted values', () => {
+  it('refuses a body param carrying the redaction marker: final, nothing sent, not counted', async () => {
+    const h = harness(resp(200));
+    const r = failure(await write(h, { system: 'acme', operation: 'create_note', params: { text: `טלפון ${REDACTED}` } }));
+    expect(r).toMatchObject({ code: 'external_redacted_value', retryable: false });
+    expect(r.message).toBe(EXTERNAL_MESSAGES_HE.external_redacted_value);
+    expect(h.rec.sent).toHaveLength(0);
+    expect(h.rec.calls).toHaveLength(0);
+  });
+
+  it('refuses the marker nested at depth inside a param', async () => {
+    const h = harness(resp(200));
+    const r = failure(await write(h, { system: 'acme', operation: 'create_note', params: { text: { a: [{ b: REDACTED }] } } }));
+    expect(r.code).toBe('external_redacted_value');
+    expect(h.rec.sent).toHaveLength(0);
+  });
+
+  it('refuses the marker in a path param, where it reaches the URL only encoded', async () => {
+    const h = harness(resp(200));
+    const r = failure(await read(h, { system: 'acme', operation: 'get_customer', params: { id: REDACTED } }));
+    expect(r.code).toBe('external_redacted_value');
+    expect(h.rec.sent).toHaveLength(0);
+  });
+
+  it('sends a param that carries no marker', async () => {
+    const h = harness(resp(200));
+    expect((await write(h, { system: 'acme', operation: 'create_note', params: { text: 'טלפון 050-1234567' } })).ok).toBe(true);
+    expect(h.rec.sent).toHaveLength(1);
   });
 });

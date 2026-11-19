@@ -50,7 +50,10 @@ export function capabilityCatalogue(
       .map((toolName) => {
         const actionClass = classifyAction(toolName);
         const ceilings: AutonomyLevel[] = [provenanceCeiling];
-        if (actionClass !== null) ceilings.push(bundle.autonomyBase[actionClass]);
+        // An ext.* class is per signed operation; its static class is a
+        // placeholder and contributes no ceiling here (the column renders
+        // EXTERNAL_AUTONOMY_LABEL instead, never a level computed from it).
+        if (actionClass !== null && !isExternalTool(toolName)) ceilings.push(bundle.autonomyBase[actionClass]);
         if (options.rampLevel !== undefined) ceilings.push(options.rampLevel);
 
         return {
@@ -104,6 +107,14 @@ export const READ_ONLY_CLASS_LABEL = 'ללא מחלקה (expectedActionClass: nu
  * the column.
  */
 export const EXTERNAL_CLASS_LABEL = 'לפי הפעולה החתומה (expectedActionClass: המחלקה שמופיעה לפעולה ב"פעולות במערכות חיצוניות", או null)';
+
+/**
+ * The autonomy column for `ext.read` / `ext.call`: the level depends on the
+ * signed operation's class, so a single level computed from the placeholder
+ * would be wrong for every operation but the strictest. Prose, like
+ * `EXTERNAL_CLASS_LABEL`; the gate applies the real level per call.
+ */
+export const EXTERNAL_AUTONOMY_LABEL = 'לפי הפעולה החתומה';
 
 function byCodePoint(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
@@ -164,7 +175,8 @@ export function renderCatalogue(entries: CatalogueEntry[]): string {
       const cls = isExternalTool(tool.toolName)
         ? EXTERNAL_CLASS_LABEL
         : (tool.actionClass ?? READ_ONLY_CLASS_LABEL);
-      lines.push(`- ${tool.toolName} · ${cls} · ${tool.effectiveAutonomy}`);
+      const autonomy = isExternalTool(tool.toolName) ? EXTERNAL_AUTONOMY_LABEL : tool.effectiveAutonomy;
+      lines.push(`- ${tool.toolName} · ${cls} · ${autonomy}`);
     }
     lines.push('');
   }

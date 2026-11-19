@@ -118,7 +118,7 @@ import { descriptionFragment } from '../business/description-store.js';
 import { profileFragment } from '../business/profile.js';
 import { makePlan, type PlanOutcome, type PlanRequest } from '../sdk/planner.js';
 import { planStepIsFeasible } from './catalogue.js';
-import { renderConfirmationQuestion } from './command-echo.js';
+import { externalRedactionProblem, renderConfirmationQuestion } from './command-echo.js';
 import { answerScheduleQuery, runMeetingOperation } from '../meetings/door.js';
 import type { CharterOperations } from '../meetings/free-time.js';
 import type { MeetingRequest } from '../meetings/request.js';
@@ -801,6 +801,17 @@ async function planAndCheck(
           audit: `instruction door: step ${step.id} external request invalid (${built.code})`,
         };
       }
+      // Ruling T7-b: the adapter receives the REDACTED payload. A value the
+      // charter hides would reach the provider as the marker in place of what
+      // the owner approved, so such a step is refused here, before he is asked.
+      const redaction = externalRedactionProblem(step, door.bundle.redactPatterns);
+      if (redaction !== null) {
+        return {
+          kind: 'refused',
+          reason: redaction,
+          audit: `instruction door: step ${step.id} external request carries a redacted value`,
+        };
+      }
     }
 
     const mismatch = classMismatch(step, door.bundle.externalSystems);
@@ -1089,6 +1100,7 @@ async function planPerCandidate(
   const rendered = renderConfirmationQuestion(options, {
     currency: door.bundle.ceilings.currency,
     systems: door.bundle.externalSystems,
+    redactPatterns: door.bundle.redactPatterns,
     extraEchoes: ledgerEchoes,
   });
   if ('refused' in rendered) {
@@ -1165,6 +1177,7 @@ async function finishSingle(
     const rendered = renderConfirmationQuestion([option], {
       currency: door.bundle.ceilings.currency,
       systems: door.bundle.externalSystems,
+      redactPatterns: door.bundle.redactPatterns,
       extraEchoes: [single.extraEcho ?? (await ledgerEchoOf(door, plan))],
     });
     if ('refused' in rendered) {

@@ -1756,6 +1756,25 @@ describe('runInstruction — external-system steps', () => {
     expect(result.question).not.toContain('שדה נוסף');
   });
 
+  // Ruling T7-b, layer (a): the adapter receives the REDACTED payload, so a
+  // param the charter hides would reach the provider as the marker in place
+  // of the value the owner approved. Refused at plan time instead.
+  it('refuses an ext step whose param the charter would redact, with nothing parked', async () => {
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({
+      version: '2026-08-15.redact-phone',
+      externalSystems: [crmFixture()],
+      connections: [MAIL_CONNECTION, crmConnection()],
+      redactBeforeSending: ['\\b05\\d-?\\d{7}\\b'],
+    })));
+    const plan = extPlan({ system: 'crm', operation: 'update_customer', params: { customer_id: 'c1', phone: '050-1234567' } });
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תעדכני את הטלפון של c1' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan }) }));
+    expect(result.status).toBe('refused');
+    if (result.status !== 'refused') throw new Error('unreachable');
+    expect(result.reason).toContain('ערך שהתקנון מסתיר');
+    const { rows } = await testDb().query(`SELECT 1 FROM instruction_confirmations`);
+    expect(rows).toHaveLength(0);
+  });
+
   it('refuses a step whose request cannot be built, quoting the builder, with nothing parked', async () => {
     const plan = extPlan({ system: 'crm', operation: 'update_customer', params: { phone: '050' } });
     const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תעדכני את הטלפון' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan }) }));

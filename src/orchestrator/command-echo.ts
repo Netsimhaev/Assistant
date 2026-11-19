@@ -9,6 +9,7 @@ import { formatMinor } from '../util/money.js';
 import type { ExternalSystem } from '../domain/external-system.js';
 import { buildExternalRequestFromPayload } from '../external/request.js';
 import { isExternalTool, resolveExternalCall } from '../policy/external-class.js';
+import { redactPayload } from '../policy/redact.js';
 
 /**
  * The Hebrew confirmation question (boss command, spec §4.1, §4.2, §10.5, §10.6).
@@ -184,6 +185,47 @@ export function externalEchoProblem(step: PlanStep, systems: readonly ExternalSy
   return built.ok ? null : `${UNBUILDABLE_EXTERNAL}: ${built.message}`;
 }
 
+/** Shown under the URL line: the URL is percent-encoded, the param lines are not. */
+export const EXTERNAL_PARAMS_DECODED_NOTE = '(הפרמטרים שלמטה מוצגים כערכים המפוענחים, לפני קידוד הכתובת)';
+
+/** The refusal when an `ext.*` step carries a value the charter redacts (ruling T7-b). */
+export const EXTERNAL_REDACTED_HE =
+  'בקשה למערכת חיצונית כוללת ערך שהתקנון מסתיר (למשל מספר טלפון או חשבון), ולכן לא תישלח — ערוך את כללי ההסתרה או את הבקשה.';
+
+function canonicalOrNull(value: unknown): string | null {
+  try {
+    return canonicalJson(value ?? null);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ruling T7-b, layer (a). `ext.*` are outbound tools, so every `allow` hands
+ * the adapter `redactPayload(input, bundle)`: a param value matching a charter
+ * redaction pattern would reach the third-party system as the marker in place
+ * of the value the owner approved — the owner approves X and Y runs. Such a
+ * step is refused instead, with the same redaction function the gate applies.
+ * Null when the step is fine (or is not an `ext.*` step). A pattern that does
+ * not compile — a bundle that bypassed the charter schema — refuses too.
+ */
+export function externalRedactionProblem(step: PlanStep, redactPatterns: readonly string[]): string | null {
+  if (!isExternalTool(step.toolName)) return null;
+  let redacted: unknown;
+  try {
+    redacted = redactPayload(step.input, { redactPatterns: [...redactPatterns] });
+  } catch {
+    return EXTERNAL_REDACTED_HE;
+  }
+  const after = redacted !== null && typeof redacted === 'object' ? (redacted as Record<string, unknown>) : {};
+  for (const key of ['params', 'amountMinor'] as const) {
+    const before = canonicalOrNull(step.input[key]);
+    const now = canonicalOrNull(after[key]);
+    if (before === null || before !== now) return EXTERNAL_REDACTED_HE;
+  }
+  return null;
+}
+
 /**
  * The echo of a resolved `ext.*` step whose request builds: the operation's
  * label, the SIGNED class (never the `TOOL_ACTION_CLASS` placeholder), the
@@ -205,6 +247,7 @@ function externalEcho(step: PlanStep, currency: string, systems: readonly Extern
     `כלי: ${inlineValue(step.toolName)}`,
     `מערכת: ${labelText(system.label)} (${inlineValue(system.id)})`,
     `שיטה וכתובת: ${built.method} ${inlineValue(built.url.href)}`,
+    EXTERNAL_PARAMS_DECODED_NOTE,
   ];
   const params = step.input['params'];
   if (params !== null && typeof params === 'object' && !Array.isArray(params)) {
@@ -278,11 +321,14 @@ function optionEchoes(
   option: ConfirmationOption,
   currency: string,
   systems: readonly ExternalSystem[],
+  redactPatterns: readonly string[],
 ): string[] | { refused: string } {
   const echoes: string[] = [];
   for (const step of option.plan.steps) {
     const problem = externalEchoProblem(step, systems);
     if (problem !== null) return { refused: problem };
+    const redaction = externalRedactionProblem(step, redactPatterns);
+    if (redaction !== null) return { refused: redaction };
     const echo = renderStepEcho(step, currency, systems);
     if (echo === '') continue;
     if (echo.length > MAX_ECHO_CHARS_PER_STEP) return { refused: TOO_LONG };
@@ -298,6 +344,8 @@ export function renderConfirmationQuestion(
     currency: string;
     /** The active charter's signed external systems (`bundle.externalSystems`) — required, never defaulted. */
     systems: readonly ExternalSystem[];
+    /** The active charter's redaction patterns (`bundle.redactPatterns`) — required: an `ext.*` value they hide is refused (T7-b). */
+    redactPatterns: readonly string[];
     reask?: boolean;
     /** Steps of the original plan that completed and were dropped from this one; shown when > 0. */
     alreadyDone?: number;
@@ -316,7 +364,7 @@ export function renderConfirmationQuestion(
   const multiple = options.length > 1;
   const rendered: string[] = [];
   for (const [index, option] of options.entries()) {
-    const echoes = optionEchoes(option, opts.currency, opts.systems);
+    const echoes = optionEchoes(option, opts.currency, opts.systems, opts.redactPatterns);
     if (!Array.isArray(echoes)) return echoes;
     const head = `${multiple ? `${index + 1}. ` : ''}${labelText(option.label)}${sourceMarker(option)}`;
     const extra = opts.extraEchoes?.[index] ?? null;

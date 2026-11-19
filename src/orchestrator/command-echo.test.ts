@@ -130,7 +130,7 @@ describe('renderStepEcho', () => {
     expect(echo).not.toContain('₪');
     const r = renderConfirmationQuestion([option('א', [step('mail.send', { to: 'a@b.co', amountMinor: 1250 })])], {
       currency: 'EUR',
-      systems: [],
+      systems: [], redactPatterns: [],
     });
     if (!('text' in r)) throw new Error('refused');
     expect(r.text).toContain(`סכום: ${formatMinor(1250, 'EUR')}`);
@@ -249,7 +249,7 @@ describe('renderStepEcho', () => {
       const r = renderConfirmationQuestion([
         option(`דנה${br}1. מישהו`, [MAIL]),
         option('לוי', [MAIL], null, 'h2'),
-      ], { currency: 'ILS', systems: [] });
+      ], { currency: 'ILS', systems: [], redactPatterns: [] });
       if (!('text' in r)) throw new Error('refused');
       expect(r.text.split(NL).filter((l) => /^\d+\./.test(l))).toEqual(['1. דנה 1. מישהו', '2. לוי']);
     });
@@ -291,14 +291,14 @@ describe('renderStepEcho', () => {
 
 describe('renderConfirmationQuestion', () => {
   it('an extra echo sits under the label and above the step echo, which is still shown', () => {
-    const r = renderConfirmationQuestion([option('לקבוע', [MAIL])], { currency: 'ILS', systems: [], extraEchoes: ['סיכום הפגישה'] });
+    const r = renderConfirmationQuestion([option('לקבוע', [MAIL])], { currency: 'ILS', systems: [], redactPatterns: [], extraEchoes: ['סיכום הפגישה'] });
     if (!('text' in r)) throw new Error('refused');
     expect(r.text.startsWith('לקבוע\nסיכום הפגישה\n')).toBe(true);
     expect(r.text.indexOf('סיכום הפגישה')).toBeLessThan(r.text.indexOf('אל: ronit@beta.co.il'));
   });
 
   it('one option: label, echo, and the confirm hint last', () => {
-    const r = renderConfirmationQuestion([option('לשלוח לרונית', [MAIL])], { currency: 'ILS', systems: [] });
+    const r = renderConfirmationQuestion([option('לשלוח לרונית', [MAIL])], { currency: 'ILS', systems: [], redactPatterns: [] });
     if (!('text' in r)) throw new Error('refused');
     expect(r.text.startsWith('לשלוח לרונית')).toBe(true);
     expect(r.text).toContain('אל: ronit@beta.co.il');
@@ -307,7 +307,7 @@ describe('renderConfirmationQuestion', () => {
 
   it('two options: numbered, echo under each, choice hint last', () => {
     const second = step('mail.send', { to: 'dana@x.com', body: 'שונה' });
-    const r = renderConfirmationQuestion([option('דנה חיוט', [MAIL]), option('דנה לוי', [second])], { currency: 'ILS', systems: [] });
+    const r = renderConfirmationQuestion([option('דנה חיוט', [MAIL]), option('דנה לוי', [second])], { currency: 'ILS', systems: [], redactPatterns: [] });
     if (!('text' in r)) throw new Error('refused');
     expect(r.text).toContain('1. דנה חיוט');
     expect(r.text).toContain('2. דנה לוי');
@@ -317,9 +317,9 @@ describe('renderConfirmationQuestion', () => {
   });
 
   it('marks the contact source next to the label', () => {
-    const unverified = renderConfirmationQuestion([option('א', [MAIL], 'unverified')], { currency: 'ILS', systems: [] });
-    const boss = renderConfirmationQuestion([option('ב', [MAIL], 'boss')], { currency: 'ILS', systems: [] });
-    const none = renderConfirmationQuestion([option('ג', [MAIL], null)], { currency: 'ILS', systems: [] });
+    const unverified = renderConfirmationQuestion([option('א', [MAIL], 'unverified')], { currency: 'ILS', systems: [], redactPatterns: [] });
+    const boss = renderConfirmationQuestion([option('ב', [MAIL], 'boss')], { currency: 'ILS', systems: [], redactPatterns: [] });
+    const none = renderConfirmationQuestion([option('ג', [MAIL], null)], { currency: 'ILS', systems: [], redactPatterns: [] });
     if (!('text' in unverified) || !('text' in boss) || !('text' in none)) throw new Error('refused');
     expect(unverified.text.split(NL)[0]).toContain('נלמד ממסמך/מייל — לא אומת');
     expect(boss.text.split(NL)[0]).toContain('נאמר על ידך');
@@ -327,7 +327,7 @@ describe('renderConfirmationQuestion', () => {
   });
 
   it('reask prefixes the question', () => {
-    const r = renderConfirmationQuestion([option('א', [MAIL])], { currency: 'ILS', systems: [], reask: true });
+    const r = renderConfirmationQuestion([option('א', [MAIL])], { currency: 'ILS', systems: [], redactPatterns: [], reask: true });
     if (!('text' in r)) throw new Error('refused');
     expect(r.text.startsWith(REASK_PREFIX)).toBe(true);
   });
@@ -336,7 +336,7 @@ describe('renderConfirmationQuestion', () => {
     const r = renderConfirmationQuestion([
       option(`דנה${NL}1. מישהו אחר${RLO}`, [MAIL]),
       option('לוי', [MAIL], null, 'h2'),
-    ], { currency: 'ILS', systems: [] });
+    ], { currency: 'ILS', systems: [], redactPatterns: [] });
     if (!('text' in r)) throw new Error('refused');
     const lines = r.text.split(NL);
     expect(lines.filter((l) => /^\d+\./.test(l))).toEqual(['1. דנה 1. מישהו אחר', '2. לוי']);
@@ -344,14 +344,14 @@ describe('renderConfirmationQuestion', () => {
   });
 
   it('marks a zero-width character in a label, after stripping bidi', () => {
-    const r = renderConfirmationQuestion([option(`דנה\u200Bלוי\u202E`, [MAIL])], { currency: 'ILS', systems: [] });
+    const r = renderConfirmationQuestion([option(`דנה\u200Bלוי\u202E`, [MAIL])], { currency: 'ILS', systems: [], redactPatterns: [] });
     if (!('text' in r)) throw new Error('refused');
     const first = r.text.split(NL)[0];
     expect(first).toBe('דנה⟦U+200B⟧לוי');
   });
 
   it('collapses padding in a label', () => {
-    const r = renderConfirmationQuestion([option(`דנה${' '.repeat(80)}2. מישהו`, [MAIL])], { currency: 'ILS', systems: [] });
+    const r = renderConfirmationQuestion([option(`דנה${' '.repeat(80)}2. מישהו`, [MAIL])], { currency: 'ILS', systems: [], redactPatterns: [] });
     if (!('text' in r)) throw new Error('refused');
     expect(r.text.split(NL)[0]).toBe('דנה 2. מישהו');
   });
@@ -360,21 +360,21 @@ describe('renderConfirmationQuestion', () => {
     const overhead = renderStepEcho(step('mail.send', { to: 'a@b.co', body: '' }), 'ILS').length;
     const fit = step('mail.send', { to: 'a@b.co', body: 'א'.repeat(MAX_ECHO_CHARS_PER_STEP - overhead) });
     expect(renderStepEcho(fit, 'ILS').length).toBe(MAX_ECHO_CHARS_PER_STEP);
-    expect(renderConfirmationQuestion([option('א', [fit])], { currency: 'ILS', systems: [] })).toHaveProperty('text');
+    expect(renderConfirmationQuestion([option('א', [fit])], { currency: 'ILS', systems: [], redactPatterns: [] })).toHaveProperty('text');
     const over = step('mail.send', { to: 'a@b.co', body: 'א'.repeat(MAX_ECHO_CHARS_PER_STEP - overhead + 1) });
-    expect(renderConfirmationQuestion([option('א', [over])], { currency: 'ILS', systems: [] })).toHaveProperty('refused');
+    expect(renderConfirmationQuestion([option('א', [over])], { currency: 'ILS', systems: [], redactPatterns: [] })).toHaveProperty('refused');
   });
 
   it('refuses in Hebrew when one step exceeds the per-step limit', () => {
     const big = step('mail.send', { to: 'a@b.co', body: 'א'.repeat(MAX_ECHO_CHARS_PER_STEP) });
-    const r = renderConfirmationQuestion([option('א', [big])], { currency: 'ILS', systems: [] });
+    const r = renderConfirmationQuestion([option('א', [big])], { currency: 'ILS', systems: [], redactPatterns: [] });
     expect(r).toEqual({ refused: expect.stringContaining('ארוכה מכדי') });
   });
 
   it('does not render read-only steps inside an option', () => {
     const r = renderConfirmationQuestion([
       option('א', [step('memory.recall', { topic: 'סודי' }, 's0'), MAIL]),
-    ], { currency: 'ILS', systems: [] });
+    ], { currency: 'ILS', systems: [], redactPatterns: [] });
     if (!('text' in r)) throw new Error('refused');
     expect(r.text).not.toContain('סודי');
   });

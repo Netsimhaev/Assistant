@@ -206,3 +206,51 @@ describe('a re-signed charter', () => {
     expect(rows).toHaveLength(0);
   });
 });
+
+/**
+ * Ruling T7-c: the owner approved the exact request shown under the charter
+ * version the job was created with. If the charter is re-signed before the
+ * step runs, the run would use another definition — refuse the whole plan
+ * before anything is bound or sent.
+ */
+describe('a charter re-signed after the job was created', () => {
+  it('refuses an ext.* plan with external_definition_changed, nothing sent', async () => {
+    const { jobId } = await setup();
+    const newer = await withBusiness(BUSINESS, (bdb) =>
+      installCharter(bdb, buildCharter({ version: '2026-08-20.resigned', externalSystems: [crmFixture()], connections: [crmConnection()] })),
+    );
+    crmVersion = newer.charterVersion;
+    let sent = 0;
+    const job = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
+    if (job === null) throw new Error('job vanished');
+    expect(job.charterVersion).not.toBe(newer.charterVersion);
+    const result = await withBusiness(BUSINESS, (db) =>
+      runPlan(db, {
+        job,
+        bundle: newer,
+        plan: readPlan(),
+        registry: new AdapterRegistry([
+          createExternalAdapter(newer.externalSystems[0]!, {
+            http: { send: async () => { sent += 1; return { kind: 'response', status: 200, body: '{}' }; } },
+            callsToday: async () => 0, recordCall: async () => {}, capPerDay: 200, charterVersion: newer.charterVersion,
+          }),
+        ]),
+        bindings: [LIVE],
+        credentials: CREDENTIALS,
+        counterpartyTags: [],
+        rampLevel: 'auto',
+        now: NOON,
+      }),
+    );
+    expect(result).toMatchObject({ status: 'rejected', code: 'external_definition_changed' });
+    expect(sent).toBe(0);
+    const { rows } = await testDb().query('SELECT 1 FROM job_plans');
+    expect(rows).toHaveLength(0);
+  });
+
+  it('runs when the job and the bundle share the charter version', async () => {
+    const { bundle, jobId } = await setup();
+    const result = await run(bundle, jobId, { kind: 'response', status: 200, body: '{"data":{"name":"x"}}' });
+    expect(result.status).not.toBe('rejected');
+  });
+});

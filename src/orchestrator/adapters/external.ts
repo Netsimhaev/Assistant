@@ -7,6 +7,7 @@ import {
   type ExternalResult,
 } from '../../external/http.js';
 import { buildExternalRequestFromPayload } from '../../external/request.js';
+import { REDACTED } from '../../policy/redact.js';
 import { resolveExternalCall } from '../../policy/external-class.js';
 import type { AdapterCall, AdapterResult, ExternalAdapter } from './types.js';
 
@@ -68,6 +69,7 @@ export const EXTERNAL_MESSAGES_HE = {
   external_definition_stale: 'הגדרת המערכת החיצונית התעדכנה בזמן הביצוע — ננסה שוב בסבב הבא',
   external_bad_url: 'כתובת המערכת החיצונית אינה כתובת מאובטחת — לא נשלח דבר',
   external_disabled: 'החיבור למערכות חיצוניות כבוי',
+  external_redacted_value: 'הבקשה למערכת החיצונית כוללת ערך שהתקנון מסתיר — לא נשלח דבר',
 } as const;
 
 type ExternalCode = keyof typeof EXTERNAL_MESSAGES_HE;
@@ -109,6 +111,33 @@ function authHeader(system: ExternalSystem, secret: string): [string, string] {
       return ['Authorization', `Basic ${Buffer.from(secret, 'utf8').toString('base64')}`];
     case 'header':
       return [system.auth.header, secret];
+  }
+}
+
+/** Deep enough for any real payload; a guard against a cyclic structure. */
+const MARKER_SCAN_DEPTH = 12;
+
+/**
+ * Does any string anywhere in `value` carry the redaction marker? A value too
+ * deep to scan counts as carrying it — what we could not read is never the
+ * permissive answer.
+ */
+function carriesRedactionMarker(value: unknown, depth = 0): boolean {
+  if (depth > MARKER_SCAN_DEPTH) return true;
+  if (typeof value === 'string') return value.includes(REDACTED);
+  if (Array.isArray(value)) return value.some((v) => carriesRedactionMarker(v, depth + 1));
+  if (value !== null && typeof value === 'object') {
+    return Object.values(value as Record<string, unknown>).some((v) => carriesRedactionMarker(v, depth + 1));
+  }
+  return false;
+}
+
+/** The URL as text, percent-decoded where it decodes (a path param reaches it only encoded). */
+function decodedUrl(url: URL): string {
+  try {
+    return decodeURIComponent(url.href);
+  } catch {
+    return url.href;
   }
 }
 
@@ -214,6 +243,14 @@ export function createExternalAdapter(system: ExternalSystem, deps: ExternalAdap
       // `built.message` is our own Hebrew sentence (it may quote a param name
       // the plan wrote), never provider text and never the secret.
       return { ok: false, retryable: false, code: 'bad_params', message: built.message };
+    }
+
+    // Ruling T7-b, the backstop: the gate hands this adapter the REDACTED
+    // payload, and a write must never carry the marker in place of a value the
+    // owner approved. The instruction door refuses such a step first; this
+    // catches one that arrives anyway. Final, nothing sent, not counted.
+    if (carriesRedactionMarker(input['params']) || decodedUrl(built.url).includes(REDACTED)) {
+      return fail('external_redacted_value', false);
     }
 
     if (deps.capPerDay <= 0) return fail('external_disabled', false);

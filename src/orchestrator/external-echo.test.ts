@@ -9,12 +9,13 @@ import { crmConnection, crmFixture, type ExternalSystemInput } from '../test/ext
 import { buildCharter } from '../test/fixtures.js';
 import { formatMinor } from '../util/money.js';
 import {
+  EXTERNAL_AUTONOMY_LABEL,
   EXTERNAL_CLASS_LABEL,
   capabilityCatalogue,
   renderCatalogue,
   renderExternalCatalogue,
 } from './catalogue.js';
-import { renderConfirmationQuestion, renderStepEcho } from './command-echo.js';
+import { EXTERNAL_PARAMS_DECODED_NOTE, renderConfirmationQuestion, renderStepEcho } from './command-echo.js';
 import { classMismatch } from './run-plan.js';
 
 /**
@@ -80,6 +81,8 @@ describe('the echo of an ext.* step shows the exact request', () => {
     expect(lines).toContain('כלי: ext.call');
     expect(lines).toContain('מערכת: מערכת החיובים (billing)');
     expect(lines).toContain('שיטה וכתובת: POST https://api.example.com/customers/42');
+    // The URL is percent-encoded; the param lines show the decoded values.
+    expect(lines[lines.indexOf('שיטה וכתובת: POST https://api.example.com/customers/42') + 1]).toBe(EXTERNAL_PARAMS_DECODED_NOTE);
     expect(lines).toContain('פרמטר customer_id: 42');
     expect(lines).toContain('פרמטר note: חיוב חודשי');
     expect(lines).toContain(`סכום: ${formatMinor(150_000, 'ILS')}`);
@@ -116,12 +119,15 @@ describe('the echo of an ext.* step shows the exact request', () => {
       step('ext.call', {
         system: 'billing',
         operation: 'charge_customer',
-        params: { customer_id: '42', note: 'a‮b\nאל: x@evil.example' },
+        params: { customer_id: '42', note: 'a‮b\nאל: x@evil.example\n1. אפשרות מזויפת' },
         amountMinor: 1,
       }),
       'ILS',
       SYSTEMS,
     );
+    expect(echo.split('\n')).toContain('פרמטר note: a⟦U+202E⟧b אל: x@evil.example 1. אפשרות מזויפת');
+    // The forged option inside the value is folded into its line, never a line of its own.
+    expect(echo.split('\n').some((l) => /^\d+\./.test(l))).toBe(false);
     expect(echo).toContain('⟦U+202E⟧');
     expect(echo).not.toContain('‮');
     expect(echo.split('\n').some((l) => l.startsWith('אל:'))).toBe(false);
@@ -129,7 +135,7 @@ describe('the echo of an ext.* step shows the exact request', () => {
 
   it('refuses the question for a step whose request cannot be built, never echoing it partially', () => {
     const broken = step('ext.call', { system: 'billing', operation: 'charge_customer', params: {}, amountMinor: 1 });
-    const r = renderConfirmationQuestion([option([broken])], { currency: 'ILS', systems: SYSTEMS });
+    const r = renderConfirmationQuestion([option([broken])], { currency: 'ILS', systems: SYSTEMS, redactPatterns: [] });
     expect(r).toHaveProperty('refused');
     if (!('refused' in r)) throw new Error('unreachable');
     expect(r.refused).toContain('חסר פרמטר חובה');
@@ -137,7 +143,17 @@ describe('the echo of an ext.* step shows the exact request', () => {
 
   it('refuses the question for an ext step naming no signed operation', () => {
     const unknown = step('ext.call', { system: 'billing', operation: 'nope' });
-    expect(renderConfirmationQuestion([option([unknown])], { currency: 'ILS', systems: SYSTEMS })).toHaveProperty('refused');
+    expect(renderConfirmationQuestion([option([unknown])], { currency: 'ILS', systems: SYSTEMS, redactPatterns: [] })).toHaveProperty('refused');
+  });
+
+  it('refuses the question for an ext step whose param the charter would redact (T7-b)', () => {
+    const phone = step('ext.call', { system: 'crm', operation: 'update_customer', params: { customer_id: 'c1', phone: '050-1234567' } });
+    const r = renderConfirmationQuestion([option([phone])], { currency: 'ILS', systems: SYSTEMS, redactPatterns: ['\\b05\\d-?\\d{7}\\b'] });
+    expect(r).toHaveProperty('refused');
+    if (!('refused' in r)) throw new Error('unreachable');
+    expect(r.refused).toContain('ערך שהתקנון מסתיר');
+    // A pattern the param does not match leaves the question intact.
+    expect(renderConfirmationQuestion([option([phone])], { currency: 'ILS', systems: SYSTEMS, redactPatterns: ['\\b\\d{9}\\b'] })).toHaveProperty('text');
   });
 
   it('still refuses an ext step too long to show whole', () => {
@@ -147,8 +163,10 @@ describe('the echo of an ext.* step shows the exact request', () => {
       params: { customer_id: '42', note: 'x'.repeat(5000) },
       amountMinor: 1,
     });
-    const r = renderConfirmationQuestion([option([long])], { currency: 'ILS', systems: SYSTEMS });
+    const r = renderConfirmationQuestion([option([long])], { currency: 'ILS', systems: SYSTEMS, redactPatterns: [] });
     expect(r).toHaveProperty('refused');
+    if (!('refused' in r)) throw new Error('unreachable');
+    expect(r.refused).toContain('ארוכה מכדי');
   });
 });
 
@@ -185,6 +203,8 @@ describe('the planner sees the signed operations with their real classes', () =>
       expect(line).toContain(EXTERNAL_CLASS_LABEL);
       expect(line).not.toContain('external.delete');
       expect(line).not.toContain('external.read');
+      // The autonomy column is per operation too — never computed from the placeholder.
+      expect(line.endsWith(` · ${EXTERNAL_AUTONOMY_LABEL}`)).toBe(true);
     }
   });
 

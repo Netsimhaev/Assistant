@@ -307,6 +307,17 @@ export async function runPlan(db: BusinessDb, request: RunPlanRequest): Promise<
     // done. Same function the gate calls, so the two cannot disagree about
     // which operation a step is.
     if (isExternalTool(step.toolName)) {
+      // Ruling T7-c: the owner approved the exact request shown under the
+      // charter version this job was created with. A charter re-signed since
+      // would run another definition — another URL, another class — so the
+      // whole plan is refused before anything is bound or sent.
+      if (job.charterVersion !== bundle.charterVersion) {
+        return {
+          status: 'rejected',
+          code: 'external_definition_changed',
+          reason: `צעד ${step.id}: הגדרת המערכת החיצונית השתנתה אחרי שאישרת — צריך לבקש שוב`,
+        };
+      }
       const resolved = resolveExternalCall(bundle.externalSystems, step.toolName, step.input);
       if (!resolved.ok) {
         return {
