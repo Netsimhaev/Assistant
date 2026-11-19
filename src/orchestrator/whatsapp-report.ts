@@ -336,7 +336,6 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
   external_bad_url: 'כתובת המערכת החיצונית אינה כתובת מאובטחת — לא נשלח דבר',
   external_disabled: 'החיבור למערכות חיצוניות כבוי',
   external_redacted_value: 'הבקשה למערכת החיצונית כוללת ערך שהתקנון מסתיר — לא נשלח דבר',
-  external_definition_changed: 'הגדרת המערכת החיצונית השתנתה אחרי שאישרת — צריך לבקש שוב',
 
   // Attachments on mail.send (document production §8.2): performStep's own
   // refusals (run-plan.ts, production/attachments.ts) and the mailbox
@@ -375,6 +374,9 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
   'run_due:no_adapter_for_system': 'אין חיבור פעיל למערכת הנדרשת',
   'run_due:plan_changed_mid_flight': 'התוכנית השתנתה באמצע הביצוע',
   'run_due:job_not_executable': 'המשימה לא הייתה במצב שמאפשר ביצוע',
+  // runPlan's external-system rejections (Stage D, run-plan.ts).
+  'run_due:external_definition_changed': 'הגדרת המערכת החיצונית השתנתה אחרי שאישרת — צריך לבקש שוב',
+  'run_due:external_operation_unknown': 'הפעולה שהתבקשה במערכת החיצונית אינה מופיעה בהגדרה שנחתמה',
 };
 
 /**

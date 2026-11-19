@@ -1155,6 +1155,16 @@ describe('failedText', () => {
     expect(failedText('run_due: plan_changed_mid_flight')).toContain('באמצע הביצוע');
   });
 
+  // The real reason format `run-due.ts` writes for a `runPlan` rejection.
+  it('maps the two external-plan rejections runPlan records as run_due: <code>', () => {
+    expect(failedText('run_due: external_definition_changed')).toBe(
+      'הניסיון לבצע את ההוראה נכשל: הגדרת המערכת החיצונית השתנתה אחרי שאישרת — צריך לבקש שוב.',
+    );
+    expect(failedText('run_due: external_operation_unknown')).toBe(
+      'הניסיון לבצע את ההוראה נכשל: הפעולה שהתבקשה במערכת החיצונית אינה מופיעה בהגדרה שנחתמה.',
+    );
+  });
+
   it('maps delegation_refused:<code> as a prefix, regardless of the inner code', () => {
     expect(failedText('delegation_refused:not_permitted — she said no')).toContain('נדחתה');
     expect(failedText('delegation_refused:unknown_intent — she said no')).toContain('נדחתה');
