@@ -1384,7 +1384,11 @@ describe('reportWhatsAppJobs — boss commands (spec §4.6)', () => {
     expect(sent.length).toBeLessThanOrEqual(WHATSAPP_MESSAGE_MAX_CHARS);
     const last = sent.split('\n').at(-1)!;
     expect(last === READS_ON_DASHBOARD_LINE || /^… ועוד \d+ שורות שלא הוצגו$/.test(last)).toBe(true);
-    expect(cutLine(1)).toMatch(/שורות שלא הוצגו/);
+    if (last !== READS_ON_DASHBOARD_LINE) {
+      // 30 fields in all; the cut line must count exactly the field lines not shown.
+      const shown = sent.split('\n').filter((l) => /^f\d+: x+$/.test(l)).length;
+      expect(last).toBe(cutLine(30 - shown));
+    }
   });
 
   it('the confirmation sentence is for confirmed commands only', async () => {

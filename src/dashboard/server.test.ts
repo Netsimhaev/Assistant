@@ -23,6 +23,8 @@ import type { PolicyBundle } from '../domain/policy.js';
 import type { Proposal } from '../domain/proposal.js';
 import { canonicalHash } from '../util/canonical.js';
 import { buildCharter } from '../test/fixtures.js';
+import { recordExternalRead } from '../external/store.js';
+import { cutLine } from '../external/render-reads.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { insertOrGetDocument } from '../documents/store.js';
 import { saveReading } from '../documents/reading-store.js';
@@ -47,6 +49,7 @@ import {
   liveWindowStart,
   reasonForSupersededJob,
   renderInstructionOutcome,
+  recentReadsBlock,
 } from './server.js';
 import { renderInstruct, renderLogin } from './views.js';
 
@@ -3757,5 +3760,50 @@ describe('renderInstruct — reads (Stage D, task 8)', () => {
 
   it('renders nothing for an empty or absent block', () => {
     expect(renderInstruct({ csrf: 'tok', reads: '' })).toBe(renderInstruct({ csrf: 'tok' }));
+  });
+});
+
+describe('recentReadsBlock (Stage D, task 8)', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+  });
+
+  async function jobWithRead(fieldCount: number, closed: boolean): Promise<string> {
+    const bundle = await withBusiness(BUSINESS, (bdb) =>
+      installCharter(bdb, buildCharter({ version: `reads-${ulid()}` })),
+    );
+    const job = await withBusiness(BUSINESS, (db) =>
+      createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }),
+    );
+    await withBusiness(BUSINESS, (db) =>
+      saveInstruction(db, { jobId: job.jobId, text: 'תבדקי', textOrigin: 'typed' }),
+    );
+    const path = closed
+      ? (['understand', 'plan', 'execute', 'verify', 'remember', 'closed'] as const)
+      : (['understand', 'plan', 'execute'] as const);
+    for (const to of path) {
+      await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
+    }
+    await withBusiness(BUSINESS, (db) =>
+      recordExternalRead(db, {
+        jobId: job.jobId, stepId: 's1', systemId: 'crm', operation: 'lookup',
+        fields: Array.from({ length: fieldCount }, (_, i) => ({ label: `f${i}`, value: 'v' })),
+      }),
+    );
+    // 09:00Z in November is 11:00 in Asia/Jerusalem (the fixture charter's zone).
+    await testDb().query(`UPDATE external_reads SET created_at = $2 WHERE job_id = $1`, [job.jobId, '2026-11-18T09:00:00Z']);
+    return job.jobId;
+  }
+
+  it('heads each read with its label, local read time and whether its job finished; caps each read alone', async () => {
+    await jobWithRead(60, true);
+    await jobWithRead(1, false);
+    const block = await withBusiness(BUSINESS, (db) => recentReadsBlock(db));
+    // Neither read is in the signed charter, so ids stand in for labels.
+    expect(block).toContain('מcrm — lookup: (נקרא 2026-11-18 11:00, הושלם)');
+    expect(block).toContain('מcrm — lookup: (נקרא 2026-11-18 11:00, לא הושלם)');
+    // The 60-field read is cut on its own; the small read is whole.
+    expect(block).toContain(cutLine(22));
+    expect(block).toContain('f0: v');
   });
 });

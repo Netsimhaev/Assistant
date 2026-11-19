@@ -1428,7 +1428,7 @@ async function handleInstructGet(
  * time zone), whether its job finished — with its own line cap, so one long
  * read cannot hide the others.
  */
-async function recentReadsBlock(db: BusinessDb): Promise<string> {
+export async function recentReadsBlock(db: BusinessDb): Promise<string> {
   const reads = await loadRecentOwnerReads(db);
   if (reads.length === 0) return '';
   const active = await loadActiveCharter(db);

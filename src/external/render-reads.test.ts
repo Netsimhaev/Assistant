@@ -17,7 +17,7 @@ describe('renderReadsForOwner', () => {
 
   it('strips bidi controls from values and falls back to ids for unsigned systems', () => {
     const out = renderReadsForOwner(
-      [{ systemId: 'gone', operation: 'op‮', fields: [{ label: 'a', value: 'x‮y' }] }],
+      [{ systemId: 'gone', operation: 'op\u202E', fields: [{ label: 'a', value: 'x\u202Ey' }] }],
       SYSTEMS,
     );
     expect(out).toBe('מgone — op:\na: xy');
