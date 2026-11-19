@@ -9,7 +9,7 @@ import {
   isReservedHeaderName,
   unrecognisedKeyPaths,
 } from './external-system.js';
-import { NEVER_FULLY_AUTONOMOUS } from './action.js';
+import { AMOUNT_REQUIRED_CLASSES, NEVER_FULLY_AUTONOMOUS } from './action.js';
 import { crmFixture, type ExternalSystemInput } from '../test/external-fixtures.js';
 
 type Op = ExternalSystemInput['operations'][number];
@@ -103,8 +103,14 @@ describe('ExternalSystem — kind and class', () => {
       'אינו מותר לפעולה מסוג "money"',
     );
   });
-  it('accepts every class in CHANGE_CLASSES for a change operation', () => {
-    for (const cls of CHANGE_CLASSES) expectAccepted(withEdit((s) => { op(s, 'update_customer').actionClass = cls; }));
+  it('accepts every class in CHANGE_CLASSES for a change operation (with an amount where the class needs one)', () => {
+    for (const cls of CHANGE_CLASSES) {
+      expectAccepted(withEdit((s) => {
+        const o = op(s, 'update_customer');
+        o.actionClass = cls;
+        if (AMOUNT_REQUIRED_CLASSES.has(cls)) o.amount = { field: 'total', unit: 'minor', currency: 'ILS' };
+      }));
+    }
   });
   it('keeps every money class, and external.delete, never fully autonomous', () => {
     for (const cls of MONEY_CLASSES) expect(NEVER_FULLY_AUTONOMOUS.has(cls)).toBe(true);
@@ -155,6 +161,70 @@ describe('ExternalSystem — money', () => {
       withEdit((s) => { op(s, 'issue_refund').params?.push({ name: 'amount_cents', in: 'body', required: true }); }),
       `operations.${REFUND}.amount.field`,
       'לא יכול להיות גם פרמטר',
+    );
+  });
+});
+
+describe('ExternalSystem — amount rules (I1, I2)', () => {
+  const AMOUNT = { field: 'total', unit: 'minor', currency: 'ILS' } as const;
+  it.each(['accounting.write', 'quote.issue'] as const)(
+    'refuses a change operation judged as %s with no amount — the gate would always refuse it',
+    (cls) => {
+      expectRefusedBy(
+        withEdit((s) => { op(s, 'update_customer').actionClass = cls; }),
+        `operations.${UPDATE}.amount`,
+        'בלעדיו היא תסורב תמיד',
+      );
+    },
+  );
+  it('accepts an amount-required change operation that declares its amount', () => {
+    expectAccepted(withEdit((s) => {
+      const o = op(s, 'update_customer');
+      o.actionClass = 'accounting.write';
+      o.amount = { ...AMOUNT };
+    }));
+  });
+  it('refuses an amount on a change operation whose class needs none', () => {
+    expectRefusedBy(
+      withEdit((s) => { op(s, 'update_customer').amount = { ...AMOUNT }; }),
+      `operations.${UPDATE}.amount`,
+      'רשאית להצהיר על שדה סכום',
+    );
+  });
+  it('refuses an amount on a read operation', () => {
+    expectRefusedBy(
+      withEdit((s) => {
+        const o = op(s, 'get_customer');
+        o.method = 'POST';
+        o.amount = { ...AMOUNT };
+      }),
+      `operations.${GET}.amount`,
+      'רשאית להצהיר על שדה סכום',
+    );
+  });
+  it('refuses an amount on a delete operation', () => {
+    expectRefusedBy(
+      withEdit((s) => { op(s, 'delete_customer').amount = { ...AMOUNT }; }),
+      `operations.${DELETE}.amount`,
+      'רשאית להצהיר על שדה סכום',
+    );
+  });
+  it('refuses an amount on a GET operation, even a money one', () => {
+    expectRefusedBy(
+      withEdit((s) => { op(s, 'issue_refund').method = 'GET'; }),
+      `operations.${REFUND}.method`,
+      'בקשת GET אינה שולחת את הסכום',
+    );
+    expectRefusedBy(
+      withEdit((s) => {
+        const o = op(s, 'update_customer');
+        o.actionClass = 'quote.issue';
+        o.method = 'GET';
+        o.params = [{ name: 'customer_id', in: 'path', required: true }];
+        o.amount = { ...AMOUNT };
+      }),
+      `operations.${UPDATE}.method`,
+      'בקשת GET אינה שולחת את הסכום',
     );
   });
 });

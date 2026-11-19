@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { ActionClass } from './action.js';
+import { AMOUNT_REQUIRED_CLASSES, ActionClass } from './action.js';
 
 /**
  * An external system the owner has signed for: a CRM, an accounting package,
@@ -215,6 +215,38 @@ export const ExternalOperation = OperationShape.superRefine((op, ctx) => {
 
   if (op.kind === 'money' && op.amount === null) {
     ctx.addIssue({ code: 'custom', path: ['amount'], message: 'פעולת כסף חייבת להצהיר על שדה הסכום שלה' });
+  }
+
+  // The gate refuses every call of an amount-required class that carries no
+  // readable amount (`amount_unreadable`), so a change op signed under one
+  // without a declared amount field could never run. Say so at signing.
+  const amountClass = AMOUNT_REQUIRED_CLASSES.has(op.actionClass);
+  if (op.kind === 'change' && amountClass && op.amount === null) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['amount'],
+      message: `פעולה מסוג "${op.actionClass}" חייבת להצהיר על שדה הסכום שלה — בלעדיו היא תסורב תמיד`,
+    });
+  }
+  // An amount is declared positively: a money op, or a change op of an
+  // amount-required class. Anywhere else the gate would judge an amount the
+  // operation has no business carrying.
+  const amountAllowed = op.kind === 'money' || (op.kind === 'change' && amountClass);
+  if (op.amount !== null && !amountAllowed) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['amount'],
+      message: 'רק פעולת כסף, או פעולת שינוי מסוג שדורש סכום, רשאית להצהיר על שדה סכום',
+    });
+  }
+  // A GET sends no body, so the amount the gate judged and the echo showed
+  // would never reach the provider.
+  if (op.amount !== null && op.method === 'GET') {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['method'],
+      message: 'פעולה שמצהירה על סכום אינה יכולה להשתמש ב-GET — בקשת GET אינה שולחת את הסכום',
+    });
   }
 
   const paramNames = new Set<string>();

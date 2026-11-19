@@ -292,3 +292,45 @@ describe('buildExternalRequest', () => {
     });
   });
 });
+
+describe('buildExternalRequest — an operation that declares an amount always sends it (I2)', () => {
+  const amountOps = [
+    {
+      name: 'pay_json', label: 'תשלום', kind: 'money', actionClass: 'payment.make', method: 'POST',
+      path: '/pay', params: [{ name: 'ref', in: 'body', required: false }],
+      amount: { field: 'amount', unit: 'major', currency: 'ILS' },
+    },
+    {
+      name: 'pay_form', label: 'תשלום טופס', kind: 'money', actionClass: 'refund.issue', method: 'POST',
+      path: '/refunds', bodyEncoding: 'form', params: [],
+      amount: { field: 'amount_cents', unit: 'minor', currency: 'ILS' },
+    },
+    {
+      name: 'invoice_json', label: 'חשבונית', kind: 'change', actionClass: 'accounting.write', method: 'PUT',
+      path: '/invoices', params: [],
+      amount: { field: 'total', unit: 'minor', currency: 'USD' },
+    },
+    {
+      name: 'quote_form', label: 'הצעה', kind: 'change', actionClass: 'quote.issue', method: 'PATCH',
+      path: '/quotes', bodyEncoding: 'form', params: [{ name: 'note', in: 'body', required: false }],
+      amount: { field: 'sum', unit: 'major', currency: 'EUR' },
+    },
+  ];
+
+  it('puts the amount in the body of every such operation, JSON and form', () => {
+    const s = sys({}, amountOps);
+    const withAmount = s.operations.filter((o) => o.amount !== null);
+    expect(withAmount.length).toBe(4);
+    expect(new Set(withAmount.map((o) => o.bodyEncoding))).toEqual(new Set(['json', 'form']));
+    for (const o of withAmount) {
+      const r = good(buildExternalRequest(s, o, { amountMinor: 1250 }, 'k'));
+      expect(r.body, o.name).not.toBeNull();
+      const expected = o.amount!.unit === 'major' ? 12.5 : 1250;
+      if (o.bodyEncoding === 'form') {
+        expect(new URLSearchParams(r.body!).get(o.amount!.field), o.name).toBe(String(expected));
+      } else {
+        expect((JSON.parse(r.body!) as Record<string, unknown>)[o.amount!.field], o.name).toBe(expected);
+      }
+    }
+  });
+});
