@@ -1,7 +1,8 @@
 import { mkdir } from 'node:fs/promises';
 import { withPlatform } from '../db/platform-pool.js';
 import { isValidBusinessId, RESERVED_BUSINESS_IDS } from '../db/pool.js';
-import { businessSaveRoot } from './paths.js';
+import { countFilesUnder } from './business-deletion.js';
+import { businessFolders, businessSaveRoot } from './paths.js';
 
 /** A refusal meant for the platform operator; the message is Hebrew. */
 export class TenancyError extends Error {
@@ -40,7 +41,8 @@ function malformedIdMessage(id: string): string {
   return `מזהה עסק לא תקין "${id}" — אותיות אנגליות קטנות, ספרות ומקפים בלבד, באורך 3 עד 63`;
 }
 
-export type BusinessStatus = 'active' | 'suspended';
+/** `deleting`: the rows are gone, the files not yet (migration 081); the id stays taken until they are. */
+export type BusinessStatus = 'active' | 'suspended' | 'deleting';
 
 export interface Business {
   businessId: string;
@@ -70,6 +72,28 @@ export async function createBusiness(id: string, displayName: string): Promise<v
   const name = displayName.trim();
   if (name.length === 0 || name.length > 120) {
     throw new TenancyError('שם העסק חייב להכיל בין 1 ל-120 תווים');
+  }
+  // A business re-created with an old id starts empty (deletion spec). While
+  // the old one is still being deleted its id is taken; once its row is gone,
+  // a file it left in any of its three folders — the save folder above all,
+  // which deletion never removes — would become the new business's. An empty
+  // or missing folder does not block.
+  const existing = await getBusiness(id);
+  if (existing?.status === 'deleting') {
+    throw new TenancyError(
+      `העסק ${id} נמצא באמצע מחיקה. אפשר לפתוח עסק עם המזהה הזה רק אחרי שהמחיקה תסתיים.`,
+    );
+  }
+  if (existing === null) {
+    const folders = businessFolders(id);
+    for (const folder of [folders.document, folders.inbox, folders.save]) {
+      if (folder !== null && (await countFilesUnder(folder)) > 0) {
+        throw new TenancyError(
+          `בשרת נשארו קבצים בתיקייה של המזהה ${id} מעסק קודם. ` +
+            'אפשר לפתוח עסק עם המזהה הזה רק אחרי שהקבצים יועברו או יימחקו.',
+        );
+      }
+    }
   }
   await withPlatform(async (db) => {
     // One statement, so the registry row and the profile copy of the name

@@ -61,3 +61,29 @@ export function businessSaveRoot(businessId: string): string | null {
 export function isFolderOfBusiness(folder: string, businessId: string): boolean {
   return isValidBusinessId(businessId) && basename(resolve(folder)) === businessId;
 }
+
+/** The three folders of one business on the server; `null` where the server has no such root. */
+export interface BusinessFolders {
+  /** `<DOCUMENT_ROOT>/<businessId>` — ingested documents, produced files, the logo. */
+  document: string;
+  /** `<DOCUMENT_INBOX_ROOT>/<businessId>`, or `null` when the server has no inbox root. */
+  inbox: string | null;
+  /** `<DOCUMENT_SAVE_ROOT>/<businessId>`, or `null` when the server has no save root. */
+  save: string | null;
+}
+
+/**
+ * Every folder a business owns on the server, each the business id joined as
+ * ONE segment under its root — so `acme` and `acme-2` are siblings, never one
+ * inside the other's name. A caller compares or removes these folders whole;
+ * it never tests a path with a string prefix (`startsWith`), which would take
+ * `acme-2` for part of `acme`.
+ */
+export function businessFolders(businessId: string): BusinessFolders {
+  const id = checkedId(businessId);
+  return {
+    document: join(config.documentRoot, id),
+    inbox: config.documentInboxRoot === null ? null : join(config.documentInboxRoot, id),
+    save: config.documentSaveRoot === null ? null : join(config.documentSaveRoot, id),
+  };
+}
