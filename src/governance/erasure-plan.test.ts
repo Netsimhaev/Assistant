@@ -1792,6 +1792,7 @@ describe('external systems', () => {
     expect(plan.externalSystemsKept).toEqual(['מערכת הלקוחות']);
     const html = renderErasure({ csrf: 't', anchorLabel: RONIT, plan });
     expect(html).toContain('נשארים במערכת מערכת הלקוחות');
+    expect(html).toContain('אם המערכת עדיין מחזיקה את הרשומה ותשנה אותה, היא עלולה להגיע שוב בסריקה או בהתראה');
 
     await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
     const left = await testDb().query<{ read_id: string }>('SELECT read_id FROM external_reads');

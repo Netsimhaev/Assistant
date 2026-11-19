@@ -19,6 +19,8 @@ import { registerBusiness, resetDatabase, testDb } from '../test/db.js';
 import { TEST_MASTER_KEY } from '../test/owner.js';
 import { createServer } from '../dashboard/server.js';
 import { canonicalHash } from '../util/canonical.js';
+import { buildErasurePlan } from '../governance/erasure-plan.js';
+import { executeErasure } from '../governance/erasure.js';
 import { EXTERNAL_HOOK_MAX_BYTES, EXTERNAL_HOOK_PATH, handleExternalWebhook } from './webhook.js';
 
 const BUSINESS = 'hook-shop';
@@ -580,5 +582,35 @@ describe('item hash', () => {
     expect((await post(HOOK, b, { 'Stripe-Signature': stripeHeader(b) })).status).toBe(202);
     expect(await eventRows()).toHaveLength(2);
     expect(canonicalHash({ eventType: 'customer.created', fields: [] })).not.toBe(canonicalHash({ eventType: 'payment.failed', fields: [] }));
+  });
+});
+
+describe('an erased item does not come back (I3, migration 080)', () => {
+  async function eraseDana(): Promise<void> {
+    const plan = await withBusiness(BUSINESS, (db) => buildErasurePlan(db, { kind: 'contact', identifier: 'דנה כהן' }));
+    expect(plan.externalEventIds).toHaveLength(1);
+    await withBusiness(BUSINESS, (db) => executeErasure(db, plan));
+  }
+
+  it('the same alert re-delivered after an erasure stores nothing; a changed record is stored', async () => {
+    expect((await post(HOOK, CREATED, { 'Stripe-Signature': stripeHeader(CREATED) })).status).toBe(202);
+    await eraseDana();
+    expect(await eventRows()).toHaveLength(0);
+    const tombstones = await testDb().query<{ system_id: string; item_hash: string }>(
+      'SELECT system_id, item_hash FROM external_erased_items WHERE business_id = $1',
+      [BUSINESS],
+    );
+    expect(tombstones.rows).toEqual([
+      { system_id: 'crm', item_hash: canonicalHash({ eventType: 'customer.created', fields: [{ label: 'שם', value: 'דנה כהן' }] }) },
+    ]);
+
+    const again = await post(HOOK, CREATED, { 'Stripe-Signature': stripeHeader(CREATED) });
+    expect(again.status).toBe(202);
+    expect(await eventRows()).toHaveLength(0);
+
+    const changed = JSON.stringify({ type: 'customer.created', data: { name: 'דנה כהן-לוי' } });
+    expect((await post(HOOK, changed, { 'Stripe-Signature': stripeHeader(changed) })).status).toBe(202);
+    const rows = await eventRows();
+    expect(rows.map((r) => r.fields)).toEqual([[{ label: 'שם', value: 'דנה כהן-לוי' }]]);
   });
 });

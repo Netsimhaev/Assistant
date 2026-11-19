@@ -412,8 +412,10 @@ export interface ErasurePlan {
   externalEventIds: string[];
   /**
    * The external systems that held an erased read or event, by their signed
-   * label (the system id when it is no longer signed), cleaned to one line
-   * and sorted. Their own records at the provider are NEVER deleted — this
+   * label, cleaned to one line and sorted. A label that is not signed any
+   * more, or that cleans to the empty string, falls back to the system id;
+   * two systems whose labels agree are each shown as `label (id)`, so the
+   * owner can tell them apart. Their own records at the provider are NEVER deleted — this
    * module has no client for them — and the preview says so, one line per
    * system. Included in `planFingerprint`.
    */

@@ -1937,8 +1937,17 @@ function calendarEventsKeptSection(events: readonly CalendarEventKept[], timeZon
 function externalSystemsKeptSection(labels: readonly string[]): string {
   if (labels.length === 0) return '';
   return `<p class="muted">הרשומות במערכות החיצוניות עצמן אינן נמחקות — המחיקה מסירה רק את מה שנשמר כאן. אם צריך, מחק אותן במערכת עצמה.</p>
-     <ul>${labels.map((label) => `<li>נשארים במערכת ${escLabel(label)}</li>`).join('')}</ul>`;
+     <ul>${labels.map((label) => `<li>נשארים במערכת ${escLabel(label)}</li>`).join('')}</ul>
+     <p class="muted">${EXTERNAL_RECORD_MAY_RETURN_NOTE}</p>`;
 }
+
+/**
+ * Told beside the systems kept (I3): an erased event leaves a hash tombstone
+ * (`external_erased_items`), so the provider's UNCHANGED record is not stored
+ * again — but a record it changes hashes differently and is.
+ */
+export const EXTERNAL_RECORD_MAY_RETURN_NOTE =
+  'אם המערכת עדיין מחזיקה את הרשומה ותשנה אותה, היא עלולה להגיע שוב בסריקה או בהתראה';
 
 /** The contact's name sits in some version of the owner's business description: told, never edited. */
 function descriptionNoticeSection(mentioned: boolean): string {

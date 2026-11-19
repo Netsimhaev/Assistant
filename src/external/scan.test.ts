@@ -18,6 +18,8 @@ import { MAX_SCAN_ITEMS, SCAN_RETRY_MS, scanExternalSystems } from './scan.js';
 import type { BusinessDb } from '../db/pool.js';
 import { trip } from '../governance/killswitch.js';
 import { loadSystemState } from './store.js';
+import { buildErasurePlan } from '../governance/erasure-plan.js';
+import { executeErasure } from '../governance/erasure.js';
 
 const BUSINESS = 'scan-shop';
 const KEY = 'sk_test_scan_key';
@@ -317,5 +319,27 @@ describe('scanExternalSystems', () => {
     expect(out.scanned).toBe(0);
     expect(out.warnings.join(' ')).toContain('charter unreadable');
     expect(http.requests).toHaveLength(0);
+  });
+});
+
+describe('an erased item does not come back on the next scan (I3, migration 080)', () => {
+  it('the same record re-scanned after an erasure stores nothing; a changed record is stored', async () => {
+    await install();
+    await connect();
+    expect(await scan(fakeHttp(() => ok()), T0)).toMatchObject({ newItems: 2 });
+
+    const plan = await withBusiness(BUSINESS, (db) => buildErasurePlan(db, { kind: 'contact', identifier: 'dana@x.example' }));
+    expect(plan.externalEventIds).toHaveLength(1);
+    await withBusiness(BUSINESS, (db) => executeErasure(db, plan));
+    expect((await events()).map((r) => r.fields[0]?.value)).toEqual(['רון לוי']);
+
+    const again = await scan(fakeHttp(() => ok()), new Date(T0.getTime() + 24 * HOUR));
+    expect(again).toMatchObject({ scanned: 1, newItems: 0 });
+    expect((await events()).map((r) => r.fields[0]?.value)).toEqual(['רון לוי']);
+
+    const changed = JSON.stringify({ data: [{ id: 'c1', name: 'דנה כהן', email: 'dana.new@x.example' }] });
+    const later = await scan(fakeHttp(() => ok(changed)), new Date(T0.getTime() + 48 * HOUR));
+    expect(later).toMatchObject({ scanned: 1, newItems: 1 });
+    expect((await events()).map((r) => r.fields[1]?.value)).toEqual(['ron@x.example', 'dana.new@x.example']);
   });
 });

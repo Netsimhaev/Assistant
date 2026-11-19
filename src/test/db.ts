@@ -116,6 +116,7 @@ export async function resetDatabase(): Promise<void> {
       external_calls,
       external_system_state,
       external_learning_jobs,
+      external_erased_items,
       setup_packages,
       business_profiles,
       business_colleagues,

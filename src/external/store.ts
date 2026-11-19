@@ -254,7 +254,13 @@ function toEvent(r: EventRow): ExternalEventRecord {
   };
 }
 
-/** Returns false when the same (system, item hash) was already stored. */
+/**
+ * Returns false when the same (system, item hash) was already stored — or was
+ * stored once and then erased by the owner (`external_erased_items`, migration
+ * 080). Without the tombstone, the provider's unchanged record would arrive on
+ * the next scan or alert and learning would write the erased person back.
+ * A record the provider changed hashes differently and is stored again.
+ */
 export async function insertEvent(
   db: BusinessDb,
   input: {
@@ -267,7 +273,11 @@ export async function insertEvent(
 ): Promise<boolean> {
   const { rows } = await db.query(
     `INSERT INTO external_events (business_id, event_id, system_id, source, event_type, item_hash, fields)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+     SELECT $1, $2, $3, $4, $5, $6, $7::jsonb
+      WHERE NOT EXISTS (
+        SELECT 1 FROM external_erased_items t
+         WHERE t.business_id = $1 AND t.system_id = $3 AND t.item_hash = $6
+      )
      ON CONFLICT (business_id, system_id, item_hash) DO NOTHING
      RETURNING event_id`,
     [db.businessId, `XE-${ulid()}`, input.systemId, input.source, input.eventType, input.itemHash, JSON.stringify(input.fields)],

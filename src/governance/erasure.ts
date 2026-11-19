@@ -531,6 +531,19 @@ export async function executeErasure(
       `DELETE FROM external_reads WHERE ${EXTERNAL_READS_ERASED_PREDICATE}`,
       [businessId, jobIds],
     );
+    // The tombstone first, in this transaction (migration 080): one row per
+    // event about to be deleted, so the provider's unchanged record cannot be
+    // stored again by the next scan or alert (`insertEvent` refuses it). It
+    // holds hashes only — no content about a person — so it is a by-product
+    // of the erasure, not erased content: not counted in the audit reason, not
+    // a discovery source, and not swept.
+    await client.query(
+      `INSERT INTO external_erased_items (business_id, system_id, item_hash)
+       SELECT business_id, system_id, item_hash FROM external_events
+        WHERE ${EXTERNAL_EVENTS_ERASED_PREDICATE}
+       ON CONFLICT (business_id, system_id, item_hash) DO NOTHING`,
+      [businessId, externalEventIds],
+    );
     await del(
       'external_events',
       `DELETE FROM external_events WHERE ${EXTERNAL_EVENTS_ERASED_PREDICATE}`,
