@@ -231,6 +231,9 @@ export const config = {
   // Ledger follow-ups (nudges) opened per day, counted in the charter zone. Each
   // is a drafter call and an outbound job, so it is capped like the others. 0 stops them.
   ledgerNudgesPerDay: positiveInt('LEDGER_NUDGES_PER_DAY', 20),
+  // External-system calls (Stage D) per system per day, counted in the charter
+  // zone off `external_calls` — every attempt that reached the network. 0 stops them.
+  externalCallsPerDay: positiveInt('EXTERNAL_CALLS_PER_DAY', 200),
   // Two budgets, not one — docs/superpowers/specs/2026-10-01-whatsapp-boss-channel-design.md
   // §6.2. Shared, a customer sending fifty voice notes exhausts the budget and
   // then the OWNER'S OWN recording goes untranscribed: a stranger degrading

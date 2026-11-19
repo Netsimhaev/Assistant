@@ -318,6 +318,21 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
   calendar_delivery_unknown: 'לא ניתן לדעת אם השינוי ביומן נשמר — כדאי לבדוק ביומן',
   recheck_incomplete: 'לא ניתן היה לוודא שהמועד פנוי — לא נכתב דבר',
 
+  // The external-system adapter (adapters/external.ts, Stage D). Its
+  // `adapter_timeout`, `delivery_unknown` and `credential_unavailable` reuse
+  // the entries above.
+  bad_params: 'הפרמטרים לפעולה במערכת החיצונית אינם תקינים — לא נשלח דבר',
+  external_unresolved: 'הפעולה אינה מוגדרת במערכת שנחתמה — לא נשלח דבר',
+  external_daily_cap: 'הגענו לתקרת הפניות היומית למערכת החיצונית', // retryable
+  external_cap_unreadable: 'לא ניתן היה לבדוק את תקרת הפניות היומית', // retryable
+  external_address_refused: 'כתובת המערכת החיצונית חסומה — לא נשלח דבר',
+  external_auth: 'המערכת החיצונית דחתה את המפתח — צריך לעדכן אותו',
+  external_unavailable: 'המערכת החיצונית לא הייתה זמינה', // retryable
+  external_rejected: 'המערכת החיצונית דחתה את הבקשה',
+  external_network: 'לא ניתן היה להגיע למערכת החיצונית', // retryable
+  external_response_too_large: 'התשובה מהמערכת החיצונית גדולה מדי',
+  external_request_failed: 'אירעה תקלה בשליחת הבקשה למערכת החיצונית',
+
   // Attachments on mail.send (document production §8.2): performStep's own
   // refusals (run-plan.ts, production/attachments.ts) and the mailbox
   // adapter's Microsoft cap. All final.

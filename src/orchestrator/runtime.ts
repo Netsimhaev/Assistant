@@ -23,6 +23,12 @@ import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import type { CalendarProvider } from '../calendar/calendar.js';
 import type { CalendarClient } from '../calendar/types.js';
 import { createCalendarAdapter } from './adapters/calendar.js';
+import { createExternalAdapter } from './adapters/external.js';
+import { createGuardedHttps } from '../external/http.js';
+import type { ExternalHttp } from '../external/http.js';
+import { countCallsToday, recordCall } from '../external/store.js';
+import { config } from '../config.js';
+import type { ActiveCharter } from '../charter/store.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { loadBindings } from './bindings.js';
 import type { CredentialSource } from './credentials.js';
@@ -229,6 +235,11 @@ export interface ServerRuntimeOverrides {
   mailboxClient?: (provider: MailProvider) => MailboxClient;
   /** Test seam: the calendar client the calendar adapter uses, per provider. */
   calendarClient?: (provider: CalendarProvider) => CalendarClient;
+  /**
+   * Test seam: the HTTPS client every external-system adapter uses. Absent in
+   * production, where the one guarded client (`createGuardedHttps`) is used.
+   */
+  externalHttp?: ExternalHttp;
   /** Test seam only — see `businessRuntime`'s docblock. No default exists yet. */
   whatsappGateway?: (creds: { instance: CredentialHandle; token: CredentialHandle }) => WhatsAppGateway;
 }
@@ -700,7 +711,20 @@ export async function businessRuntime(server: ServerRuntime, db: BusinessDb): Pr
   // The charter and the bindings are read on every pass (this function is
   // rebuilt per pass — see its docblock), so a `provider` column written by
   // the dashboard takes effect on that business's next pass, with no restart.
-  const charter = await loadActiveCharter(db);
+  // An unreadable charter registers no charter-driven adapter and says so;
+  // it does not stop the business's runtime from being built (the pass still
+  // has approvals to expire). Every job that would use an adapter loads the
+  // charter itself and fails there, loudly.
+  let charter: ActiveCharter | null;
+  try {
+    charter = await loadActiveCharter(db);
+  } catch (error) {
+    charter = null;
+    warnings.push(
+      `charter unreadable — no charter-driven adapters registered (calendar, mailbox, external-system adapters): ` +
+        (error instanceof Error ? error.message : String(error)),
+    );
+  }
   const bindings = await loadBindings(db);
   const connectionBySystem = new Map(
     (charter?.charter.connections ?? []).map((connection) => [connection.system, connection] as const),
@@ -821,6 +845,35 @@ export async function businessRuntime(server: ServerRuntime, db: BusinessDb): Pr
     );
   }
 
+  // External systems (Stage D): one adapter per system signed in the ACTIVE
+  // charter, under `ext:<id>` — the connection name the charter pairs each
+  // system with, which `resolveChannel` emits and `AdapterRegistry.resolve`
+  // looks up. The definition handed to the adapter is the compiled bundle's,
+  // the same list the gate resolves operations against at stage 3. Nothing is
+  // upserted: no binding row is created here; a system without a live binding
+  // never reaches its adapter (`channel_unavailable` in `performStep`).
+  if (charter !== null) {
+    const timeZone = charter.charter.identity.timezone;
+    const http = overrides.externalHttp ?? sharedGuardedHttps();
+    for (const system of charter.bundle.externalSystems) {
+      const name = `ext:${system.id}`;
+      if (systemAdapters.some((a) => a.system === name)) {
+        warnings.push(`no external-system adapter for "${name}": an adapter is already registered under this system name`);
+        continue;
+      }
+      systemAdapters.push(
+        createExternalAdapter(system, {
+          http,
+          // Each opens its own connection for THIS business: the adapter runs
+          // during a later step, long after this runtime's `db` was released.
+          callsToday: (systemId) => withBusiness(businessId, (bdb) => countCallsToday(bdb, systemId, timeZone)),
+          recordCall: (call) => withBusiness(businessId, (bdb) => recordCall(bdb, call)),
+          capPerDay: config.externalCallsPerDay,
+        }),
+      );
+    }
+  }
+
   return {
     registry: new AdapterRegistry(systemAdapters, [browserAdapter]),
     // The encrypted store, never `envCredentials` — that one exists for tests
@@ -837,4 +890,12 @@ export async function businessRuntime(server: ServerRuntime, db: BusinessDb): Pr
     production: server.production,
     warnings,
   };
+}
+
+let guardedHttps: ExternalHttp | null = null;
+
+/** The one guarded HTTPS client of this process, built on first use. Stateless per request. */
+function sharedGuardedHttps(): ExternalHttp {
+  guardedHttps ??= createGuardedHttps();
+  return guardedHttps;
 }

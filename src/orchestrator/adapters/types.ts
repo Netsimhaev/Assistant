@@ -160,7 +160,22 @@ export interface OutgoingAttachment {
 
 export type AdapterResult =
   | { ok: true; output: unknown; externalId: string | null }
-  | { ok: false; retryable: boolean; code: string; message: string };
+  | {
+      ok: false;
+      retryable: boolean;
+      code: string;
+      message: string;
+      /**
+       * The request was dispatched and no authoritative answer came back, so
+       * the far end may or may not have acted. Only meaningful beside
+       * `retryable: true`: it tells `executeStep` to write the `unknown`
+       * `job_step_results` row (`StepChannelError.outcomeUnknown`), exactly as
+       * `callWithDeadline`'s own timeout does, so a re-plan cannot change the
+       * idempotency key over a write that may already have landed. Optional
+       * and absent everywhere it does not apply; only `true` is ever set.
+       */
+      outcomeUnknown?: true;
+    };
 
 /**
  * One external system, as the orchestrator sees it.

@@ -804,7 +804,14 @@ async function performStep(
   // Acting on the result is the whole point. Ignoring it would record an
   // unimplemented browser call as an order placed, and send the confirmation.
   if (!result.ok) {
-    throw new StepChannelError(result.code, result.message, result.retryable);
+    // `outcomeUnknown` only beside `retryable`: a final failure moves the job
+    // to `failed`, where no completion row is written in any case.
+    throw new StepChannelError(
+      result.code,
+      result.message,
+      result.retryable,
+      result.retryable && result.outcomeUnknown === true,
+    );
   }
   // `performed: true` unconditionally — reaching this line at all already
   // means the adapter returned `ok: true` (the `throw` above is the only exit
