@@ -670,16 +670,24 @@ describe('collectDigestFacts', () => {
         [BUSINESS, id, type, JSON.stringify([{ label: 'שם', value }, { label: 'מייל', value: 'x@y.example' }]), at],
       );
     }
-    // A learning job closed in the window is not one of the owner's tasks.
+    // Learning jobs — one closed, one failed — are neither the owner's tasks
+    // nor his failed instructions; a failed job WITHOUT the marker still is.
     await db.query(
       `INSERT INTO jobs (job_id, business_id, title, phase, charter_version, provenance, content_ingested, closed_at)
-       VALUES ('J-learn', $1, 'למידה ממערכת חיצונית', 'closed', (SELECT charter_version FROM charter_active WHERE business_id = $1), 'unknown_external', false, $2)`,
+       VALUES ('J-learn', $1, 'למידה ממערכת חיצונית', 'closed', (SELECT charter_version FROM charter_active WHERE business_id = $1), 'unknown_external', false, $2),
+              ('J-learn-bad', $1, 'למידה ממערכת חיצונית', 'failed', (SELECT charter_version FROM charter_active WHERE business_id = $1), 'unknown_external', false, $2),
+              ('J-other-bad', $1, 'הוראה שנכשלה', 'failed', (SELECT charter_version FROM charter_active WHERE business_id = $1), 'boss', false, $2)`,
       [BUSINESS, inWindow(10)],
     );
-    await db.query(`UPDATE external_events SET curation_job_id = 'J-learn' WHERE business_id = $1 AND event_id = 'XE-1'`, [BUSINESS]);
+    await db.query(
+      `INSERT INTO external_learning_jobs (business_id, job_id, system_id, failed_at)
+       VALUES ($1, 'J-learn', 'crm', NULL), ($1, 'J-learn-bad', 'crm', $2)`,
+      [BUSINESS, inWindow(10)],
+    );
 
     const facts = await withBusiness(BUSINESS, (bdb) => collectDigestFacts(bdb, WINDOW, CEILINGS));
     expect(facts.done.jobsCompleted).toBe(0);
+    expect(facts.exceptions.map((e) => e.subject)).toEqual(['הוראה שנכשלה']);
     expect(facts.external.total).toBe(6);
     expect(facts.external.counts).toEqual([
       { system: 'מערכת הלקוחות', type: 'לקוח חדש', count: 2 },

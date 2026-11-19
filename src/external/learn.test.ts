@@ -5,7 +5,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
-import { closePool, withBusiness } from '../db/pool.js';
+import { closePool, withBusiness, type BusinessDb } from '../db/pool.js';
 import { createJob } from '../orchestrator/jobs.js';
 import type { CurationBrief } from '../memory/curation-brief.js';
 import type { CurationResult } from '../memory/curation-parse.js';
@@ -203,5 +203,46 @@ describe('learnFromExternalEvents', () => {
     expect(out).toMatchObject({ jobs: 1, curated: 1 });
     const { rows } = await testDb().query<{ phase: string }>('SELECT phase FROM jobs WHERE job_id = $1', [orphan.jobId]);
     expect(rows[0]?.phase).toBe('failed');
+  });
+
+  it('a throw before the model call leaves the events uncurated and unclaimed, and marks the job failed', async () => {
+    await install();
+    await seedEvents(2);
+    let calls = 0;
+    const curator = async (): Promise<CurationResult> => {
+      calls += 1;
+      return { candidates: [] };
+    };
+    // Break `buildExternalBrief`: its label lookup reads charter_active.
+    const out = await withBusiness(BUSINESS, (real) => {
+      const db: BusinessDb = {
+        businessId: real.businessId,
+        inTransaction: real.inTransaction,
+        query: ((text: string, values?: unknown[]) => {
+          if (text.includes("cv.charter -> 'externalSystems'")) throw new Error('brief fault');
+          return real.query(text, values as never);
+        }) as BusinessDb['query'],
+      };
+      return learnFromExternalEvents(db, { curator });
+    });
+    expect(calls).toBe(0);
+    expect(out).toMatchObject({ jobs: 1, curated: 0 });
+    expect(await uncurated()).toBe(2);
+    const claimed = await testDb().query(
+      `SELECT 1 FROM external_events WHERE business_id = $1 AND curation_job_id IS NOT NULL`,
+      [BUSINESS],
+    );
+    expect(claimed.rowCount).toBe(0);
+    const { rows } = await testDb().query<{ failed_at: Date | null; phase: string }>(
+      `SELECT l.failed_at, j.phase FROM external_learning_jobs l JOIN jobs j ON j.job_id = l.job_id WHERE l.business_id = $1`,
+      [BUSINESS],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.failed_at).not.toBeNull();
+    expect(rows[0]?.phase).toBe('failed');
+
+    // The next pass retries them.
+    expect(await learn(curator)).toMatchObject({ jobs: 1, curated: 2 });
+    expect(calls).toBe(1);
   });
 });

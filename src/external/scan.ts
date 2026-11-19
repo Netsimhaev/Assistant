@@ -28,10 +28,24 @@
  *    `canonicalHash({ eventType, fields })` — the same hash the webhook writes
  *    (ruling T11-a). No job, no step, no card: no `ext.*` step can come of it.
  *
- * A failed scan inserts nothing and leaves `last_scan_at` where it was; its
- * outcome code is recorded (`last_scan_outcome`) and it is not retried for an
- * hour (`SCAN_RETRY_MS`), so a refused address or a bad key cannot eat the
- * day's call cap — which the owner's own commands share — in an afternoon.
+ * A scan that fails BEFORE an item is stored (refused address, bad key, cap,
+ * timeout, an answer not in the signed shape) inserts nothing and leaves
+ * `last_scan_at` where it was; its outcome code is recorded
+ * (`last_scan_outcome`) and it is not retried for an hour (`SCAN_RETRY_MS`),
+ * so a broken system cannot eat the day's call cap — which the owner's own
+ * commands share — in an afternoon. A throw WHILE items are being stored
+ * (a database fault mid-loop) keeps the events already inserted, records the
+ * attempt as `scan_failed` at best effort (so the same back-off applies) and
+ * likewise leaves `last_scan_at` where it was; the next scan asks from the
+ * same point and `itemHash` dedupe drops what was already stored.
+ *
+ * A list longer than `MAX_SCAN_ITEMS` is cut, and the cut is never silent:
+ * only the first `MAX_SCAN_ITEMS` items are stored, the outcome is
+ * `scan_truncated`, `last_scan_at` does NOT move (the next scan asks from the
+ * same point; dedupe stops repeats), the pass result counts it and warns, and
+ * `/systems` tells the owner. Items beyond the cut are not stored by this
+ * scan, and a system whose answer stays above the cap keeps losing the tail
+ * until the technician narrows the scan.
  */
 import type { BusinessDb } from '../db/pool.js';
 import { config } from '../config.js';
@@ -50,8 +64,14 @@ import { countCallsToday, insertEvent, loadSystemState, recordCall, recordScanAt
 /** After a failed attempt, the next one waits at least this long. */
 export const SCAN_RETRY_MS = 60 * 60 * 1000;
 
-/** Items kept from one scan response; the rest wait for the next scan. */
+/** Items stored from one scan response; a longer list is `scan_truncated` (see the docblock). */
 export const MAX_SCAN_ITEMS = 200;
+
+/** Outcome of a scan whose list was longer than `MAX_SCAN_ITEMS`. */
+export const SCAN_TRUNCATED = 'scan_truncated';
+
+/** Outcome of a scan that threw after its request was sent. */
+export const SCAN_FAILED = 'scan_failed';
 
 /** The success outcome code stored on the state row. */
 export const SCAN_OK = 'ok';
@@ -71,6 +91,8 @@ export interface ScanResult {
   newItems: number;
   /** Systems with a signed scan that were not due, or not connected. */
   skipped: number;
+  /** Scans whose list was longer than `MAX_SCAN_ITEMS` and was cut. */
+  truncated: number;
   warnings: string[];
 }
 
@@ -89,7 +111,7 @@ function isDue(
 }
 
 export async function scanExternalSystems(db: BusinessDb, options: ScanOptions): Promise<ScanResult> {
-  const result: ScanResult = { scanned: 0, newItems: 0, skipped: 0, warnings: [] };
+  const result: ScanResult = { scanned: 0, newItems: 0, skipped: 0, truncated: 0, warnings: [] };
   const now = options.now ?? new Date();
 
   let active;
@@ -120,6 +142,7 @@ export async function scanExternalSystems(db: BusinessDb, options: ScanOptions):
   for (const system of active.bundle.externalSystems) {
     const scan = system.scan;
     if (scan === null) continue;
+    let sentRequest = false;
     try {
       const state = await loadSystemState(db, system.id);
       if (!isDue({ ...system, scan }, state, now)) {
@@ -174,12 +197,14 @@ export async function scanExternalSystems(db: BusinessDb, options: ScanOptions):
         recordCall: (call) => recordCall(db, call),
         capPerDay,
       });
+      sentRequest = true;
       if (!sent.ok) {
         await record(sent.code, false);
         continue;
       }
 
       let items: unknown[];
+      let cut = false;
       if (sent.json === undefined) {
         await record('scan_unreadable', false);
         continue;
@@ -188,7 +213,10 @@ export async function scanExternalSystems(db: BusinessDb, options: ScanOptions):
       else {
         const list = readFieldPath(sent.json, scan.itemsPath);
         if (list === undefined || list === null) items = [];
-        else if (Array.isArray(list)) items = list.slice(0, MAX_SCAN_ITEMS);
+        else if (Array.isArray(list)) {
+          cut = list.length > MAX_SCAN_ITEMS;
+          items = list.slice(0, MAX_SCAN_ITEMS);
+        }
         else {
           await record('scan_unreadable', false);
           continue;
@@ -209,11 +237,23 @@ export async function scanExternalSystems(db: BusinessDb, options: ScanOptions):
         });
         if (inserted) result.newItems += 1;
       }
-      await record(SCAN_OK, true);
+      if (cut) {
+        result.truncated += 1;
+        result.warnings.push(`external scan of ext:${system.id} returned more than ${MAX_SCAN_ITEMS} items — the rest were not stored`);
+        await record(SCAN_TRUNCATED, false);
+      } else {
+        await record(SCAN_OK, true);
+      }
     } catch (error) {
       result.warnings.push(
         `external scan of ext:${system.id} failed: ${error instanceof Error ? error.constructor.name : 'unknown'}`,
       );
+      if (sentRequest) {
+        // Best effort, so the back-off applies; a second failure here is only noted.
+        await recordScanAttempt(db, system.id, { at: now, outcome: SCAN_FAILED, succeeded: false }).catch(() => {
+          result.warnings.push(`external scan of ext:${system.id}: the failed attempt could not be recorded`);
+        });
+      }
     }
   }
   return result;

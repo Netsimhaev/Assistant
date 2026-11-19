@@ -352,11 +352,12 @@ export async function collectDigestFacts(
         AND NOT EXISTS (
           SELECT 1 FROM job_steps s
            WHERE s.job_id = j.job_id AND s.actor = 'human' AND s.reason LIKE 'denied:%')
-        -- A learning job over external events (positive marker: it claimed
-        -- events) is the assistant reading, not a task done for the owner.
+        -- A learning job over external events (positive marker: its
+        -- external_learning_jobs row) is the assistant reading, not a task
+        -- done for the owner.
         AND NOT EXISTS (
-          SELECT 1 FROM external_events e
-           WHERE e.business_id = j.business_id AND e.curation_job_id = j.job_id)`,
+          SELECT 1 FROM external_learning_jobs l
+           WHERE l.business_id = j.business_id AND l.job_id = j.job_id)`,
     [businessId, start, end],
   );
   // Windowed on the STEP's own `completed_at` — fix round 1, item 4. Windowing
@@ -437,6 +438,11 @@ export async function collectDigestFacts(
        FROM jobs j
       WHERE j.business_id = $1 AND j.phase = 'failed'
         AND j.closed_at >= $2 AND j.closed_at < $3
+        -- A failed learning job is not a failed instruction of the owner's;
+        -- it is shown on /systems instead (same marker as jobsCompleted).
+        AND NOT EXISTS (
+          SELECT 1 FROM external_learning_jobs l
+           WHERE l.business_id = j.business_id AND l.job_id = j.job_id)
       ORDER BY j.closed_at DESC
       LIMIT ${MAX_NAMED_EXCEPTIONS}`,
     [businessId, start, end],

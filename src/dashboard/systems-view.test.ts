@@ -15,7 +15,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { createServer } from './server.js';
-import { scanOutcomeText } from './systems-view.js';
+import { LEARNING_FAILED_TEXT, scanOutcomeText } from './systems-view.js';
 
 const BUSINESS = 'test-business';
 const USERNAME = 'owner';
@@ -88,6 +88,26 @@ describe('GET /systems', () => {
     // The connections page links here.
     const connections = await (await fetch(`${baseUrl}/connections`, { headers: { cookie } })).text();
     expect(connections).toContain('href="/systems"');
+  });
+
+  it('says when the last scan was cut at 200 items, and when learning failed in the last 24h', async () => {
+    await withBusiness(BUSINESS, (db) =>
+      installCharter(db, buildCharter({ externalSystems: [crmFixture()], connections: [crmConnection()] })),
+    );
+    await withBusiness(BUSINESS, (db) => recordScanAttempt(db, 'crm', { at: new Date(), outcome: 'scan_truncated', succeeded: false }));
+    await testDb().query(
+      `INSERT INTO external_learning_jobs (business_id, job_id, system_id, failed_at) VALUES ($1, 'J-1', 'crm', now() - interval '1 hour')`,
+      [BUSINESS],
+    );
+    const { baseUrl, cookie } = await start();
+    const html = await (await fetch(`${baseUrl}/systems`, { headers: { cookie } })).text();
+    expect(html).toContain('הסריקה האחרונה החזירה יותר מ-200 פריטים — חלק לא נקלטו; כדאי לצמצם את הסריקה או להגדיר סינון לפי תאריך');
+    expect(html).toContain(LEARNING_FAILED_TEXT);
+
+    // A failure older than 24h is not shown.
+    await testDb().query(`UPDATE external_learning_jobs SET failed_at = now() - interval '2 days' WHERE business_id = $1`, [BUSINESS]);
+    const later = await (await fetch(`${baseUrl}/systems`, { headers: { cookie } })).text();
+    expect(later).not.toContain(LEARNING_FAILED_TEXT);
   });
 
   it('says so when no system is signed, and sits behind the no-charter gate', async () => {

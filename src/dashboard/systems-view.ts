@@ -13,8 +13,8 @@
 import type { ServerResponse } from 'node:http';
 import { loadActiveCharter } from '../charter/store.js';
 import type { BusinessDb } from '../db/pool.js';
-import { countEventsSince, loadSystemState, recentEvents } from '../external/store.js';
-import { SCAN_OK } from '../external/scan.js';
+import { countEventsSince, lastLearningFailure, loadSystemState, recentEvents } from '../external/store.js';
+import { MAX_SCAN_ITEMS, SCAN_FAILED, SCAN_OK, SCAN_TRUNCATED } from '../external/scan.js';
 import { EXTERNAL_MESSAGES_HE } from '../orchestrator/adapters/external.js';
 import { errorPage, page, sendHtml } from './mailbox-connect.js';
 import { escLabel, escapeHtml as esc } from './views.js';
@@ -31,7 +31,12 @@ const SCAN_OUTCOME_HE: Readonly<Record<string, string>> = {
   not_connected: 'המערכת אינה מחוברת כרגע — לא נסרקה',
   scan_unreadable: 'התשובה מהמערכת לא הייתה במבנה שהוגדר — לא נשמר דבר',
   bad_params: 'לא ניתן היה לבנות את בקשת הסריקה מההגדרה',
+  [SCAN_FAILED]: 'אירעה תקלה בזמן שמירת מה שהסריקה החזירה — מה שנשמר עד התקלה נשאר, ננסה שוב בעוד שעה',
+  [SCAN_TRUNCATED]: `הסריקה האחרונה החזירה יותר מ-${MAX_SCAN_ITEMS} פריטים — חלק לא נקלטו; כדאי לצמצם את הסריקה או להגדיר סינון לפי תאריך`,
 };
+
+/** Shown when a learning job of this system failed in the last 24 hours. */
+export const LEARNING_FAILED_TEXT = 'הלמידה האחרונה ממה שהגיע מהמערכת הזו נכשלה ב-24 השעות האחרונות — ננסה שוב בסבב הבא.';
 
 /** The Hebrew sentence for a stored outcome code; an unknown code is said as unknown, never shown raw. */
 export function scanOutcomeText(code: string): string {
@@ -76,6 +81,7 @@ export async function handleSystems(res: ServerResponse, db: BusinessDb, now: Da
     const day = await countEventsSince(db, system.id, new Date(now.getTime() - DAY_MS));
     const week = await countEventsSince(db, system.id, new Date(now.getTime() - 7 * DAY_MS));
     const recent = await recentEvents(db, system.id, SYSTEMS_RECENT_ITEMS);
+    const learningFailedAt = await lastLearningFailure(db, system.id, new Date(now.getTime() - DAY_MS));
 
     const scanLine =
       system.scan === null
@@ -102,6 +108,7 @@ export async function handleSystems(res: ServerResponse, db: BusinessDb, now: Da
 <h2>${escLabel(system.label)} <span class="muted">(${escLabel(hostOf(system.baseUrl))})</span></h2>
 <p>${esc(scanLine)}</p>
 <p>אירועים: ${day} ב-24 השעות האחרונות · ${week} ב-7 הימים האחרונים</p>
+${learningFailedAt === null ? '' : `<p class="error">${esc(LEARNING_FAILED_TEXT)} (${esc(when(learningFailedAt, timeZone))})</p>`}
 ${items.length === 0 ? '<p class="muted">עוד לא הגיע דבר מהמערכת הזו.</p>' : `<p>האחרונים:</p><ul>${items.join('')}</ul>`}
 <p class="muted">התראות שנדחו (חתימה או מפתח שגויים): ${rejected}</p>
 </div>`);

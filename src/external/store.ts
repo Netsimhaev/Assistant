@@ -475,3 +475,31 @@ export async function recentEvents(db: BusinessDb, systemId: string, limit: numb
   );
   return rows.map(toEvent);
 }
+
+/** Records that `jobId` is a learning job for `systemId` (migration 079). */
+export async function recordLearningJob(db: BusinessDb, jobId: string, systemId: string): Promise<void> {
+  await db.query(
+    `INSERT INTO external_learning_jobs (business_id, job_id, system_id) VALUES ($1, $2, $3)
+     ON CONFLICT (business_id, job_id) DO NOTHING`,
+    [db.businessId, jobId, systemId],
+  );
+}
+
+/** Marks a learning job failed (first failure time is kept). */
+export async function markLearningJobFailed(db: BusinessDb, jobId: string): Promise<void> {
+  await db.query(
+    `UPDATE external_learning_jobs SET failed_at = coalesce(failed_at, now())
+      WHERE business_id = $1 AND job_id = $2`,
+    [db.businessId, jobId],
+  );
+}
+
+/** The latest learning failure of one system at or after `since`, or `null`. */
+export async function lastLearningFailure(db: BusinessDb, systemId: string, since: Date): Promise<Date | null> {
+  const { rows } = await db.query<{ at: Date | null }>(
+    `SELECT max(failed_at) AS at FROM external_learning_jobs
+      WHERE business_id = $1 AND system_id = $2 AND failed_at >= $3`,
+    [db.businessId, systemId, since],
+  );
+  return rows[0]?.at ?? null;
+}

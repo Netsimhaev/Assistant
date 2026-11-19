@@ -14,7 +14,8 @@ import { buildCharter } from '../test/fixtures.js';
 import { registerBusiness, resetDatabase, testDb } from '../test/db.js';
 import { TEST_MASTER_KEY } from '../test/owner.js';
 import { createGuardedHttps, type ExternalHttp, type ExternalRequest, type ExternalResult } from './http.js';
-import { SCAN_RETRY_MS, scanExternalSystems } from './scan.js';
+import { MAX_SCAN_ITEMS, SCAN_RETRY_MS, scanExternalSystems } from './scan.js';
+import type { BusinessDb } from '../db/pool.js';
 import { trip } from '../governance/killswitch.js';
 import { loadSystemState } from './store.js';
 
@@ -249,6 +250,58 @@ describe('scanExternalSystems', () => {
     expect(out).toMatchObject({ scanned: 0, skipped: 1, newItems: 0 });
     expect(http.requests).toHaveLength(0);
     expect(await calls()).toEqual([]);
+  });
+
+  it('a list longer than MAX_SCAN_ITEMS is cut, said, and does not move last_scan_at; a repeat stores no duplicate', async () => {
+    await install();
+    await connect();
+    const many = JSON.stringify({ data: Array.from({ length: 250 }, (_, i) => ({ name: `לקוח ${i}`, email: `c${i}@x.example` })) });
+    const http = fakeHttp(() => ok(many));
+
+    const first = await scan(http, T0);
+    expect(MAX_SCAN_ITEMS).toBe(200);
+    expect(first).toMatchObject({ scanned: 1, newItems: 200, truncated: 1 });
+    expect(first.warnings.join(' ')).toContain('more than 200');
+    expect(await events()).toHaveLength(200);
+    const state = await withBusiness(BUSINESS, (db) => loadSystemState(db, 'crm'));
+    expect(state?.lastScanAt).toBeNull();
+    expect(state?.lastScanOutcome).toBe('scan_truncated');
+
+    // The next attempt asks from the same point (no since yet) and stores no duplicate.
+    const again = await scan(http, new Date(T0.getTime() + SCAN_RETRY_MS));
+    expect(again).toMatchObject({ scanned: 1, newItems: 0, truncated: 1 });
+    expect(http.requests[1]?.url.searchParams.has('updated_since')).toBe(false);
+    expect(await events()).toHaveLength(200);
+  });
+
+  it('a throw while storing items keeps what was stored, records scan_failed, and backs off', async () => {
+    await install();
+    await connect();
+    const http = fakeHttp(() => ok());
+    let inserts = 0;
+    const out = await withBusiness(BUSINESS, (real) => {
+      const db: BusinessDb = {
+        businessId: real.businessId,
+        inTransaction: real.inTransaction,
+        query: ((text: string, values?: unknown[]) => {
+          if (text.includes('INSERT INTO external_events')) {
+            inserts += 1;
+            if (inserts === 2) throw new Error('db fault');
+          }
+          return real.query(text, values as never);
+        }) as BusinessDb['query'],
+      };
+      return scanExternalSystems(db, { http, credentials: storedCredentials(TEST_MASTER_KEY), now: T0 });
+    });
+    expect(out.warnings.join(' ')).toContain('failed');
+    expect(await events()).toHaveLength(1);
+    const state = await withBusiness(BUSINESS, (db) => loadSystemState(db, 'crm'));
+    expect(state?.lastScanOutcome).toBe('scan_failed');
+    expect(state?.lastScanAttemptAt?.toISOString()).toBe(T0.toISOString());
+    expect(state?.lastScanAt).toBeNull();
+
+    await scan(http, new Date(T0.getTime() + SCAN_RETRY_MS - 1));
+    expect(http.requests).toHaveLength(1);
   });
 
   it('an unreadable charter scans nothing and says so', async () => {

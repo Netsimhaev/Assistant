@@ -37,6 +37,13 @@ export interface CurationOutcome {
   rejected: number;
   /** True when something threw partway through — a bug or an outage, never a control. */
   failed: boolean;
+  /**
+   * True once the curator (the billed model call) was actually invoked —
+   * whether it then answered or threw. A throw BEFORE it (brief, cap query)
+   * leaves this false: nothing was paid for, and a caller that claimed work
+   * for this run may give it back to be retried (`external/learn.ts`).
+   */
+  modelCalled: boolean;
 }
 
 export interface CurateJobOptions {
@@ -113,10 +120,11 @@ export async function curateJob(
   const businessId = db.businessId;
   const scope = options.scope ?? 'default';
   const prefix = SCOPE_PREFIX[scope];
-  const idle: CurationOutcome = { ran: false, skipped: null, written: 0, rejected: 0, failed: false };
+  const idle: CurationOutcome = { ran: false, skipped: null, written: 0, rejected: 0, failed: false, modelCalled: false };
 
   let written = 0;
   let rejected = 0;
+  let modelCalled = false;
 
   // Everything that can throw — plan lookup, the cap query, the brief, the
   // model call, and every write — lives inside this one `try`. Fix round 1
@@ -163,6 +171,7 @@ export async function curateJob(
     if (brief === null) return { ...idle, skipped: 'no_brief' };
 
     const curator = options.curator ?? curateWithModel;
+    modelCalled = true;
     const result = await curator(brief);
     const sifted = siftCandidates(result, brief.touched);
     rejected = sifted.rejected.length;
@@ -206,7 +215,7 @@ export async function curateJob(
       }
     );
 
-    return { ran: true, skipped: null, written, rejected, failed: false };
+    return { ran: true, skipped: null, written, rejected, failed: false, modelCalled };
   } catch (err) {
     // The job is finished either way — see the header. But a billed call
     // that throws must still leave a trace (fix round 1, I2): otherwise the
@@ -221,7 +230,7 @@ export async function curateJob(
     // completed before the failure are real and must not be reported
     // alongside `ran: false`, which fix round 1 (minor 8) called
     // self-contradictory.
-    return { ran: written > 0, skipped: null, written, rejected, failed: true };
+    return { ran: written > 0, skipped: null, written, rejected, failed: true, modelCalled };
   }
 }
 
