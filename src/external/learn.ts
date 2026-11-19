@@ -80,6 +80,7 @@ async function releaseStaleClaims(db: BusinessDb): Promise<void> {
   );
   for (const row of rows) {
     if (row.phase === 'understand') {
+      let failedHere = false;
       try {
         await transition(db, row.job_id, {
           to: 'failed',
@@ -87,12 +88,40 @@ async function releaseStaleClaims(db: BusinessDb): Promise<void> {
           reason: 'external learning: interrupted pass',
           expectFrom: 'understand',
         });
+        failedHere = true;
       } catch (error) {
         if (!(error instanceof PhaseMovedError)) throw error;
+        // Another pass already moved it; its outcome is that pass's to record,
+        // so no failure is written here (it would show falsely on /systems).
       }
-      await markLearningJobFailed(db, row.job_id);
+      if (failedHere) await markLearningJobFailed(db, row.job_id);
     }
     await releaseCurationClaim(db, row.job_id);
+  }
+}
+
+/**
+ * Moves a learning job that is still open (`intake` or `understand`) to
+ * `failed`, at best effort. A job another pass already moved is left alone
+ * (`PhaseMovedError`); any other error is noted by class name only.
+ */
+async function failOpenJob(db: BusinessDb, jobId: string, result: LearnResult): Promise<void> {
+  for (const from of ['understand', 'intake'] as const) {
+    try {
+      await transition(db, jobId, {
+        to: 'failed',
+        actor: 'orchestrator',
+        reason: 'external learning: failed',
+        expectFrom: from,
+      });
+      return;
+    } catch (error) {
+      if (error instanceof PhaseMovedError) continue;
+      result.warnings.push(
+        `external learning: could not fail job ${jobId}: ${error instanceof Error ? error.constructor.name : 'unknown'}`,
+      );
+      return;
+    }
   }
 }
 
@@ -172,11 +201,13 @@ export async function learnFromExternalEvents(db: BusinessDb, options: LearnOpti
       result.warnings.push(
         `external learning for ext:${system.id} failed: ${error instanceof Error ? error.constructor.name : 'unknown'}`,
       );
-      // Best effort: a job opened before the throw is marked failed and its
-      // still-uncurated events go back; if this also fails, the stale-claim
-      // sweep of a later pass does the same.
+      // Best effort: a job opened before the throw is failed, marked failed,
+      // and its still-uncurated events go back. The job must be moved HERE:
+      // once its claims are released the stale-claim sweep can no longer find
+      // it, and it would sit in `understand` for good.
       if (jobId !== null) {
         const id = jobId;
+        await failOpenJob(db, id, result);
         await markLearningJobFailed(db, id).catch(() => undefined);
         await releaseCurationClaim(db, id).catch(() => undefined);
       }

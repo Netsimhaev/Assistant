@@ -245,4 +245,67 @@ describe('learnFromExternalEvents', () => {
     expect(await learn(curator)).toMatchObject({ jobs: 1, curated: 2 });
     expect(calls).toBe(1);
   });
+
+  it('a throw after the job was opened leaves it failed, not stuck in understand', async () => {
+    await install();
+    await seedEvents(2);
+    const out = await withBusiness(BUSINESS, (real) => {
+      const db: BusinessDb = {
+        businessId: real.businessId,
+        inTransaction: real.inTransaction,
+        query: ((text: string, values?: unknown[]) => {
+          if (text.includes('SET curation_job_id = $3')) throw new Error('claim fault');
+          return real.query(text, values as never);
+        }) as BusinessDb['query'],
+      };
+      return learnFromExternalEvents(db, { curator: async () => ({ candidates: [] }) });
+    });
+    expect(out.jobs).toBe(1);
+    expect(out.warnings.join(' ')).toContain('failed');
+    const { rows } = await testDb().query<{ phase: string; failed_at: Date | null }>(
+      `SELECT j.phase, l.failed_at FROM external_learning_jobs l JOIN jobs j ON j.job_id = l.job_id WHERE l.business_id = $1`,
+      [BUSINESS],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.phase).toBe('failed');
+    expect(rows[0]?.failed_at).not.toBeNull();
+    expect(await uncurated()).toBe(2);
+  });
+
+  it('a stale orphan another pass already moved is not recorded as a learning failure', async () => {
+    const charterVersion = await install();
+    await seedEvents(1);
+    const orphan = await withBusiness(BUSINESS, (db) =>
+      createJob(db, { charterVersion, provenance: 'unknown_external', title: LEARNING_JOB_TITLE }),
+    );
+    await testDb().query(
+      `INSERT INTO external_learning_jobs (business_id, job_id, system_id) VALUES ($1, $2, 'crm')`,
+      [BUSINESS, orphan.jobId],
+    );
+    await testDb().query(`UPDATE jobs SET phase = 'understand', created_at = now() - interval '2 hours' WHERE job_id = $1`, [orphan.jobId]);
+    await testDb().query(`UPDATE external_events SET curation_job_id = $1 WHERE business_id = $2`, [orphan.jobId, BUSINESS]);
+
+    let raced = false;
+    await withBusiness(BUSINESS, (real) => {
+      const db: BusinessDb = {
+        businessId: real.businessId,
+        inTransaction: real.inTransaction,
+        query: (async (text: string, values?: unknown[]) => {
+          if (!raced && text.includes('FOR UPDATE') && Array.isArray(values) && values[0] === orphan.jobId) {
+            raced = true;
+            // Another pass moves the job between the sweep's read and its transition.
+            await testDb().query(`UPDATE jobs SET phase = 'closed' WHERE job_id = $1`, [orphan.jobId]);
+          }
+          return real.query(text, values as never);
+        }) as BusinessDb['query'],
+      };
+      return learnFromExternalEvents(db, { curator: async () => ({ candidates: [] }) });
+    });
+    expect(raced).toBe(true);
+    const { rows } = await testDb().query<{ failed_at: Date | null }>(
+      `SELECT failed_at FROM external_learning_jobs WHERE job_id = $1`,
+      [orphan.jobId],
+    );
+    expect(rows[0]?.failed_at).toBeNull();
+  });
 });
