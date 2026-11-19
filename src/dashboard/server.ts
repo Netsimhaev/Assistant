@@ -69,6 +69,7 @@ import { localParts } from '../util/local-time.js';
 import { readHeader, renderReadsForOwner } from '../external/render-reads.js';
 import { loadRecentOwnerReads } from '../external/store.js';
 import { EXTERNAL_HOOK_PATH, handleExternalWebhook } from '../external/webhook.js';
+import { handleSystems } from './systems-view.js';
 import { storedCredentials } from '../governance/credential-store.js';
 import { config } from '../config.js';
 import { DigestSchedule, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
@@ -3527,6 +3528,7 @@ async function route(
     return handleCalendarRevertPost(res, db, session, await readFormBody(req));
   }
   // External systems: the owner signs what the technician drafted (Stage D).
+  if (method === 'GET' && pathname === '/systems') return handleSystems(res, db);
   if (method === 'GET' && pathname === '/connections/external') {
     return handleExternalStatus(res, db, issueCsrfToken(session.sessionId), requestUrl.searchParams);
   }

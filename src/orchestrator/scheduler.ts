@@ -37,6 +37,11 @@ import { evaluateAutonomy } from './promote.js';
 import type { AutonomyPassResult } from './promote.js';
 import { resumeDelegatedJobs } from './resume-delegated.js';
 import { pollMailbox } from './mail-poll.js';
+import { scanExternalSystems, type ScanResult as ExternalScanResult } from '../external/scan.js';
+import { learnFromExternalEvents, type LearnResult as ExternalLearnResult } from '../external/learn.js';
+import type { ExternalHttp } from '../external/http.js';
+import type { Curator } from '../sdk/curator.js';
+import { sharedGuardedHttps } from './runtime.js';
 import type { MailPollResult, PollMailboxOptions } from './mail-poll.js';
 import type { ResumeResult } from './resume-delegated.js';
 import { runDueJobs } from './run-due.js';
@@ -679,6 +684,21 @@ export interface SchedulerPassResult {
    * reason: a broken mailbox must not stop the plans and closes below it.
    */
   mailError: string | null;
+  /**
+   * The daily scan of every system the ACTIVE charter signs with a `scan`
+   * block (`external/scan.ts`, ruling 9: a documented gate bypass), right
+   * after the mailbox poll. `null` only when it threw — `externalScanError`
+   * says why; a pass where nothing was due is zeros.
+   */
+  externalScan: ExternalScanResult | null;
+  externalScanError: string | null;
+  /**
+   * Learning from external events (webhook and scan) — chunk-only curation
+   * under its own daily cap (`external/learn.ts`), right after the scan, so
+   * what the scan stored this pass is learned this pass. `null` = it threw.
+   */
+  externalLearn: ExternalLearnResult | null;
+  externalLearnError: string | null;
   due: RunDueResult;
   /**
    * Confirmed boss commands asked again this pass (`reaskFailedCommands`):
@@ -923,6 +943,10 @@ export async function schedulerPass(
     mailClient?: PollMailboxOptions['client'];
     mailTriage?: PollMailboxOptions['triage'];
     mailDrafter?: PollMailboxOptions['drafter'];
+    /** Test seam; production leaves it unset and the scan uses `runtime.externalHttp` (the guarded client). */
+    externalHttp?: ExternalHttp;
+    /** Test seam; production leaves it unset and external learning gets the billed curator (`refuseUnderTest` guards it). */
+    externalCurator?: Curator;
     /** Test seam; production leaves it unset and act-mode nudges use `runNudgeDrafter`. */
     ledgerDrafter?: NudgeDrafter;
     /** Test seam; production leaves it unset and the meetings sweep uses the real calendar client. */
@@ -1091,6 +1115,35 @@ export async function schedulerPass(
     }));
   } catch (err) {
     mailError = err instanceof Error ? err.message : String(err);
+  }
+
+  // External systems (Stage D): the daily scan, then learning from whatever
+  // the scan and the webhook stored. Each in its own stage and its own catch:
+  // a broken system must not stop the plans and closes below.
+  let externalScan: ExternalScanResult | null = null;
+  let externalScanError: string | null = null;
+  try {
+    const http = options.externalHttp ?? runtime.externalHttp ?? sharedGuardedHttps();
+    externalScan = await stage((db) =>
+      scanExternalSystems(db, {
+        http,
+        credentials: runtime.credentials,
+        ...(options.now !== undefined ? { now: options.now } : {}),
+      }),
+    );
+  } catch (err) {
+    externalScanError = err instanceof Error ? err.message : String(err);
+  }
+  let externalLearn: ExternalLearnResult | null = null;
+  let externalLearnError: string | null = null;
+  try {
+    externalLearn = await stage((db) =>
+      learnFromExternalEvents(db, {
+        ...(options.externalCurator !== undefined ? { curator: options.externalCurator } : {}),
+      }),
+    );
+  } catch (err) {
+    externalLearnError = err instanceof Error ? err.message : String(err);
   }
 
   // Right after the poll: a reply that arrived this pass closes its item
@@ -1371,6 +1424,10 @@ export async function schedulerPass(
     whatsappDoor,
     mail,
     mailError,
+    externalScan,
+    externalScanError,
+    externalLearn,
+    externalLearnError,
     due,
     reasked,
     reaskError,

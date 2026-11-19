@@ -140,6 +140,14 @@ export interface Runtime {
    */
   production?: { available: boolean; sofficePath: string | null; chromiumPath: string | null };
   /**
+   * The HTTPS client this business's external-system adapters were built
+   * with — the one guarded client, or the test seam. The daily scan
+   * (`external/scan.ts`) sends through this same client. Optional so
+   * hand-built test runtimes keep typechecking; `schedulerPass` falls back
+   * to the process's guarded client.
+   */
+  externalHttp?: ExternalHttp;
+  /**
    * What could not be assembled, and why.
    *
    * Returned rather than logged here, and never swallowed: a runtime missing
@@ -889,6 +897,7 @@ export async function businessRuntime(server: ServerRuntime, db: BusinessDb): Pr
     ...(whatsapp !== undefined ? { whatsapp } : {}),
     ...(inbox !== undefined ? { inbox } : {}),
     production: server.production,
+    externalHttp: overrides.externalHttp ?? sharedGuardedHttps(),
     warnings,
   };
 }
@@ -896,7 +905,7 @@ export async function businessRuntime(server: ServerRuntime, db: BusinessDb): Pr
 let guardedHttps: ExternalHttp | null = null;
 
 /** The one guarded HTTPS client of this process, built on first use. Stateless per request. */
-function sharedGuardedHttps(): ExternalHttp {
+export function sharedGuardedHttps(): ExternalHttp {
   guardedHttps ??= createGuardedHttps();
   return guardedHttps;
 }

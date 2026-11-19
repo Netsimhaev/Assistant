@@ -1,11 +1,13 @@
 import type { ExternalSystem } from '../../domain/external-system.js';
-import { extractFields, readFieldPath, displayValue } from '../../external/extract.js';
+import { readFieldPath, displayValue } from '../../external/extract.js';
+import type { ExternalHttp } from '../../external/http.js';
 import {
-  EXTERNAL_DEADLINE_MS,
-  EXTERNAL_MAX_BYTES,
-  type ExternalHttp,
-  type ExternalResult,
-} from '../../external/http.js';
+  carriesSecret,
+  extractSafeFields,
+  headerSafe,
+  secretForms,
+  sendExternal,
+} from '../../external/perform.js';
 import { buildExternalRequestFromPayload } from '../../external/request.js';
 import { REDACTED } from '../../policy/redact.js';
 import { resolveExternalCall } from '../../policy/external-class.js';
@@ -94,26 +96,6 @@ function fail(code: ExternalCode, retryable: boolean, extra: { outcomeUnknown?: 
   return { ok: false, retryable, code, message: EXTERNAL_MESSAGES_HE[code], ...extra };
 }
 
-/**
- * A secret usable as a header value: printable ASCII, no spaces at the ends,
- * nothing that could end the header line. Anything else is refused before a
- * request exists, rather than left for the HTTP stack to throw on.
- */
-function headerSafe(secret: string): boolean {
-  return /^[\x21-\x7E](?:[\x20-\x7E]*[\x21-\x7E])?$/.test(secret);
-}
-
-function authHeader(system: ExternalSystem, secret: string): [string, string] {
-  switch (system.auth.kind) {
-    case 'bearer':
-      return ['Authorization', `Bearer ${secret}`];
-    case 'basic':
-      return ['Authorization', `Basic ${Buffer.from(secret, 'utf8').toString('base64')}`];
-    case 'header':
-      return [system.auth.header, secret];
-  }
-}
-
 /** Deep enough for any real payload; a guard against a cyclic structure. */
 const MARKER_SCAN_DEPTH = 12;
 
@@ -145,81 +127,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-/** The JSON body of a response, or `undefined` when it is not JSON. */
-function parseJson(body: string): unknown {
-  if (body.trim() === '') return undefined;
-  try {
-    return JSON.parse(body) as unknown;
-  } catch {
-    return undefined;
-  }
-}
-
-/** The outcome of one send, for a read (`isWrite: false`) or a write. */
-function classify(result: ExternalResult, isWrite: boolean): ExternalCode | 'ok' | 'timeout_unknown' | 'timeout' {
-  switch (result.kind) {
-    case 'refused_address':
-      return 'external_address_refused';
-    case 'too_large':
-      // The far end answered, so a write may well have landed; the status is
-      // not known to us. A read just cannot be used.
-      return isWrite ? 'delivery_unknown' : 'external_response_too_large';
-    case 'timeout':
-      return isWrite && result.sent ? 'timeout_unknown' : 'timeout';
-    case 'network':
-      if (!result.sent) return 'external_network';
-      return isWrite ? 'delivery_unknown' : 'external_network';
-    case 'response': {
-      const s = result.status;
-      if (s >= 200 && s <= 299) return 'ok';
-      if (s === 401 || s === 403) return 'external_auth';
-      if (!isWrite && (s === 429 || (s >= 500 && s <= 599))) return 'external_unavailable';
-      if (isWrite && (s === 429 || s === 503)) return 'external_unavailable';
-      if (isWrite && s >= 500 && s <= 599) return 'delivery_unknown';
-      if (s >= 400 && s <= 499) return 'external_rejected';
-      // 1xx / 3xx (redirects are never followed). A write answered with a
-      // redirect may have been performed (POST-then-redirect), so it is
-      // ambiguous; a read simply did not get its answer.
-      return isWrite ? 'delivery_unknown' : 'external_rejected';
-    }
-  }
-}
-
-const RETRYABLE: ReadonlySet<ExternalCode> = new Set<ExternalCode>([
-  'external_daily_cap',
-  'external_cap_unreadable',
-  'external_unavailable',
-  'external_network',
-  'adapter_timeout',
-  'external_definition_stale',
-]);
-
-/**
- * The secret in every form this adapter sends it: raw, and for basic auth its
- * base64. A field value that contains any of them is dropped — a provider
- * echoing the Authorization header must never land the key in `output` or
- * `external_reads`.
- */
-function secretForms(system: ExternalSystem, secret: string): string[] {
-  const forms = [secret];
-  if (system.auth.kind === 'basic') forms.push(Buffer.from(secret, 'utf8').toString('base64'));
-  return forms;
-}
-
-function carriesSecret(value: string, forms: readonly string[]): boolean {
-  return forms.some((form) => value.includes(form));
-}
-
 export function createExternalAdapter(system: ExternalSystem, deps: ExternalAdapterDeps): ExternalAdapter {
   const systemName = `ext:${system.id}`;
-
-  async function count(outcome: string): Promise<void> {
-    // Bookkeeping, not control: the call already happened, and a failed
-    // INSERT must not turn its outcome into a different one.
-    await deps.recordCall({ systemId: system.id, outcome }).catch(() => {
-      console.error(`[external] could not record a call for ${systemName}`);
-    });
-  }
 
   async function execute(call: AdapterCall): Promise<AdapterResult> {
     // Same definition as the gate, or nothing: see `ExternalAdapterDeps.charterVersion`.
@@ -253,60 +162,18 @@ export function createExternalAdapter(system: ExternalSystem, deps: ExternalAdap
       return fail('external_redacted_value', false);
     }
 
-    if (deps.capPerDay <= 0) return fail('external_disabled', false);
-    let today: number;
-    try {
-      today = await deps.callsToday(system.id);
-    } catch {
-      return fail('external_cap_unreadable', true);
+    // The shared path (`external/perform.ts`): cap, auth, guarded send,
+    // outcome table and call log — the same one the daily scan takes.
+    const sent = await sendExternal(system, built, secret, isWrite, deps);
+    if (!sent.ok) {
+      return fail(sent.code, sent.retryable, sent.outcomeUnknown === true ? { outcomeUnknown: true } : {});
     }
-    if (today >= deps.capPerDay) return fail('external_daily_cap', true);
-
-    const [authName, authValue] = authHeader(system, secret);
-    const headers: Record<string, string> = { ...built.headers, [authName]: authValue };
-
-    let result: ExternalResult;
-    try {
-      result = await deps.http.send({
-        method: built.method,
-        url: built.url,
-        headers,
-        body: built.body,
-        deadlineMs: EXTERNAL_DEADLINE_MS,
-        maxBytes: EXTERNAL_MAX_BYTES,
-      });
-    } catch (error) {
-      // Nothing from the thrown error is kept — it may quote a header. The one
-      // throw placed BEFORE any send is the client's refusal of a non-https
-      // URL (a TypeError): a final refusal, never "maybe done". Any other
-      // throw cannot be placed, so a write is `delivery_unknown`.
-      const beforeSend = error instanceof TypeError && built.url.protocol !== 'https:';
-      const code: ExternalCode = beforeSend
-        ? 'external_bad_url'
-        : isWrite
-          ? 'delivery_unknown'
-          : 'external_request_failed';
-      await count(code);
-      return fail(code, false);
-    }
-
-    const outcome = classify(result, isWrite);
-    if (outcome === 'ok' && result.kind === 'response') {
-      await count('ok');
-      const json = parseJson(result.body);
-      const forms = secretForms(system, secret);
-      const fields = extractFields(json, op.fields).filter((f) => !carriesSecret(f.value, forms));
-      const rawId = op.idPath === null ? null : displayValue(readFieldPath(json, op.idPath));
-      const externalId = rawId !== null && carriesSecret(rawId, forms) ? null : rawId;
-      return { ok: true, output: { fields }, externalId };
-    }
-    if (outcome === 'timeout' || outcome === 'timeout_unknown') {
-      await count('adapter_timeout');
-      return fail('adapter_timeout', true, outcome === 'timeout_unknown' ? { outcomeUnknown: true } : {});
-    }
-    const code: ExternalCode = outcome === 'ok' ? 'external_request_failed' : outcome;
-    await count(code);
-    return fail(code, RETRYABLE.has(code));
+    const json = sent.json;
+    const forms = secretForms(system, secret);
+    const fields = extractSafeFields(json, op.fields, forms);
+    const rawId = op.idPath === null ? null : displayValue(readFieldPath(json, op.idPath));
+    const externalId = rawId !== null && carriesSecret(rawId, forms) ? null : rawId;
+    return { ok: true, output: { fields }, externalId };
   }
 
   return { system: systemName, channel: 'api', serves: EXTERNAL_SERVES, execute };

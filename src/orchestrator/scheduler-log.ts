@@ -55,6 +55,14 @@ export function logErrored(result: SchedulerPassResult, businessId: string | nul
   if (result.mailError !== null) {
     console.error(`mailbox poll failed: ${result.mailError}`);
   }
+  // External systems (Stage D): the scan and the learning loop. A thrown
+  // stage, and every per-system warning (an unreadable charter, a system
+  // whose scan or learning faulted) — codes and class names only, never
+  // provider text.
+  if (result.externalScanError !== null) console.error(`external scan failed: ${result.externalScanError}`);
+  for (const warning of result.externalScan?.warnings ?? []) console.error(`external scan: ${warning}`);
+  if (result.externalLearnError !== null) console.error(`external learning failed: ${result.externalLearnError}`);
+  for (const warning of result.externalLearn?.warnings ?? []) console.error(`external learning: ${warning}`);
   // Mail body retention (`mail-retention.ts`): a failed pass leaves bodies
   // past their year in place until the next one succeeds.
   if (result.mailRetentionError !== null) {

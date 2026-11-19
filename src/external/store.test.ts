@@ -9,7 +9,12 @@ import {
   loadDrafts,
   loadReadsForJob,
   markEventsCurated,
-  newEventsSince,
+  uncuratedEvents,
+  claimEventsForCuration,
+  eventsForCurationJob,
+  releaseCurationClaim,
+  recordScanAttempt,
+  loadSystemState,
   recordCall,
   recordExternalRead,
   recordRejectedHook,
@@ -57,14 +62,42 @@ describe('external store', () => {
     expect(rows).toHaveLength(1);
   });
 
-  it('lists uncurated events after a cursor and marks them curated', async () => {
+  it('lists uncurated events, claims them for one job only, and marks them curated', async () => {
+    await withBusiness(TEST_BUSINESS, async (db) => {
+      await insertEvent(db, { systemId: 'crm', source: 'scan', eventType: 'x', itemHash: 'a', fields });
+      await insertEvent(db, { systemId: 'crm', source: 'webhook', eventType: 'x', itemHash: 'b', fields });
+      await insertEvent(db, { systemId: 'erp', source: 'scan', eventType: 'x', itemHash: 'c', fields });
+    });
+    const first = await withBusiness(TEST_BUSINESS, (db) => uncuratedEvents(db, 'crm', 20));
+    expect(first.map((e) => e.itemHash)).toEqual(['a', 'b']);
+    expect(await withBusiness(TEST_BUSINESS, (db) => uncuratedEvents(db, 'crm', 1))).toHaveLength(1);
+
+    const ids = first.map((e) => e.eventId);
+    expect(await withBusiness(TEST_BUSINESS, (db) => claimEventsForCuration(db, ids, 'J-1'))).toHaveLength(2);
+    // Claimed rows are neither listed again nor claimable by a second job.
+    expect(await withBusiness(TEST_BUSINESS, (db) => uncuratedEvents(db, 'crm', 20))).toHaveLength(0);
+    expect(await withBusiness(TEST_BUSINESS, (db) => claimEventsForCuration(db, ids, 'J-2'))).toEqual([]);
+    expect((await withBusiness(TEST_BUSINESS, (db) => eventsForCurationJob(db, 'J-1'))).map((e) => e.itemHash)).toEqual(['a', 'b']);
+
+    // A release gives them back; a mark makes them curated for good.
+    await withBusiness(TEST_BUSINESS, (db) => releaseCurationClaim(db, 'J-1'));
+    expect(await withBusiness(TEST_BUSINESS, (db) => uncuratedEvents(db, 'crm', 20))).toHaveLength(2);
+    await withBusiness(TEST_BUSINESS, (db) => markEventsCurated(db, ids));
+    expect(await withBusiness(TEST_BUSINESS, (db) => uncuratedEvents(db, 'crm', 20))).toHaveLength(0);
+  });
+
+  it('a failed scan attempt records its outcome without moving last_scan_at', async () => {
+    const ok = new Date('2026-11-01T08:00:00Z');
+    const bad = new Date('2026-11-02T08:00:00Z');
+    await withBusiness(TEST_BUSINESS, (db) => recordScanAttempt(db, 'crm', { at: ok, outcome: 'ok', succeeded: true }));
     await withBusiness(TEST_BUSINESS, (db) =>
-      insertEvent(db, { systemId: 'crm', source: 'scan', eventType: 'x', itemHash: 'a', fields }),
+      recordScanAttempt(db, 'crm', { at: bad, outcome: 'external_auth', succeeded: false }),
     );
-    const first = await withBusiness(TEST_BUSINESS, (db) => newEventsSince(db, null));
-    expect(first).toHaveLength(1);
-    await withBusiness(TEST_BUSINESS, (db) => markEventsCurated(db, first.map((e) => e.eventId)));
-    expect(await withBusiness(TEST_BUSINESS, (db) => newEventsSince(db, null))).toHaveLength(0);
+    const state = await withBusiness(TEST_BUSINESS, (db) => loadSystemState(db, 'crm'));
+    expect(state?.lastScanAt?.toISOString()).toBe(ok.toISOString());
+    expect(state?.lastScanAttemptAt?.toISOString()).toBe(bad.toISOString());
+    expect(state?.lastScanOutcome).toBe('external_auth');
+    expect(await withBusiness(TEST_BUSINESS, (db) => loadSystemState(db, 'nope'))).toBeNull();
   });
 
   it('counts calls from local midnight of the zone, not UTC midnight', async () => {
@@ -109,7 +142,7 @@ describe('external store', () => {
     });
     await withBusiness(OTHER, async (db) => {
       expect(await loadDrafts(db)).toHaveLength(0);
-      expect(await newEventsSince(db, null)).toHaveLength(0);
+      expect(await uncuratedEvents(db, 'crm', 20)).toHaveLength(0);
       expect(await countCallsToday(db, 'crm', 'UTC')).toBe(0);
       // the same hash is a fresh event for the other business
       expect(await insertEvent(db, { systemId: 'crm', source: 'scan', eventType: 'x', itemHash: 'h', fields })).toBe(true);

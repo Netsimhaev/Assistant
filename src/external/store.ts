@@ -98,6 +98,53 @@ export async function loadSignedDefinition(db: BusinessDb, systemId: string): Pr
   return rows[0]?.definition ?? null;
 }
 
+export interface SignedSystemName {
+  label: string;
+  /** Webhook event types and operation names, each with its signed Hebrew label. */
+  eventLabels: Map<string, string>;
+}
+
+/**
+ * The signed label of every system in the active charter, and of its event
+ * types and operations, by id. A narrow read like `loadSignedDefinition` —
+ * an unparseable charter does not take a brief, a digest or a screen down
+ * with it; a missing label is simply absent and the caller falls back to the id.
+ */
+export async function signedSystemNames(db: BusinessDb): Promise<Map<string, SignedSystemName>> {
+  const { rows } = await db.query<{ def: unknown }>(
+    `SELECT e.def
+       FROM charter_active ca
+       JOIN charter_versions cv ON cv.business_id = ca.business_id AND cv.charter_version = ca.charter_version
+       CROSS JOIN LATERAL jsonb_array_elements(
+         CASE WHEN jsonb_typeof(cv.charter -> 'externalSystems') = 'array'
+              THEN cv.charter -> 'externalSystems' ELSE '[]'::jsonb END) AS e(def)
+      WHERE ca.business_id = $1`,
+    [db.businessId],
+  );
+  const text = (v: unknown): string | null => (typeof v === 'string' ? v : null);
+  const out = new Map<string, SignedSystemName>();
+  for (const { def } of rows) {
+    if (def === null || typeof def !== 'object') continue;
+    const d = def as Record<string, unknown>;
+    const id = text(d['id']);
+    const label = text(d['label']);
+    if (id === null || label === null) continue;
+    const eventLabels = new Map<string, string>();
+    for (const list of [d['operations'], (d['webhook'] as Record<string, unknown> | null | undefined)?.['events']]) {
+      if (!Array.isArray(list)) continue;
+      for (const item of list) {
+        if (item === null || typeof item !== 'object') continue;
+        const it = item as Record<string, unknown>;
+        const key = text(it['name']) ?? text(it['type']);
+        const name = text(it['label']);
+        if (key !== null && name !== null) eventLabels.set(key, name);
+      }
+    }
+    out.set(id, { label, eventLabels });
+  }
+  return out;
+}
+
 interface ReadRow {
   read_id: string;
   job_id: string;
@@ -228,16 +275,68 @@ export async function insertEvent(
   return rows.length > 0;
 }
 
-/** Uncurated events with an id after `cursor` (null = from the start), oldest first. */
-export async function newEventsSince(db: BusinessDb, cursor: string | null): Promise<ExternalEventRecord[]> {
+/**
+ * Up to `limit` uncurated, unclaimed events of one system, oldest first.
+ *
+ * Selected by `curated_at IS NULL`, never by an id cursor. Two writers insert
+ * events — the webhook receiver (dashboard process) and the daily scan
+ * (scheduler) — and each takes its own monotonic ULID factory, so a ULID
+ * cursor could skip an event a slower writer inserted with a lower id after
+ * the cursor moved past it. The column is the truth; the order is only
+ * fairness.
+ */
+export async function uncuratedEvents(
+  db: BusinessDb,
+  systemId: string,
+  limit: number,
+): Promise<ExternalEventRecord[]> {
   const { rows } = await db.query<EventRow>(
     `SELECT event_id, system_id, source, event_type, item_hash, fields, created_at, curated_at
        FROM external_events
-      WHERE business_id = $1 AND curated_at IS NULL AND ($2::text IS NULL OR event_id > $2)
-      ORDER BY event_id`,
-    [db.businessId, cursor],
+      WHERE business_id = $1 AND system_id = $2 AND curated_at IS NULL AND curation_job_id IS NULL
+      ORDER BY created_at, event_id
+      LIMIT $3`,
+    [db.businessId, systemId, limit],
   );
   return rows.map(toEvent);
+}
+
+/**
+ * Claims events for one learning job: only those still uncurated and
+ * unclaimed. Returns the ids actually claimed — a concurrent pass that got
+ * there first keeps its own.
+ */
+export async function claimEventsForCuration(db: BusinessDb, ids: string[], jobId: string): Promise<string[]> {
+  if (ids.length === 0) return [];
+  const { rows } = await db.query<{ event_id: string }>(
+    `UPDATE external_events SET curation_job_id = $3
+      WHERE business_id = $1 AND event_id = ANY($2::text[])
+        AND curated_at IS NULL AND curation_job_id IS NULL
+      RETURNING event_id`,
+    [db.businessId, ids, jobId],
+  );
+  return rows.map((r) => r.event_id);
+}
+
+/** The events a learning job claimed, oldest first — what its curation brief is built from. */
+export async function eventsForCurationJob(db: BusinessDb, jobId: string): Promise<ExternalEventRecord[]> {
+  const { rows } = await db.query<EventRow>(
+    `SELECT event_id, system_id, source, event_type, item_hash, fields, created_at, curated_at
+       FROM external_events
+      WHERE business_id = $1 AND curation_job_id = $2
+      ORDER BY created_at, event_id`,
+    [db.businessId, jobId],
+  );
+  return rows.map(toEvent);
+}
+
+/** Gives a job's still-uncurated events back, so the next pass can claim them again. */
+export async function releaseCurationClaim(db: BusinessDb, jobId: string): Promise<void> {
+  await db.query(
+    `UPDATE external_events SET curation_job_id = NULL
+      WHERE business_id = $1 AND curation_job_id = $2 AND curated_at IS NULL`,
+    [db.businessId, jobId],
+  );
 }
 
 export async function markEventsCurated(db: BusinessDb, ids: string[]): Promise<void> {
@@ -291,10 +390,88 @@ export async function lastScanAt(db: BusinessDb, systemId: string): Promise<Date
   return rows[0]?.last_scan_at ?? null;
 }
 
+/**
+ * One scan attempt: always its time and outcome code, and `last_scan_at` only
+ * when it succeeded — a failed scan never moves the window it asks about.
+ */
+export async function recordScanAttempt(
+  db: BusinessDb,
+  systemId: string,
+  input: { at: Date; outcome: string; succeeded: boolean },
+): Promise<void> {
+  await db.query(
+    `INSERT INTO external_system_state (business_id, system_id, last_scan_attempt_at, last_scan_outcome, last_scan_at)
+     VALUES ($1, $2, $3, $4, CASE WHEN $5 THEN $3::timestamptz ELSE NULL END)
+     ON CONFLICT (business_id, system_id) DO UPDATE SET
+       last_scan_attempt_at = EXCLUDED.last_scan_attempt_at,
+       last_scan_outcome = EXCLUDED.last_scan_outcome,
+       last_scan_at = CASE WHEN $5 THEN EXCLUDED.last_scan_attempt_at ELSE external_system_state.last_scan_at END`,
+    [db.businessId, systemId, input.at, input.outcome, input.succeeded],
+  );
+}
+
+interface StateRow {
+  system_id: string;
+  last_scan_at: Date | null;
+  last_scan_attempt_at: Date | null;
+  last_scan_outcome: string | null;
+  rejected_hooks: number;
+  last_rejected_at: Date | null;
+}
+export interface ExternalSystemState {
+  systemId: string;
+  lastScanAt: Date | null;
+  lastScanAttemptAt: Date | null;
+  lastScanOutcome: string | null;
+  rejectedHooks: number;
+  lastRejectedAt: Date | null;
+}
+function toState(r: StateRow): ExternalSystemState {
+  return {
+    systemId: r.system_id,
+    lastScanAt: r.last_scan_at,
+    lastScanAttemptAt: r.last_scan_attempt_at,
+    lastScanOutcome: r.last_scan_outcome,
+    rejectedHooks: r.rejected_hooks,
+    lastRejectedAt: r.last_rejected_at,
+  };
+}
+
+/** The state row of one system, or `null` when nothing was ever recorded for it. */
+export async function loadSystemState(db: BusinessDb, systemId: string): Promise<ExternalSystemState | null> {
+  const { rows } = await db.query<StateRow>(
+    `SELECT system_id, last_scan_at, last_scan_attempt_at, last_scan_outcome, rejected_hooks, last_rejected_at
+       FROM external_system_state WHERE business_id = $1 AND system_id = $2`,
+    [db.businessId, systemId],
+  );
+  const row = rows[0];
+  return row === undefined ? null : toState(row);
+}
+
 export async function setLastScanAt(db: BusinessDb, systemId: string, at: Date): Promise<void> {
   await db.query(
     `INSERT INTO external_system_state (business_id, system_id, last_scan_at) VALUES ($1, $2, $3)
      ON CONFLICT (business_id, system_id) DO UPDATE SET last_scan_at = EXCLUDED.last_scan_at`,
     [db.businessId, systemId, at],
   );
+}
+
+/** Events of one system since `since`, counted. */
+export async function countEventsSince(db: BusinessDb, systemId: string, since: Date): Promise<number> {
+  const { rows } = await db.query<{ n: string }>(
+    `SELECT count(*)::text AS n FROM external_events WHERE business_id = $1 AND system_id = $2 AND created_at >= $3`,
+    [db.businessId, systemId, since],
+  );
+  return Number(rows[0]?.n ?? 0);
+}
+
+/** The newest `limit` events of one system, newest first. */
+export async function recentEvents(db: BusinessDb, systemId: string, limit: number): Promise<ExternalEventRecord[]> {
+  const { rows } = await db.query<EventRow>(
+    `SELECT event_id, system_id, source, event_type, item_hash, fields, created_at, curated_at
+       FROM external_events WHERE business_id = $1 AND system_id = $2
+      ORDER BY created_at DESC, event_id DESC LIMIT $3`,
+    [db.businessId, systemId, limit],
+  );
+  return rows.map(toEvent);
 }

@@ -19,6 +19,7 @@ function facts(over: Partial<DigestFacts> = {}): DigestFacts {
     cost: { windowMinor: 0, rolling30Minor: 0, ceilingMinor: 50000, currency: 'ILS' },
     ledger: { open: 0, overdue: 0, stuck: 0, closedByEvidence: 0, topStuck: [] },
     documents: { produced: 0, sent: 0, waiting: 0 },
+    external: { total: 0, counts: [], recent: [] },
     ...over,
   };
 }
@@ -343,5 +344,36 @@ describe('renderDigest', () => {
     const out = renderDigest(facts({ documents: { produced: 0, sent: 0, waiting: 2 } }));
     expect(out.body).toContain('הופקו 0 מסמכים, 0 נשלחו, 2 מחכים לבדיקתך');
     expect(out.hadContent).toBe(false);
+  });
+
+  describe('the external systems section', () => {
+    it('renders counts and the last items, and new events are content', () => {
+      const out = renderDigest(
+        facts({
+          external: {
+            total: 3,
+            counts: [
+              { system: 'מערכת הלקוחות', type: 'לקוח חדש', count: 2 },
+              { system: 'מערכת הלקוחות', type: 'תשלום נכשל', count: 1 },
+            ],
+            recent: ['מערכת הלקוחות · לקוח חדש — שם: דנה ‮כהן\n· מזויף'],
+          },
+        }),
+      );
+      expect(out.hadContent).toBe(true);
+      expect(out.body).toContain('ממערכות חיצוניות:');
+      expect(out.body).toContain('· מערכת הלקוחות · לקוח חדש: 2');
+      expect(out.body).toContain('· מערכת הלקוחות · תשלום נכשל: 1');
+      expect(out.body).toContain('  · מערכת הלקוחות · לקוח חדש — שם: דנה כהן · מזויף');
+      expect(out.body).not.toContain('‮');
+      expect(out.body).not.toContain('\n· מזויף');
+      expect(out.body).not.toContain('לא קרה');
+    });
+
+    it('is omitted, and is not content, when there were no events', () => {
+      const out = renderDigest(facts());
+      expect(out.body).not.toContain('ממערכות חיצוניות');
+      expect(out.hadContent).toBe(false);
+    });
   });
 });
