@@ -109,6 +109,23 @@ export async function loadReadsForJob(db: BusinessDb, jobId: string): Promise<Ex
   return rows.map(toRead);
 }
 
+/**
+ * Reads from the last day's jobs the owner's own instructions opened, newest
+ * first — what the instruct screen shows as "what came back". Joined to
+ * `boss_instructions`, so a read from any other kind of job never appears.
+ */
+export async function loadRecentOwnerReads(db: BusinessDb, limit = 5): Promise<ExternalReadRecord[]> {
+  const { rows } = await db.query<ReadRow>(
+    `SELECT r.read_id, r.job_id, r.step_id, r.system_id, r.operation, r.fields, r.created_at
+       FROM external_reads r
+       JOIN boss_instructions i ON i.business_id = r.business_id AND i.job_id = r.job_id
+      WHERE r.business_id = $1 AND r.created_at > now() - interval '24 hours'
+      ORDER BY r.read_id DESC LIMIT $2`,
+    [db.businessId, limit],
+  );
+  return rows.map(toRead);
+}
+
 interface EventRow {
   event_id: string;
   system_id: string;

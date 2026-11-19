@@ -1464,6 +1464,8 @@ export function renderInstruct(options: {
   confirmations?: PendingConfirmation[] | null;
   /** A schedule answer ("מה יש לי מחר?"): calendar text, so `escLabel`. */
   answer?: string | null;
+  /** What a recent boss command's `ext.read` returned (`renderReadsForOwner`): a stranger's bytes, so `escLabel`. */
+  reads?: string | null;
 }): string {
   const error =
     options.error === undefined ? '' : `<p class="error">${esc(options.error)}</p>`;
@@ -1511,6 +1513,11 @@ export function renderInstruct(options: {
       ? ''
       : `<p class="confirm" style="white-space: pre-wrap">${escLabel(options.answer)}</p>`;
 
+  const reads =
+    options.reads == null || options.reads === ''
+      ? ''
+      : `<p class="confirm" style="white-space: pre-wrap">${escLabel(options.reads)}</p>`;
+
   const confirmations =
     options.confirmations == null
       ? ''
@@ -1529,6 +1536,7 @@ export function renderInstruct(options: {
      ${recordingNote}
      ${ledgerEcho}
      ${answer}
+     ${reads}
      ${confirmationQuestion}
      ${confirmations}
      ${identityNote}

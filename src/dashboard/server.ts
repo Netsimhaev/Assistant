@@ -65,6 +65,8 @@ import {
   type SetupOptions,
 } from './setup-routes.js';
 import type { ActiveCharter } from '../charter/store.js';
+import { renderReadsForOwner } from '../external/render-reads.js';
+import { loadRecentOwnerReads } from '../external/store.js';
 import { config } from '../config.js';
 import { DigestSchedule, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
 import type { DigestSettings } from '../governance/digest-settings.js';
@@ -1414,8 +1416,17 @@ async function handleInstructGet(
     renderInstruct({
       csrf: issueCsrfToken(session.sessionId),
       ...(await openOnInstructScreen(db)),
+      reads: await recentReadsBlock(db),
     }),
   );
+}
+
+/** What the owner's recent commands read from external systems, rendered; '' when nothing. */
+async function recentReadsBlock(db: BusinessDb): Promise<string> {
+  const reads = await loadRecentOwnerReads(db);
+  if (reads.length === 0) return '';
+  const active = await loadActiveCharter(db);
+  return renderReadsForOwner(reads, active?.bundle.externalSystems ?? []);
 }
 
 /**

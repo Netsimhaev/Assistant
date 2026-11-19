@@ -20,6 +20,7 @@ import { recordInbound, settleMessage } from '../whatsapp/store.js';
 import { saveInstruction } from '../governance/instructions.js';
 import { confirmChoice, createConfirmation } from '../governance/instruction-confirmations.js';
 import { REASK_REASON } from './command-reask.js';
+import { loadRecentOwnerReads, recordExternalRead } from '../external/store.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import {
   awaitingApprovalText,
@@ -1311,6 +1312,36 @@ describe('reportWhatsAppJobs — boss commands (spec §4.6)', () => {
     await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
     expect(PERFORMED_ON_CONFIRMATION_TEXT).toBe('בוצע לפי אישורך.');
     expect(messenger.sentTexts).toEqual([PERFORMED_ON_CONFIRMATION_TEXT]);
+  });
+
+  it('a confirmed command that ran an ext.read reports the fields after the sentence', async () => {
+    const jobId = await seed({ instruction: true, confirm: true });
+    await withBusiness(BUSINESS, (db) =>
+      recordExternalRead(db, {
+        jobId, stepId: 's1', systemId: 'crm', operation: 'lookup',
+        fields: [{ label: 'שם', value: 'דנה‮' }],
+      }),
+    );
+    await close(jobId);
+    await linkToWhatsApp(jobId);
+    const messenger = fakeMessenger();
+    await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
+    expect(messenger.sentTexts).toEqual([`${PERFORMED_ON_CONFIRMATION_TEXT}
+
+מcrm — lookup:
+שם: דנה`]);
+  });
+
+  it('the dashboard query returns reads of instruction jobs only', async () => {
+    const owned = await seed({ instruction: true, confirm: true });
+    const other = await seed({ instruction: false, confirm: true });
+    for (const jobId of [owned, other]) {
+      await withBusiness(BUSINESS, (db) =>
+        recordExternalRead(db, { jobId, stepId: 's1', systemId: 'crm', operation: 'lookup', fields: [{ label: 'a', value: 'b' }] }),
+      );
+    }
+    const rows = await withBusiness(BUSINESS, (db) => loadRecentOwnerReads(db));
+    expect(rows.map((r) => r.jobId)).toEqual([owned]);
   });
 
   it('the confirmation sentence is for confirmed commands only', async () => {

@@ -3746,3 +3746,16 @@ describe('boss-command confirmation on the dashboard', () => {
     expect(res.status).toBe(404);
   });
 });
+
+describe('renderInstruct — reads (Stage D, task 8)', () => {
+  it('shows what a read returned, bidi-stripped and escaped', () => {
+    const html = renderInstruct({ csrf: 'tok', reads: 'מה-CRM — חיפוש:\nשם: דנה\u202E <b>x</b>' });
+    expect(html).toContain('מה-CRM — חיפוש:');
+    expect(html).not.toContain('\u202E');
+    expect(html).not.toContain('<b>x</b>');
+  });
+
+  it('renders nothing for an empty or absent block', () => {
+    expect(renderInstruct({ csrf: 'tok', reads: '' })).toBe(renderInstruct({ csrf: 'tok' }));
+  });
+});

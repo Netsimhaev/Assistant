@@ -97,6 +97,9 @@ import { JobPhase } from '../domain/job.js';
 import { pendingApprovalForJob } from '../governance/approvals.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { claimForReport } from '../whatsapp/store.js';
+import { loadActiveCharter } from '../charter/store.js';
+import { renderReadsForOwner } from '../external/render-reads.js';
+import { loadReadsForJob } from '../external/store.js';
 import { REASK_REASON } from './command-reask.js';
 import { jobHistory } from './jobs.js';
 import { loadPlanBody, stepResults } from './plan-store.js';
@@ -692,6 +695,27 @@ function composeText(
 }
 
 /**
+ * Append what an `ext.read` returned to a performed job's sentence. Only the
+ * two performed outcomes carry it (a failed or denied job returned nothing to
+ * show); a job with no reads gets `text` back byte for byte.
+ */
+async function withReads(
+  db: BusinessDb,
+  jobId: string,
+  verdict: Extract<JobVerdict, { status: 'report' }>,
+  text: string,
+): Promise<string> {
+  if (verdict.outcome !== 'performed' && verdict.outcome !== 'performed_on_confirmation') return text;
+  const reads = await loadReadsForJob(db, jobId);
+  if (reads.length === 0) return text;
+  const active = await loadActiveCharter(db);
+  const block = renderReadsForOwner(reads, active?.bundle.externalSystems ?? []);
+  return `${text}
+
+${block}`;
+}
+
+/**
  * Send the owner one honest sentence for every WhatsApp-opened job that has
  * reached a reportable phase and still owes a report.
  *
@@ -723,7 +747,7 @@ export async function reportWhatsAppJobs(
         deferred += 1;
         continue;
       }
-      const text = composeText(verdict, dashboardBaseUrl);
+      const text = await withReads(db, candidate.jobId, verdict, composeText(verdict, dashboardBaseUrl));
 
       // The claim's KIND follows the candidate's own PHASE, never the
       // classified outcome — fix round 1, Critical 1. A job read as
