@@ -920,6 +920,11 @@ ${
       ? '<p><a href="/connections/calendar">מצב יומן העסק</a> · <a href="/meetings/settings">הגדרות הפגישות</a></p>'
       : ''
 }
+${
+  options.charterStatus === 'ok'
+    ? '<p><a href="/connections/external">מערכות חיצוניות (מערכת לקוחות, הנהלת חשבונות ועוד) — חתימה, שינוי והסרה</a></p>'
+    : ''
+}
 ${sections === '' && notice === '' ? '<p>התקנון הפעיל אינו מצהיר על אף חיבור.</p>' : sections}`,
   );
 }

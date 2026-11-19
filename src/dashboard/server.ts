@@ -120,6 +120,12 @@ import {
   handleCalendarStatus,
 } from './calendar-connect.js';
 import {
+  handleExternalRemovePost,
+  handleExternalSignGet,
+  handleExternalSignPost,
+  handleExternalStatus,
+} from './external-connect.js';
+import {
   calendarWiring,
   handleMeetingMarkPost,
   handleMeetingNewPost,
@@ -3266,6 +3272,8 @@ const LEDGER_ACTION_PATH = /^\/ledger\/([^/]+)\/action$/;
 const LEDGER_RULE_DELETE_PATH = /^\/ledger\/rules\/([^/]+)\/delete$/;
 const MAIL_PATH = /^\/mail\/([^/]+)$/;
 const DOCUMENT_FILE_PATH = /^\/documents\/([^/]+)\/file$/;
+/** `/connections/external/<system>/(sign|remove)`; the handlers check the id against `EXTERNAL_SYSTEM_ID`. */
+const EXTERNAL_SYSTEM_PATH = /^\/connections\/external\/([^/]+)\/(sign|remove)$/;
 const DOCUMENT_CARD_PATH = /^\/documents\/(DC-[^/]+)$/;
 const DOCUMENT_CARD_GET_PATH = /^\/documents\/(DC-[^/]+)\/(download|preview)$/;
 const DOCUMENT_CARD_POST_PATH = /^\/documents\/(DC-[^/]+)\/(approve|fix|address)$/;
@@ -3507,6 +3515,24 @@ async function route(
   }
   if (method === 'POST' && pathname === '/connections/calendar/revert') {
     return handleCalendarRevertPost(res, db, session, await readFormBody(req));
+  }
+  // External systems: the owner signs what the technician drafted (Stage D).
+  if (method === 'GET' && pathname === '/connections/external') {
+    return handleExternalStatus(res, db, issueCsrfToken(session.sessionId), requestUrl.searchParams);
+  }
+  const externalMatch = EXTERNAL_SYSTEM_PATH.exec(pathname);
+  if (externalMatch?.[1] !== undefined) {
+    const systemId = decodePathSegment(externalMatch[1]);
+    if (systemId === null) return notFound(res);
+    if (method === 'GET' && externalMatch[2] === 'sign') {
+      return handleExternalSignGet(res, db, issueCsrfToken(session.sessionId), systemId);
+    }
+    if (method === 'POST' && externalMatch[2] === 'sign') {
+      return handleExternalSignPost(res, db, session, issueCsrfToken(session.sessionId), systemId, await readFormBody(req));
+    }
+    if (method === 'POST' && externalMatch[2] === 'remove') {
+      return handleExternalRemovePost(res, db, session, systemId, await readFormBody(req));
+    }
   }
   if (method === 'GET' && pathname === '/meetings/settings') {
     return handleMeetingSettingsGet(res, db, session, requestUrl.searchParams, meetingOptions);

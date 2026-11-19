@@ -37,7 +37,7 @@ import {
   unrecognisedKeyPaths,
 } from '../domain/external-system.js';
 import { deleteDraft, loadDrafts, loadSignedDefinition, saveDraft } from '../external/store.js';
-import { describeExternalSystem } from '../external/describe.js';
+import { describeForTechnician } from '../external/describe.js';
 import { putSecret } from '../governance/credential-store.js';
 import { getBusiness } from '../tenancy/businesses.js';
 import { businessDetailForPanel, type ExternalSystemPanelStatus } from '../tenancy/panel-reads.js';
@@ -238,7 +238,7 @@ async function showEditor(
         ? JSON.stringify(signed, null, 2)
         : blankTemplate(systemId));
   const parsedDraft = draft === null ? null : ExternalSystem.safeParse(draft.definition);
-  const preview = parsedDraft?.success === true ? describeExternalSystem(parsedDraft.data) : null;
+  const preview = parsedDraft?.success === true ? describeForTechnician(parsedDraft.data) : null;
   ctx.sendHtml(
     status,
     renderEditor(ctx.viewer, businessId, systemId, {

@@ -52,6 +52,22 @@ export async function loadDrafts(db: BusinessDb): Promise<DraftRecord[]> {
   return rows.map(toDraft);
 }
 
+/**
+ * One draft, row-locked (`FOR UPDATE`) when `db` is in a transaction — the
+ * owner's sign route reads it under the lock it later deletes it under, so a
+ * draft the technician saves between the hash check and the delete is never
+ * deleted unseen. `null` when there is none.
+ */
+export async function lockDraft(db: BusinessDb, systemId: string): Promise<DraftRecord | null> {
+  const { rows } = await db.query<DraftRow>(
+    `SELECT system_id, definition, updated_at, updated_by_staff
+       FROM external_system_drafts WHERE business_id = $1 AND system_id = $2 FOR UPDATE`,
+    [db.businessId, systemId],
+  );
+  const row = rows[0];
+  return row === undefined ? null : toDraft(row);
+}
+
 /** Deletes the draft; returns how many rows went (0 when there was none). */
 export async function deleteDraft(db: BusinessDb, systemId: string): Promise<number> {
   const result = await db.query(`DELETE FROM external_system_drafts WHERE business_id = $1 AND system_id = $2`, [
