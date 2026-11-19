@@ -5,7 +5,6 @@ import {
   countCallsToday,
   deleteDraft,
   insertEvent,
-  lastScanAt,
   loadDrafts,
   loadReadsForJob,
   markEventsCurated,
@@ -19,7 +18,6 @@ import {
   recordExternalRead,
   recordRejectedHook,
   saveDraft,
-  setLastScanAt,
 } from './store.js';
 
 const OTHER = 'other-business';
@@ -128,10 +126,28 @@ describe('external store', () => {
     await withBusiness(TEST_BUSINESS, (db) => recordRejectedHook(db, 'crm', 'bad_signature'));
     const { rows } = await testDb().query('SELECT rejected_hooks FROM external_system_state');
     expect(rows[0].rejected_hooks).toBe(2);
-    expect(await withBusiness(TEST_BUSINESS, (db) => lastScanAt(db, 'crm'))).toBeNull();
+    expect((await withBusiness(TEST_BUSINESS, (db) => loadSystemState(db, 'crm')))?.lastScanAt).toBeNull();
     const at = new Date('2026-11-18T10:00:00Z');
-    await withBusiness(TEST_BUSINESS, (db) => setLastScanAt(db, 'crm', at));
-    expect((await withBusiness(TEST_BUSINESS, (db) => lastScanAt(db, 'crm')))?.toISOString()).toBe(at.toISOString());
+    await withBusiness(TEST_BUSINESS, (db) => recordScanAttempt(db, 'crm', { at, outcome: 'ok', succeeded: true }));
+    const state = await withBusiness(TEST_BUSINESS, (db) => loadSystemState(db, 'crm'));
+    expect(state?.lastScanAt?.toISOString()).toBe(at.toISOString());
+    expect(state?.lastScanAttemptAt?.toISOString()).toBe(at.toISOString());
+  });
+
+  it('refuses an item an erasure tombstoned, and only that one (migration 080)', async () => {
+    await testDb().query(
+      `INSERT INTO external_erased_items (business_id, system_id, item_hash) VALUES ($1, 'crm', 'gone')`,
+      [TEST_BUSINESS],
+    );
+    await withBusiness(TEST_BUSINESS, async (db) => {
+      expect(await insertEvent(db, { systemId: 'crm', source: 'scan', eventType: 'x', itemHash: 'gone', fields })).toBe(false);
+      // Another system, or another hash, is stored.
+      expect(await insertEvent(db, { systemId: 'erp', source: 'scan', eventType: 'x', itemHash: 'gone', fields })).toBe(true);
+      expect(await insertEvent(db, { systemId: 'crm', source: 'scan', eventType: 'x', itemHash: 'changed', fields })).toBe(true);
+    });
+    await withBusiness(OTHER, async (db) => {
+      expect(await insertEvent(db, { systemId: 'crm', source: 'scan', eventType: 'x', itemHash: 'gone', fields })).toBe(true);
+    });
   });
 
   it('hides a business\'s rows from another business', async () => {

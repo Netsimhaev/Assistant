@@ -392,14 +392,6 @@ export async function recordRejectedHook(db: BusinessDb, systemId: string, _reas
   );
 }
 
-export async function lastScanAt(db: BusinessDb, systemId: string): Promise<Date | null> {
-  const { rows } = await db.query<{ last_scan_at: Date | null }>(
-    `SELECT last_scan_at FROM external_system_state WHERE business_id = $1 AND system_id = $2`,
-    [db.businessId, systemId],
-  );
-  return rows[0]?.last_scan_at ?? null;
-}
-
 /**
  * One scan attempt: always its time and outcome code, and `last_scan_at` only
  * when it succeeded — a failed scan never moves the window it asks about.
@@ -456,14 +448,6 @@ export async function loadSystemState(db: BusinessDb, systemId: string): Promise
   );
   const row = rows[0];
   return row === undefined ? null : toState(row);
-}
-
-export async function setLastScanAt(db: BusinessDb, systemId: string, at: Date): Promise<void> {
-  await db.query(
-    `INSERT INTO external_system_state (business_id, system_id, last_scan_at) VALUES ($1, $2, $3)
-     ON CONFLICT (business_id, system_id) DO UPDATE SET last_scan_at = EXCLUDED.last_scan_at`,
-    [db.businessId, systemId, at],
-  );
 }
 
 /** Events of one system since `since`, counted. */
