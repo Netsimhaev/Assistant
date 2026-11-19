@@ -194,6 +194,39 @@ export async function executeErasure(
   const results: ErasureItem[] = [];
   await transaction(db, async (client) => {
 
+    // The events this plan erases, locked, with the learning job each is
+    // claimed by right now. A learning pass can claim one between the preview
+    // and this transaction (`claimEventsForCuration` is an UPDATE, so the lock
+    // serialises against it): if that job is open and not in the plan, its
+    // curator is about to write from a brief that holds the content this
+    // erasure removes — refused, the same as any live job.
+    if (externalEventIds.length > 0) {
+      const { rows: lockedEvents } = await client.query<{ curation_job_id: string | null; open: boolean }>(
+        `SELECT e.curation_job_id, coalesce((${LEARNING_JOB_OPEN_CONDITION}), false) AS open
+           FROM external_events e
+           LEFT JOIN jobs ON jobs.business_id = e.business_id AND jobs.job_id = e.curation_job_id
+          WHERE e.business_id = $1 AND e.event_id = ANY ($2)
+          FOR UPDATE OF e`,
+        [businessId, externalEventIds],
+      );
+      const claimedByOpen = [
+        ...new Set(
+          lockedEvents.flatMap((row) =>
+            row.open && row.curation_job_id !== null && !jobIds.includes(row.curation_job_id)
+              ? [row.curation_job_id]
+              : [],
+          ),
+        ),
+      ];
+      if (claimedByOpen.length > 0) {
+        throw new ErasureRefusedError(
+          claimedByOpen
+            .map((jobId) => `משימה ${jobId} התחילה ללמוד מהפריטים האלה מאז שהתצוגה המקדימה הוכנה; המחיקה בוטלה.`)
+            .join(' · '),
+        );
+      }
+    }
+
     // Re-check liveness under a row lock. The plan-time refusal in
     // `buildErasurePlan` reads `jobs.phase` with no lock and is never read
     // again — a job sitting in `followup` when the preview was built, which

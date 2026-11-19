@@ -281,7 +281,7 @@ import type { BusinessDb, Queryable } from '../db/pool.js';
 import { keptIds, type KeptItemKind } from './kept-items.js';
 import { LIKE_ESCAPE, likeLiteral } from '../util/like.js';
 import { TERMINAL_STAGES } from '../production/store.js';
-import { signedSystemNames } from '../external/store.js';
+import { LEARNING_JOB_STALE_MINUTES, signedSystemNames } from '../external/store.js';
 import { toOneLine } from '../util/bidi.js';
 
 export { LIKE_ESCAPE };
@@ -1041,13 +1041,21 @@ export const EXTERNAL_LEARNING_JOBS_ERASED_PREDICATE = `business_id = $1 AND job
  * Scoped to learning jobs (a row in `external_learning_jobs`) rather than
  * adding `understand` to `LIVE_PHASES`: other jobs pass through `understand`
  * in moments, and one stranded there by a crash is inert (nothing picks it
- * up) — making it unerasable forever would buy nothing. A crashed learning
- * job does not stay open: `releaseStaleClaims` fails it after 30 minutes.
+ * up) — making it unerasable forever would buy nothing.
+ *
+ * **And only while it is young** — created within `LEARNING_JOB_STALE_MINUTES`,
+ * the same constant the stale sweep uses. Past that a pass has crashed: an
+ * open job past the limit is not live here, so a crash can never block an
+ * erasure, and the sweep at the start of every learning pass
+ * (`releaseStaleClaims`, which also finds jobs that hold no claim) fails it.
+ * A pass that really is still curating after 30 minutes is not protected;
+ * the curator call's own deadline is far shorter.
  *
  * Interpolated into a `SELECT ... FROM jobs` (unaliased): it reads the outer
  * row as `jobs`.
  */
 export const LEARNING_JOB_OPEN_CONDITION = `(jobs.phase IN ('intake', 'understand')
+    AND jobs.created_at >= now() - make_interval(mins => ${LEARNING_JOB_STALE_MINUTES})
     AND EXISTS (SELECT 1 FROM external_learning_jobs l
                  WHERE l.business_id = jobs.business_id AND l.job_id = jobs.job_id))`;
 
@@ -2149,13 +2157,22 @@ export async function buildErasurePlan(
     );
     if (rows.length > 0) {
       const names = await signedSystemNames(db);
-      const labels = new Set<string>();
+      // Keyed by system id: two systems are two lines even when their labels
+      // agree, and then each carries its id so the owner can tell them apart.
+      // A label that cleans to nothing falls back to the id.
+      const labelById = new Map<string, string>();
       for (const row of rows) {
-        const signed = names.get(row.system_id)?.label;
-        labels.add(toOneLine(signed ?? row.system_id));
+        const id = toOneLine(row.system_id);
+        const signed = toOneLine(names.get(row.system_id)?.label ?? '');
+        labelById.set(row.system_id, signed === '' ? id : signed);
       }
+      const uses = new Map<string, number>();
+      for (const label of labelById.values()) uses.set(label, (uses.get(label) ?? 0) + 1);
+      const lines = [...labelById.entries()].map(([id, label]) =>
+        (uses.get(label) ?? 0) > 1 && label !== toOneLine(id) ? `${label} (${toOneLine(id)})` : label,
+      );
       // Plain code-unit order, the same as the fingerprint's sort.
-      externalSystemsKept.push(...[...labels].sort());
+      externalSystemsKept.push(...[...new Set(lines)].sort());
     }
   }
 

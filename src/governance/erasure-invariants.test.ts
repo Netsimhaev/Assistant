@@ -688,8 +688,10 @@ describe('what an erasure leaves behind', () => {
     //
     // A read on a job that names nothing, so only the read's own discovery
     // can bring the job in. An event whose learning job (also nameless)
-    // curated an `ext:crm` chunk naming the probe under a subject that does
-    // not: the chunk goes only if the event pulls its learning job in.
+    // curated an `ext:crm` chunk that does NOT carry the probe: nothing in the
+    // chunk matches the contact, so it goes only because the event pulls its
+    // learning job in (`written_by_job`). Asserted gone directly below — the
+    // sweep cannot see a row with no probe in it.
     const readJob = await withBusiness(BUSINESS, (db) => createJob(db, {
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -715,7 +717,7 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS, JSON.stringify({ customer: { email: PROBE } }), learningJob.jobId],
     );
     await withBusiness(BUSINESS, (bdb) =>
-      writeMemory(bdb, { jobId: learningJob.jobId, kind: 'chunk', subjectKey: 'ext:crm', body: { text: `נרשם לקוח ${PROBE}` } }),
+      writeMemory(bdb, { jobId: learningJob.jobId, kind: 'chunk', subjectKey: 'ext:crm', body: { text: 'נרשם לקוח חדש' } }),
     );
     await withBusiness(BUSINESS, (bdb) => transition(bdb, learningJob.jobId, { to: 'understand', actor: 'orchestrator', reason: 't' }));
     await withBusiness(BUSINESS, (bdb) => transition(bdb, learningJob.jobId, { to: 'closed', actor: 'orchestrator', reason: 't' }));
@@ -769,6 +771,13 @@ describe('what an erasure leaves behind', () => {
     const otherDraft = await db.query('SELECT 1 FROM charter_interview_drafts WHERE draft_id = $1', ['DR-unrelated']);
     expect(otherDraft.rows).toHaveLength(1);
     await db.query(`DELETE FROM charter_interview_drafts WHERE draft_id = 'DR-unrelated'`);
+
+    // The learning job's chunk, gone only through the event's pull-in.
+    const learnedChunk = await db.query('SELECT 1 FROM memories WHERE business_id = $1 AND written_by_job = $2', [
+      BUSINESS,
+      learningJob.jobId,
+    ]);
+    expect(learnedChunk.rows).toHaveLength(0);
 
     // `external_learning_jobs` holds no content — asserted gone directly.
     const learningRecord = await db.query('SELECT 1 FROM external_learning_jobs WHERE business_id = $1 AND job_id = $2', [

@@ -476,6 +476,15 @@ export async function recentEvents(db: BusinessDb, systemId: string, limit: numb
   return rows.map(toEvent);
 }
 
+/**
+ * A learning job still open (`intake`/`understand`) this long after it was
+ * created belongs to a crashed pass. One constant for both readers: the stale
+ * sweep in `learn.ts` fails such a job, and erasure stops counting it as live
+ * (`LEARNING_JOB_OPEN_CONDITION` in `governance/erasure-plan.ts`) — so the two
+ * can never disagree about whether a job is still at work.
+ */
+export const LEARNING_JOB_STALE_MINUTES = 30;
+
 /** Records that `jobId` is a learning job for `systemId` (migration 079). */
 export async function recordLearningJob(db: BusinessDb, jobId: string, systemId: string): Promise<void> {
   await db.query(

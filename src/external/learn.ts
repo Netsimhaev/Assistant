@@ -36,6 +36,7 @@ import type { Curator } from '../sdk/curator.js';
 import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 import {
   claimEventsForCuration,
+  LEARNING_JOB_STALE_MINUTES,
   markEventsCurated,
   markLearningJobFailed,
   recordLearningJob,
@@ -49,8 +50,6 @@ export const EVENTS_PER_JOB = 20;
 /** Fixed: a title built from event content would carry a stranger's text into `jobs`. */
 export const LEARNING_JOB_TITLE = 'למידה ממערכת חיצונית';
 
-/** A claim older than this, on a job still in `understand`, belongs to a crashed pass. */
-const STALE_CLAIM_MINUTES = 30;
 
 export interface LearnOptions {
   /** Injected by tests; production leaves it unset and gets the billed call (`refuseUnderTest` guards it). */
@@ -67,8 +66,45 @@ export interface LearnResult {
   warnings: string[];
 }
 
-/** Fails orphan learning jobs and gives their events back. */
+/**
+ * Fails orphan learning jobs and gives their events back. Two ways in:
+ *
+ *  1. through claimed events — a claim whose job is gone, no longer in
+ *     `understand`, or in `understand` past `LEARNING_JOB_STALE_MINUTES`;
+ *  2. through `external_learning_jobs` itself — any learning job still in
+ *     `intake`/`understand` past the same limit, claims or not. A crash
+ *     before `claimEventsForCuration`, or after a release, leaves such a job
+ *     holding nothing, and the first way never sees it.
+ *
+ * Run at the very start of every pass, before any early return (charter,
+ * key, cap), so an orphan is failed even while learning is switched off.
+ */
 async function releaseStaleClaims(db: BusinessDb): Promise<void> {
+  const { rows: open } = await db.query<{ job_id: string; phase: 'intake' | 'understand' }>(
+    `SELECT j.job_id, j.phase
+       FROM external_learning_jobs l
+       JOIN jobs j ON j.business_id = l.business_id AND j.job_id = l.job_id
+      WHERE l.business_id = $1 AND j.phase IN ('intake', 'understand')
+        AND j.created_at < now() - make_interval(mins => $2)`,
+    [db.businessId, LEARNING_JOB_STALE_MINUTES],
+  );
+  for (const row of open) {
+    let failedHere = false;
+    try {
+      await transition(db, row.job_id, {
+        to: 'failed',
+        actor: 'orchestrator',
+        reason: 'external learning: interrupted pass',
+        expectFrom: row.phase,
+      });
+      failedHere = true;
+    } catch (error) {
+      if (!(error instanceof PhaseMovedError)) throw error;
+    }
+    if (failedHere) await markLearningJobFailed(db, row.job_id);
+    await releaseCurationClaim(db, row.job_id);
+  }
+
   const { rows } = await db.query<{ job_id: string; phase: string | null }>(
     `SELECT DISTINCT e.curation_job_id AS job_id, j.phase
        FROM external_events e
@@ -76,7 +112,7 @@ async function releaseStaleClaims(db: BusinessDb): Promise<void> {
       WHERE e.business_id = $1 AND e.curated_at IS NULL AND e.curation_job_id IS NOT NULL
         AND (j.job_id IS NULL OR j.phase <> 'understand'
              OR j.created_at < now() - make_interval(mins => $2))`,
-    [db.businessId, STALE_CLAIM_MINUTES],
+    [db.businessId, LEARNING_JOB_STALE_MINUTES],
   );
   for (const row of rows) {
     if (row.phase === 'understand') {
@@ -128,6 +164,16 @@ async function failOpenJob(db: BusinessDb, jobId: string, result: LearnResult): 
 export async function learnFromExternalEvents(db: BusinessDb, options: LearnOptions = {}): Promise<LearnResult> {
   const result: LearnResult = { jobs: 0, curated: 0, warnings: [] };
 
+  // First, before any early return: an orphan learning job is failed even
+  // when this pass learns nothing (no charter, no key, cap 0).
+  try {
+    await releaseStaleClaims(db);
+  } catch (error) {
+    result.warnings.push(
+      `external learning: stale sweep failed: ${error instanceof Error ? error.constructor.name : 'unknown'}`,
+    );
+  }
+
   let active;
   try {
     active = await loadActiveCharter(db);
@@ -144,8 +190,6 @@ export async function learnFromExternalEvents(db: BusinessDb, options: LearnOpti
   // The same switch `curateJob` reads: without a key no job is opened at all,
   // rather than one per system per pass that closes on `no_key`.
   if (options.curator === undefined && (process.env['ANTHROPIC_API_KEY'] ?? '') === '') return result;
-
-  await releaseStaleClaims(db);
 
   for (const system of active.bundle.externalSystems) {
     let jobId: string | null = null;

@@ -18,6 +18,7 @@ import { ErasureRefusedError, executeErasure } from './erasure.js';
 import { saveDescription } from '../business/description-store.js';
 import { renderErasure } from '../dashboard/views.js';
 import { crmConnection, crmFixture } from '../test/external-fixtures.js';
+import { learnFromExternalEvents } from '../external/learn.js';
 
 const BUSINESS = 'test-business';
 const RONIT = 'ronit@beta-log.example';
@@ -1890,5 +1891,92 @@ describe('external systems', () => {
 
     const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
     expect(plan.refusals).toEqual([]);
+  });
+
+  it('a claimless learning job orphaned in intake 31 minutes ago does not block erasure; the sweep fails it even at cap 0', async () => {
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'orphan' })));
+    const orphan = await withBusiness(BUSINESS, (db) => createJob(db, {
+      charterVersion: bundle.charterVersion,
+      provenance: 'unknown_external',
+      title: 'למידה ממערכת חיצונית',
+    }));
+    await testDb().query(
+      'INSERT INTO external_learning_jobs (business_id, job_id, system_id) VALUES ($1, $2, $3)',
+      [BUSINESS, orphan.jobId, 'crm'],
+    );
+    await testDb().query(`UPDATE jobs SET created_at = now() - interval '31 minutes' WHERE job_id = $1`, [orphan.jobId]);
+    // Control: the same job, young, is live.
+    await testDb().query(`UPDATE jobs SET created_at = now() WHERE job_id = $1`, [orphan.jobId]);
+    const window = { kind: 'window', fromIso: '2000-01-01T00:00:00Z', toIso: '2100-01-01T00:00:00Z' } as const;
+    const young = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, window));
+    expect(young.refusals.map((r) => r.kind)).toEqual(['live_job']);
+    await testDb().query(`UPDATE jobs SET created_at = now() - interval '31 minutes' WHERE job_id = $1`, [orphan.jobId]);
+
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, window));
+    expect(plan.jobIds).toContain(orphan.jobId);
+    expect(plan.refusals).toEqual([]);
+
+    // Learning off (cap 0): the sweep still runs and fails the orphan.
+    await withBusiness(BUSINESS, (db) =>
+      learnFromExternalEvents(db, { curator: async () => ({ candidates: [] }), runsPerDay: 0 }),
+    );
+    const { rows } = await testDb().query<{ phase: string }>('SELECT phase FROM jobs WHERE job_id = $1', [orphan.jobId]);
+    expect(rows[0]?.phase).toBe('failed');
+    const record = await testDb().query<{ failed_at: Date | null }>(
+      'SELECT failed_at FROM external_learning_jobs WHERE job_id = $1',
+      [orphan.jobId],
+    );
+    expect(record.rows[0]?.failed_at).not.toBeNull();
+
+    const after = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, window));
+    expect(after.refusals).toEqual([]);
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, after));
+    const left = await testDb().query('SELECT 1 FROM external_learning_jobs WHERE job_id = $1', [orphan.jobId]);
+    expect(left.rows).toHaveLength(0);
+  });
+
+  it('refuses when an open learning job claimed an erased event after the preview', async () => {
+    await anEvent('E-race', 'crm', { who: RONIT });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
+    expect(plan.externalEventIds).toEqual(['E-race']);
+    expect(plan.refusals).toEqual([]);
+
+    const claimer = await aLearningJob('crm', 'understand');
+    await testDb().query(`UPDATE external_events SET curation_job_id = $1 WHERE event_id = 'E-race'`, [claimer]);
+
+    await expect(withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan))).rejects.toBeInstanceOf(
+      ErasureRefusedError,
+    );
+    const still = await testDb().query(`SELECT 1 FROM external_events WHERE event_id = 'E-race'`);
+    expect(still.rows).toHaveLength(1);
+
+    // A claim by a job that is no longer open does not refuse.
+    await withBusiness(BUSINESS, (db) => transition(db, claimer, { to: 'closed', actor: 'orchestrator', reason: 't' }));
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
+    const gone = await testDb().query(`SELECT 1 FROM external_events WHERE event_id = 'E-race'`);
+    expect(gone.rows).toHaveLength(0);
+  });
+
+  it('keys systems kept by id: a shared label carries its id, an empty label falls back to the id', async () => {
+    const job = await jobAbout(RONIT, 'ext-labels');
+    await signCrm();
+    // Two more signed systems, written straight into the active charter's JSON
+    // (the narrow read the plan uses): one sharing crm's label, one whose
+    // label cleans to nothing.
+    await testDb().query(
+      `UPDATE charter_versions cv
+          SET charter = jsonb_set(cv.charter, '{externalSystems}', (cv.charter -> 'externalSystems')
+            || jsonb_build_array(jsonb_build_object('id', 'crm2', 'label', 'מערכת הלקוחות'),
+                                 jsonb_build_object('id', 'blank', 'label', E'\\u202E \\n')))
+         FROM charter_active ca
+        WHERE ca.business_id = cv.business_id AND ca.charter_version = cv.charter_version AND ca.business_id = $1`,
+      [BUSINESS],
+    );
+    await aRead('R-1', job, 'crm', { x: 1 });
+    await aRead('R-2', job, 'crm2', { x: 1 });
+    await aRead('R-3', job, 'blank', { x: 1 });
+
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
+    expect(plan.externalSystemsKept).toEqual(['blank', 'מערכת הלקוחות (crm)', 'מערכת הלקוחות (crm2)'].sort());
   });
 });

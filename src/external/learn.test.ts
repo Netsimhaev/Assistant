@@ -205,6 +205,68 @@ describe('learnFromExternalEvents', () => {
     expect(rows[0]?.phase).toBe('failed');
   });
 
+  it('an open learning job holding no claim is failed once stale — at the start of the pass, even at cap 0', async () => {
+    const charterVersion = await install();
+    const open = async (phase: 'intake' | 'understand', minutesAgo: number): Promise<string> => {
+      const job = await withBusiness(BUSINESS, (db) =>
+        createJob(db, { charterVersion, provenance: 'unknown_external', title: LEARNING_JOB_TITLE }),
+      );
+      await testDb().query(
+        'INSERT INTO external_learning_jobs (business_id, job_id, system_id) VALUES ($1, $2, $3)',
+        [BUSINESS, job.jobId, 'crm'],
+      );
+      await testDb().query(
+        `UPDATE jobs SET phase = $2, created_at = now() - make_interval(mins => $3) WHERE job_id = $1`,
+        [job.jobId, phase, minutesAgo],
+      );
+      return job.jobId;
+    };
+    const staleIntake = await open('intake', 31);
+    const staleUnderstand = await open('understand', 45);
+    const young = await open('understand', 5);
+
+    const out = await learn(async () => ({ candidates: [] }), 0);
+    expect(out).toMatchObject({ jobs: 0, curated: 0 });
+
+    const phases = await testDb().query<{ job_id: string; phase: string }>(
+      'SELECT job_id, phase FROM jobs WHERE job_id = ANY ($1)',
+      [[staleIntake, staleUnderstand, young]],
+    );
+    const phaseOf = new Map(phases.rows.map((r) => [r.job_id, r.phase]));
+    expect(phaseOf.get(staleIntake)).toBe('failed');
+    expect(phaseOf.get(staleUnderstand)).toBe('failed');
+    expect(phaseOf.get(young)).toBe('understand');
+    const failed = await testDb().query<{ job_id: string }>(
+      'SELECT job_id FROM external_learning_jobs WHERE failed_at IS NOT NULL ORDER BY job_id',
+    );
+    expect(failed.rows.map((r) => r.job_id).sort()).toEqual([staleIntake, staleUnderstand].sort());
+  });
+
+  it('the stale sweep runs even when no charter carries a system', async () => {
+    await registerBusiness(BUSINESS);
+    const charterVersion = await withBusiness(BUSINESS, async (db) => {
+      await installCharter(db, buildCharter({ version: 'no-systems' }));
+      const { rows } = await db.query<{ charter_version: string }>(
+        'SELECT charter_version FROM charter_active WHERE business_id = $1',
+        [BUSINESS],
+      );
+      return rows[0]?.charter_version ?? '';
+    });
+    const job = await withBusiness(BUSINESS, (db) =>
+      createJob(db, { charterVersion, provenance: 'unknown_external', title: LEARNING_JOB_TITLE }),
+    );
+    await testDb().query('INSERT INTO external_learning_jobs (business_id, job_id, system_id) VALUES ($1, $2, $3)', [
+      BUSINESS,
+      job.jobId,
+      'crm',
+    ]);
+    await testDb().query(`UPDATE jobs SET created_at = now() - interval '2 hours' WHERE job_id = $1`, [job.jobId]);
+
+    await learn(async () => ({ candidates: [] }));
+    const { rows } = await testDb().query<{ phase: string }>('SELECT phase FROM jobs WHERE job_id = $1', [job.jobId]);
+    expect(rows[0]?.phase).toBe('failed');
+  });
+
   it('a throw before the model call leaves the events uncurated and unclaimed, and marks the job failed', async () => {
     await install();
     await seedEvents(2);
