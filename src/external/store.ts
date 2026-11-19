@@ -109,21 +109,30 @@ export async function loadReadsForJob(db: BusinessDb, jobId: string): Promise<Ex
   return rows.map(toRead);
 }
 
+export interface OwnerReadRecord extends ExternalReadRecord {
+  /** The phase of the job the read belongs to; only `closed` is "done". */
+  jobPhase: string;
+}
+
 /**
  * Reads from the last day's jobs the owner's own instructions opened, newest
- * first — what the instruct screen shows as "what came back". Joined to
- * `boss_instructions`, so a read from any other kind of job never appears.
+ * first — what the instruct screen shows as "what came back". `EXISTS` on
+ * `boss_instructions` (not a join), so a job with several instruction rows
+ * does not repeat its reads, and a read from any other kind of job never
+ * appears.
  */
-export async function loadRecentOwnerReads(db: BusinessDb, limit = 5): Promise<ExternalReadRecord[]> {
-  const { rows } = await db.query<ReadRow>(
-    `SELECT r.read_id, r.job_id, r.step_id, r.system_id, r.operation, r.fields, r.created_at
+export async function loadRecentOwnerReads(db: BusinessDb, limit = 5): Promise<OwnerReadRecord[]> {
+  const { rows } = await db.query<ReadRow & { phase: string }>(
+    `SELECT r.read_id, r.job_id, r.step_id, r.system_id, r.operation, r.fields, r.created_at, j.phase
        FROM external_reads r
-       JOIN boss_instructions i ON i.business_id = r.business_id AND i.job_id = r.job_id
+       JOIN jobs j ON j.business_id = r.business_id AND j.job_id = r.job_id
       WHERE r.business_id = $1 AND r.created_at > now() - interval '24 hours'
+        AND EXISTS (SELECT 1 FROM boss_instructions i
+                     WHERE i.business_id = r.business_id AND i.job_id = r.job_id)
       ORDER BY r.read_id DESC LIMIT $2`,
     [db.businessId, limit],
   );
-  return rows.map(toRead);
+  return rows.map((r) => ({ ...toRead(r), jobPhase: r.phase }));
 }
 
 interface EventRow {

@@ -20,6 +20,8 @@ import { recordInbound, settleMessage } from '../whatsapp/store.js';
 import { saveInstruction } from '../governance/instructions.js';
 import { confirmChoice, createConfirmation } from '../governance/instruction-confirmations.js';
 import { REASK_REASON } from './command-reask.js';
+import { cutLine, READS_ON_DASHBOARD_LINE } from '../external/render-reads.js';
+import { WHATSAPP_MESSAGE_MAX_CHARS } from './command-confirm.js';
 import { loadRecentOwnerReads, recordExternalRead } from '../external/store.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import {
@@ -1342,6 +1344,47 @@ describe('reportWhatsAppJobs — boss commands (spec §4.6)', () => {
     }
     const rows = await withBusiness(BUSINESS, (db) => loadRecentOwnerReads(db));
     expect(rows.map((r) => r.jobId)).toEqual([owned]);
+  });
+
+  it('a performed job with no reads reports exactly the sentence', async () => {
+    const jobId = await seed({ instruction: true, confirm: true });
+    await close(jobId);
+    await linkToWhatsApp(jobId);
+    const messenger = fakeMessenger();
+    await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
+    expect(messenger.sentTexts).toEqual(['בוצע לפי אישורך.']);
+  });
+
+  it('a failed job that has reads gets no block', async () => {
+    const jobId = await seed({ instruction: true, confirm: true });
+    await withBusiness(BUSINESS, (db) =>
+      recordExternalRead(db, { jobId, stepId: 's1', systemId: 'crm', operation: 'lookup', fields: [{ label: 'a', value: 'b' }] }),
+    );
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'failed', actor: 'orchestrator', reason: 'adapter_timeout' }));
+    await linkToWhatsApp(jobId);
+    const messenger = fakeMessenger();
+    await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
+    expect(messenger.sentTexts).toHaveLength(1);
+    expect(messenger.sentTexts[0]).not.toContain('crm');
+  });
+
+  it('long values keep the whole message within the WhatsApp limit and end on a cut line', async () => {
+    const jobId = await seed({ instruction: true, confirm: true });
+    await withBusiness(BUSINESS, (db) =>
+      recordExternalRead(db, {
+        jobId, stepId: 's1', systemId: 'crm', operation: 'lookup',
+        fields: Array.from({ length: 30 }, (_, i) => ({ label: `f${i}`, value: 'x'.repeat(500) })),
+      }),
+    );
+    await close(jobId);
+    await linkToWhatsApp(jobId);
+    const messenger = fakeMessenger();
+    await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
+    const sent = messenger.sentTexts[0]!;
+    expect(sent.length).toBeLessThanOrEqual(WHATSAPP_MESSAGE_MAX_CHARS);
+    const last = sent.split('\n').at(-1)!;
+    expect(last === READS_ON_DASHBOARD_LINE || /^… ועוד \d+ שורות שלא הוצגו$/.test(last)).toBe(true);
+    expect(cutLine(1)).toMatch(/שורות שלא הוצגו/);
   });
 
   it('the confirmation sentence is for confirmed commands only', async () => {

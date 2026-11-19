@@ -65,7 +65,8 @@ import {
   type SetupOptions,
 } from './setup-routes.js';
 import type { ActiveCharter } from '../charter/store.js';
-import { renderReadsForOwner } from '../external/render-reads.js';
+import { localParts } from '../util/local-time.js';
+import { readHeader, renderReadsForOwner } from '../external/render-reads.js';
 import { loadRecentOwnerReads } from '../external/store.js';
 import { config } from '../config.js';
 import { DigestSchedule, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
@@ -1421,12 +1422,26 @@ async function handleInstructGet(
   );
 }
 
-/** What the owner's recent commands read from external systems, rendered; '' when nothing. */
+/**
+ * What the owner's recent commands read from external systems; '' when
+ * nothing. Each read is its own block — labels, when it was read (charter
+ * time zone), whether its job finished — with its own line cap, so one long
+ * read cannot hide the others.
+ */
 async function recentReadsBlock(db: BusinessDb): Promise<string> {
   const reads = await loadRecentOwnerReads(db);
   if (reads.length === 0) return '';
   const active = await loadActiveCharter(db);
-  return renderReadsForOwner(reads, active?.bundle.externalSystems ?? []);
+  const systems = active?.bundle.externalSystems ?? [];
+  const timeZone = active?.charter.identity.timezone ?? 'UTC';
+  return reads
+    .map((read) => {
+      const when = localParts(read.createdAt, timeZone);
+      const status = read.jobPhase === 'closed' ? 'הושלם' : 'לא הושלם';
+      const header = `${readHeader(read, systems)} (נקרא ${when.date} ${when.time}, ${status})`;
+      return renderReadsForOwner([read], systems, { headers: [header] });
+    })
+    .join('\n\n');
 }
 
 /**

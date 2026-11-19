@@ -100,6 +100,7 @@ import { claimForReport } from '../whatsapp/store.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { renderReadsForOwner } from '../external/render-reads.js';
 import { loadReadsForJob } from '../external/store.js';
+import { WHATSAPP_MESSAGE_MAX_CHARS } from './command-confirm.js';
 import { REASK_REASON } from './command-reask.js';
 import { jobHistory } from './jobs.js';
 import { loadPlanBody, stepResults } from './plan-store.js';
@@ -709,7 +710,10 @@ async function withReads(
   const reads = await loadReadsForJob(db, jobId);
   if (reads.length === 0) return text;
   const active = await loadActiveCharter(db);
-  const block = renderReadsForOwner(reads, active?.bundle.externalSystems ?? []);
+  // The sentence plus the block must fit one message: the block gets what is left.
+  const block = renderReadsForOwner(reads, active?.bundle.externalSystems ?? [], {
+    maxChars: WHATSAPP_MESSAGE_MAX_CHARS - text.length - 2,
+  });
   return `${text}
 
 ${block}`;
