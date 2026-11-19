@@ -62,7 +62,8 @@ const POLICY_NAME = 'tenant_isolation';
  * the privilege wall refuses before the policy is reached. Their isolation is
  * still covered by SELECT, by the policy checks and by the grants test.
  */
-const APPEND_ONLY = new Set(['business_descriptions']);
+// audit_log: migration 081 revokes UPDATE and DELETE from the app account.
+const APPEND_ONLY = new Set(['business_descriptions', 'audit_log']);
 
 /** Every base table in `public` with a `business_id` column, minus the named exclusions. */
 async function businessTables(db: Queryable): Promise<string[]> {

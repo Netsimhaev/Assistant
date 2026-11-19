@@ -29,6 +29,7 @@ import { createJob, transition } from '../orchestrator/jobs.js';
 import { writeMemory } from '../memory/store.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
+import { TEST_PLATFORM_USER } from '../config.js';
 
 const BIZ_A = 'del-biz-a';
 /** Starts with A's id on purpose: a prefix match anywhere would take its rows. */
@@ -51,18 +52,28 @@ const NO_BUSINESS_ID: Readonly<Record<string, string>> = {
   platform_staff_unknown_login_throttle: "the panel's one server-wide unknown-login bucket",
 };
 
-/** Every base table in `public` with a `business_id`, minus `businesses` itself. */
-async function businessTables(db: Queryable): Promise<string[]> {
-  const { rows } = await db.query<{ table_name: string }>(
-    `SELECT DISTINCT c.table_name
-       FROM information_schema.columns c
-       JOIN information_schema.tables t
-         ON t.table_schema = c.table_schema AND t.table_name = c.table_name
-      WHERE c.table_schema = 'public' AND c.column_name = 'business_id'
-        AND t.table_type = 'BASE TABLE' AND c.table_name <> 'businesses'
+/**
+ * Every table in `public` (relkind r/p) with whether it has a live
+ * `business_id` column — read from pg_catalog, the same catalog query the
+ * function runs, not information_schema (which filters by privilege).
+ */
+async function publicTables(db: Queryable): Promise<Array<{ name: string; hasBusinessId: boolean }>> {
+  const { rows } = await db.query<{ name: string; has_bid: boolean }>(
+    `SELECT c.relname::text AS name,
+            EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
+                     WHERE a.attrelid = c.oid AND a.attname = 'business_id'
+                       AND a.attnum > 0 AND NOT a.attisdropped) AS has_bid
+       FROM pg_catalog.pg_class c
+       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
       ORDER BY 1`,
   );
-  return rows.map((r) => r.table_name);
+  return rows.map((r) => ({ name: r.name, hasBusinessId: r.has_bid }));
+}
+
+/** Every table in `public` with a `business_id`, minus `businesses` itself. */
+async function businessTables(db: Queryable): Promise<string[]> {
+  return (await publicTables(db)).filter((t) => t.hasBusinessId && t.name !== 'businesses').map((t) => t.name);
 }
 
 /** Row counts of `businessId` in every table, on the migrator (a superuser in tests). */
@@ -299,14 +310,14 @@ describe('delete_business_rows (migration 081)', () => {
     expect(rows[0]).toEqual({ app: false, platform: true, public_acl: false, definer: true, same_owner: true });
   });
 
-  it('the app account cannot delete audit_log rows, even with app.deleting_business set', async () => {
+  it('the app account holds no DELETE on audit_log, even with app.deleting_business set', async () => {
     await seedRealistic(BIZ_A);
     await expect(
       withBusinessTransaction(BIZ_A, async (db) => {
         await db.query(`SELECT set_config('app.deleting_business', $1, true)`, [BIZ_A]);
         await db.query('DELETE FROM audit_log');
       }),
-    ).rejects.toThrow(/append-only|permission denied/);
+    ).rejects.toThrow(/permission denied for table audit_log/);
     const { rows } = await testDb().query<{ n: string }>(
       'SELECT count(*) AS n FROM audit_log WHERE business_id = $1',
       [BIZ_A],
@@ -354,17 +365,121 @@ describe('delete_business_rows (migration 081)', () => {
   });
 
   it('inventory lock: every table without business_id is a named server table', async () => {
-    const { rows } = await testDb().query<{ table_name: string; has_bid: boolean }>(
-      `SELECT t.table_name,
-              EXISTS (SELECT 1 FROM information_schema.columns c
-                       WHERE c.table_schema = t.table_schema AND c.table_name = t.table_name
-                         AND c.column_name = 'business_id') AS has_bid
-         FROM information_schema.tables t
-        WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE'
-        ORDER BY 1`,
-    );
+    const rows = await publicTables(testDb());
     expect(rows.length).toBeGreaterThan(50);
-    const without = rows.filter((r) => !r.has_bid).map((r) => r.table_name);
+    const without = rows.filter((r) => !r.hasBusinessId).map((r) => r.name);
     expect(without).toEqual(Object.keys(NO_BUSINESS_ID).sort());
+  });
+  it('refuses a NULL, empty or malformed business id before touching anything', async () => {
+    await seedRealistic(BIZ_A);
+    const before = await countsFor(tables, BIZ_A);
+    for (const bad of [null, '', 'ab', 'Del-Biz-A', 'del_biz_a', 'del-biz-a%', `${'a'.repeat(64)}`]) {
+      await expect(
+        withPlatform((db) => db.query('SELECT * FROM delete_business_rows($1)', [bad])),
+        String(bad),
+      ).rejects.toThrow('delete_business_rows: not a business id');
+    }
+    expect(await countsFor(tables, BIZ_A)).toEqual(before);
+  });
+
+  it('the app account holds neither UPDATE nor DELETE on audit_log', async () => {
+    const { rows } = await testDb().query<{ upd: boolean; del: boolean; ins: boolean }>(
+      `SELECT has_table_privilege('assistant_app', 'public.audit_log', 'UPDATE') AS upd,
+              has_table_privilege('assistant_app', 'public.audit_log', 'DELETE') AS del,
+              has_table_privilege('assistant_app', 'public.audit_log', 'INSERT') AS ins`,
+    );
+    expect(rows[0]).toEqual({ upd: false, del: false, ins: true });
+  });
+
+  /**
+   * The attack fix round 1 closed: the app login shadows `pg_class` with a
+   * temp table whose only row names itself as audit_log's owner, puts pg_temp
+   * first on its search_path and sets `app.deleting_business` itself. With an
+   * unqualified catalog name in the trigger and the app's DELETE grant, that
+   * deleted the chain. Both the pinned/qualified trigger and the revoke stand
+   * against it; this test fails if both are undone.
+   */
+  it('the app login cannot delete audit_log by shadowing pg_class with a temp table', async () => {
+    await seedRealistic(BIZ_A);
+    await expect(
+      withBusinessTransaction(BIZ_A, async (db) => {
+        await db.query('CREATE TEMP TABLE pg_class (oid oid, relowner oid) ON COMMIT DROP');
+        await db.query(
+          `INSERT INTO pg_temp.pg_class
+           SELECT 'public.audit_log'::regclass::oid, r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = current_user`,
+        );
+        await db.query(`SELECT set_config('search_path', 'pg_temp, pg_catalog, public', true)`);
+        await db.query(`SELECT set_config('app.deleting_business', $1, true)`, [BIZ_A]);
+        await db.query('DELETE FROM audit_log');
+      }),
+    ).rejects.toThrow(/permission denied for table audit_log|audit_log is append-only: DELETE/);
+    const { rows } = await testDb().query<{ n: string }>(
+      'SELECT count(*) AS n FROM audit_log WHERE business_id = $1',
+      [BIZ_A],
+    );
+    expect(Number(rows[0]?.n)).toBe(3);
+  });
+
+  /**
+   * In tests the migrator is a superuser, and superusers bypass even FORCEd
+   * row level security — so the function's `set_config('app.business_id', …)`
+   * and the trigger's owner branch are exercised here under a NON-superuser
+   * owner, the shape production has. One transaction on the migrator, rolled
+   * back: a NOSUPERUSER NOBYPASSRLS role takes ownership of the function and of
+   * audit_log, is granted SELECT and DELETE on every table (RLS then applies to
+   * it on every one of them, FORCEd on audit_log, which it owns), and the
+   * platform login calls the function.
+   */
+  it('works under a non-superuser owner: RLS is matched and the trigger lets its owner delete', async () => {
+    await seedRealistic(BIZ_A);
+    await seedRealistic(BIZ_B);
+    const owner = `del_probe_owner_${ulid().toLowerCase()}`;
+    const client = await testDb().connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE ROLE ${owner} NOLOGIN NOSUPERUSER NOBYPASSRLS`);
+      await client.query(`GRANT ${owner} TO current_user`);
+      await client.query(`GRANT USAGE ON SCHEMA public TO ${owner}`);
+      await client.query(`GRANT SELECT, DELETE ON ALL TABLES IN SCHEMA public TO ${owner}`);
+      await client.query(`ALTER TABLE audit_log OWNER TO ${owner}`);
+      await client.query(`ALTER FUNCTION delete_business_rows(text) OWNER TO ${owner}`);
+      const { rows: probe } = await client.query<{ su: boolean; bypass: boolean }>(
+        `SELECT rolsuper AS su, rolbypassrls AS bypass FROM pg_roles WHERE rolname = $1`,
+        [owner],
+      );
+      expect(probe[0]).toEqual({ su: false, bypass: false });
+
+      await client.query(`SET LOCAL ROLE ${TEST_PLATFORM_USER}`);
+      const { rows: returned } = await client.query<{ table_name: string }>(
+        'SELECT table_name FROM delete_business_rows($1)',
+        [BIZ_A],
+      );
+      await client.query('RESET ROLE');
+      expect(returned.map((r) => r.table_name)).toContain('audit_log');
+
+      for (const [business, expected] of [[BIZ_A, 0], [BIZ_B, 3]] as const) {
+        const { rows } = await client.query<{ n: string }>(
+          'SELECT count(*) AS n FROM audit_log WHERE business_id = $1',
+          [business],
+        );
+        expect({ business, n: Number(rows[0]?.n) }).toEqual({ business, n: expected });
+      }
+      for (const table of tables) {
+        const { rows } = await client.query<{ n: string }>(
+          `SELECT count(*) AS n FROM ${table} WHERE business_id = $1`,
+          [BIZ_A],
+        );
+        expect({ table, n: Number(rows[0]?.n) }).toEqual({ table, n: 0 });
+      }
+    } finally {
+      await client.query('ROLLBACK');
+      client.release();
+    }
+    // Rolled back: the role, the ownership and the rows are as they were.
+    const { rows } = await testDb().query<{ n: string }>(
+      'SELECT count(*) AS n FROM audit_log WHERE business_id = $1',
+      [BIZ_A],
+    );
+    expect(Number(rows[0]?.n)).toBe(3);
   });
 });

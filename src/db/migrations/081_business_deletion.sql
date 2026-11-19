@@ -36,25 +36,39 @@ ALTER TABLE businesses ADD COLUMN pass_finished_at timestamptz;
 -- subject to; and the RESTRICT / NO ACTION foreign keys (`signatures` →
 -- `documents`, `spend_ledger` → `audit_log`, `jobs` → `charter_versions`) are
 -- ordered by the rounds below, not bypassed.
-CREATE OR REPLACE FUNCTION audit_log_is_append_only() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION audit_log_is_append_only() RETURNS trigger
+LANGUAGE plpgsql
+-- Pinned, and every catalog name below is qualified as well (fix round 1): with
+-- the caller's search_path, an app login could `CREATE TEMP TABLE pg_class`
+-- holding a forged owner row, put pg_temp first, and pass the owner check.
+SET search_path = pg_catalog, pg_temp
+AS $$
 BEGIN
     IF TG_OP = 'DELETE'
-       AND current_user::text = (SELECT pg_get_userbyid(c.relowner)::text
-                                   FROM pg_class c WHERE c.oid = TG_RELID)
-       AND current_setting('app.deleting_business', true) = OLD.business_id THEN
+       AND current_user::text = (SELECT pg_catalog.pg_get_userbyid(c.relowner)::text
+                                   FROM pg_catalog.pg_class c WHERE c.oid = TG_RELID)
+       AND pg_catalog.current_setting('app.deleting_business', true) = OLD.business_id THEN
         RETURN OLD;
     END IF;
     RAISE EXCEPTION 'audit_log is append-only: % on seq % rejected', TG_OP, OLD.seq;
 END;
-$$ LANGUAGE plpgsql;
+$$;
+
+-- And the app account loses UPDATE and DELETE on audit_log altogether (fix
+-- round 1): no production code updates or deletes it on the app or platform
+-- pool (it only appends), so the trigger is now the second wall, not the only
+-- one. The platform login took its DML through `assistant_app` and loses it
+-- too; the deletion function runs as the owner and needs neither.
+REVOKE UPDATE, DELETE ON audit_log FROM assistant_app;
 
 -- ---------------------------------------------------------------------------
 -- delete_business_rows(p_business): every row whose business_id is
 -- p_business, from every base table in `public` that has the column — except
 -- `businesses`, which the caller deletes last, after the files.
 --
--- * The tables are found here, at call time, from information_schema — never a
---   list — so a table a later migration adds is covered by construction
+-- * The tables are found here, at call time, from pg_catalog — never a list,
+--   and not information_schema, which filters by privilege and would skip a
+--   table silently — so a table a later migration adds is covered by construction
 --   (Ruling 1). That includes `platform_activity_log`, which has no RLS: its
 --   `business_id` names the business an action touched, and those rows go too
 --   (the spec: nothing records that the business existed).
@@ -62,7 +76,9 @@ $$ LANGUAGE plpgsql;
 --   its own subtransaction; a table a foreign key blocked (foreign_key_violation)
 --   is rolled back and retried next round. A round in which no table succeeds
 --   raises, naming the tables still blocked. The remaining set shrinks every
---   round, so the loop ends.
+--   round, so the loop ends. A future DEFERRABLE INITIALLY DEFERRED foreign key
+--   would escape the retry (checked at commit, not per statement) and fail
+--   loudly at the caller's COMMIT — never a silent partial delete.
 -- * One transaction (Ruling 3): a raise rolls every round back with it.
 -- * FORCE row level security applies to the owner too, so `app.business_id` is
 --   set (transaction-local) to the business being deleted; every policy then
@@ -76,7 +92,7 @@ CREATE FUNCTION delete_business_rows(p_business text)
 RETURNS TABLE (table_name text, deleted bigint)
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public, pg_temp
 AS $$
 #variable_conflict use_column
 DECLARE
@@ -87,23 +103,25 @@ DECLARE
     v_table          text;
     v_count          bigint;
 BEGIN
-    IF p_business IS NULL OR p_business = '' THEN
-        RAISE EXCEPTION 'delete_business_rows: no business';
+    -- The registry's own id format (migration 063): NULL, '' and anything else
+    -- are refused before a setting is touched.
+    IF p_business IS NULL OR p_business !~ '^[a-z0-9-]{3,63}$' THEN
+        RAISE EXCEPTION 'delete_business_rows: not a business id';
     END IF;
 
     PERFORM set_config('app.business_id', p_business, true);
     PERFORM set_config('app.deleting_business', p_business, true);
 
-    SELECT coalesce(array_agg(t.tname ORDER BY t.tname), '{}')
+    SELECT coalesce(array_agg(c.relname::text ORDER BY c.relname::text), '{}')
       INTO v_remaining
-      FROM (SELECT DISTINCT c.table_name::text AS tname
-              FROM information_schema.columns c
-              JOIN information_schema.tables tb
-                ON tb.table_schema = c.table_schema AND tb.table_name = c.table_name
-             WHERE c.table_schema = 'public'
-               AND c.column_name = 'business_id'
-               AND tb.table_type = 'BASE TABLE'
-               AND c.table_name <> 'businesses') t;
+      FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public'
+       AND c.relkind IN ('r', 'p')
+       AND c.relname <> 'businesses'
+       AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
+                    WHERE a.attrelid = c.oid AND a.attname = 'business_id'
+                      AND a.attnum > 0 AND NOT a.attisdropped);
 
     LOOP
         EXIT WHEN cardinality(v_remaining) = 0;
