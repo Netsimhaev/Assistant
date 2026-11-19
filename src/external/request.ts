@@ -201,3 +201,38 @@ export function buildExternalRequest(
 
   return { ok: true, method: op.method, url, headers, body };
 }
+
+/** The adapter's refusal when a payload's `params` is present but not an object. */
+export const PARAMS_NOT_OBJECT_MESSAGE = 'הפרמטרים לפעולה אינם תקינים — לא נשלח דבר';
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * A plan step's payload, read as the request builder's input — the ONE
+ * reading the adapter, the confirmation echo and the instruction door share,
+ * so the request the owner is shown is the request that is sent.
+ *
+ * Own keys only. `params` must be an object when present; `amountMinor` is
+ * passed through untouched for `buildExternalRequest` to validate against
+ * the operation (it refuses anything that is not a safe non-negative integer).
+ */
+export function buildExternalRequestFromPayload(
+  system: ExternalSystem,
+  op: ExternalOperation,
+  payload: Record<string, unknown>,
+  idempotencyKey: string,
+): ExternalRequestResult {
+  let params: Record<string, unknown> | undefined;
+  if (Object.hasOwn(payload, 'params')) {
+    const p = payload['params'];
+    if (!isPlainObject(p)) return bad(PARAMS_NOT_OBJECT_MESSAGE);
+    params = p;
+  }
+  const requestInput: { params?: Record<string, unknown>; amountMinor?: number } = {
+    ...(params !== undefined ? { params } : {}),
+    ...(Object.hasOwn(payload, 'amountMinor') ? { amountMinor: payload['amountMinor'] as number } : {}),
+  };
+  return buildExternalRequest(system, op, requestInput, idempotencyKey);
+}

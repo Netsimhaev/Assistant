@@ -374,6 +374,7 @@ describe('approveDocumentCard', () => {
       options: card.deliveryPlans,
       stage: 'ready',
       currency: 'ILS',
+      systems: [],
     });
     expect(text).toContain('הצעה לנובמבר');
     expect(text).toContain('שלום, מצורפת ההצעה.');

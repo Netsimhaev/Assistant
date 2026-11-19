@@ -129,6 +129,7 @@ import { createJob, transition } from './jobs.js';
 import { bindPlanToJob, planHashOf } from './plan-store.js';
 import { classMismatch } from './run-plan.js';
 import { isExternalTool, resolveExternalCall } from '../policy/external-class.js';
+import { buildExternalRequestFromPayload } from '../external/request.js';
 import { DocProduceInput } from '../production/produce-input.js';
 import { resolveSourceDocuments, type SourceResolution } from '../production/source-resolver.js';
 
@@ -787,6 +788,19 @@ async function planAndCheck(
           audit: `instruction door: step ${step.id} external operation unknown (${resolved.reason})`,
         };
       }
+      // The request the adapter would build, built now with the same payload
+      // reading (`buildExternalRequestFromPayload`). A step whose request the
+      // builder refuses is refused here, quoting the builder's own Hebrew
+      // sentence — before the owner is asked about it, so the question never
+      // echoes a request that could not run, and never echoes it partially.
+      const built = buildExternalRequestFromPayload(resolved.system, resolved.op, step.input, 'plan-check');
+      if (!built.ok) {
+        return {
+          kind: 'refused',
+          reason: `התוכנית כוללת בקשה למערכת חיצונית שאינה תקינה, ולכן לא רצה: ${built.message}`,
+          audit: `instruction door: step ${step.id} external request invalid (${built.code})`,
+        };
+      }
     }
 
     const mismatch = classMismatch(step, door.bundle.externalSystems);
@@ -1074,6 +1088,7 @@ async function planPerCandidate(
   for (const option of options) ledgerEchoes.push(await ledgerEchoOf(door, option.plan));
   const rendered = renderConfirmationQuestion(options, {
     currency: door.bundle.ceilings.currency,
+    systems: door.bundle.externalSystems,
     extraEchoes: ledgerEchoes,
   });
   if ('refused' in rendered) {
@@ -1149,6 +1164,7 @@ async function finishSingle(
     };
     const rendered = renderConfirmationQuestion([option], {
       currency: door.bundle.ceilings.currency,
+      systems: door.bundle.externalSystems,
       extraEchoes: [single.extraEcho ?? (await ledgerEchoOf(door, plan))],
     });
     if ('refused' in rendered) {

@@ -6,6 +6,9 @@ import { READ_ONLY_TOOLS, classifyAction, isOutbound, refineActionClass } from '
 import { markInvisibleControls, stripBidiControls } from '../util/bidi.js';
 import { canonicalJson } from '../util/canonical.js';
 import { formatMinor } from '../util/money.js';
+import type { ExternalSystem } from '../domain/external-system.js';
+import { buildExternalRequestFromPayload } from '../external/request.js';
+import { isExternalTool, resolveExternalCall } from '../policy/external-class.js';
 
 /**
  * The Hebrew confirmation question (boss command, spec §4.1, §4.2, §10.5, §10.6).
@@ -157,16 +160,95 @@ function isHidden(toolName: string): boolean {
 }
 
 /**
+ * The idempotency key handed to the request builder for the echo's URL line.
+ * The key only ever reaches a header, never the URL, and the echo shows no
+ * header — so any fixed value builds the exact URL that will be sent.
+ */
+const ECHO_IDEMPOTENCY_KEY = 'echo';
+const UNRESOLVED_EXTERNAL_LABEL = 'פעולה במערכת חיצונית שלא נחתמה';
+const UNBUILDABLE_EXTERNAL = 'אי אפשר להציג את הבקשה למערכת החיצונית';
+/** The payload keys an `ext.*` echo shows in structured form, once. */
+const EXTERNAL_KEYS: ReadonlySet<string> = new Set(['system', 'operation', 'params', 'amountMinor']);
+
+/**
+ * Why an `ext.*` step cannot be shown whole, or null when it can (or is not an
+ * `ext.*` step). An unresolved operation or a request the builder refuses is
+ * never echoed partially: the question is refused instead, quoting the
+ * builder's own Hebrew sentence.
+ */
+export function externalEchoProblem(step: PlanStep, systems: readonly ExternalSystem[]): string | null {
+  if (!isExternalTool(step.toolName)) return null;
+  const resolved = resolveExternalCall(systems, step.toolName, step.input);
+  if (!resolved.ok) return `${UNBUILDABLE_EXTERNAL}: הפעולה אינה פעולה שנחתמה בתקנון.`;
+  const built = buildExternalRequestFromPayload(resolved.system, resolved.op, step.input, ECHO_IDEMPOTENCY_KEY);
+  return built.ok ? null : `${UNBUILDABLE_EXTERNAL}: ${built.message}`;
+}
+
+/**
+ * The echo of a resolved `ext.*` step whose request builds: the operation's
+ * label, the SIGNED class (never the `TOOL_ACTION_CLASS` placeholder), the
+ * tool, the system, the exact method and URL the adapter will send, each param
+ * on its own line and the amount. Null when the step does not resolve or its
+ * request cannot be built — the caller then falls back to showing every field
+ * as it is, and the question refuses it (`externalEchoProblem`).
+ */
+function externalEcho(step: PlanStep, currency: string, systems: readonly ExternalSystem[]): string | null {
+  const resolved = resolveExternalCall(systems, step.toolName, step.input);
+  if (!resolved.ok) return null;
+  const { system, op } = resolved;
+  const built = buildExternalRequestFromPayload(system, op, step.input, ECHO_IDEMPOTENCY_KEY);
+  if (!built.ok) return null;
+
+  const lines: string[] = [
+    labelText(op.label),
+    `סוג פעולה: ${actionClassLabel(resolved.actionClass)}`,
+    `כלי: ${inlineValue(step.toolName)}`,
+    `מערכת: ${labelText(system.label)} (${inlineValue(system.id)})`,
+    `שיטה וכתובת: ${built.method} ${inlineValue(built.url.href)}`,
+  ];
+  const params = step.input['params'];
+  if (params !== null && typeof params === 'object' && !Array.isArray(params)) {
+    const record = params as Record<string, unknown>;
+    // Declared order; the builder already refused any undeclared key.
+    for (const param of op.params) {
+      if (!Object.hasOwn(record, param.name)) continue;
+      lines.push(`פרמטר ${inlineValue(param.name)}: ${renderValue(record[param.name])}`);
+    }
+  }
+  if (Object.hasOwn(step.input, 'amountMinor')) {
+    lines.push(`סכום: ${renderKnown('amountMinor', step.input['amountMinor'], currency)}`);
+  }
+  const extras = Object.keys(step.input)
+    .filter((key) => !EXTERNAL_KEYS.has(key))
+    .sort();
+  for (const key of extras) {
+    lines.push(`שדה נוסף: ${inlineValue(key)} = ${renderValue(step.input[key])}`);
+  }
+  return lines.join('\n');
+}
+
+/**
  * The echo of one step; empty string only for a positively read-only step.
  *
  * `currency` is the active charter's (`bundle.ceilings.currency`), required
  * and with no default: an amount shown in a currency the charter does not
- * keep is an amount the owner did not see.
+ * keep is an amount the owner did not see. `systems` is the active charter's
+ * signed external systems (`bundle.externalSystems`), required for the same
+ * reason: an `ext.*` step is labelled by the class the owner signed and shows
+ * the exact request the adapter will build — never the placeholder class.
  */
-export function renderStepEcho(step: PlanStep, currency: string): string {
+export function renderStepEcho(step: PlanStep, currency: string, systems: readonly ExternalSystem[]): string {
   if (isHidden(step.toolName)) return '';
+  if (isExternalTool(step.toolName)) {
+    const echo = externalEcho(step, currency, systems);
+    if (echo !== null) return echo;
+  }
   const base = classifyAction(step.toolName);
-  const label = base === null ? UNCLASSIFIED_LABEL : actionClassLabel(refineActionClass(base, step.input));
+  const label = isExternalTool(step.toolName)
+    ? UNRESOLVED_EXTERNAL_LABEL
+    : base === null
+      ? UNCLASSIFIED_LABEL
+      : actionClassLabel(refineActionClass(base, step.input));
   const lines: string[] = [label, `כלי: ${inlineValue(step.toolName)}`];
 
   for (const { key, name } of KNOWN_FIELDS) {
@@ -192,10 +274,16 @@ function sourceMarker(option: ConfirmationOption): string {
 }
 
 /** Echoes of an option's side-effecting steps, or the refusal if one is too long. */
-function optionEchoes(option: ConfirmationOption, currency: string): string[] | { refused: string } {
+function optionEchoes(
+  option: ConfirmationOption,
+  currency: string,
+  systems: readonly ExternalSystem[],
+): string[] | { refused: string } {
   const echoes: string[] = [];
   for (const step of option.plan.steps) {
-    const echo = renderStepEcho(step, currency);
+    const problem = externalEchoProblem(step, systems);
+    if (problem !== null) return { refused: problem };
+    const echo = renderStepEcho(step, currency, systems);
     if (echo === '') continue;
     if (echo.length > MAX_ECHO_CHARS_PER_STEP) return { refused: TOO_LONG };
     echoes.push(echo);
@@ -208,6 +296,8 @@ export function renderConfirmationQuestion(
   opts: {
     /** The active charter's currency (`bundle.ceilings.currency`) — every amount is shown in it. */
     currency: string;
+    /** The active charter's signed external systems (`bundle.externalSystems`) — required, never defaulted. */
+    systems: readonly ExternalSystem[];
     reask?: boolean;
     /** Steps of the original plan that completed and were dropped from this one; shown when > 0. */
     alreadyDone?: number;
@@ -226,7 +316,7 @@ export function renderConfirmationQuestion(
   const multiple = options.length > 1;
   const rendered: string[] = [];
   for (const [index, option] of options.entries()) {
-    const echoes = optionEchoes(option, opts.currency);
+    const echoes = optionEchoes(option, opts.currency, opts.systems);
     if (!Array.isArray(echoes)) return echoes;
     const head = `${multiple ? `${index + 1}. ` : ''}${labelText(option.label)}${sourceMarker(option)}`;
     const extra = opts.extraEchoes?.[index] ?? null;

@@ -15,6 +15,7 @@ import type { Plan } from '../domain/plan.js';
 import { buildPlannerPrompt, type PlanRequest } from '../sdk/planner.js';
 import { createLedgerItem } from '../ledger/store.js';
 import { runDueJobs } from './run-due.js';
+import { crmConnection, crmFixture } from '../test/external-fixtures.js';
 
 const BUSINESS = 'test-business';
 
@@ -1707,5 +1708,63 @@ describe('business description', () => {
 
   it('passes no description key when none exists', async () => {
     expect('businessDescription' in (await plannerSees())).toBe(false);
+  });
+});
+
+/**
+ * Stage D, Task 7: an `ext.*` step is shown in the question as the exact
+ * request that will run, and a step whose request cannot be built is refused
+ * at plan time with the builder's Hebrew sentence — never echoed partially.
+ */
+describe('runInstruction — external-system steps', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({
+      externalSystems: [crmFixture()],
+      connections: [MAIL_CONNECTION, crmConnection()],
+    })));
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  function extPlan(input: Record<string, unknown>): Plan {
+    return {
+      goal: 'לעדכן לקוח',
+      assumptions: [],
+      clarifyingQuestion: null,
+      estimatedCostMinor: 0,
+      steps: [{
+        id: 's1',
+        agent: 'ops.systems',
+        intent: 'לעדכן את הטלפון',
+        toolName: 'ext.call',
+        input,
+        dependsOn: [],
+        expectedActionClass: 'crm.write',
+      }],
+    };
+  }
+
+  it('echoes the method, the exact URL and each param of the signed operation', async () => {
+    const plan = extPlan({ system: 'crm', operation: 'update_customer', params: { customer_id: 'c1', phone: '050-1234567' } });
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תעדכני את הטלפון של c1' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan }) }));
+    if (result.status !== 'needs_confirmation') throw new Error(`unexpected ${result.status}`);
+    expect(result.question).toContain('שיטה וכתובת: PATCH https://api.crm.example.com/v1/customers/c1');
+    expect(result.question).toContain('פרמטר phone: 050-1234567');
+    expect(result.question).not.toContain('שדה נוסף');
+  });
+
+  it('refuses a step whose request cannot be built, quoting the builder, with nothing parked', async () => {
+    const plan = extPlan({ system: 'crm', operation: 'update_customer', params: { phone: '050' } });
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תעדכני את הטלפון' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan }) }));
+    expect(result.status).toBe('refused');
+    if (result.status !== 'refused') throw new Error('unreachable');
+    expect(result.reason).toContain('חסר פרמטר חובה "customer_id"');
+    // The plan-time refusal, not the question's own refusal behind it.
+    expect(result.reason).toContain('התוכנית כוללת בקשה למערכת חיצונית שאינה תקינה');
+    const { rows } = await testDb().query(`SELECT 1 FROM instruction_confirmations`);
+    expect(rows).toHaveLength(0);
   });
 });

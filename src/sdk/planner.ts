@@ -4,7 +4,13 @@ import { config } from '../config.js';
 import { Plan, planProblems } from '../domain/plan.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
-import { READ_ONLY_CLASS_LABEL, capabilityCatalogue, renderCatalogue } from '../orchestrator/catalogue.js';
+import {
+  EXTERNAL_CLASS_LABEL,
+  READ_ONLY_CLASS_LABEL,
+  capabilityCatalogue,
+  renderCatalogue,
+  renderExternalCatalogue,
+} from '../orchestrator/catalogue.js';
 import { REFINEMENT_RULES } from '../policy/classify.js';
 import { renderLocalToolContracts } from '../orchestrator/local-tools.js';
 import { renderDescriptionSection } from '../business/description-prompt.js';
@@ -142,6 +148,28 @@ function profileLines(profile: ProfileForPrompt | undefined): string[] {
   return section === '' ? [] : [section, ''];
 }
 
+/**
+ * The signed external operations (Stage D), right after the capability
+ * catalogue and still inside the cacheable prefix: the section is
+ * byte-identical between calls and changes only with the charter. Absent when
+ * nothing is signed, so such a business keeps the prefix it had.
+ */
+function externalLines(bundle: PlanRequest['bundle']): string[] {
+  const rendered = renderExternalCatalogue(bundle.externalSystems);
+  if (rendered === '') return [];
+  return [
+    '# פעולות במערכות חיצוניות',
+    'אלה הפעולות שבעל העסק חתם עליהן במערכות החיצוניות. קריאה לפעולה: הכלי שמופיע לה (ext.read או ext.call), ' +
+      'והמטען בדיוק {"system": <מזהה המערכת>, "operation": <שם הפעולה>, "params": {...}} — ' +
+      'ולפעולת כסף גם "amountMinor". פרמטר שאינו מופיע לפעולה ייפסל.',
+    `בקטלוג שלמעלה עמודת המחלקה של ext.read ו-ext.call מסומנת «${EXTERNAL_CLASS_LABEL}». ` +
+      'בשדה expectedActionClass של צעד כזה כתבי את המחלקה שמופיעה כאן לפעולה (expectedActionClass: ...) — או null. ' +
+      'כל מחלקה אחרת תיפסל.',
+    rendered,
+    '',
+  ];
+}
+
 export function buildPlannerPrompt(
   request: PlanRequest,
   nonce: string = randomBytes(16).toString('hex'),
@@ -162,6 +190,7 @@ export function buildPlannerPrompt(
     'הרשימה כבר לוקחת בחשבון את מקור השרשרת ואת רמת האוטונומיה. כלי שאינו ברשימה ייענה בסירוב.',
     catalogue,
     '',
+    ...externalLines(request.bundle),
     '# מה לייצר',
     'החזר JSON יחיד התואם לסכמה, בלי טקסט לפניו או אחריו:',
     '{"goal": string, "assumptions": string[], "clarifyingQuestion": string|null,',

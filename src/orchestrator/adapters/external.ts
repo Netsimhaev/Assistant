@@ -6,7 +6,7 @@ import {
   type ExternalHttp,
   type ExternalResult,
 } from '../../external/http.js';
-import { buildExternalRequest } from '../../external/request.js';
+import { buildExternalRequestFromPayload } from '../../external/request.js';
 import { resolveExternalCall } from '../../policy/external-class.js';
 import type { AdapterCall, AdapterResult, ExternalAdapter } from './types.js';
 
@@ -206,21 +206,10 @@ export function createExternalAdapter(system: ExternalSystem, deps: ExternalAdap
     const op = resolved.op;
     const isWrite = op.kind !== 'read';
 
-    // Own keys only. `params` must be an object; the amount is passed through
-    // untouched for `buildExternalRequest` to validate against the operation.
-    let params: Record<string, unknown> | undefined;
-    if (Object.hasOwn(input, 'params')) {
-      const p = input['params'];
-      if (!isPlainObject(p)) {
-        return { ok: false, retryable: false, code: 'bad_params', message: 'הפרמטרים לפעולה אינם תקינים — לא נשלח דבר' };
-      }
-      params = p;
-    }
-    const requestInput: { params?: Record<string, unknown>; amountMinor?: number } = {
-      ...(params !== undefined ? { params } : {}),
-      ...(Object.hasOwn(input, 'amountMinor') ? { amountMinor: input['amountMinor'] as number } : {}),
-    };
-    const built = buildExternalRequest(system, op, requestInput, call.idempotencyKey);
+    // The same payload reading the confirmation echo and the instruction door
+    // use (`buildExternalRequestFromPayload`): the request the owner was shown
+    // is the request built here.
+    const built = buildExternalRequestFromPayload(system, op, input, call.idempotencyKey);
     if (!built.ok) {
       // `built.message` is our own Hebrew sentence (it may quote a param name
       // the plan wrote), never provider text and never the secret.
