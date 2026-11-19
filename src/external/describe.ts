@@ -41,6 +41,16 @@ function isIdPath(path: string): boolean {
   return last === 'id' || last.endsWith('_id');
 }
 
+/**
+ * Does this system's webhook declare some event with no id-like field? Then
+ * two identical deliveries are deduplicated on the declared fields and kept
+ * as one, and `WEBHOOK_DEDUP_HINT` is said — on the preview, the sign page
+ * and `/systems` alike, from this one test.
+ */
+export function needsWebhookDedupHint(def: ExternalSystem): boolean {
+  return def.webhook !== null && def.webhook.events.some((e) => !e.fields.some((f) => isIdPath(f.path)));
+}
+
 function describe(def: ExternalSystem, audience: Audience, currency: string | null): string[] {
   const lines = def.operations.map((op) => operationLine(op, audience, currency));
   if (def.webhook !== null) {
@@ -58,7 +68,7 @@ function describe(def: ExternalSystem, audience: Audience, currency: string | nu
           : `התראות נכנסות (webhook): המערכת תוכל לשלוח לעוזרת התראות על: ${events.join(', ')}`,
       );
     }
-    if (def.webhook.events.some((e) => !e.fields.some((f) => isIdPath(f.path)))) lines.push(WEBHOOK_DEDUP_HINT);
+    if (needsWebhookDedupHint(def)) lines.push(WEBHOOK_DEDUP_HINT);
   }
   if (def.scan !== null) {
     const op = def.operations.find((o) => o.name === def.scan?.operation);

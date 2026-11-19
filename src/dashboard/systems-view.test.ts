@@ -15,7 +15,8 @@ import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { createServer } from './server.js';
-import { LEARNING_FAILED_TEXT, scanOutcomeText } from './systems-view.js';
+import { LEARNING_FAILED_TEXT, SYSTEMS_DIGEST_NOTE, scanOutcomeText } from './systems-view.js';
+import { WEBHOOK_DEDUP_HINT } from '../external/describe.js';
 
 const BUSINESS = 'test-business';
 const USERNAME = 'owner';
@@ -108,6 +109,45 @@ describe('GET /systems', () => {
     await testDb().query(`UPDATE external_learning_jobs SET failed_at = now() - interval '2 days' WHERE business_id = $1`, [BUSINESS]);
     const later = await (await fetch(`${baseUrl}/systems`, { headers: { cookie } })).text();
     expect(later).not.toContain(LEARNING_FAILED_TEXT);
+  });
+
+  it('always says the summary is also in the digest, and on this screen only when the digest is off (I4)', async () => {
+    expect(SYSTEMS_DIGEST_NOTE).toBe('הסיכום ממערכות חיצוניות מופיע גם בתדריך היומי/השבועי — אם התדריך כבוי, הוא מופיע רק כאן');
+    await withBusiness(BUSINESS, (db) => installCharter(db, buildCharter({})));
+    const { baseUrl, cookie } = await start();
+    const off = await (await fetch(`${baseUrl}/systems`, { headers: { cookie } })).text();
+    expect(off).toContain(SYSTEMS_DIGEST_NOTE);
+    await testDb().query(
+      `INSERT INTO digest_settings (business_id, schedule, daily_hour, weekly_day, weekly_hour, to_email, to_whatsapp, updated_by)
+       VALUES ($1, 'daily', 8, 0, 8, true, false, 'test')
+       ON CONFLICT (business_id) DO UPDATE SET schedule = 'daily'`,
+      [BUSINESS],
+    );
+    const on = await (await fetch(`${baseUrl}/systems`, { headers: { cookie } })).text();
+    expect(on).toContain(SYSTEMS_DIGEST_NOTE);
+  });
+
+  it('shows the dedupe hint only on a system whose webhook events declare no id-like field (M-g)', async () => {
+    const withId = crmFixture();
+    withId.id = 'crm2';
+    withId.label = 'מערכת עם מזהה';
+    withId.webhook!.events = [{ type: 'customer.created', label: 'לקוח חדש', fields: [{ path: 'data.id', label: 'מזהה' }] }];
+    const withIdConnection = { ...crmConnection(), system: 'ext:crm2', label: 'מערכת עם מזהה', target: 'crm2' };
+    await withBusiness(BUSINESS, (db) =>
+      installCharter(
+        db,
+        buildCharter({ externalSystems: [crmFixture(), withId], connections: [crmConnection(), withIdConnection] }),
+      ),
+    );
+    const { baseUrl, cookie } = await start();
+    const html = await (await fetch(`${baseUrl}/systems`, { headers: { cookie } })).text();
+    const cards = html.split('<div class="card">').slice(1);
+    expect(cards).toHaveLength(2);
+    const crm = cards.find((c) => c.includes('מערכת הלקוחות'));
+    const crm2 = cards.find((c) => c.includes('מערכת עם מזהה'));
+    expect(crm).toContain(WEBHOOK_DEDUP_HINT);
+    expect(crm2).toBeDefined();
+    expect(crm2).not.toContain(WEBHOOK_DEDUP_HINT);
   });
 
   it('says so when no system is signed, and sits behind the no-charter gate', async () => {

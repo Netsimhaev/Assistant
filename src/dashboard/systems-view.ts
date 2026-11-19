@@ -14,12 +14,21 @@ import type { ServerResponse } from 'node:http';
 import { loadActiveCharter } from '../charter/store.js';
 import type { BusinessDb } from '../db/pool.js';
 import { countEventsSince, lastLearningFailure, loadSystemState, recentEvents } from '../external/store.js';
+import { WEBHOOK_DEDUP_HINT, needsWebhookDedupHint } from '../external/describe.js';
 import { MAX_SCAN_ITEMS, SCAN_FAILED, SCAN_OK, SCAN_TRUNCATED } from '../external/scan.js';
 import { EXTERNAL_MESSAGES_HE } from '../orchestrator/adapters/external.js';
 import { errorPage, page, sendHtml } from './mailbox-connect.js';
 import { escLabel, escapeHtml as esc } from './views.js';
 
 export const SYSTEMS_TITLE = 'מה הגיע ממערכות חיצוניות';
+
+/**
+ * Said on the page whatever the digest setting (planning ruling 4): the
+ * summary of these systems also travels in the daily/weekly digest, and when
+ * the digest is off this screen is the only place it is shown.
+ */
+export const SYSTEMS_DIGEST_NOTE =
+  'הסיכום ממערכות חיצוניות מופיע גם בתדריך היומי/השבועי — אם התדריך כבוי, הוא מופיע רק כאן';
 
 /** How many of a system's newest items the card names. */
 export const SYSTEMS_RECENT_ITEMS = 5;
@@ -111,6 +120,7 @@ export async function handleSystems(res: ServerResponse, db: BusinessDb, now: Da
 ${learningFailedAt === null ? '' : `<p class="error">${esc(LEARNING_FAILED_TEXT)} (${esc(when(learningFailedAt, timeZone))})</p>`}
 ${items.length === 0 ? '<p class="muted">עוד לא הגיע דבר מהמערכת הזו.</p>' : `<p>האחרונים:</p><ul>${items.join('')}</ul>`}
 <p class="muted">התראות שנדחו (חתימה או מפתח שגויים): ${rejected}</p>
+${needsWebhookDedupHint(system) ? `<p class="muted">${esc(WEBHOOK_DEDUP_HINT)}</p>` : ''}
 </div>`);
   }
 
@@ -121,6 +131,7 @@ ${items.length === 0 ? '<p class="muted">עוד לא הגיע דבר מהמער�
       SYSTEMS_TITLE,
       `<h1>${esc(SYSTEMS_TITLE)}</h1>
 <p>מה שהמערכות החיצוניות החתומות שלחו (התראות) ומה שהסריקה היומית מצאה. זה מידע שנכתב מחוץ לעסק: העוזרת לומדת ממנו כטענה, ולעולם אינה פועלת לפיו בלי שתבקש.</p>
+<p class="muted">${esc(SYSTEMS_DIGEST_NOTE)}</p>
 ${cards.length === 0 ? '<p>אין מערכות חיצוניות חתומות בתקנון.</p>' : cards.join('\n')}
 <p><a href="/connections">&rarr; חזרה לחיבורים</a></p>`,
     ),
