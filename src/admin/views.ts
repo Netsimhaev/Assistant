@@ -562,8 +562,9 @@ export function renderServerError(): string {
   return page('שגיאה', '<h1>שגיאה</h1><p>משהו השתבש. נסה שוב בעוד רגע.</p>');
 }
 
-export function renderTooLarge(): string {
-  return page('הבקשה גדולה מדי', '<h1>הבקשה גדולה מדי</h1>');
+export function renderTooLarge(message?: string): string {
+  const detail = message === undefined ? '' : `<p class="error">${esc(message)}</p>`;
+  return page('הבקשה גדולה מדי', `<h1>הבקשה גדולה מדי</h1>${detail}`);
 }
 
 // ---------------------------------------------------------------------------

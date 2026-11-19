@@ -7,6 +7,7 @@ import {
   RESERVED_HEADER_NAMES,
   externalSecretRefs,
   isReservedHeaderName,
+  unrecognisedKeyPaths,
 } from './external-system.js';
 import { NEVER_FULLY_AUTONOMOUS } from './action.js';
 import { crmFixture, type ExternalSystemInput } from '../test/external-fixtures.js';
@@ -76,14 +77,14 @@ describe('ExternalSystem — kind and class', () => {
     expectRefusedBy(
       withEdit((s) => { op(s, 'get_customer').actionClass = 'crm.write'; }),
       `operations.${GET}.actionClass`,
-      'is not allowed for a "read" operation',
+      'אינו מותר לפעולה מסוג "read"',
     );
   });
   it('refuses a delete operation judged as anything but external.delete', () => {
     expectRefusedBy(
       withEdit((s) => { op(s, 'delete_customer').actionClass = 'crm.write'; }),
       `operations.${DELETE}.actionClass`,
-      'is not allowed for a "delete" operation',
+      'אינו מותר לפעולה מסוג "delete"',
     );
   });
   it('refuses a change operation outside CHANGE_CLASSES', () => {
@@ -91,7 +92,7 @@ describe('ExternalSystem — kind and class', () => {
       expectRefusedBy(
         withEdit((s) => { op(s, 'update_customer').actionClass = cls; }),
         `operations.${UPDATE}.actionClass`,
-        'is not allowed for a "change" operation',
+        'אינו מותר לפעולה מסוג "change"',
       );
     }
   });
@@ -99,7 +100,7 @@ describe('ExternalSystem — kind and class', () => {
     expectRefusedBy(
       withEdit((s) => { op(s, 'issue_refund').actionClass = 'purchase.place'; }),
       `operations.${REFUND}.actionClass`,
-      'is not allowed for a "money" operation',
+      'אינו מותר לפעולה מסוג "money"',
     );
   });
   it('accepts every class in CHANGE_CLASSES for a change operation', () => {
@@ -117,7 +118,7 @@ describe('ExternalSystem — method per kind', () => {
     expectRefusedBy(
       withEdit((s) => { op(s, 'get_customer').method = method; }),
       `operations.${GET}.method`,
-      'must use GET or POST',
+      'חייבת להשתמש ב-GET או ב-POST',
     );
   });
   it('accepts a POST read (search endpoints)', () => {
@@ -127,7 +128,7 @@ describe('ExternalSystem — method per kind', () => {
     expectRefusedBy(
       withEdit((s) => { op(s, 'list_customers').method = 'POST'; }),
       'scan.operation',
-      'must be a GET read operation',
+      'חייבת להיות פעולת קריאה מסוג GET',
     );
   });
 });
@@ -137,7 +138,7 @@ describe('ExternalSystem — money', () => {
     expectRefusedBy(
       withEdit((s) => { op(s, 'issue_refund').amount = null; }),
       `operations.${REFUND}.amount`,
-      'must declare its amount field',
+      'חייבת להצהיר על שדה הסכום שלה',
     );
   });
   it('refuses a currency outside the closed list', () => {
@@ -153,7 +154,7 @@ describe('ExternalSystem — money', () => {
     expectRefusedBy(
       withEdit((s) => { op(s, 'issue_refund').params?.push({ name: 'amount_cents', in: 'body', required: true }); }),
       `operations.${REFUND}.amount.field`,
-      'must not also be a parameter',
+      'לא יכול להיות גם פרמטר',
     );
   });
 });
@@ -180,7 +181,7 @@ describe('ExternalSystem — base URL', () => {
     ['https://h.example/v1 x'],
     ['https://H.example/v1'],
   ])('refuses %j', (baseUrl) => {
-    expectRefusedBy(withEdit((s) => { s.baseUrl = baseUrl; }), 'baseUrl', 'baseUrl must be an https: URL');
+    expectRefusedBy(withEdit((s) => { s.baseUrl = baseUrl; }), 'baseUrl', 'baseUrl חייב להיות כתובת https:');
   });
 });
 
@@ -198,21 +199,21 @@ describe('ExternalSystem — path and parameters', () => {
     expectRefusedBy(
       withEdit((s) => { op(s, 'get_customer').path = '/customers/{customer_id}/{extra}'; }),
       `operations.${GET}.path`,
-      'placeholder {extra} has no "path" parameter',
+      'למקום {extra} בנתיב אין פרמטר מסוג "path"',
     );
   });
   it('refuses a path parameter with no placeholder', () => {
     expectRefusedBy(
       withEdit((s) => { op(s, 'get_customer').path = '/customers'; }),
       `operations.${GET}.params`,
-      'path parameter "customer_id" has no placeholder',
+      'לפרמטר הנתיב "customer_id" אין מקום בנתיב',
     );
   });
   it('refuses malformed braces', () => {
     expectRefusedBy(
       withEdit((s) => { op(s, 'list_customers').path = '/customers/{'; }),
       `operations.${LIST}.path`,
-      'placeholders must be of the form {param}',
+      'חייבים להיות בצורה {param}',
     );
   });
   it.each(['/customers/../admin', '/./customers', '/customers/..', '//evil.example/x', '/customers//x'])(
@@ -221,7 +222,7 @@ describe('ExternalSystem — path and parameters', () => {
       expectRefusedBy(
         withEdit((s) => { op(s, 'list_customers').path = path; }),
         `operations.${LIST}.path`,
-        'must not contain "." or ".." segments or "//"',
+        'לא יכול להכיל מקטעי "." או ".." או "//"',
       );
     },
   );
@@ -232,26 +233,26 @@ describe('ExternalSystem — path and parameters', () => {
     expectRefusedBy(
       withEdit((s) => { op(s, 'delete_customer').name = 'get_customer'; }),
       `operations.${DELETE}.name`,
-      'duplicate operation "get_customer"',
+      'הפעולה "get_customer" מופיעה פעמיים',
     );
   });
   it.each(['__proto__', 'constructor', 'prototype'])('refuses the parameter name %s', (name) => {
     expectRefusedBy(
       withEdit((s) => { op(s, 'update_customer').params?.push({ name, in: 'body', required: false }); }),
       `operations.${UPDATE}.params.2.name`,
-      'expected a parameter name',
+      'נדרש שם פרמטר תקין',
     );
   });
   it('refuses a scan operation that is not a read of this system', () => {
     expectRefusedBy(
       withEdit((s) => { if (s.scan) s.scan.operation = 'update_customer'; }),
       'scan.operation',
-      'must be a GET read operation',
+      'חייבת להיות פעולת קריאה מסוג GET',
     );
     expectRefusedBy(
       withEdit((s) => { if (s.scan) s.scan.operation = 'no_such_op'; }),
       'scan.operation',
-      'must be a GET read operation',
+      'חייבת להיות פעולת קריאה מסוג GET',
     );
   });
   it('refuses a sinceParam the scan operation does not declare', () => {
@@ -282,21 +283,21 @@ describe('ExternalSystem — path and parameters', () => {
     expectRefusedBy(
       withEdit((s) => { s.webhook?.events?.push({ type: 'customer.created', label: 'שוב', fields: [] }); }),
       'webhook.events.2.type',
-      'duplicate event type "customer.created"',
+      'סוג האירוע "customer.created" מופיע פעמיים',
     );
   });
   it('refuses a form body on a GET operation', () => {
     expectRefusedBy(
       withEdit((s) => { op(s, 'list_customers').bodyEncoding = 'form'; }),
       `operations.${LIST}.bodyEncoding`,
-      'no body to form-encode',
+      'אין גוף לקידוד form',
     );
   });
   it('refuses a field path that walks the prototype chain', () => {
     expectRefusedBy(
       withEdit((s) => { op(s, 'get_customer').idPath = 'data.__proto__'; }),
       `operations.${GET}.idPath`,
-      'expected a dotted field path',
+      'נדרש נתיב שדה מנוקד',
     );
   });
 });
@@ -377,30 +378,30 @@ describe('ExternalSystem — webhook', () => {
     expectAccepted(withPayload('v0:{timestamp}:{body}'));
   });
   it('refuses a template without {body}', () => {
-    expectRefusedBy(withPayload('{timestamp}'), 'webhook.scheme.signedPayload', 'must contain {body} exactly once');
+    expectRefusedBy(withPayload('{timestamp}'), 'webhook.scheme.signedPayload', 'חייב להכיל את {body} פעם אחת בדיוק');
   });
   it('refuses {body} twice', () => {
-    expectRefusedBy(withPayload('{body}.{body}'), 'webhook.scheme.signedPayload', 'must contain {body} exactly once');
+    expectRefusedBy(withPayload('{body}.{body}'), 'webhook.scheme.signedPayload', 'חייב להכיל את {body} פעם אחת בדיוק');
   });
   it('refuses any other placeholder', () => {
     expectRefusedBy(
       withPayload('{secret}.{body}'),
       'webhook.scheme.signedPayload',
-      'may only use {timestamp} and {body}',
+      'מותר להשתמש רק ב-{timestamp} וב-{body}',
     );
   });
   it('refuses {timestamp} with no timestamp source', () => {
     expectRefusedBy(
       withPayload('{timestamp}.{body}', true),
       'webhook.scheme.timestamp',
-      'needs a timestamp source',
+      'צריך מקור לחותמת הזמן',
     );
   });
   it('refuses a null typePath with more than one event', () => {
     expectRefusedBy(
       withEdit((s) => { if (s.webhook) s.webhook.typePath = null; }),
       'webhook.typePath',
-      'only when exactly one event is declared',
+      'רק כשמוגדר אירוע אחד בדיוק',
     );
   });
   it('refuses a null typePath with no event', () => {
@@ -411,7 +412,7 @@ describe('ExternalSystem — webhook', () => {
         s.webhook.events = [];
       }),
       'webhook.typePath',
-      'only when exactly one event is declared',
+      'רק כשמוגדר אירוע אחד בדיוק',
     );
   });
   it('accepts a null typePath with exactly one event', () => {
@@ -432,7 +433,7 @@ describe('ExternalSystem — webhook', () => {
         s.webhook.handshake = { kind: 'body_challenge', typeValue: 'url_verification', challengePath: 'challenge' };
       }),
       'webhook.typePath',
-      'a body_challenge handshake needs typePath',
+      'לחיצת יד מסוג body_challenge צריכה typePath',
     );
   });
   it('accepts a body_challenge with a typePath, and a query_challenge', () => {
@@ -468,5 +469,32 @@ describe('externalSecretRefs', () => {
   it('refuses an invalid id', () => {
     expect(() => externalSecretRefs('Bad-Id')).toThrow();
     expect(EXTERNAL_SYSTEM_ID.test('a')).toBe(false);
+  });
+});
+
+describe('unrecognisedKeyPaths', () => {
+  it('finds nothing in the fixture, even though parsing added defaults', () => {
+    const raw = crmFixture();
+    expect(unrecognisedKeyPaths(raw, ExternalSystem.parse(raw))).toEqual([]);
+  });
+
+  it('lists every stripped key by its dotted path, through auth, operations, webhook and scan', () => {
+    const raw = JSON.parse(JSON.stringify(crmFixture())) as Record<string, any>;
+    raw.idempotencyHeaders = 'Idempotency-Key';
+    raw.auth.headr = 'X-Key';
+    raw.operations[2].ammount = { field: 'x' };
+    raw.operations[0].params[0].requird = true;
+    raw.webhook.scheme.secret = 'x';
+    raw.scan.every = 12;
+    expect(unrecognisedKeyPaths(raw, ExternalSystem.parse(raw)).sort()).toEqual(
+      [
+        'idempotencyHeaders',
+        'auth.headr',
+        'operations.2.ammount',
+        'operations.0.params.0.requird',
+        'webhook.scheme.secret',
+        'scan.every',
+      ].sort(),
+    );
   });
 });

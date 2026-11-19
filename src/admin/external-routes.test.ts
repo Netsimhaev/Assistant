@@ -131,9 +131,52 @@ describe('editing a draft', () => {
     expect(html).toContain('baseUrl');
     expect(html).toContain('operations');
     // zod's own messages are rendered through the Hebrew locale.
-    expect(html).toMatch(/operations[^<]*:[^<]*[֐-׿]/);
+    expect(html).toMatch(/operations[^<]*:[^<]*[\u0590-\u05FF]/);
+    // The definition's own messages are Hebrew too — the baseUrl one above all.
+    expect(html).toContain('baseUrl: baseUrl חייב להיות כתובת https:');
+    expect(html).not.toContain('must be an https');
     expect(await drafts()).toEqual([]);
     expect(await activity()).toEqual([]);
+  });
+
+  it('refuses a definition with a key the schema does not know, listing its path', async () => {
+    const base = await startPanel();
+    const cookie = await signedIn();
+    const csrf = await editCsrf(base, cookie);
+    const { idempotencyHeader, ...rest } = crmFixture();
+    const typo = { ...rest, idempotencyHeaders: idempotencyHeader };
+    const res = await post(base, `${PATH}/crm/save`, { csrf, definition: JSON.stringify(typo) }, cookie);
+    expect(res.status).toBe(400);
+    const html = await res.text();
+    expect(html).toContain('שדות שלא זוהו: idempotencyHeaders');
+    expect(await drafts()).toEqual([]);
+    expect(await activity()).toEqual([]);
+  });
+
+  it('refuses an unknown key nested inside the webhook', async () => {
+    const base = await startPanel();
+    const cookie = await signedIn();
+    const csrf = await editCsrf(base, cookie);
+    const def = crmFixture() as unknown as { webhook: Record<string, unknown> };
+    const events = def.webhook.events as Array<Record<string, unknown>>;
+    events[1] = { type: 'payment.failed', label: 'תשלום נכשל', feilds: [] };
+    def.webhook = { ...def.webhook, typepath: 'type' };
+    const res = await post(base, `${PATH}/crm/save`, { csrf, definition: JSON.stringify(def) }, cookie);
+    expect(res.status).toBe(400);
+    const html = await res.text();
+    expect(html).toContain('webhook.typepath');
+    expect(html).toContain('webhook.events.1.feilds');
+    expect(await drafts()).toEqual([]);
+  });
+
+  it('refuses a definition over the form size limit with its own message', async () => {
+    const base = await startPanel();
+    const cookie = await signedIn();
+    const csrf = await editCsrf(base, cookie);
+    const res = await post(base, `${PATH}/crm/save`, { csrf, definition: 'א'.repeat(20_000) }, cookie);
+    expect(res.status).toBe(413);
+    expect(await res.text()).toContain('ההגדרה גדולה מדי');
+    expect(await drafts()).toEqual([]);
   });
 
   it('refuses a definition whose id differs from the route', async () => {
@@ -203,6 +246,10 @@ describe('editing a draft', () => {
     expect(res.status).toBe(303);
     expect(await drafts()).toEqual([]);
     expect(await activity()).toEqual([{ action: 'external_draft_deleted', detail: {} }]);
+
+    // A second delete finds nothing and logs nothing.
+    expect((await post(base, `${PATH}/crm/delete`, { csrf }, cookie)).status).toBe(303);
+    expect(await activity()).toHaveLength(1);
   });
 });
 
@@ -238,14 +285,51 @@ describe('what the technician sees of a signed system', () => {
     expect(businessPage).toContain(`href="${PATH}"`);
   });
 
-  it('never shows the signed definition itself — with no draft the editor holds a blank template', async () => {
+  it('preloads the signed definition, labelled, when there is no draft — saving it unchanged stays signed', async () => {
     await signCrm();
     const base = await startPanel();
     const cookie = await signedIn();
     const page = await (await get(base, `${PATH}/crm`, cookie)).text();
-    expect(page).not.toContain('api.crm.example.com');
-    expect(page).not.toContain('רשימת לקוחות');
-    expect(page).toContain('&quot;id&quot;: &quot;crm&quot;');
+    expect(page).toContain('ההגדרה החתומה — שינוי ייצור טיוטה חדשה שדורשת חתימה מחדש');
+    expect(page).toContain('https://api.crm.example.com/v1');
+
+    // The textarea's text, submitted as is.
+    const match = /<textarea name="definition"[^>]*>([\s\S]*?)<\/textarea>/.exec(page);
+    const text = (match?.[1] ?? '')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&');
+    expect(text).toContain('"baseUrl"');
+    const res = await post(base, `${PATH}/crm/save`, { csrf: csrfIn(page), definition: text }, cookie);
+    expect(res.status).toBe(303);
+    expect(await drafts()).toHaveLength(1);
+    const list = await (await get(base, PATH, cookie)).text();
+    expect(list).toContain('<td>חתום</td>');
+  });
+
+  it('never shows events or reads on the external screens', async () => {
+    await signCrm();
+    await withBusiness(TEST_BUSINESS, async (db) => {
+      await db.query(
+        `INSERT INTO external_events (business_id, event_id, system_id, source, event_type, item_hash, fields)
+         VALUES ($1, 'XE-1', 'crm', 'webhook', 'customer.created', 'h1', $2::jsonb)`,
+        [db.businessId, JSON.stringify([{ label: 'שם', value: 'EVENT_PROBE_77' }])],
+      );
+      await db.query(
+        `INSERT INTO external_reads (business_id, read_id, job_id, step_id, system_id, operation, fields)
+         VALUES ($1, 'XR-1', 'J1', 's1', 'crm', 'get_customer', $2::jsonb)`,
+        [db.businessId, JSON.stringify([{ label: 'שם', value: 'READ_PROBE_77' }])],
+      );
+    });
+    const base = await startPanel();
+    const cookie = await signedIn();
+    for (const path of [PATH, `${PATH}/crm`, `/businesses/${TEST_BUSINESS}`]) {
+      const page = await (await get(base, path, cookie)).text();
+      expect(page).not.toContain('EVENT_PROBE_77');
+      expect(page).not.toContain('READ_PROBE_77');
+    }
   });
 });
 
@@ -273,7 +357,21 @@ describe('secrets', () => {
     for (const text of [JSON.stringify(log), ...(await staffAuditRows())]) expect(text).not.toContain(SECRET_VALUE);
   });
 
+  it('refuses a secret for a system with neither a draft nor a signed definition', async () => {
+    const base = await startPanel();
+    const cookie = await signedIn();
+    const csrf = await editCsrf(base, cookie);
+    const res = await post(base, `${PATH}/crm/secret`, { csrf, kind: 'key', value: SECRET_VALUE }, cookie);
+    expect(res.status).toBe(400);
+    const html = await res.text();
+    expect(html).toContain('אין עדיין טיוטה או הגדרה חתומה');
+    expect(html).not.toContain(SECRET_VALUE);
+    expect(await withBusiness(TEST_BUSINESS, (db) => listSecretRefs(db))).toEqual([]);
+    expect(await activity()).toEqual([]);
+  });
+
   it('refuses an empty value and a kind outside the closed list, storing nothing', async () => {
+    await withBusiness(TEST_BUSINESS, (db) => saveDraft(db, { systemId: 'crm', definition: crmFixture(), staffId: 's' }));
     const base = await startPanel();
     const cookie = await signedIn();
     const csrf = await editCsrf(base, cookie);

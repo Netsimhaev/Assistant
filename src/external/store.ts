@@ -52,11 +52,34 @@ export async function loadDrafts(db: BusinessDb): Promise<DraftRecord[]> {
   return rows.map(toDraft);
 }
 
-export async function deleteDraft(db: BusinessDb, systemId: string): Promise<void> {
-  await db.query(`DELETE FROM external_system_drafts WHERE business_id = $1 AND system_id = $2`, [
+/** Deletes the draft; returns how many rows went (0 when there was none). */
+export async function deleteDraft(db: BusinessDb, systemId: string): Promise<number> {
+  const result = await db.query(`DELETE FROM external_system_drafts WHERE business_id = $1 AND system_id = $2`, [
     db.businessId,
     systemId,
   ]);
+  return result.rowCount ?? 0;
+}
+
+/**
+ * The active charter's signed definition of one system, as stored, or `null`.
+ * Read by the panel's editor as the starting text when there is no draft: a
+ * definition is technician-authored configuration (ruling T9-b). A narrow
+ * read, not `loadActiveCharter`, so an unparseable charter does not take the
+ * editor down with it.
+ */
+export async function loadSignedDefinition(db: BusinessDb, systemId: string): Promise<unknown> {
+  const { rows } = await db.query<{ definition: unknown }>(
+    `SELECT e.def AS definition
+       FROM charter_active ca
+       JOIN charter_versions cv ON cv.business_id = ca.business_id AND cv.charter_version = ca.charter_version
+       CROSS JOIN LATERAL jsonb_array_elements(
+         CASE WHEN jsonb_typeof(cv.charter -> 'externalSystems') = 'array'
+              THEN cv.charter -> 'externalSystems' ELSE '[]'::jsonb END) AS e(def)
+      WHERE ca.business_id = $1 AND e.def ->> 'id' = $2`,
+    [db.businessId, systemId],
+  );
+  return rows[0]?.definition ?? null;
 }
 
 interface ReadRow {

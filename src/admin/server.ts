@@ -72,7 +72,7 @@ import {
   type PanelViewer,
 } from './views.js';
 import { handleBusinessRoute, type UploadBody } from './business-routes.js';
-import { handleExternalRoute } from './external-routes.js';
+import { handleExternalRoute, tooLargeMessageFor } from './external-routes.js';
 import { adminBaseUrlFor, handleStaffRoute } from './staff-routes.js';
 import { readBoundedMultipart } from '../dashboard/multipart.js';
 
@@ -496,7 +496,8 @@ export function createAdminServer(options: AdminOptions): Server {
       ownerNotice: options.ownerNotice ?? NO_OWNER_NOTICE,
     }).catch((err: unknown) => {
       if (err instanceof FormBodyTooLargeError) {
-        if (!res.headersSent) sendHtml(res, 413, renderTooLarge());
+        const message = tooLargeMessageFor(new URL(req.url ?? '/', 'http://admin.local').pathname);
+        if (!res.headersSent) sendHtml(res, 413, renderTooLarge(message ?? undefined));
         else res.end();
         return;
       }

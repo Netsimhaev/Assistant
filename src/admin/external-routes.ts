@@ -10,11 +10,16 @@
  * - `POST /businesses/:id/external/:system/delete`
  * - `POST /businesses/:id/external/:system/secret`  `kind=key|hook|verify`, `value`
  *
- * **What the technician sees.** Status flags (`businessDetailForPanel`), and
- * the DRAFT text he wrote himself — read on the business's own connection
- * under RLS, never through the platform pool. Never the signed definition's
- * content (with no draft the editor holds a blank template), and never
- * anything a system returned (`external_events`, `external_reads`).
+ * **What the technician sees.** Status flags (`businessDetailForPanel`), the
+ * DRAFT text he wrote himself and — when there is no draft — the signed
+ * definition as the starting text, labelled (ruling T9-b: a definition is
+ * technician-authored configuration, not business content). Both are read on
+ * the business's own connection under RLS, never through the platform pool.
+ * Never anything a system returned (`external_events`, `external_reads`).
+ *
+ * **Every key must be recognised** (ruling T9-a). zod strips unknown keys, so a
+ * misspelled field would vanish on save; a definition with a key the schema
+ * did not keep is refused, with the paths listed.
  *
  * **Secrets are never echoed.** The answer to a save is a redirect; the page
  * shows `✓ שמור` / `חסר`; the activity row carries `{ kind }` only.
@@ -25,8 +30,13 @@
 import type { IncomingMessage } from 'node:http';
 import { z } from 'zod';
 import { isValidBusinessId, withBusiness } from '../db/pool.js';
-import { EXTERNAL_SYSTEM_ID, ExternalSystem, externalSecretRefs } from '../domain/external-system.js';
-import { deleteDraft, loadDrafts, saveDraft } from '../external/store.js';
+import {
+  EXTERNAL_SYSTEM_ID,
+  ExternalSystem,
+  externalSecretRefs,
+  unrecognisedKeyPaths,
+} from '../domain/external-system.js';
+import { deleteDraft, loadDrafts, loadSignedDefinition, saveDraft } from '../external/store.js';
 import { describeExternalSystem } from '../external/describe.js';
 import { putSecret } from '../governance/credential-store.js';
 import { getBusiness } from '../tenancy/businesses.js';
@@ -50,6 +60,20 @@ export const EXTERNAL_ID_INVALID =
 export const EXTERNAL_SECRET_KIND_INVALID = 'סוג הסוד אינו מוכר.';
 export const EXTERNAL_SECRET_EMPTY = 'יש למלא ערך לסוד.';
 export const EXTERNAL_SECRET_TOO_LONG = 'הערך ארוך מדי.';
+export const EXTERNAL_SECRET_NO_SYSTEM =
+  'אין עדיין טיוטה או הגדרה חתומה למערכת הזו — שמור קודם טיוטה, ואחר כך את הסודות.';
+export const EXTERNAL_UNKNOWN_KEYS_PREFIX = 'שדות שלא זוהו: ';
+export const EXTERNAL_SIGNED_PRELOAD_NOTE = 'ההגדרה החתומה — שינוי ייצור טיוטה חדשה שדורשת חתימה מחדש';
+export const EXTERNAL_DEFINITION_TOO_LARGE =
+  'ההגדרה גדולה מדי לטופס (עד 64KB; אותיות עבריות תופסות יותר מקום). קצר תוויות או פצל את המערכת. דבר לא נשמר.';
+
+/**
+ * The message for a form body over the panel's cap, when the request was a
+ * definition save; `null` for any other path (the generic page applies).
+ */
+export function tooLargeMessageFor(pathname: string): string | null {
+  return /^\/businesses\/[^/]+\/external\/[^/]+\/save$/.test(pathname) ? EXTERNAL_DEFINITION_TOO_LARGE : null;
+}
 
 /** Generous for an API key or a signing secret; anything longer is a paste gone wrong. */
 const SECRET_MAX_CHARS = 4000;
@@ -199,12 +223,33 @@ async function showEditor(
   const detail = await businessDetailForPanel(businessId);
   if (detail === null) return ctx.sendHtml(404, renderNotFound());
   const systemStatus = detail.externalSystems.find((s) => s.systemId === systemId) ?? null;
-  // The technician's own draft, on the business's connection under RLS.
-  const draft = (await withBusiness(businessId, (db) => loadDrafts(db))).find((d) => d.systemId === systemId) ?? null;
-  const text = options.text ?? (draft === null ? blankTemplate(systemId) : JSON.stringify(draft.definition, null, 2));
+  // The technician's own draft — or, without one, the signed definition — on
+  // the business's connection under RLS.
+  const { draft, signed } = await withBusiness(businessId, async (db) => {
+    const found = (await loadDrafts(db)).find((d) => d.systemId === systemId) ?? null;
+    return { draft: found, signed: found === null ? await loadSignedDefinition(db, systemId) : null };
+  });
+  const preloadedSigned = options.text === undefined && draft === null && signed !== null;
+  const text =
+    options.text ??
+    (draft !== null
+      ? JSON.stringify(draft.definition, null, 2)
+      : signed !== null
+        ? JSON.stringify(signed, null, 2)
+        : blankTemplate(systemId));
   const parsedDraft = draft === null ? null : ExternalSystem.safeParse(draft.definition);
   const preview = parsedDraft?.success === true ? describeExternalSystem(parsedDraft.data) : null;
-  ctx.sendHtml(status, renderEditor(ctx.viewer, businessId, systemId, { text, systemStatus, hasDraft: draft !== null, preview, ...options }));
+  ctx.sendHtml(
+    status,
+    renderEditor(ctx.viewer, businessId, systemId, {
+      text,
+      systemStatus,
+      hasDraft: draft !== null,
+      preloadedSigned,
+      preview,
+      ...options,
+    }),
+  );
 }
 
 function renderEditor(
@@ -215,6 +260,7 @@ function renderEditor(
     text: string;
     systemStatus: ExternalSystemPanelStatus | null;
     hasDraft: boolean;
+    preloadedSigned: boolean;
     preview: string[] | null;
   },
 ): string {
@@ -260,6 +306,7 @@ ${view.error === undefined ? '' : `<p class="error">${esc(view.error)}</p>`}
 ${problems}
 <section class="card">
 <h2>הגדרה (JSON)</h2>
+${view.preloadedSigned ? `<p class="muted">${esc(EXTERNAL_SIGNED_PRELOAD_NOTE)}</p>` : ''}
 <form method="post" action="${base}/save">
   ${csrf}
   <textarea name="definition" rows="24" dir="ltr" style="width:100%;box-sizing:border-box;font-family:monospace">${esc(view.text)}</textarea>
@@ -315,6 +362,8 @@ async function handleSave(ctx: ExternalRouteContext, businessId: string, systemI
   }
   const parsed = ExternalSystem.safeParse(raw, { error: z.locales.he().localeError });
   if (!parsed.success) return refuse({ problems: issueLines(parsed.error) });
+  const unknown = unrecognisedKeyPaths(raw, parsed.data);
+  if (unknown.length > 0) return refuse({ error: `${EXTERNAL_UNKNOWN_KEYS_PREFIX}${unknown.join(', ')}` });
   if (parsed.data.id !== systemId) {
     return refuse({ error: `המזהה בהגדרה (${parsed.data.id}) אינו תואם למזהה בכתובת (${systemId}).` });
   }
@@ -334,8 +383,9 @@ async function handleSave(ctx: ExternalRouteContext, businessId: string, systemI
 async function handleDelete(ctx: ExternalRouteContext, businessId: string, systemId: string): Promise<void> {
   const form = await ctx.readForm();
   if (!(await admitted(ctx, form, businessId))) return;
-  await withBusiness(businessId, (db) => deleteDraft(db, systemId));
-  await recordStaffAction(ctx.staff, 'external_draft_deleted', businessId);
+  const deleted = await withBusiness(businessId, (db) => deleteDraft(db, systemId));
+  // Logged only when a draft actually went.
+  if (deleted > 0) await recordStaffAction(ctx.staff, 'external_draft_deleted', businessId);
   ctx.seeOther(`/businesses/${businessId}/external/${systemId}`);
 }
 
@@ -352,6 +402,13 @@ async function handleSecret(ctx: ExternalRouteContext, businessId: string, syste
   const value = (form.get('value') ?? '').trim();
   if (value === '') return showEditor(ctx, businessId, systemId, 400, { error: EXTERNAL_SECRET_EMPTY });
   if (value.length > SECRET_MAX_CHARS) return showEditor(ctx, businessId, systemId, 400, { error: EXTERNAL_SECRET_TOO_LONG });
+
+  // A secret belongs to a system someone defined: a draft or a signed definition.
+  const detail = await businessDetailForPanel(businessId);
+  if (detail === null) return ctx.sendHtml(404, renderNotFound());
+  if (!detail.externalSystems.some((s) => s.systemId === systemId)) {
+    return showEditor(ctx, businessId, systemId, 400, { error: EXTERNAL_SECRET_NO_SYSTEM });
+  }
 
   const ref = externalSecretRefs(systemId)[kind];
   await withBusiness(businessId, (db) =>

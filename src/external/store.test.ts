@@ -34,8 +34,9 @@ describe('external store', () => {
     const rows = await withBusiness(TEST_BUSINESS, (db) => loadDrafts(db));
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ systemId: 'crm', definition: { a: 2 }, updatedByStaff: 's2' });
-    await withBusiness(TEST_BUSINESS, (db) => deleteDraft(db, 'crm'));
+    expect(await withBusiness(TEST_BUSINESS, (db) => deleteDraft(db, 'crm'))).toBe(1);
     expect(await withBusiness(TEST_BUSINESS, (db) => loadDrafts(db))).toHaveLength(0);
+    expect(await withBusiness(TEST_BUSINESS, (db) => deleteDraft(db, 'crm'))).toBe(0);
   });
 
   it('records and loads reads per job', async () => {

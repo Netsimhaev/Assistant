@@ -271,7 +271,7 @@ describe('buildExternalRequest', () => {
         { name: 'pay', label: 'x', kind: 'money', actionClass: 'payment.make', method: 'POST', path: '/pay',
           params: [{ name: 'Amount_Cents', in: 'body', required: false }],
           amount: { field: 'amount_cents', unit: 'minor', currency: 'ILS' } },
-      ])).toThrow(/must not also be a parameter/);
+      ])).toThrow(/לא יכול להיות גם פרמטר/);
     });
     it('refuses a nested key that differs from the amount field only by case', () => {
       const s = sys();

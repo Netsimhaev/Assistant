@@ -118,12 +118,12 @@ const FieldPath = z
       const segments = path.split('.');
       return segments.every((s) => FIELD_SEGMENT.test(s) && !UNSAFE_SEGMENTS.has(s));
     },
-    { message: 'expected a dotted field path of letters, digits and underscores' },
+    { message: 'נדרש נתיב שדה מנוקד של אותיות אנגליות, ספרות וקו תחתון (למשל data.customer.id)' },
   );
 
 const HeaderName = z
   .string()
-  .regex(HEADER_NAME, 'expected an HTTP header name')
+  .regex(HEADER_NAME, 'נדרש שם כותרת HTTP תקין')
   .refine((name) => !isReservedHeaderName(name), {
     message: 'כותרת שמורה — אסור להגדיר אותה (Host, Content-Length, Cookie, Content-Type, Proxy-* ועוד)',
   });
@@ -136,7 +136,7 @@ export type ExternalField = z.infer<typeof ExternalField>;
 
 const ExternalParam = z
   .object({
-    name: z.string().refine(isParamName, { message: 'expected a parameter name' }),
+    name: z.string().refine(isParamName, { message: 'נדרש שם פרמטר תקין (אותיות אנגליות, ספרות וקו תחתון)' }),
     in: z.enum(['path', 'query', 'body']),
     required: z.boolean(),
   })
@@ -168,7 +168,7 @@ function pathPlaceholders(path: string): { names: string[]; malformed: boolean }
 }
 
 const OperationShape = z.object({
-  name: z.string().regex(OPERATION_NAME, 'expected a lowercase operation name'),
+  name: z.string().regex(OPERATION_NAME, 'נדרש שם פעולה באותיות אנגליות קטנות, ספרות וקו תחתון'),
   label: Label,
   kind: OperationKind,
   actionClass: ActionClass,
@@ -176,8 +176,8 @@ const OperationShape = z.object({
   path: z
     .string()
     .max(300)
-    .regex(/^\/[A-Za-z0-9\-._~/{}]*$/, 'expected a path that starts with "/"')
-    .refine((path) => !pathEscapes(path), { message: 'path must not contain "." or ".." segments or "//"' }),
+    .regex(/^\/[A-Za-z0-9\-._~/{}]*$/, 'נדרש נתיב שמתחיל ב-"/"')
+    .refine((path) => !pathEscapes(path), { message: 'הנתיב לא יכול להכיל מקטעי "." או ".." או "//"' }),
   params: z.array(ExternalParam).max(30).default([]),
   bodyEncoding: z.enum(['json', 'form']).default('json'),
   fields: z.array(ExternalField).max(20).default([]),
@@ -204,23 +204,23 @@ export const ExternalOperation = OperationShape.superRefine((op, ctx) => {
     ctx.addIssue({
       code: 'custom',
       path: ['actionClass'],
-      message: `action class "${op.actionClass}" is not allowed for a "${op.kind}" operation`,
+      message: `סוג הפעולה "${op.actionClass}" אינו מותר לפעולה מסוג "${op.kind}"`,
     });
   }
 
   // A read must not change anything; POST is allowed for search endpoints.
   if (op.kind === 'read' && op.method !== 'GET' && op.method !== 'POST') {
-    ctx.addIssue({ code: 'custom', path: ['method'], message: 'a read operation must use GET or POST' });
+    ctx.addIssue({ code: 'custom', path: ['method'], message: 'פעולת קריאה חייבת להשתמש ב-GET או ב-POST' });
   }
 
   if (op.kind === 'money' && op.amount === null) {
-    ctx.addIssue({ code: 'custom', path: ['amount'], message: 'a money operation must declare its amount field' });
+    ctx.addIssue({ code: 'custom', path: ['amount'], message: 'פעולת כסף חייבת להצהיר על שדה הסכום שלה' });
   }
 
   const paramNames = new Set<string>();
   for (const [index, param] of op.params.entries()) {
     if (paramNames.has(param.name)) {
-      ctx.addIssue({ code: 'custom', path: ['params', index, 'name'], message: `duplicate parameter "${param.name}"` });
+      ctx.addIssue({ code: 'custom', path: ['params', index, 'name'], message: `הפרמטר "${param.name}" מופיע פעמיים` });
     }
     paramNames.add(param.name);
   }
@@ -232,7 +232,7 @@ export const ExternalOperation = OperationShape.superRefine((op, ctx) => {
     ctx.addIssue({
       code: 'custom',
       path: ['amount', 'field'],
-      message: `amount field "${op.amount.field}" must not also be a parameter`,
+      message: `שדה הסכום "${op.amount.field}" לא יכול להיות גם פרמטר`,
     });
   }
 
@@ -246,22 +246,22 @@ export const ExternalOperation = OperationShape.superRefine((op, ctx) => {
     });
   }
   if (malformed) {
-    ctx.addIssue({ code: 'custom', path: ['path'], message: 'path placeholders must be of the form {param}' });
+    ctx.addIssue({ code: 'custom', path: ['path'], message: 'פרמטרים בנתיב חייבים להיות בצורה {param}' });
   }
   const pathParams = new Set(op.params.filter((p) => p.in === 'path').map((p) => p.name));
   for (const name of placeholders) {
     if (!pathParams.has(name)) {
-      ctx.addIssue({ code: 'custom', path: ['path'], message: `placeholder {${name}} has no "path" parameter` });
+      ctx.addIssue({ code: 'custom', path: ['path'], message: `למקום {${name}} בנתיב אין פרמטר מסוג "path"` });
     }
   }
   for (const name of pathParams) {
     if (!placeholders.includes(name)) {
-      ctx.addIssue({ code: 'custom', path: ['params'], message: `path parameter "${name}" has no placeholder in the path` });
+      ctx.addIssue({ code: 'custom', path: ['params'], message: `לפרמטר הנתיב "${name}" אין מקום בנתיב` });
     }
   }
 
   if (op.method === 'GET' && op.bodyEncoding === 'form') {
-    ctx.addIssue({ code: 'custom', path: ['bodyEncoding'], message: 'a GET operation has no body to form-encode' });
+    ctx.addIssue({ code: 'custom', path: ['bodyEncoding'], message: 'לפעולת GET אין גוף לקידוד form' });
   }
 });
 export type ExternalOperation = z.infer<typeof ExternalOperation>;
@@ -294,11 +294,11 @@ const TimestampSource = z.discriminatedUnion('from', [
  */
 function signedPayloadProblem(template: string): string | null {
   const placeholders = [...template.matchAll(/\{([^{}]*)\}/g)].map((m) => m[1]);
-  if (/[{}]/.test(template.replace(/\{([^{}]*)\}/g, ''))) return 'unbalanced braces in signedPayload';
+  if (/[{}]/.test(template.replace(/\{([^{}]*)\}/g, ''))) return 'סוגריים מסולסלים לא מאוזנים ב-signedPayload';
   if (placeholders.some((p) => p !== 'timestamp' && p !== 'body')) {
-    return 'signedPayload may only use {timestamp} and {body}';
+    return 'ב-signedPayload מותר להשתמש רק ב-{timestamp} וב-{body}';
   }
-  if (placeholders.filter((p) => p === 'body').length !== 1) return 'signedPayload must contain {body} exactly once';
+  if (placeholders.filter((p) => p === 'body').length !== 1) return 'signedPayload חייב להכיל את {body} פעם אחת בדיוק';
   return null;
 }
 
@@ -319,7 +319,7 @@ const WebhookScheme = z.discriminatedUnion('kind', [
         ctx.addIssue({
           code: 'custom',
           path: ['timestamp'],
-          message: 'a signedPayload that uses {timestamp} needs a timestamp source',
+          message: 'signedPayload שמשתמש ב-{timestamp} צריך מקור לחותמת הזמן (timestamp)',
         });
       }
     }),
@@ -328,10 +328,10 @@ const WebhookScheme = z.discriminatedUnion('kind', [
 const Handshake = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('query_challenge'),
-    modeParam: z.string().regex(QUERY_NAME),
+    modeParam: z.string().regex(QUERY_NAME, 'נדרש שם פרמטר שאילתה תקין'),
     modeValue: z.string().min(1).max(64),
-    tokenParam: z.string().regex(QUERY_NAME),
-    challengeParam: z.string().regex(QUERY_NAME),
+    tokenParam: z.string().regex(QUERY_NAME, 'נדרש שם פרמטר שאילתה תקין'),
+    challengeParam: z.string().regex(QUERY_NAME, 'נדרש שם פרמטר שאילתה תקין'),
   }),
   z.object({
     kind: z.literal('body_challenge'),
@@ -357,7 +357,7 @@ const ExternalWebhook = z
     const seen = new Set<string>();
     for (const [index, event] of hook.events.entries()) {
       if (seen.has(event.type)) {
-        ctx.addIssue({ code: 'custom', path: ['events', index, 'type'], message: `duplicate event type "${event.type}"` });
+        ctx.addIssue({ code: 'custom', path: ['events', index, 'type'], message: `סוג האירוע "${event.type}" מופיע פעמיים` });
       }
       seen.add(event.type);
     }
@@ -367,18 +367,18 @@ const ExternalWebhook = z
       ctx.addIssue({
         code: 'custom',
         path: ['typePath'],
-        message: 'typePath may be null only when exactly one event is declared',
+        message: 'typePath יכול להיות null רק כשמוגדר אירוע אחד בדיוק',
       });
     }
     // A body challenge is recognised by its type value, so there must be a
     // path to read the type from.
     if (hook.handshake?.kind === 'body_challenge' && hook.typePath === null) {
-      ctx.addIssue({ code: 'custom', path: ['typePath'], message: 'a body_challenge handshake needs typePath' });
+      ctx.addIssue({ code: 'custom', path: ['typePath'], message: 'לחיצת יד מסוג body_challenge צריכה typePath' });
     }
   });
 
 const ExternalScan = z.object({
-  operation: z.string().regex(OPERATION_NAME),
+  operation: z.string().regex(OPERATION_NAME, 'נדרש שם פעולה באותיות אנגליות קטנות, ספרות וקו תחתון'),
   sinceParam: z
     .string()
     .refine(isParamName, { message: 'שם פרמטר לא תקין לפרמטר "מאז" של הסריקה' })
@@ -412,12 +412,12 @@ const BaseUrl = z
       if (pathEscapes(url.pathname)) return false;
       return url.protocol === 'https:' && url.username === '' && url.password === '' && url.hostname !== '';
     },
-    { message: 'baseUrl must be an https: URL with no credentials, query, fragment, dot segments or "//" in its path' },
+    { message: 'baseUrl חייב להיות כתובת https: בלי פרטי התחברות, שאילתה (?), עוגן (#), מקטעי נקודה או "//" בנתיב' },
   );
 
 export const ExternalSystem = z
   .object({
-    id: z.string().regex(EXTERNAL_SYSTEM_ID, 'expected a lowercase system id'),
+    id: z.string().regex(EXTERNAL_SYSTEM_ID, 'מזהה מערכת לא תקין — אותיות אנגליות קטנות, ספרות וקו תחתון, מתחיל באות, באורך 2 עד 31'),
     label: Label,
     baseUrl: BaseUrl,
     auth: ExternalAuth,
@@ -430,7 +430,7 @@ export const ExternalSystem = z
     const names = new Set<string>();
     for (const [index, op] of system.operations.entries()) {
       if (names.has(op.name)) {
-        ctx.addIssue({ code: 'custom', path: ['operations', index, 'name'], message: `duplicate operation "${op.name}"` });
+        ctx.addIssue({ code: 'custom', path: ['operations', index, 'name'], message: `הפעולה "${op.name}" מופיעה פעמיים` });
       }
       names.add(op.name);
     }
@@ -440,7 +440,7 @@ export const ExternalSystem = z
         ctx.addIssue({
           code: 'custom',
           path: ['scan', 'operation'],
-          message: `scan operation "${system.scan.operation}" must be a GET read operation of this system`,
+          message: `פעולת הסריקה "${system.scan.operation}" חייבת להיות פעולת קריאה מסוג GET של המערכת הזו`,
         });
       }
       const since = system.scan.sinceParam;
@@ -458,6 +458,30 @@ export const ExternalSystem = z
     }
   });
 export type ExternalSystem = z.infer<typeof ExternalSystem>;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The dotted paths of every key in `raw` that the schema did not keep in
+ * `parsed`, recursively through objects and arrays. zod strips unknown keys,
+ * so without this a misspelled `idempotencyHeader` would vanish on save and
+ * the definition would run without it (ruling T9-a: the panel refuses such a
+ * draft). Keys the schema added as defaults are not reported.
+ */
+export function unrecognisedKeyPaths(raw: unknown, parsed: unknown, path: readonly (string | number)[] = []): string[] {
+  if (Array.isArray(raw) && Array.isArray(parsed)) {
+    return raw.flatMap((item, index) => unrecognisedKeyPaths(item, parsed[index], [...path, index]));
+  }
+  if (!isPlainObject(raw) || !isPlainObject(parsed)) return [];
+  const found: string[] = [];
+  for (const key of Object.keys(raw)) {
+    if (!Object.hasOwn(parsed, key)) found.push([...path, key].join('.'));
+    else found.push(...unrecognisedKeyPaths(raw[key], parsed[key], [...path, key]));
+  }
+  return found;
+}
 
 /**
  * The three credential refs a system's secrets are stored under. Derived, so
