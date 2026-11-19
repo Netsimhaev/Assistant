@@ -39,6 +39,7 @@ describe('isForbiddenAddress', () => {
     ['224/4', '239.255.255.255'],
     ['240/4', '240.0.0.1'],
     ['255.255.255.255', '255.255.255.255'],
+    ['192.88.99/24 6to4 relay', '192.88.99.1'],
   ])('refuses IPv4 %s (%s)', (_range, ip) => {
     expect(isForbiddenAddress(ip)).toBe(true);
   });
@@ -54,6 +55,13 @@ describe('isForbiddenAddress', () => {
     ['64:ff9b::/96 embedding 10.0.0.1', '64:ff9b::10.0.0.1'],
     ['2001:db8::/32', '2001:db8::1'],
     ['2001:db8::/32', '2001:0db8:ffff::1'],
+    ['2002::/16 6to4 (refused whole, even embedding a public v4)', '2002:808:808::1'],
+    ['2002::/16 6to4 embedding loopback', '2002:7f00:1::1'],
+    ['2001::/23 Teredo 2001::/32', '2001:0:4136:e378:8000:63bf:3fff:fdd2'],
+    ['2001::/23 upper edge', '2001:1ff:ffff::1'],
+    ['64:ff9b:1::/48 NAT64 local-use', '64:ff9b:1::808:808'],
+    ['100::/64 discard-only', '100::1'],
+    ['::ffff:0:0:0/96 IPv4-translated', '::ffff:0:808:808'],
     ['mapped hex loopback', '::ffff:7f00:1'],
     ['mapped hex metadata', '::ffff:a9fe:a9fe'],
     ['mapped dotted metadata', '::ffff:169.254.169.254'],
@@ -86,6 +94,12 @@ describe('isForbiddenAddress', () => {
     '::ffff:808:808',
     '64:ff9b::808:808',
     '2001:db9::1',
+    '2001:200::1', // just above 2001::/23
+    '2003::1', // just above 2002::/16
+    '64:ff9b:2::1', // outside 64:ff9b:1::/48
+    '100::1:0:0:0:1', // outside 100::/64
+    '192.88.98.255',
+    '192.88.100.0',
   ])('allows the public address %s', (ip) => {
     expect(isForbiddenAddress(ip)).toBe(false);
   });

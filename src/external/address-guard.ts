@@ -12,7 +12,12 @@
  * and NAT64 (`64:ff9b::/96`) are judged by the IPv4 address they carry, so
  * `::ffff:127.0.0.1` cannot slip past as "an IPv6 address that isn't ::1".
  * The deprecated IPv4-compatible block `::/96` is refused outright: it is not
- * a public destination under any current routing.
+ * a public destination under any current routing. So are the transition and
+ * special-purpose blocks that can tunnel to an arbitrary IPv4: 6to4
+ * `2002::/16` (refused whole — deprecated, not judged by its embedded v4),
+ * `2001::/23` (incl. Teredo), NAT64 local-use `64:ff9b:1::/48`, discard
+ * `100::/64`, IPv4-translated `::ffff:0:0:0/96`, and the 6to4 relay
+ * `192.88.99.0/24`.
  *
  * This module is pure. `http.ts` calls it on every address DNS returned and
  * on any IP-literal hostname, on the socket that is actually used.
@@ -29,6 +34,7 @@ const FORBIDDEN_V4: ReadonlyArray<readonly [string, number]> = [
   ['172.16.0.0', 12], // private
   ['192.0.0.0', 24], // IETF protocol assignments
   ['192.0.2.0', 24], // TEST-NET-1
+  ['192.88.99.0', 24], // deprecated 6to4 relay anycast
   ['192.168.0.0', 16], // private
   ['198.18.0.0', 15], // benchmarking
   ['198.51.100.0', 24], // TEST-NET-2
@@ -116,6 +122,12 @@ function v6Forbidden(g: readonly number[]): boolean {
   if ((g0 & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
   if ((g0 & 0xff00) === 0xff00) return true; // ff00::/8 multicast
   if (g0 === 0x2001 && g1 === 0x0db8) return true; // 2001:db8::/32 documentation
+  // ::ffff:0:0:0/96 — IPv4-translated (SIIT): never a public destination here.
+  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0xffff && g5 === 0) return true;
+  if (g0 === 0x64 && g1 === 0xff9b && g2 === 1) return true; // 64:ff9b:1::/48 NAT64 local-use
+  if (g0 === 0x100 && g1 === 0 && g2 === 0 && g3 === 0) return true; // 100::/64 discard-only
+  if (g0 === 0x2001 && g1 < 0x200) return true; // 2001::/23 IETF protocols, incl. Teredo 2001::/32
+  if (g0 === 0x2002) return true; // 2002::/16 6to4 — deprecated; refused whole, not judged
   return false;
 }
 

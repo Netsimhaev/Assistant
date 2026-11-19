@@ -3,6 +3,10 @@ import { createServer as createHttpsServer, type Server as HttpsServer } from 'n
 import { createServer as createTcpServer, type AddressInfo, type Server as TcpServer, type Socket } from 'node:net';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createServer as createTlsServer, type TLSSocket as TLSSocketType } from 'node:tls';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, relative, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { config } from '../config.js';
 import {
   EXTERNAL_DEADLINE_MS,
   EXTERNAL_MAX_BYTES,
@@ -344,5 +348,101 @@ describe('createGuardedHttps — request and response', () => {
   it('throws on a non-https URL — the builder never produces one', async () => {
     const http = createGuardedHttps({ __testOnly: permissive() });
     await expect(http.send({ ...request(1), url: new URL('http://api.example.test/') })).rejects.toThrow(/https/);
+  });
+});
+
+describe('createGuardedHttps — hardening', () => {
+  it('ignores __testOnly entirely outside NODE_ENV=test (the seam is inert in production)', async () => {
+    const server = await startHttps((_q, res) => res.end('reached'));
+    const url = new URL(`https://127.0.0.1:${server.port}/`);
+    const mutable = config as { isTest: boolean };
+    const original = mutable.isTest;
+    let prodLike: ReturnType<typeof createGuardedHttps>;
+    try {
+      mutable.isTest = false;
+      prodLike = createGuardedHttps({ __testOnly: permissive() });
+    } finally {
+      mutable.isTest = original;
+    }
+    // Same seam, built under test: the permissive guard is honoured.
+    const underTest = createGuardedHttps({ __testOnly: permissive() });
+    expect(await underTest.send({ ...request(server.port), url })).toEqual({
+      kind: 'response',
+      status: 200,
+      body: 'reached',
+    });
+    // Built outside test: the real guard refuses the loopback literal.
+    expect(await prodLike.send({ ...request(server.port), url })).toEqual({ kind: 'refused_address' });
+    expect(server.connections).toBe(1); // only the under-test call connected
+  });
+
+  it('classifies a lookup error by code, not only by class', async () => {
+    const server = await startHttps((_q, res) => res.end('no'));
+    const byCode = createGuardedHttps({
+      __testOnly: {
+        ca: TEST_CERT,
+        resolve: async () => {
+          throw Object.assign(new Error('wrapped refusal'), { code: 'EXTERNAL_ADDRESS_REFUSED' });
+        },
+      },
+    });
+    expect(await byCode.send(request(server.port))).toEqual({ kind: 'refused_address' });
+    const byCause = createGuardedHttps({
+      __testOnly: {
+        ca: TEST_CERT,
+        resolve: async () => {
+          throw new Error('outer', { cause: Object.assign(new Error('inner'), { code: 'EXTERNAL_ADDRESS_REFUSED' }) });
+        },
+      },
+    });
+    expect(await byCause.send(request(server.port))).toEqual({ kind: 'refused_address' });
+    const plainDnsError = createGuardedHttps({
+      __testOnly: {
+        ca: TEST_CERT,
+        resolve: async () => {
+          throw Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' });
+        },
+      },
+    });
+    expect(await plainDnsError.send(request(server.port))).toEqual({ kind: 'network', sent: false });
+    expect(server.connections).toBe(0);
+  });
+
+  it.each(['https://user@api.example.test/', 'https://user:pass@api.example.test/', 'https://:pass@api.example.test/'])(
+    'refuses a URL carrying userinfo (%s) before resolving or connecting',
+    async (raw) => {
+      const server = await startHttps((_q, res) => res.end('no'));
+      const calls: string[] = [];
+      const http = createGuardedHttps({ __testOnly: permissive(calls) });
+      const url = new URL(raw);
+      url.port = String(server.port);
+      expect(await http.send({ ...request(server.port), url })).toEqual({ kind: 'refused_address' });
+      expect(calls).toEqual([]);
+      expect(server.connections).toBe(0);
+    },
+  );
+});
+
+describe('the __testOnly seam is named only in tests', () => {
+  it('appears in no production file under src/ except its defining module', () => {
+    const root = fileURLToPath(new URL('../', import.meta.url));
+    const offenders: string[] = [];
+    let scanned = 0;
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.name.endsWith('.ts') && !entry.name.endsWith('.test.ts')) {
+          scanned += 1;
+          const rel = relative(root, full).split(sep).join('/');
+          if (rel === 'external/http.ts') continue;
+          if (readFileSync(full, 'utf8').includes('__testOnly')) offenders.push(rel);
+        }
+      }
+    };
+    walk(root);
+    expect(scanned).toBeGreaterThan(100); // the walk really covered src/
+    expect(readFileSync(join(root, 'external', 'http.ts'), 'utf8')).toContain('__testOnly');
+    expect(offenders).toEqual([]);
   });
 });

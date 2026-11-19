@@ -36,7 +36,13 @@
  * carry elsewhere.
  *
  * Test seams live under `__testOnly` and nowhere else: production code calls
- * `createGuardedHttps()` with no argument.
+ * `createGuardedHttps()` with no argument, and outside `NODE_ENV=test`
+ * (`config.isTest`) `__testOnly` is ignored entirely — the same pattern as
+ * `refuseUnderTest`. Only `*.test.ts` files may name it (invariant test).
+ *
+ * A URL carrying userinfo (`user:pass@host`) is refused as `refused_address`:
+ * `https.request(URL)` would turn it into an Authorization header, a
+ * credential path that bypasses the vault.
  */
 import { request as httpsRequest } from 'node:https';
 import { lookup as dnsLookup, type LookupAddress, type LookupOptions } from 'node:dns';
@@ -44,6 +50,7 @@ import { isIP } from 'node:net';
 import type { ClientRequest, IncomingMessage } from 'node:http';
 import type { TLSSocket } from 'node:tls';
 import { isForbiddenAddress } from './address-guard.js';
+import { config } from '../config.js';
 
 export const EXTERNAL_DEADLINE_MS = 30_000;
 export const EXTERNAL_MAX_BYTES = 1_048_576;
@@ -85,13 +92,23 @@ export interface GuardedHttpsOptions {
   __testOnly?: GuardedHttpsTestOnly;
 }
 
+const ADDRESS_REFUSED_CODE = 'EXTERNAL_ADDRESS_REFUSED';
+
 /** Marks a lookup failure that is the guard's refusal, not a DNS error. */
 class AddressRefusedError extends Error {
-  readonly code = 'EXTERNAL_ADDRESS_REFUSED';
+  readonly code = ADDRESS_REFUSED_CODE;
   constructor() {
     super('external address refused by the guard');
     this.name = 'AddressRefusedError';
   }
+}
+
+/** By class or by code, so a lookup error wrapped on its way out still classifies. */
+function isAddressRefusal(err: unknown, depth = 0): boolean {
+  if (err instanceof AddressRefusedError) return true;
+  if (typeof err !== 'object' || err === null || depth > 4) return false;
+  if ((err as { code?: unknown }).code === ADDRESS_REFUSED_CODE) return true;
+  return isAddressRefusal((err as { cause?: unknown }).cause, depth + 1);
 }
 
 function systemResolve(host: string): Promise<LookupAddress[]> {
@@ -153,7 +170,8 @@ function outgoingHeaders(req: ExternalRequest): Record<string, string> {
 }
 
 export function createGuardedHttps(options: GuardedHttpsOptions = {}): ExternalHttp {
-  const seams = options.__testOnly ?? {};
+  // Inert outside tests: a production caller cannot loosen the guard.
+  const seams: GuardedHttpsTestOnly = config.isTest ? (options.__testOnly ?? {}) : {};
   const isForbidden = seams.isForbidden ?? isForbiddenAddress;
   const lookup = guardedLookup(seams.resolve ?? systemResolve, isForbidden);
 
@@ -161,6 +179,9 @@ export function createGuardedHttps(options: GuardedHttpsOptions = {}): ExternalH
     send(req: ExternalRequest): Promise<ExternalResult> {
       if (req.url.protocol !== 'https:') {
         return Promise.reject(new TypeError('guarded client: only https URLs are allowed'));
+      }
+      if (req.url.username !== '' || req.url.password !== '') {
+        return Promise.resolve({ kind: 'refused_address' });
       }
       const host = bareHost(req.url);
       if (isIP(host) !== 0 && isForbidden(host)) {
@@ -239,7 +260,7 @@ export function createGuardedHttps(options: GuardedHttpsOptions = {}): ExternalH
           finished = true;
         });
         clientReq.on('error', (err: NodeJS.ErrnoException) => {
-          if (err instanceof AddressRefusedError) settle({ kind: 'refused_address' });
+          if (isAddressRefusal(err)) settle({ kind: 'refused_address' });
           else settle({ kind: 'network', sent: sent() });
         });
         clientReq.end(req.body ?? undefined);
