@@ -2,6 +2,8 @@ import type { Queryable, BusinessDb } from '../db/pool.js';
 import { actionClassLabel, autonomyLevelLabel } from '../domain/labels.js';
 import type { DigestWindow } from './digest-window.js';
 import { isLedgerOverdue } from '../domain/ledger.js';
+import { signedSystemNames } from '../external/store.js';
+import { toOneLine } from '../util/bidi.js';
 import { failedText, isGateDenialCode, leadingCode, NOT_PERMITTED_TEXT } from './whatsapp-report.js';
 
 /** One thing that did not go smoothly, already phrased in Hebrew. */
@@ -96,6 +98,59 @@ export interface DigestFacts {
     sent: number;
     waiting: number;
   };
+  /**
+   * "ממערכות חיצוניות" (Stage D, Task 12): events received (webhook) or
+   * scanned inside the window. `counts` is per system and event type, both
+   * by their SIGNED Hebrew labels (the id or code when the charter no longer
+   * carries one); `recent` is at most `MAX_RECENT_EXTERNAL` lines, newest
+   * first, each the event's first declared field — already one line
+   * (`toOneLine`), but still a stranger's text, so the renderer passes it
+   * through `safe` like every other name it lists.
+   */
+  external: {
+    total: number;
+    counts: readonly { system: string; type: string; count: number }[];
+    recent: readonly string[];
+  };
+}
+
+/** How many recent external events the digest names. */
+export const MAX_RECENT_EXTERNAL = 5;
+
+/**
+ * The external section's facts, from plain SQL on `external_events` and a
+ * narrow read of the signed labels (`external/store.ts`, which reaches no
+ * model at any depth — `digest-invariants.test.ts` walks the graph).
+ */
+async function externalFacts(db: BusinessDb, window: DigestWindow): Promise<DigestFacts['external']> {
+  const names = await signedSystemNames(db);
+  const systemLabel = (id: string): string => names.get(id)?.label ?? id;
+  const typeLabel = (id: string, type: string): string => names.get(id)?.eventLabels.get(type) ?? type;
+
+  const { rows: grouped } = await db.query<{ system_id: string; event_type: string; n: string }>(
+    `SELECT system_id, event_type, count(*)::text AS n FROM external_events
+      WHERE business_id = $1 AND created_at >= $2 AND created_at < $3
+      GROUP BY system_id, event_type`,
+    [db.businessId, window.start, window.end],
+  );
+  const counts = grouped
+    .map((r) => ({ system: toOneLine(systemLabel(r.system_id)), type: toOneLine(typeLabel(r.system_id, r.event_type)), count: Number(r.n) }))
+    .sort((a, b) => (a.system === b.system ? a.type.localeCompare(b.type, 'he') : a.system.localeCompare(b.system, 'he')));
+  const total = counts.reduce((sum, c) => sum + c.count, 0);
+
+  const { rows: latest } = await db.query<{ system_id: string; event_type: string; fields: { label: string; value: string }[] }>(
+    `SELECT system_id, event_type, fields FROM external_events
+      WHERE business_id = $1 AND created_at >= $2 AND created_at < $3
+      ORDER BY created_at DESC, event_id DESC
+      LIMIT $4`,
+    [db.businessId, window.start, window.end, MAX_RECENT_EXTERNAL],
+  );
+  const recent = latest.map((r) => {
+    const head = `${toOneLine(systemLabel(r.system_id))} · ${toOneLine(typeLabel(r.system_id, r.event_type))}`;
+    const first = Array.isArray(r.fields) ? r.fields[0] : undefined;
+    return first === undefined ? head : `${head} — ${toOneLine(first.label)}: ${toOneLine(first.value)}`;
+  });
+  return { total, counts, recent };
 }
 
 /** How many stuck ledger rows the digest names; the rest are counted. */
@@ -296,7 +351,13 @@ export async function collectDigestFacts(
       WHERE j.business_id = $1 AND j.phase = 'closed' AND j.closed_at >= $2 AND j.closed_at < $3
         AND NOT EXISTS (
           SELECT 1 FROM job_steps s
-           WHERE s.job_id = j.job_id AND s.actor = 'human' AND s.reason LIKE 'denied:%')`,
+           WHERE s.job_id = j.job_id AND s.actor = 'human' AND s.reason LIKE 'denied:%')
+        -- A learning job over external events (positive marker: its
+        -- external_learning_jobs row) is the assistant reading, not a task
+        -- done for the owner.
+        AND NOT EXISTS (
+          SELECT 1 FROM external_learning_jobs l
+           WHERE l.business_id = j.business_id AND l.job_id = j.job_id)`,
     [businessId, start, end],
   );
   // Windowed on the STEP's own `completed_at` — fix round 1, item 4. Windowing
@@ -377,6 +438,11 @@ export async function collectDigestFacts(
        FROM jobs j
       WHERE j.business_id = $1 AND j.phase = 'failed'
         AND j.closed_at >= $2 AND j.closed_at < $3
+        -- A failed learning job is not a failed instruction of the owner's;
+        -- it is shown on /systems instead (same marker as jobsCompleted).
+        AND NOT EXISTS (
+          SELECT 1 FROM external_learning_jobs l
+           WHERE l.business_id = j.business_id AND l.job_id = j.job_id)
       ORDER BY j.closed_at DESC
       LIMIT ${MAX_NAMED_EXCEPTIONS}`,
     [businessId, start, end],
@@ -532,6 +598,7 @@ export async function collectDigestFacts(
     },
     ledger,
     documents: { produced, sent, waiting: documentsWaiting },
+    external: await externalFacts(db, window),
   };
 }
 

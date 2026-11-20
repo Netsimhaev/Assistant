@@ -17,6 +17,8 @@ import { buildErasurePlan } from './erasure-plan.js';
 import { ErasureRefusedError, executeErasure } from './erasure.js';
 import { saveDescription } from '../business/description-store.js';
 import { renderErasure } from '../dashboard/views.js';
+import { crmConnection, crmFixture } from '../test/external-fixtures.js';
+import { learnFromExternalEvents } from '../external/learn.js';
 
 const BUSINESS = 'test-business';
 const RONIT = 'ronit@beta-log.example';
@@ -1707,5 +1709,275 @@ describe('setup data: colleagues and the setup package (migration 073)', () => {
     // The business's own address is not a counterparty and is never touched.
     const profile = await testDb().query('SELECT 1 FROM business_profiles WHERE business_id = $1', [BUSINESS]);
     expect(profile.rows).toHaveLength(1);
+  });
+});
+
+/**
+ * External systems (Stage D, migrations 077–079). `external_reads` is a
+ * discovery source by its `fields` and a delete target by `job_id`;
+ * `external_events` is a discovery source of its own that pulls its learning
+ * job in; `external_learning_jobs` goes with its job. The records at the
+ * provider are never deleted, and the preview names the system they stay in.
+ */
+describe('external systems', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  async function signCrm(): Promise<void> {
+    await withBusiness(BUSINESS, (bdb) =>
+      installCharter(bdb, buildCharter({ version: 'ext-crm', externalSystems: [crmFixture()], connections: [crmConnection()] })),
+    );
+  }
+
+  async function aRead(readId: string, jobId: string, systemId: string, fields: unknown, createdAt?: string): Promise<void> {
+    await testDb().query(
+      `INSERT INTO external_reads (business_id, read_id, job_id, step_id, system_id, operation, fields, created_at)
+       VALUES ($1, $2, $3, 's1', $4, 'list_customers', $5::jsonb, coalesce($6::timestamptz, now()))`,
+      [BUSINESS, readId, jobId, systemId, JSON.stringify(fields), createdAt ?? null],
+    );
+  }
+
+  async function anEvent(
+    eventId: string,
+    systemId: string,
+    fields: unknown,
+    opts: { curationJobId?: string | null; createdAt?: string } = {},
+  ): Promise<void> {
+    await testDb().query(
+      `INSERT INTO external_events (business_id, event_id, system_id, source, event_type, item_hash, fields, created_at, curation_job_id)
+       VALUES ($1, $2, $3, 'scan', 'customer.created', $2, $4::jsonb, coalesce($5::timestamptz, now()), $6)`,
+      [BUSINESS, eventId, systemId, JSON.stringify(fields), opts.createdAt ?? null, opts.curationJobId ?? null],
+    );
+  }
+
+  /** A learning job as `learn.ts` opens it: `unknown_external`, with its record row. */
+  async function aLearningJob(systemId: string, phase: 'closed' | 'understand' = 'closed'): Promise<string> {
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `learn-${ulid()}` })));
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
+      charterVersion: bundle.charterVersion,
+      provenance: 'unknown_external',
+      title: 'למידה ממערכת חיצונית',
+    }));
+    await testDb().query(
+      'INSERT INTO external_learning_jobs (business_id, job_id, system_id) VALUES ($1, $2, $3)',
+      [BUSINESS, job.jobId, systemId],
+    );
+    await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't' }));
+    if (phase === 'closed') {
+      await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to: 'closed', actor: 'orchestrator', reason: 't' }));
+    }
+    return job.jobId;
+  }
+
+  const count = (plan: Awaited<ReturnType<typeof buildErasurePlan>>, table: string): number | undefined =>
+    plan.items.find((i) => i.table === table && i.action === 'delete')?.count;
+
+  it('discovers a contact named only in an external read, deletes the read with its job, and names the system kept', async () => {
+    const job = await bareJob('ext-read-job');
+    const other = await bareJob('ext-read-other');
+    await signCrm();
+    await aRead('R-1', job, 'crm', { customer: { name: 'רונית', email: RONIT } });
+    await aRead('R-2', other, 'crm', { customer: { name: 'דנה' } });
+
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
+
+    expect(plan.jobIds).toContain(job);
+    expect(plan.jobIds).not.toContain(other);
+    expect(count(plan, 'external_reads')).toBe(1);
+    expect(plan.externalSystemsKept).toEqual(['מערכת הלקוחות']);
+    const html = renderErasure({ csrf: 't', anchorLabel: RONIT, plan });
+    expect(html).toContain('נשארים במערכת מערכת הלקוחות');
+    expect(html).toContain('אם המערכת עדיין מחזיקה את הרשומה ותשנה אותה, היא עלולה להגיע שוב בסריקה או בהתראה');
+
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
+    const left = await testDb().query<{ read_id: string }>('SELECT read_id FROM external_reads');
+    expect(left.rows).toEqual([{ read_id: 'R-2' }]);
+  });
+
+  it('discovers a contact in an event (JSON-escaped too), pulls its learning job, and deletes job, record and memory', async () => {
+    const learning = await aLearningJob('crm');
+    const untouched = await aLearningJob('crm');
+    const name = 'אלפא בע"מ';
+    await anEvent('E-1', 'crm', { customer: { name } }, { curationJobId: learning });
+    await anEvent('E-2', 'crm', { customer: { name: 'בטא' } }, { curationJobId: untouched });
+    await withBusiness(BUSINESS, (db) =>
+      writeMemory(db, { jobId: learning, kind: 'chunk', subjectKey: 'ext:crm', body: { text: 'לקוח חדש נרשם' } }),
+    );
+
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: name }));
+
+    expect(plan.externalEventIds).toEqual(['E-1']);
+    expect(plan.jobIds).toContain(learning);
+    expect(plan.jobIds).not.toContain(untouched);
+    expect(count(plan, 'external_events')).toBe(1);
+    expect(count(plan, 'external_learning_jobs')).toBe(1);
+    expect(plan.memoryIds).toHaveLength(1);
+    // Not signed in this charter: the system id stands in for the label.
+    expect(plan.externalSystemsKept).toEqual(['crm']);
+
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
+    const events = await testDb().query<{ event_id: string }>('SELECT event_id FROM external_events');
+    expect(events.rows).toEqual([{ event_id: 'E-2' }]);
+    const records = await testDb().query<{ job_id: string }>('SELECT job_id FROM external_learning_jobs');
+    expect(records.rows).toEqual([{ job_id: untouched }]);
+    const memories = await testDb().query('SELECT 1 FROM memories WHERE written_by_job = $1', [learning]);
+    expect(memories.rows).toHaveLength(0);
+  });
+
+  it('closes reads and events by created_at for a window anchor', async () => {
+    const inside = await bareJob('ext-win-in');
+    const outside = await bareJob('ext-win-out');
+    await aRead('R-in', inside, 'crm', { a: 1 }, '2026-03-10T10:00:00Z');
+    await aRead('R-out', outside, 'crm', { a: 2 }, '2026-05-10T10:00:00Z');
+    await anEvent('E-in', 'crm', { a: 1 }, { createdAt: '2026-03-10T10:00:00Z' });
+    await anEvent('E-out', 'crm', { a: 2 }, { createdAt: '2026-05-10T10:00:00Z' });
+
+    const plan = await withBusiness(BUSINESS, (bdb) =>
+      buildErasurePlan(bdb, { kind: 'window', fromIso: '2026-03-01T00:00:00Z', toIso: '2026-04-01T00:00:00Z' }),
+    );
+
+    expect(count(plan, 'external_reads')).toBe(1);
+    expect(count(plan, 'external_events')).toBe(1);
+    expect(plan.externalEventIds).toEqual(['E-in']);
+  });
+
+  it('sorts the systems kept, cleans an unsigned id, and lists nothing when no row matched', async () => {
+    const job = await jobAbout(RONIT, 'ext-two-systems');
+    await signCrm();
+    await aRead('R-a', job, 'zeta', { x: 1 });
+    await aRead('R-b', job, 'crm', { x: 1 });
+    await anEvent('E-a', 'alpha‮beta', { who: RONIT });
+
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
+    expect(plan.externalSystemsKept).toEqual(['alphabeta', 'zeta', 'מערכת הלקוחות'].sort());
+
+    const none = await withBusiness(BUSINESS, (bdb) =>
+      buildErasurePlan(bdb, { kind: 'contact', identifier: 'nobody@nowhere.example' }),
+    );
+    expect(none.externalSystemsKept).toEqual([]);
+  });
+
+  it('refuses while a matched learning job is still open in understand, at plan time and again at execute time', async () => {
+    const open = await aLearningJob('crm', 'understand');
+    await anEvent('E-open', 'crm', { who: RONIT }, { curationJobId: open });
+
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
+    expect(plan.refusals.map((r) => r.kind)).toEqual(['live_job']);
+
+    // The executor's own locked re-check: a learning job closed at preview
+    // time and open again by confirm time. Simulated by moving the row
+    // directly — a phase the plan never saw.
+    const closed = await aLearningJob('crm');
+    await anEvent('E-closed', 'crm', { who: 'dana@x.example' }, { curationJobId: closed });
+    const later = await withBusiness(BUSINESS, (bdb) =>
+      buildErasurePlan(bdb, { kind: 'contact', identifier: 'dana@x.example' }),
+    );
+    expect(later.refusals).toEqual([]);
+    await testDb().query(`UPDATE jobs SET phase = 'understand' WHERE job_id = $1`, [closed]);
+    await expect(withBusiness(BUSINESS, (bdb) => executeErasure(bdb, later))).rejects.toBeInstanceOf(
+      ErasureRefusedError,
+    );
+    const still = await testDb().query(`SELECT 1 FROM external_events WHERE event_id = 'E-closed'`);
+    expect(still.rows).toHaveLength(1);
+  });
+
+  it('does not treat an ordinary job in understand as live', async () => {
+    const job = await jobAbout(RONIT, 'ext-plain-understand');
+    await withBusiness(BUSINESS, (db) => transition(db, job, { to: 'understand', actor: 'orchestrator', reason: 't' }));
+
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
+    expect(plan.refusals).toEqual([]);
+  });
+
+  it('a claimless learning job orphaned in intake 31 minutes ago does not block erasure; the sweep fails it even at cap 0', async () => {
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'orphan' })));
+    const orphan = await withBusiness(BUSINESS, (db) => createJob(db, {
+      charterVersion: bundle.charterVersion,
+      provenance: 'unknown_external',
+      title: 'למידה ממערכת חיצונית',
+    }));
+    await testDb().query(
+      'INSERT INTO external_learning_jobs (business_id, job_id, system_id) VALUES ($1, $2, $3)',
+      [BUSINESS, orphan.jobId, 'crm'],
+    );
+    await testDb().query(`UPDATE jobs SET created_at = now() - interval '31 minutes' WHERE job_id = $1`, [orphan.jobId]);
+    // Control: the same job, young, is live.
+    await testDb().query(`UPDATE jobs SET created_at = now() WHERE job_id = $1`, [orphan.jobId]);
+    const window = { kind: 'window', fromIso: '2000-01-01T00:00:00Z', toIso: '2100-01-01T00:00:00Z' } as const;
+    const young = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, window));
+    expect(young.refusals.map((r) => r.kind)).toEqual(['live_job']);
+    await testDb().query(`UPDATE jobs SET created_at = now() - interval '31 minutes' WHERE job_id = $1`, [orphan.jobId]);
+
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, window));
+    expect(plan.jobIds).toContain(orphan.jobId);
+    expect(plan.refusals).toEqual([]);
+
+    // Learning off (cap 0): the sweep still runs and fails the orphan.
+    await withBusiness(BUSINESS, (db) =>
+      learnFromExternalEvents(db, { curator: async () => ({ candidates: [] }), runsPerDay: 0 }),
+    );
+    const { rows } = await testDb().query<{ phase: string }>('SELECT phase FROM jobs WHERE job_id = $1', [orphan.jobId]);
+    expect(rows[0]?.phase).toBe('failed');
+    const record = await testDb().query<{ failed_at: Date | null }>(
+      'SELECT failed_at FROM external_learning_jobs WHERE job_id = $1',
+      [orphan.jobId],
+    );
+    expect(record.rows[0]?.failed_at).not.toBeNull();
+
+    const after = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, window));
+    expect(after.refusals).toEqual([]);
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, after));
+    const left = await testDb().query('SELECT 1 FROM external_learning_jobs WHERE job_id = $1', [orphan.jobId]);
+    expect(left.rows).toHaveLength(0);
+  });
+
+  it('refuses when an open learning job claimed an erased event after the preview', async () => {
+    await anEvent('E-race', 'crm', { who: RONIT });
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
+    expect(plan.externalEventIds).toEqual(['E-race']);
+    expect(plan.refusals).toEqual([]);
+
+    const claimer = await aLearningJob('crm', 'understand');
+    await testDb().query(`UPDATE external_events SET curation_job_id = $1 WHERE event_id = 'E-race'`, [claimer]);
+
+    await expect(withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan))).rejects.toBeInstanceOf(
+      ErasureRefusedError,
+    );
+    const still = await testDb().query(`SELECT 1 FROM external_events WHERE event_id = 'E-race'`);
+    expect(still.rows).toHaveLength(1);
+
+    // A claim by a job that is no longer open does not refuse.
+    await withBusiness(BUSINESS, (db) => transition(db, claimer, { to: 'closed', actor: 'orchestrator', reason: 't' }));
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
+    const gone = await testDb().query(`SELECT 1 FROM external_events WHERE event_id = 'E-race'`);
+    expect(gone.rows).toHaveLength(0);
+  });
+
+  it('keys systems kept by id: a shared label carries its id, an empty label falls back to the id', async () => {
+    const job = await jobAbout(RONIT, 'ext-labels');
+    await signCrm();
+    // Two more signed systems, written straight into the active charter's JSON
+    // (the narrow read the plan uses): one sharing crm's label, one whose
+    // label cleans to nothing.
+    await testDb().query(
+      `UPDATE charter_versions cv
+          SET charter = jsonb_set(cv.charter, '{externalSystems}', (cv.charter -> 'externalSystems')
+            || jsonb_build_array(jsonb_build_object('id', 'crm2', 'label', 'מערכת הלקוחות'),
+                                 jsonb_build_object('id', 'blank', 'label', E'\\u202E \\n')))
+         FROM charter_active ca
+        WHERE ca.business_id = cv.business_id AND ca.charter_version = cv.charter_version AND ca.business_id = $1`,
+      [BUSINESS],
+    );
+    await aRead('R-1', job, 'crm', { x: 1 });
+    await aRead('R-2', job, 'crm2', { x: 1 });
+    await aRead('R-3', job, 'blank', { x: 1 });
+
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
+    expect(plan.externalSystemsKept).toEqual(['blank', 'מערכת הלקוחות (crm)', 'מערכת הלקוחות (crm2)'].sort());
   });
 });

@@ -1,0 +1,12 @@
+-- 082_business_deletion_grant.sql
+--
+-- The last step of deleting a whole business (spec 2026-11-19): the registry
+-- row goes once the rows (081's `delete_business_rows`) and the files are gone.
+-- That DELETE runs on the platform pool (`finishDeletion`,
+-- src/tenancy/business-deletion.ts), and 068 gave `assistant_platform_group`
+-- SELECT, INSERT and UPDATE on `businesses` only. A new migration rather than
+-- an edit of 081, which databases have already run.
+--
+-- The app account gains nothing: 068 revoked everything on `businesses` from
+-- it, and it is never a member of the platform group.
+GRANT DELETE ON businesses TO assistant_platform_group;

@@ -94,6 +94,7 @@ import {
 } from '../governance/typed-recipients.js';
 import { emailDomainProblem } from '../domain/charter.js';
 import { renderStepEcho } from '../orchestrator/command-echo.js';
+import type { ExternalSystem } from '../domain/external-system.js';
 import { WHATSAPP_MESSAGE_MAX_CHARS } from '../orchestrator/command-confirm.js';
 import type { Runtime } from '../orchestrator/runtime.js';
 import { PRODUCTION_TOOLS_MISSING_REASON } from './render-error.js';
@@ -331,6 +332,8 @@ export interface CardTextInput {
   options: readonly DeliveryOption[];
   stage: 'ready' | 'failed_checks';
   currency: string;
+  /** The active charter's signed external systems (`bundle.externalSystems`) — required, never defaulted. */
+  systems: readonly ExternalSystem[];
   dashboardBaseUrl?: string;
   prefix?: readonly string[];
 }
@@ -357,7 +360,7 @@ export function renderCardText(input: CardTextInput): string {
     input.options.forEach((option, index) => {
       lines.push(`${index + 1}. ${option.label}`);
       for (const step of option.plan.steps) {
-        for (const echo of renderStepEcho(step, input.currency).split('\n')) lines.push(`    ${echo}`);
+        for (const echo of renderStepEcho(step, input.currency, input.systems).split('\n')) lines.push(`    ${echo}`);
       }
     });
     lines.push(`${input.options.length + 1}. בקשי תיקון`);
@@ -494,11 +497,18 @@ async function recordNoticeFailure(db: BusinessDb, card: { cardId: string }): Pr
   return notice;
 }
 
-/** The active charter's currency, or `null` when the charter is missing or unreadable. */
-async function charterCurrency(db: BusinessDb): Promise<string | null> {
+/**
+ * The active charter's currency and signed external systems — what a step echo
+ * needs — or `null` when the charter is missing or unreadable.
+ */
+async function charterEchoContext(
+  db: BusinessDb,
+): Promise<{ currency: string; systems: readonly ExternalSystem[] } | null> {
   try {
     const active = await loadActiveCharter(db);
-    return active === null ? null : active.bundle.ceilings.currency;
+    return active === null
+      ? null
+      : { currency: active.bundle.ceilings.currency, systems: active.bundle.externalSystems };
   } catch {
     return null;
   }
@@ -546,8 +556,8 @@ export async function createDocumentCard(
     return { status: 'exists', cardId: existing?.cardId ?? cardId };
   }
 
-  const currency = await charterCurrency(db);
-  if (currency === null) {
+  const echoContext = await charterEchoContext(db);
+  if (echoContext === null) {
     return { status: 'created', cardId, notice: await recordNoticeFailure(db, { cardId }) };
   }
   const text = renderCardText({
@@ -556,7 +566,8 @@ export async function createDocumentCard(
     version,
     options: optionsBuilt,
     stage,
-    currency,
+    currency: echoContext.currency,
+    systems: echoContext.systems,
     ...(options.dashboardBaseUrl !== undefined ? { dashboardBaseUrl: options.dashboardBaseUrl } : {}),
   });
   const notice = await notifyCard(
@@ -748,6 +759,7 @@ export async function approveDocumentCard(
       options: card.deliveryPlans,
       stage,
       currency: active.bundle.ceilings.currency,
+      systems: active.bundle.externalSystems,
     });
     await createConfirmation(tx, {
       jobId: job.jobId,
@@ -917,6 +929,7 @@ async function resendAfterTypedAddress(
       options: card.deliveryPlans,
       stage: 'ready',
       currency: active.bundle.ceilings.currency,
+      systems: active.bundle.externalSystems,
       ...(options.dashboardBaseUrl !== undefined ? { dashboardBaseUrl: options.dashboardBaseUrl } : {}),
     });
     await notifyCard(db, card, production, version, text, options, options.documentRoot ?? config.documentRoot);
@@ -1087,8 +1100,8 @@ export async function reraiseFailedDeliveries(db: BusinessDb, options: CardSeams
       const version = await loadVersion(db, card.versionId);
       const production = version === null ? null : await loadProduction(db, version.productionId);
       if (version === null || production === null) continue;
-      const currency = await charterCurrency(db);
-      if (currency === null) {
+      const echoContext = await charterEchoContext(db);
+      if (echoContext === null) {
         // The claim already moved the card to `failed_send`: it stays on the
         // dashboard, and the owner's channels record the notice as failed.
         await recordNoticeFailure(db, card);
@@ -1109,7 +1122,8 @@ export async function reraiseFailedDeliveries(db: BusinessDb, options: CardSeams
         version,
         options: card.deliveryPlans,
         stage: production.stage === 'failed_checks' ? 'failed_checks' : 'ready',
-        currency,
+        currency: echoContext.currency,
+        systems: echoContext.systems,
         prefix,
         ...(options.dashboardBaseUrl !== undefined ? { dashboardBaseUrl: options.dashboardBaseUrl } : {}),
       });

@@ -24,7 +24,7 @@ import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import { loadPlanBody } from '../orchestrator/plan-store.js';
 import { curateWithModel, type Curator } from '../sdk/curator.js';
-import { buildCurationBrief } from './curation-brief.js';
+import { buildCurationBrief, buildExternalBrief } from './curation-brief.js';
 import { siftCandidates, type CurationCandidate } from './curation-parse.js';
 import { jobQualifiesForCuration } from './curation-trigger.js';
 import { writeMemory } from './store.js';
@@ -37,6 +37,13 @@ export interface CurationOutcome {
   rejected: number;
   /** True when something threw partway through — a bug or an outage, never a control. */
   failed: boolean;
+  /**
+   * True once the curator (the billed model call) was actually invoked —
+   * whether it then answered or threw. A throw BEFORE it (brief, cap query)
+   * leaves this false: nothing was paid for, and a caller that claimed work
+   * for this run may give it back to be retried (`external/learn.ts`).
+   */
+  modelCalled: boolean;
 }
 
 export interface CurateJobOptions {
@@ -46,13 +53,38 @@ export interface CurateJobOptions {
   runsPerDay?: number;
   /**
    * `mail` curates a mail's planless triage job from its stored summary, with
-   * its own audit-row prefix and its own daily count. Default is unchanged.
+   * its own audit-row prefix and its own daily count. `external` curates a
+   * learning job over external-system events (`external/learn.ts`) from the
+   * events' declared fields, likewise with its own prefix and count. Both are
+   * chunk-only and never retire. Default is unchanged.
    */
   scope?: CurationScope;
 }
 
-export type CurationScope = 'default' | 'mail';
-const MAIL_PREFIX = 'mail:';
+export type CurationScope = 'default' | 'mail' | 'external';
+
+/** Each scope's audit-row prefix — what its daily count matches on, positively. */
+const SCOPE_PREFIX: Readonly<Record<CurationScope, string>> = {
+  default: '',
+  mail: 'mail:',
+  external: 'ext:',
+};
+
+/** Each scope's daily cap, by its `config` / runtime-column name. */
+const SCOPE_CAP = {
+  default: 'curationRunsPerDay',
+  mail: 'mailCurationPerDay',
+  external: 'externalCurationPerDay',
+} as const satisfies Readonly<Record<CurationScope, string>>;
+
+/** The note a chunk-only scope stores beside a claim it would not let become a fact. */
+const CHUNK_NOTE: Readonly<Record<'mail' | 'external', string>> = {
+  mail: 'טענה ממייל נכנס — נשמרה כטענה ולא כעובדה',
+  external: 'טענה ממערכת חיצונית — נשמרה כטענה ולא כעובדה',
+};
+
+/** Every curation audit row's reason starts with its scope prefix and then this word. */
+const CURATION_WORD = 'אצירה';
 
 /**
  * The daily ceiling counts AUDIT rows, not `memories` rows.
@@ -72,8 +104,10 @@ export async function curationRunsToday(
   const { rows } = await db.query<{ n: string }>(
     `SELECT count(*)::text AS n FROM audit_log
       WHERE business_id = $1 AND kind = 'curation' AND at >= date_trunc('day', now())
-        AND (reason LIKE 'mail:%') = $2`,
-    [businessId, (options.scope ?? 'default') === 'mail'],
+        AND reason LIKE $2`,
+    // A positive match on the scope's own prefix: the default scope's rows
+    // start with the bare word, so a new scope's rows never land in its count.
+    [businessId, `${SCOPE_PREFIX[options.scope ?? 'default']}${CURATION_WORD}%`],
   );
   return Number(rows[0]?.n ?? '0');
 }
@@ -85,11 +119,12 @@ export async function curateJob(
 ): Promise<CurationOutcome> {
   const businessId = db.businessId;
   const scope = options.scope ?? 'default';
-  const prefix = scope === 'mail' ? MAIL_PREFIX : '';
-  const idle: CurationOutcome = { ran: false, skipped: null, written: 0, rejected: 0, failed: false };
+  const prefix = SCOPE_PREFIX[scope];
+  const idle: CurationOutcome = { ran: false, skipped: null, written: 0, rejected: 0, failed: false, modelCalled: false };
 
   let written = 0;
   let rejected = 0;
+  let modelCalled = false;
 
   // Everything that can throw — plan lookup, the cap query, the brief, the
   // model call, and every write — lives inside this one `try`. Fix round 1
@@ -123,7 +158,7 @@ export async function curateJob(
     }
     const runsPerDay =
       options.runsPerDay ??
-      capFor(await loadRuntimeSettings(db), scope === 'mail' ? 'mailCurationPerDay' : 'curationRunsPerDay');
+      capFor(await loadRuntimeSettings(db), SCOPE_CAP[scope]);
     if ((await curationRunsToday(db, { scope })) >= runsPerDay) {
       return { ...idle, skipped: 'over_cap' };
     }
@@ -132,21 +167,23 @@ export async function curateJob(
     // be built from it (see `buildCurationBrief`'s own null cases). Same
     // shape, different cause — collapsing them was an honesty-of-reporting
     // gap fix round 1 flagged (minor 7).
-    const brief = await buildCurationBrief(db, jobId);
+    const brief = scope === 'external' ? await buildExternalBrief(db, jobId) : await buildCurationBrief(db, jobId);
     if (brief === null) return { ...idle, skipped: 'no_brief' };
 
     const curator = options.curator ?? curateWithModel;
+    modelCalled = true;
     const result = await curator(brief);
     const sifted = siftCandidates(result, brief.touched);
     rejected = sifted.rejected.length;
 
     for (const candidate of sifted.accepted) {
-      // Mail scope is chunk-only and never retires: the From header is not
-      // authenticated, so a spoofed mail must not be able to supersede a
-      // fact the assistant already holds about a known sender. A chunk has no
-      // uniqueness, so nothing is retired; the claim is kept as a labelled claim.
+      // Mail and external scopes are chunk-only and never retire: the From
+      // header is not authenticated, and an external system's data is written
+      // by whoever runs it (a web form, a CRM record a stranger filled), so
+      // neither may supersede a fact the assistant already holds. A chunk has
+      // no uniqueness, so nothing is retired; the claim is kept as a labelled claim.
       const resolved =
-        scope === 'mail' ? asMailChunk(candidate) : await resolveConflict(db, candidate, jobId);
+        scope === 'default' ? await resolveConflict(db, candidate, jobId) : asChunk(candidate, CHUNK_NOTE[scope]);
       await writeMemory(
         db,
         {
@@ -178,7 +215,7 @@ export async function curateJob(
       }
     );
 
-    return { ran: true, skipped: null, written, rejected, failed: false };
+    return { ran: true, skipped: null, written, rejected, failed: false, modelCalled };
   } catch (err) {
     // The job is finished either way — see the header. But a billed call
     // that throws must still leave a trace (fix round 1, I2): otherwise the
@@ -193,7 +230,7 @@ export async function curateJob(
     // completed before the failure are real and must not be reported
     // alongside `ran: false`, which fix round 1 (minor 8) called
     // self-contradictory.
-    return { ran: written > 0, skipped: null, written, rejected, failed: true };
+    return { ran: written > 0, skipped: null, written, rejected, failed: true, modelCalled };
   }
 }
 
@@ -233,14 +270,14 @@ async function recordCurationFailure(
   }
 }
 
-function asMailChunk(candidate: CurationCandidate): { kind: 'chunk'; body: Record<string, unknown> } {
+function asChunk(candidate: CurationCandidate, note: string): { kind: 'chunk'; body: Record<string, unknown> } {
   if (candidate.kind === 'chunk') return { kind: 'chunk', body: candidate.body };
   return {
     kind: 'chunk',
     body: {
       claim: candidate.body,
       about: candidate.attribute ?? candidate.subjectKey,
-      note: 'טענה ממייל נכנס — נשמרה כטענה ולא כעובדה',
+      note,
     },
   };
 }

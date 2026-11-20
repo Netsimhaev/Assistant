@@ -309,12 +309,12 @@ describe('compiled policy has a reader', () => {
     expect(NOT_READ_BY_GATE.size).toBe(6);
     const compiled = compileCharter(buildCharter()) as Record<string, unknown>;
     const fields = Object.keys(compiled).filter((f) => !NOT_READ_BY_GATE.has(f));
-    // Both properties pinned, not just the exclusion set: 18 top-level fields
-    // total, minus the 6 excluded above, is 12. A refactor that nested some of
+    // Both properties pinned, not just the exclusion set: 19 top-level fields
+    // total, minus the 6 excluded above, is 13. A refactor that nested some of
     // these fields under a sub-object would shrink `fields` and pass this
     // invariant more vacuously than ever — a floor on the exclusion set alone
     // does not catch that.
-    expect(fields.length).toBe(12);
+    expect(fields.length).toBe(13);
     const unread = fields.filter((field) => !GATE_SOURCES.some((src) => readsField(src, field)));
     expect(unread).toEqual([]);
   });
@@ -397,6 +397,8 @@ describe('addresseeOf is pinned class by class', () => {
     'memory.write_longterm': 'internal',
     'charter.amend': 'internal',
     'agent.delegate': 'internal',
+    'external.read': 'internal',
+    'external.delete': 'internal',
   };
 
   it('has an entry for every action class', () => {

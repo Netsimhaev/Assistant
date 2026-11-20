@@ -5,10 +5,11 @@ import { resetDatabase } from '../test/db.js';
 import { loadBindings, upsertBinding } from './bindings.js';
 import { buildCharter } from '../test/fixtures.js';
 import { compileCharter } from '../charter/compile.js';
-import type { CharterConnection } from '../domain/connection.js';
+import type { CharterConnection, ConnectionBinding } from '../domain/connection.js';
 import { deriveTargetId, resolveChannel } from './channels.js';
 import { ActionClass, addresseeOf } from '../domain/action.js';
 import { buildFacts, type FactsContext } from '../policy/facts.js';
+import { crmConnection, crmFixture } from '../test/external-fixtures.js';
 
 const BUSINESS = 'test-business';
 const BY = 'net.simhaev@gmail.com';
@@ -551,10 +552,50 @@ describe('resolving a channel', () => {
       'memory.write_longterm': 'c_812',
       'charter.amend': 'c_812',
       'agent.delegate': 'c_812',
+      'external.read': 'c_812',
+      'external.delete': 'c_812',
     };
 
     it.each(ActionClass.options)('%s routes to its pinned target', (cls) => {
       expect(deriveTargetId('some.tool', BOTH, cls)).toBe(ROUTES_TO[cls]);
+    });
+
+    // The table above holds the tool constant at a non-external name, so it
+    // measures the class rule alone. The two external-system tools are routed
+    // by the TOOL, before the class rule: whatever class the owner signed for
+    // the operation — `crm.write`, a counterparty-routed class above — an
+    // `ext.*` call targets the system it names, never a `counterpartyId`.
+    const EXT_ROUTE = { ...BOTH, system: 'crm' };
+    it.each(['ext.read', 'ext.call'])('%s routes to its own `system`, whatever the class', (tool) => {
+      for (const cls of ActionClass.options) {
+        expect(deriveTargetId(tool, EXT_ROUTE, cls), `${tool} as ${cls}`).toBe('crm');
+      }
+      expect(deriveTargetId(tool, EXT_ROUTE, null)).toBe('crm');
+    });
+
+    it.each(['ext.read', 'ext.call'])('%s with no readable own `system` targets nothing', (tool) => {
+      expect(deriveTargetId(tool, BOTH, 'crm.write')).toBeNull();
+      expect(deriveTargetId(tool, { ...BOTH, system: 42 }, 'crm.write')).toBeNull();
+      expect(deriveTargetId(tool, { ...BOTH, system: '' }, 'crm.write')).toBeNull();
+      expect(deriveTargetId(tool, { ...BOTH, system: ['crm'] }, 'crm.write')).toBeNull();
+      // Inherited, not own: must not route.
+      const inherited = Object.create({ system: 'crm' }) as Record<string, unknown>;
+      expect(deriveTargetId(tool, inherited, 'crm.write')).toBeNull();
+    });
+
+    it('an ext.* call with no readable system resolves to no channel, never a catch-all', () => {
+      const bundle = compileCharter(buildCharter({
+        externalSystems: [crmFixture()],
+        connections: [crmConnection()],
+      }));
+      const binding: ConnectionBinding = {
+        system: 'ext:crm', status: 'live', endpoint: null, credentialRef: 'EXT_CRM_KEY',
+        provider: null, lastOkAt: null, lastError: null,
+      };
+      expect(resolveChannel(bundle, [binding], 'ext.call', deriveTargetId('ext.call', {}, 'crm.write')).status)
+        .toBe('no_channel');
+      const resolved = resolveChannel(bundle, [binding], 'ext.call', deriveTargetId('ext.call', { system: 'crm' }, 'crm.write'));
+      expect(resolved).toEqual({ status: 'resolved', system: 'ext:crm', channel: 'api' });
     });
   });
 

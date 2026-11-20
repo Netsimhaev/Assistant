@@ -3,11 +3,12 @@
  *
  * Three server-wide roots, one folder per business under each:
  *
- * - `DOCUMENT_ROOT/<businessId>` — every ingested document and every
- *   produced file (`produced/<businessId>/...` is ALREADY the shape of a
- *   stored path, so that tree is not re-rooted here — `stored_path` values
- *   begin with the business and are joined to `config.documentRoot` as they
- *   always were). What changes is the READER: `know.reader`'s subprocess
+ * - `DOCUMENT_ROOT/<businessId>` — every ingested document. Produced files
+ *   are NOT under it: they live in `DOCUMENT_ROOT/produced/<businessId>/…`
+ *   (the production loop's stored-path shape, `produced/<businessId>/
+ *   <productionId>/…`, joined to `config.documentRoot` as it always was), a
+ *   sibling tree that `businessFolders(...).produced` names and whole-business
+ *   deletion removes. What changes is the READER: `know.reader`'s subprocess
  *   `cwd` and the SDK gate's `isPathWithin` take the business folder, not the
  *   root, so a reader for one business cannot open another's document.
  * - `DOCUMENT_INBOX_ROOT/<businessId>` — the folder the inbox scan watches,
@@ -20,6 +21,7 @@
  * filesystem path, and `..` or a separator in it would be a traversal. The
  * shape check (`isValidBusinessId`) admits neither.
  */
+import { readdir } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import { config } from '../config.js';
 import { isValidBusinessId } from '../db/pool.js';
@@ -60,4 +62,48 @@ export function businessSaveRoot(businessId: string): string | null {
  */
 export function isFolderOfBusiness(folder: string, businessId: string): boolean {
   return isValidBusinessId(businessId) && basename(resolve(folder)) === businessId;
+}
+
+/** The three folders of one business on the server; `null` where the server has no such root. */
+export interface BusinessFolders {
+  /** `<DOCUMENT_ROOT>/<businessId>` — ingested documents and the logo. */
+  document: string;
+  /** `<DOCUMENT_ROOT>/produced/<businessId>` — the files the production loop wrote. */
+  produced: string;
+  /** `<DOCUMENT_INBOX_ROOT>/<businessId>`, or `null` when the server has no inbox root. */
+  inbox: string | null;
+  /** `<DOCUMENT_SAVE_ROOT>/<businessId>`, or `null` when the server has no save root. */
+  save: string | null;
+}
+
+/**
+ * Every folder a business owns on the server, each the business id joined as
+ * ONE segment under its root — so `acme` and `acme-2` are siblings, never one
+ * inside the other's name. A caller compares or removes these folders whole;
+ * it never tests a path with a string prefix (`startsWith`), which would take
+ * `acme-2` for part of `acme`.
+ */
+export function businessFolders(businessId: string): BusinessFolders {
+  const id = checkedId(businessId);
+  return {
+    document: join(config.documentRoot, id),
+    produced: join(config.documentRoot, 'produced', id),
+    inbox: config.documentInboxRoot === null ? null : join(config.documentInboxRoot, id),
+    save: config.documentSaveRoot === null ? null : join(config.documentSaveRoot, id),
+  };
+}
+
+/**
+ * How many files (anything that is not a directory, links included) sit
+ * under `folder`, recursively. A missing folder holds none.
+ */
+export async function countFilesUnder(folder: string): Promise<number> {
+  let entries;
+  try {
+    entries = await readdir(folder, { recursive: true, withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+    throw err;
+  }
+  return entries.filter((e) => !e.isDirectory()).length;
 }

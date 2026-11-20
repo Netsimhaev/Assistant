@@ -65,6 +65,12 @@ import {
   type SetupOptions,
 } from './setup-routes.js';
 import type { ActiveCharter } from '../charter/store.js';
+import { localParts } from '../util/local-time.js';
+import { readHeader, renderReadsForOwner } from '../external/render-reads.js';
+import { loadRecentOwnerReads } from '../external/store.js';
+import { EXTERNAL_HOOK_PATH, handleExternalWebhook } from '../external/webhook.js';
+import { handleSystems } from './systems-view.js';
+import { storedCredentials } from '../governance/credential-store.js';
 import { config } from '../config.js';
 import { DigestSchedule, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
 import type { DigestSettings } from '../governance/digest-settings.js';
@@ -116,6 +122,12 @@ import {
   handleCalendarSignPost,
   handleCalendarStatus,
 } from './calendar-connect.js';
+import {
+  handleExternalRemovePost,
+  handleExternalSignGet,
+  handleExternalSignPost,
+  handleExternalStatus,
+} from './external-connect.js';
 import {
   calendarWiring,
   handleMeetingMarkPost,
@@ -1414,8 +1426,31 @@ async function handleInstructGet(
     renderInstruct({
       csrf: issueCsrfToken(session.sessionId),
       ...(await openOnInstructScreen(db)),
+      reads: await recentReadsBlock(db),
     }),
   );
+}
+
+/**
+ * What the owner's recent commands read from external systems; '' when
+ * nothing. Each read is its own block — labels, when it was read (charter
+ * time zone), whether its job finished — with its own line cap, so one long
+ * read cannot hide the others.
+ */
+export async function recentReadsBlock(db: BusinessDb): Promise<string> {
+  const reads = await loadRecentOwnerReads(db);
+  if (reads.length === 0) return '';
+  const active = await loadActiveCharter(db);
+  const systems = active?.bundle.externalSystems ?? [];
+  const timeZone = active?.charter.identity.timezone ?? 'UTC';
+  return reads
+    .map((read) => {
+      const when = localParts(read.createdAt, timeZone);
+      const status = read.jobPhase === 'closed' ? 'הושלם' : 'לא הושלם';
+      const header = `${readHeader(read, systems)} (נקרא ${when.date} ${when.time}, ${status})`;
+      return renderReadsForOwner([read], systems, { headers: [header] });
+    })
+    .join('\n\n');
 }
 
 /**
@@ -2220,6 +2255,10 @@ function planFingerprint(plan: ErasurePlan): string {
     calendarEventsKept: plan.calendarEventsKept
       .map((e) => `${e.kind}\u0000${e.calendarId}\u0000${e.eventId}\u0000${e.start ?? ''}`)
       .sort(),
+    externalEventIds: [...plan.externalEventIds].sort(),
+    // Never deleted at the provider, but shown to the owner: a system that
+    // joined between the preview and the confirm re-shows the preview.
+    externalSystemsKept: [...plan.externalSystemsKept].sort(),
     // Display-only (the description is never touched), but what the owner was
     // told is part of what he confirms.
     descriptionMentionsContact: plan.descriptionMentionsContact,
@@ -3240,6 +3279,8 @@ const LEDGER_ACTION_PATH = /^\/ledger\/([^/]+)\/action$/;
 const LEDGER_RULE_DELETE_PATH = /^\/ledger\/rules\/([^/]+)\/delete$/;
 const MAIL_PATH = /^\/mail\/([^/]+)$/;
 const DOCUMENT_FILE_PATH = /^\/documents\/([^/]+)\/file$/;
+/** `/connections/external/<system>/(sign|remove)`; the handlers check the id against `EXTERNAL_SYSTEM_ID`. */
+const EXTERNAL_SYSTEM_PATH = /^\/connections\/external\/([^/]+)\/(sign|remove)$/;
 const DOCUMENT_CARD_PATH = /^\/documents\/(DC-[^/]+)$/;
 const DOCUMENT_CARD_GET_PATH = /^\/documents\/(DC-[^/]+)\/(download|preview)$/;
 const DOCUMENT_CARD_POST_PATH = /^\/documents\/(DC-[^/]+)\/(approve|fix|address)$/;
@@ -3301,6 +3342,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
   // which point the attacker already has direct access and gains nothing by
   // routing it through the victim's browser.
   if (method === 'POST' && pathname === '/login') return handleLoginPost(req, res);
+
+  // A signed external system's webhook: no session, no CSRF — the system's
+  // secret is the credential, and the business and system come only from
+  // the path (`external/webhook.ts`). Before the session and no-charter
+  // gates, and matched by one anchored pattern so it serves nothing else.
+  if (EXTERNAL_HOOK_PATH.test(pathname)) {
+    return handleExternalWebhook(req, res, { secrets: storedCredentials(options.masterKey), now: () => new Date() });
+  }
 
   // Invite and reset links: before any session exists. The link token is the
   // credential, and the POST's CSRF token is bound to it.
@@ -3481,6 +3530,25 @@ async function route(
   }
   if (method === 'POST' && pathname === '/connections/calendar/revert') {
     return handleCalendarRevertPost(res, db, session, await readFormBody(req));
+  }
+  // External systems: the owner signs what the technician drafted (Stage D).
+  if (method === 'GET' && pathname === '/systems') return handleSystems(res, db);
+  if (method === 'GET' && pathname === '/connections/external') {
+    return handleExternalStatus(res, db, issueCsrfToken(session.sessionId), requestUrl.searchParams);
+  }
+  const externalMatch = EXTERNAL_SYSTEM_PATH.exec(pathname);
+  if (externalMatch?.[1] !== undefined) {
+    const systemId = decodePathSegment(externalMatch[1]);
+    if (systemId === null) return notFound(res);
+    if (method === 'GET' && externalMatch[2] === 'sign') {
+      return handleExternalSignGet(res, db, issueCsrfToken(session.sessionId), systemId);
+    }
+    if (method === 'POST' && externalMatch[2] === 'sign') {
+      return handleExternalSignPost(res, db, session, issueCsrfToken(session.sessionId), systemId, await readFormBody(req));
+    }
+    if (method === 'POST' && externalMatch[2] === 'remove') {
+      return handleExternalRemovePost(res, db, session, systemId, await readFormBody(req));
+    }
   }
   if (method === 'GET' && pathname === '/meetings/settings') {
     return handleMeetingSettingsGet(res, db, session, requestUrl.searchParams, meetingOptions);

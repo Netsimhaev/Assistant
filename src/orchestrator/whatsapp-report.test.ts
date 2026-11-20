@@ -20,6 +20,9 @@ import { recordInbound, settleMessage } from '../whatsapp/store.js';
 import { saveInstruction } from '../governance/instructions.js';
 import { confirmChoice, createConfirmation } from '../governance/instruction-confirmations.js';
 import { REASK_REASON } from './command-reask.js';
+import { cutLine, READS_ON_DASHBOARD_LINE } from '../external/render-reads.js';
+import { WHATSAPP_MESSAGE_MAX_CHARS } from './command-confirm.js';
+import { loadRecentOwnerReads, recordExternalRead } from '../external/store.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import {
   awaitingApprovalText,
@@ -1155,6 +1158,16 @@ describe('failedText', () => {
     expect(failedText('run_due: plan_changed_mid_flight')).toContain('באמצע הביצוע');
   });
 
+  // The real reason format `run-due.ts` writes for a `runPlan` rejection.
+  it('maps the two external-plan rejections runPlan records as run_due: <code>', () => {
+    expect(failedText('run_due: external_definition_changed')).toBe(
+      'הניסיון לבצע את ההוראה נכשל: הגדרת המערכת החיצונית השתנתה אחרי שאישרת — צריך לבקש שוב.',
+    );
+    expect(failedText('run_due: external_operation_unknown')).toBe(
+      'הניסיון לבצע את ההוראה נכשל: הפעולה שהתבקשה במערכת החיצונית אינה מופיעה בהגדרה שנחתמה.',
+    );
+  });
+
   it('maps delegation_refused:<code> as a prefix, regardless of the inner code', () => {
     expect(failedText('delegation_refused:not_permitted — she said no')).toContain('נדחתה');
     expect(failedText('delegation_refused:unknown_intent — she said no')).toContain('נדחתה');
@@ -1301,6 +1314,105 @@ describe('reportWhatsAppJobs — boss commands (spec §4.6)', () => {
     await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
     expect(PERFORMED_ON_CONFIRMATION_TEXT).toBe('בוצע לפי אישורך.');
     expect(messenger.sentTexts).toEqual([PERFORMED_ON_CONFIRMATION_TEXT]);
+  });
+
+  it('a confirmed command that ran an ext.read reports the fields after the sentence', async () => {
+    const jobId = await seed({ instruction: true, confirm: true });
+    await withBusiness(BUSINESS, (db) =>
+      recordExternalRead(db, {
+        jobId, stepId: 's1', systemId: 'crm', operation: 'lookup',
+        fields: [{ label: 'שם', value: 'דנה‮' }],
+      }),
+    );
+    await close(jobId);
+    await linkToWhatsApp(jobId);
+    const messenger = fakeMessenger();
+    await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
+    expect(messenger.sentTexts).toEqual([`${PERFORMED_ON_CONFIRMATION_TEXT}
+
+מcrm — lookup:
+שם: דנה`]);
+  });
+
+  it('an unreadable charter still sends the report, with ids for labels (M-b)', async () => {
+    const jobId = await seed({ instruction: true, confirm: true });
+    await withBusiness(BUSINESS, (db) =>
+      recordExternalRead(db, {
+        jobId, stepId: 's1', systemId: 'crm', operation: 'lookup',
+        fields: [{ label: 'שם', value: 'דנה' }],
+      }),
+    );
+    await close(jobId);
+    await linkToWhatsApp(jobId);
+    await testDb().query(
+      `UPDATE charter_versions SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb('0'::text))
+        WHERE business_id = $1`,
+      [BUSINESS],
+    );
+    const messenger = fakeMessenger();
+    const out = await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
+    expect(out.errored).toEqual([]);
+    expect(messenger.sentTexts).toEqual([`${PERFORMED_ON_CONFIRMATION_TEXT}
+
+מcrm — lookup:
+שם: דנה`]);
+  });
+
+  it('the dashboard query returns reads of instruction jobs only', async () => {
+    const owned = await seed({ instruction: true, confirm: true });
+    const other = await seed({ instruction: false, confirm: true });
+    for (const jobId of [owned, other]) {
+      await withBusiness(BUSINESS, (db) =>
+        recordExternalRead(db, { jobId, stepId: 's1', systemId: 'crm', operation: 'lookup', fields: [{ label: 'a', value: 'b' }] }),
+      );
+    }
+    const rows = await withBusiness(BUSINESS, (db) => loadRecentOwnerReads(db));
+    expect(rows.map((r) => r.jobId)).toEqual([owned]);
+  });
+
+  it('a performed job with no reads reports exactly the sentence', async () => {
+    const jobId = await seed({ instruction: true, confirm: true });
+    await close(jobId);
+    await linkToWhatsApp(jobId);
+    const messenger = fakeMessenger();
+    await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
+    expect(messenger.sentTexts).toEqual(['בוצע לפי אישורך.']);
+  });
+
+  it('a failed job that has reads gets no block', async () => {
+    const jobId = await seed({ instruction: true, confirm: true });
+    await withBusiness(BUSINESS, (db) =>
+      recordExternalRead(db, { jobId, stepId: 's1', systemId: 'crm', operation: 'lookup', fields: [{ label: 'a', value: 'b' }] }),
+    );
+    await withBusiness(BUSINESS, (db) => transition(db, jobId, { to: 'failed', actor: 'orchestrator', reason: 'adapter_timeout' }));
+    await linkToWhatsApp(jobId);
+    const messenger = fakeMessenger();
+    await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
+    expect(messenger.sentTexts).toHaveLength(1);
+    expect(messenger.sentTexts[0]).not.toContain('crm');
+  });
+
+  it('long values keep the whole message within the WhatsApp limit and end on a cut line', async () => {
+    const jobId = await seed({ instruction: true, confirm: true });
+    await withBusiness(BUSINESS, (db) =>
+      recordExternalRead(db, {
+        jobId, stepId: 's1', systemId: 'crm', operation: 'lookup',
+        fields: Array.from({ length: 30 }, (_, i) => ({ label: `f${i}`, value: 'x'.repeat(500) })),
+      }),
+    );
+    await close(jobId);
+    await linkToWhatsApp(jobId);
+    const messenger = fakeMessenger();
+    await withBusiness(BUSINESS, (db) => reportWhatsAppJobs(db, { messenger }));
+    const sent = messenger.sentTexts[0]!;
+    expect(sent.length).toBeLessThanOrEqual(WHATSAPP_MESSAGE_MAX_CHARS);
+    const last = sent.split('\n').at(-1)!;
+    expect(last === READS_ON_DASHBOARD_LINE || /^… ועוד \d+ שורות שלא הוצגו$/.test(last)).toBe(true);
+    if (last !== READS_ON_DASHBOARD_LINE) {
+      // 30 fields in all; the cut line must count exactly the field lines not shown.
+      const shown = sent.split('\n').filter((l) => /^f\d+: x+$/.test(l)).length;
+      expect(last).toBe(cutLine(30 - shown));
+    }
   });
 
   it('the confirmation sentence is for confirmed commands only', async () => {

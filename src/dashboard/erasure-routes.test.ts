@@ -165,6 +165,8 @@ describe('the erasure screen', () => {
         productionIds: [],
         savedCopies: [],
         calendarEventsKept: [],
+        externalEventIds: [],
+        externalSystemsKept: [],
         descriptionMentionsContact: false,
         filesNotDeleted: [],
         filePaths: [],
@@ -200,6 +202,8 @@ describe('the erasure screen', () => {
         productionIds: [],
         savedCopies: [],
         calendarEventsKept: [],
+        externalEventIds: [],
+        externalSystemsKept: [],
         descriptionMentionsContact: false,
         filesNotDeleted: [],
         filePaths: [],
@@ -936,6 +940,8 @@ describe('the smaller things the screen owes the owner', () => {
         productionIds: [],
         savedCopies: [],
         calendarEventsKept: [],
+        externalEventIds: [],
+        externalSystemsKept: [],
         descriptionMentionsContact: false,
         filesNotDeleted: [],
         filePaths: [],
@@ -1062,6 +1068,44 @@ describe('calendar events in the plan fingerprint', () => {
     expect(res.status).toBe(200);
     expect(await res.text()).toContain('השתנה מאז');
     const left = await db.query(`SELECT 1 FROM meetings WHERE meeting_id = 'MT-fp'`);
+    expect(left.rows).toHaveLength(1);
+  });
+});
+
+describe('external systems kept in the plan fingerprint', () => {
+  it('refuses when the system a read stays in changed since the preview', async () => {
+    const baseUrl = await startServer();
+    const { jobId } = await seedRonit();
+    const db = testDb();
+    await db.query(
+      `INSERT INTO external_reads (business_id, read_id, job_id, step_id, system_id, operation, fields)
+       VALUES ($1, 'XR-fp', $2, 's1', 'crm', 'list_customers', '{"n": 1}'::jsonb)`,
+      [BUSINESS, jobId],
+    );
+    const cookie = await signIn(baseUrl);
+    const previewHtml = await (
+      await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, { headers: { cookie } })
+    ).text();
+    expect(previewHtml).toContain('נשארים במערכת crm');
+    const csrf = extractCsrf(previewHtml);
+    const planHash = extractPlanHash(previewHtml);
+
+    // Same counts, same ids — only the system the read belongs to moved.
+    await db.query(`UPDATE external_reads SET system_id = 'billing' WHERE read_id = 'XR-fp'`);
+
+    const res = await fetch(`${baseUrl}/erase/confirm`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({
+        csrf,
+        planHash,
+        anchor: JSON.stringify({ kind: 'contact', identifier: RONIT }),
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('השתנה מאז');
+    const left = await db.query(`SELECT 1 FROM external_reads WHERE read_id = 'XR-fp'`);
     expect(left.rows).toHaveLength(1);
   });
 });

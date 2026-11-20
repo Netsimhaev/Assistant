@@ -3,6 +3,8 @@ import type { BusinessCharter, ForbiddenRule, UnsignedCharter } from '../domain/
 import { BusinessCharter as CharterSchema, CURRENT_SCHEMA_VERSION } from '../domain/charter.js';
 import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
 import type { CharterConnection } from '../domain/connection.js';
+import type { z } from 'zod';
+import { ExternalSystem } from '../domain/external-system.js';
 import { signCharter } from '../charter/sign.js';
 
 /**
@@ -45,6 +47,9 @@ const BASE_AUTONOMY: Record<ActionClass, AutonomyLevel> = {
   // Carries no outbound authority of its own (see `CEILING_EXEMPT_TOOLS` in
   // `policy/classify.ts`); the child job it opens faces its own ceiling.
   'agent.delegate': 'auto',
+  // Stage D defaults, the same the setup interview writes.
+  'external.read': 'auto',
+  'external.delete': 'approve_required',
 };
 
 /**
@@ -73,6 +78,8 @@ export interface CharterOverrides {
   knownCounterpartyEmailDomain?: string;
   /** Connections the charter declares. Empty by default. */
   connections?: CharterConnection[];
+  /** External systems the charter declares (each needs its `ext:` connection). Empty by default. */
+  externalSystems?: z.input<typeof ExternalSystem>[];
   /** The charter's currency. `ILS` by default. */
   currency?: string;
   /**
@@ -213,6 +220,9 @@ export function buildCharter(overrides: CharterOverrides = {}): BusinessCharter 
     ],
 
     connections: overrides.connections ?? [],
+    // Parsed here so an input-shaped definition (defaults omitted) becomes the
+    // output shape `UnsignedCharter` holds, exactly as a stored charter would.
+    externalSystems: (overrides.externalSystems ?? []).map((s) => ExternalSystem.parse(s)),
 
     money: {
       currency: overrides.currency ?? 'ILS',

@@ -97,6 +97,11 @@ import { JobPhase } from '../domain/job.js';
 import { pendingApprovalForJob } from '../governance/approvals.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { claimForReport } from '../whatsapp/store.js';
+import { loadActiveCharter } from '../charter/store.js';
+import type { ExternalSystem } from '../domain/external-system.js';
+import { renderReadsForOwner } from '../external/render-reads.js';
+import { loadReadsForJob } from '../external/store.js';
+import { WHATSAPP_MESSAGE_MAX_CHARS } from './command-confirm.js';
 import { REASK_REASON } from './command-reask.js';
 import { jobHistory } from './jobs.js';
 import { loadPlanBody, stepResults } from './plan-store.js';
@@ -318,6 +323,25 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
   calendar_delivery_unknown: 'לא ניתן לדעת אם השינוי ביומן נשמר — כדאי לבדוק ביומן',
   recheck_incomplete: 'לא ניתן היה לוודא שהמועד פנוי — לא נכתב דבר',
 
+  // The external-system adapter (adapters/external.ts, Stage D). Its
+  // `adapter_timeout`, `delivery_unknown` and `credential_unavailable` reuse
+  // the entries above.
+  bad_params: 'הפרמטרים לפעולה במערכת החיצונית אינם תקינים — לא נשלח דבר',
+  external_unresolved: 'הפעולה אינה מוגדרת במערכת שנחתמה — לא נשלח דבר',
+  external_daily_cap: 'הגענו לתקרת הפניות היומית למערכת החיצונית', // retryable
+  external_cap_unreadable: 'לא ניתן היה לבדוק את תקרת הפניות היומית', // retryable
+  external_address_refused: 'כתובת המערכת החיצונית חסומה — לא נשלח דבר',
+  external_auth: 'המערכת החיצונית דחתה את המפתח — צריך לעדכן אותו',
+  external_unavailable: 'המערכת החיצונית לא הייתה זמינה', // retryable
+  external_rejected: 'המערכת החיצונית דחתה את הבקשה',
+  external_network: 'לא ניתן היה להגיע למערכת החיצונית', // retryable
+  external_response_too_large: 'התשובה מהמערכת החיצונית גדולה מדי',
+  external_request_failed: 'אירעה תקלה בשליחת הבקשה למערכת החיצונית',
+  external_definition_stale: 'הגדרת המערכת החיצונית התעדכנה בזמן הביצוע', // retryable
+  external_bad_url: 'כתובת המערכת החיצונית אינה כתובת מאובטחת — לא נשלח דבר',
+  external_disabled: 'החיבור למערכות חיצוניות כבוי',
+  external_redacted_value: 'הבקשה למערכת החיצונית כוללת ערך שהתקנון מסתיר — לא נשלח דבר',
+
   // Attachments on mail.send (document production §8.2): performStep's own
   // refusals (run-plan.ts, production/attachments.ts) and the mailbox
   // adapter's Microsoft cap. All final.
@@ -355,6 +379,9 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
   'run_due:no_adapter_for_system': 'אין חיבור פעיל למערכת הנדרשת',
   'run_due:plan_changed_mid_flight': 'התוכנית השתנתה באמצע הביצוע',
   'run_due:job_not_executable': 'המשימה לא הייתה במצב שמאפשר ביצוע',
+  // runPlan's external-system rejections (Stage D, run-plan.ts).
+  'run_due:external_definition_changed': 'הגדרת המערכת החיצונית השתנתה אחרי שאישרת — צריך לבקש שוב',
+  'run_due:external_operation_unknown': 'הפעולה שהתבקשה במערכת החיצונית אינה מופיעה בהגדרה שנחתמה',
 };
 
 /**
@@ -670,6 +697,38 @@ function composeText(
 }
 
 /**
+ * Append what an `ext.read` returned to a performed job's sentence. Only the
+ * two performed outcomes carry it (a failed or denied job returned nothing to
+ * show); a job with no reads gets `text` back byte for byte.
+ */
+async function withReads(
+  db: BusinessDb,
+  jobId: string,
+  verdict: Extract<JobVerdict, { status: 'report' }>,
+  text: string,
+): Promise<string> {
+  if (verdict.outcome !== 'performed' && verdict.outcome !== 'performed_on_confirmation') return text;
+  const reads = await loadReadsForJob(db, jobId);
+  if (reads.length === 0) return text;
+  // An unreadable charter must not cost the owner the report: the labels fall
+  // back to the system and operation ids (`renderReadsForOwner` with no
+  // systems), and the sentence and the values still go out.
+  let systems: readonly ExternalSystem[] = [];
+  try {
+    systems = (await loadActiveCharter(db))?.bundle.externalSystems ?? [];
+  } catch {
+    systems = [];
+  }
+  // The sentence plus the block must fit one message: the block gets what is left.
+  const block = renderReadsForOwner(reads, systems, {
+    maxChars: WHATSAPP_MESSAGE_MAX_CHARS - text.length - 2,
+  });
+  return `${text}
+
+${block}`;
+}
+
+/**
  * Send the owner one honest sentence for every WhatsApp-opened job that has
  * reached a reportable phase and still owes a report.
  *
@@ -701,7 +760,7 @@ export async function reportWhatsAppJobs(
         deferred += 1;
         continue;
       }
-      const text = composeText(verdict, dashboardBaseUrl);
+      const text = await withReads(db, candidate.jobId, verdict, composeText(verdict, dashboardBaseUrl));
 
       // The claim's KIND follows the candidate's own PHASE, never the
       // classified outcome — fix round 1, Critical 1. A job read as

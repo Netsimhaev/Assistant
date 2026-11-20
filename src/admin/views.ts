@@ -13,7 +13,13 @@ import { stripBidiControls } from '../util/bidi.js';
 import { formatMinor } from '../util/money.js';
 import type { StaffAction, StaffActionRow } from '../tenancy/activity-log.js';
 import type { StaffListing } from '../tenancy/staff.js';
-import type { PanelBusinessDetail, PanelBusinessRow, PanelSetupData } from '../tenancy/panel-reads.js';
+import type {
+  ExternalSystemPanelState,
+  ExternalSystemPanelStatus,
+  PanelBusinessDetail,
+  PanelBusinessRow,
+  PanelSetupData,
+} from '../tenancy/panel-reads.js';
 
 const esc = escapeHtml;
 /** A staff name is typed text: bidi controls are stripped before escaping (final review M5). */
@@ -181,6 +187,7 @@ export const INVITE_LINK_COPY = 'העתק את הקישור ושלח אותו ל
 
 /** Suspended wins over setting up: a suspended business does nothing either way. */
 export function businessStateLabel(row: Pick<PanelBusinessRow, 'status' | 'setupState'>): string {
+  if (row.status === 'deleting') return '🗑 במחיקה';
   if (row.status === 'suspended') return '⏸ מושעה';
   return row.setupState === 'setting_up' ? '🟡 בהקמה' : '🟢 פעיל';
 }
@@ -443,6 +450,9 @@ export function renderBusinessPage(viewer: PanelViewer, d: PanelBusinessDetail, 
     d.status === 'active'
       ? `<form method="post" action="/businesses/${id}/suspend"><input type="hidden" name="csrf" value="${esc(viewer.csrf)}"><button type="submit">השעיית העסק</button></form>`
       : `<form method="post" action="/businesses/${id}/resume"><input type="hidden" name="csrf" value="${esc(viewer.csrf)}"><button type="submit">החזרת העסק לפעילות</button></form>`;
+  // Only a head may delete, and only a suspended business (spec 2026-11-19).
+  const deleteLink =
+    viewer.isHead && d.status === 'suspended' ? `<p><a href="/businesses/${id}/delete">מחיקת העסק</a></p>` : '';
   const people = d.contactsPending + d.colleaguesPending + d.contactsConfirmed + d.colleaguesConfirmed;
   const s = d.snapshot;
   const cost = extras.currency === null ? '—' : esc(formatMinor(s.spendTodayMinor, extras.currency));
@@ -482,8 +492,8 @@ ${whatsappForm}
 ${setupSection(viewer, d, extras.setup)}
 <section class="card">
 <h2>3 · חיבור למערכות (פותח עבודה מלאה)</h2>
-<p class="muted">ייבנה בשלב הבא</p>
-<p>${systemsCell(d.systems)}</p>
+${renderExternalStatusTable(d.businessId, d.externalSystems)}
+<p><a href="/businesses/${id}/external">ניהול מערכות חיצוניות</a></p>
 </section>
 <section class="card">
 <h2>תמונת מצב</h2>
@@ -502,9 +512,210 @@ ${setupSection(viewer, d, extras.setup)}
 </section>
 <section class="card">
 ${statusForm}
+${deleteLink}
 </section>`,
     viewer,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Deleting a whole business (spec 2026-11-19)
+// ---------------------------------------------------------------------------
+
+/**
+ * What the deletion removes, in plain words. A fixed list: nothing on the
+ * confirmation page is read from the business.
+ */
+export const DELETED_ITEMS: readonly string[] = [
+  'כל הנתונים של העסק אצלנו: משימות, זיכרון, מיילים ומסמכים שנשמרו, פגישות, הגדרות, היסטוריית הפעולות והחשבון של בעל העסק.',
+  'הקבצים של העסק אצלנו: מסמכים שנקלטו, קבצים שהעוזרת הכינה, ותיקיית הקליטה.',
+  'הרשומות של העסק ביומן הפעולות של הפאנל.',
+  'העותק שלנו של מפתחות הגישה למערכות חיצוניות.',
+];
+
+/** What the deletion does not reach (spec, "What is not deleted"). */
+export const NOT_DELETED_ITEMS: readonly string[] = [
+  'מה שנמצא אצל הספקים ושייך ללקוח: המיילים בתיבה שלו, האירועים ביומן שלו והרשומות במערכות החיצוניות שלו.',
+  'חשבון הוואטסאפ של העסק וההודעות שבו.',
+  'הקבצים בתיקיית השמירה של העסק — הם של הלקוח ונשארים.',
+  'מפתחות הגישה למערכות חיצוניות נשארים פעילים אצל הספק, עד שהלקוח יבטל אותם שם.',
+  'גיבויים: אם השרת או בסיס הנתונים מגובים, העסק יישאר בגיבויים ישנים עד שיוחלפו.',
+  'הגישה שהלקוח נתן לאפליקציה ב-Microsoft נשארת עד שתפוג או עד שהלקוח יסיר אותה מהחשבון שלו. אי אפשר לבטל אותה מכאן.',
+];
+
+/** Said before the button: Google is revoked first, and a failed deletion does not give it back. */
+export const GOOGLE_REVOKED_FIRST =
+  'לפני מחיקת הנתונים, הגישה שהלקוח נתן ב-Google מבוטלת אצל Google. אם המחיקה תיכשל או תיעצר אחרי זה, הגישה לא תוחזר — הלקוח יצטרך לחבר את החשבון מחדש.';
+
+function listOf(items: readonly string[]): string {
+  return `<ul>\n${items.map((i) => `<li>${esc(i)}</li>`).join('\n')}\n</ul>`;
+}
+
+function retryForm(viewer: PanelViewer, businessId: string): string {
+  return `<form method="post" action="/businesses/${esc(businessId)}/delete/files">
+  <input type="hidden" name="csrf" value="${esc(viewer.csrf)}">
+  <button type="submit">ניסיון חוזר למחיקת הקבצים</button>
+</form>`;
+}
+
+/** The confirmation form: the lists, the Google note, and the name to type. */
+export function renderDeleteConfirm(
+  viewer: PanelViewer,
+  options: { businessId: string; displayName: string; error?: string },
+): string {
+  return page(
+    'מחיקת העסק',
+    `<h1>מחיקת העסק</h1>
+${errorBlock(options.error)}
+<p class="error">המחיקה סופית ואי אפשר לבטל אותה.</p>
+<section class="card">
+<h2>מה יימחק</h2>
+${listOf(DELETED_ITEMS)}
+</section>
+<section class="card">
+<h2>מה לא יימחק</h2>
+${listOf(NOT_DELETED_ITEMS)}
+</section>
+<section class="card">
+<p>${esc(GOOGLE_REVOKED_FIRST)}</p>
+<form method="post" action="/businesses/${esc(options.businessId)}/delete">
+  <input type="hidden" name="csrf" value="${esc(viewer.csrf)}">
+  <p>כדי לאשר, הקלד את שם העסק בדיוק כפי שהוא מופיע כאן:</p>
+  <p><strong>${escLabel(options.displayName)}</strong></p>
+  <label>שם העסק<input type="text" name="name" autocomplete="off" required></label>
+  <button type="submit">מחיקת העסק לצמיתות</button>
+</form>
+</section>`,
+    viewer,
+  );
+}
+
+/** A refusal with no form (not a head, not suspended, unknown). */
+export function renderDeleteRefused(viewer: PanelViewer, message: string): string {
+  return page('מחיקת העסק', `<h1>מחיקת העסק</h1><p class="error">${esc(message)}</p><p><a href="/">חזרה לרשימת העסקים</a></p>`, viewer);
+}
+
+/** A business whose rows are gone and whose files are not: only the retry. */
+export function renderDeletingNotice(viewer: PanelViewer, businessId: string): string {
+  const retry = viewer.isHead ? retryForm(viewer, businessId) : '';
+  return page(
+    'מחיקת העסק',
+    `<h1>העסק באמצע מחיקה</h1>
+<p>הנתונים של העסק כבר נמחקו, אבל חלק מהקבצים עדיין לא נמחקו.</p>
+${retry}`,
+    viewer,
+  );
+}
+
+export interface DeletionResultView {
+  /** Only for the retry form's action; never printed otherwise. */
+  businessId: string;
+  /** Summed over every table; absent on a retry of the file step. */
+  rowsDeleted?: number;
+  filesRemoved: number;
+  /** Folders that could not be removed, each relative to its root; only the root's label is printed. */
+  failed: string[];
+  /** The Google revocations, when this request ran them. */
+  revocation?: { attempted: number; failed: number; grantsUnreadable: boolean };
+  /** The registry row is gone: the deletion is complete. */
+  finished: boolean;
+}
+
+/** A failed folder's root, in words; the business id under it is never printed. */
+function folderRootLabel(failed: string): string {
+  if (failed.startsWith('DOCUMENT_INBOX_ROOT/')) return 'תיקיית הקליטה';
+  // Before the plain document root: its label is a prefix of this one.
+  if (failed.startsWith('DOCUMENT_ROOT/produced/')) return 'תיקיית המסמכים שהעוזרת הפיקה';
+  if (failed.startsWith('DOCUMENT_ROOT/')) return 'תיקיית המסמכים';
+  return 'תיקייה אחרת';
+}
+
+/** One line per root: its label and how many of its folders were not removed. */
+function failedFolderLines(failed: string[]): string[] {
+  const counts = new Map<string, number>();
+  for (const f of failed) {
+    const label = folderRootLabel(f);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  return [...counts].map(([label, n]) => `${label}: ${n}`);
+}
+
+/** The result: counts only — no business name, no id outside the retry form. */
+export function renderDeletionResult(viewer: PanelViewer, r: DeletionResultView): string {
+  const heading = r.finished
+    ? 'העסק נמחק'
+    : r.failed.length > 0
+      ? `השורות נמחקו, אבל ${r.failed.length} תיקיות לא נמחקו`
+      : 'השורות נמחקו, אבל המחיקה עוד לא הסתיימה';
+  const lines: string[] = [];
+  if (r.rowsDeleted !== undefined) lines.push(`<dt>רשומות שנמחקו</dt><dd>${r.rowsDeleted}</dd>`);
+  lines.push(`<dt>קבצים שנמחקו</dt><dd>${r.filesRemoved}</dd>`);
+  if (r.revocation !== undefined) {
+    lines.push(`<dt>ניסיונות ביטול גישה ב-Google</dt><dd>${r.revocation.attempted}</dd>`);
+    lines.push(`<dt>ביטולים שנכשלו</dt><dd>${r.revocation.failed}</dd>`);
+  }
+  const notes: string[] = [];
+  if (r.revocation?.grantsUnreadable) {
+    notes.push('לא הצלחתי לקרוא את הגישות השמורות, ולכן ייתכן שגישה ב-Google נשארה פעילה. כדאי לבקש מהלקוח להסיר את האפליקציה מחשבון Google שלו.');
+  } else if (r.revocation !== undefined && r.revocation.failed > 0) {
+    notes.push('חלק מהגישות ב-Google לא בוטלו. כדאי לבקש מהלקוח להסיר את האפליקציה מחשבון Google שלו.');
+  }
+  const failedList =
+    r.failed.length === 0
+      ? ''
+      : `<h2>תיקיות שלא נמחקו</h2>\n<ul>\n${failedFolderLines(r.failed)
+          .map((line) => `<li>${esc(line)}</li>`)
+          .join('\n')}\n</ul>`;
+  const retry = r.finished ? '' : retryForm(viewer, r.businessId);
+  return page(
+    heading,
+    `<h1>${esc(heading)}</h1>
+<dl>
+${lines.join('\n')}
+</dl>
+${notes.map((n) => `<p class="error">${esc(n)}</p>`).join('\n')}
+${failedList}
+${retry}
+<p><a href="/">חזרה לרשימת העסקים</a></p>`,
+    viewer,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// External systems (Stage D) — status only
+// ---------------------------------------------------------------------------
+
+/** One Hebrew label per state; a new state is a compile error until it is named here. */
+export const EXTERNAL_STATE_LABELS: Record<ExternalSystemPanelState, string> = {
+  draft: 'טיוטה',
+  awaiting_signature: 'ממתין לחתימה',
+  signed: 'חתום',
+  unsigned_changes: 'שינויים לא חתומים',
+};
+
+/** `✓ שמור` / `חסר`, or `—` where the definition does not need the secret. */
+export function secretCell(saved: boolean | null): string {
+  return saved === null ? '—' : saved ? '✓ שמור' : 'חסר';
+}
+
+/**
+ * Per system: its id, its state and which secrets are saved — flags from
+ * `businessDetailForPanel`, never a label or anything a system returned.
+ */
+export function renderExternalStatusTable(businessId: string, systems: ExternalSystemPanelStatus[]): string {
+  if (systems.length === 0) return '<p class="muted">עדיין לא הוגדרה מערכת.</p>';
+  const rows = systems
+    .map(
+      (s) =>
+        `<tr><td dir="ltr"><a href="/businesses/${esc(businessId)}/external/${esc(s.systemId)}">${esc(s.systemId)}</a></td><td>${esc(EXTERNAL_STATE_LABELS[s.state])}</td><td>${secretCell(s.keySaved)}</td><td>${secretCell(s.hookSaved)}</td><td>${secretCell(s.verifySaved)}</td></tr>`,
+    )
+    .join('\n');
+  return `<table>
+<thead><tr><th>מערכת</th><th>מצב</th><th>סוד</th><th>חתימת התראות</th><th>אסימון אימות</th></tr></thead>
+<tbody>
+${rows}
+</tbody>
+</table>`;
 }
 
 export function renderForbidden(): string {
@@ -519,8 +730,9 @@ export function renderServerError(): string {
   return page('שגיאה', '<h1>שגיאה</h1><p>משהו השתבש. נסה שוב בעוד רגע.</p>');
 }
 
-export function renderTooLarge(): string {
-  return page('הבקשה גדולה מדי', '<h1>הבקשה גדולה מדי</h1>');
+export function renderTooLarge(message?: string): string {
+  const detail = message === undefined ? '' : `<p class="error">${esc(message)}</p>`;
+  return page('הבקשה גדולה מדי', `<h1>הבקשה גדולה מדי</h1>${detail}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -547,6 +759,9 @@ export const STAFF_ACTION_LABELS: Record<StaffAction, string> = {
   staff_invited: 'הזמנת איש צוות',
   staff_removed: 'הסרת איש צוות',
   staff_link_reissued: 'הנפקת קישור סיסמה לאיש צוות',
+  external_draft_saved: 'שמירת טיוטת מערכת חיצונית',
+  external_draft_deleted: 'מחיקת טיוטת מערכת חיצונית',
+  external_secret_saved: 'שמירת סוד של מערכת חיצונית',
 };
 
 export interface StaffPageOptions {

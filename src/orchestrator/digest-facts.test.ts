@@ -5,6 +5,7 @@ import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { FAILED_GENERIC_TEXT, NOT_PERMITTED_TEXT } from './whatsapp-report.js';
 import { collectDigestFacts } from './digest-facts.js';
+import { crmConnection, crmFixture } from '../test/external-fixtures.js';
 
 const BUSINESS = 'test-business';
 const WINDOW = {
@@ -645,5 +646,60 @@ describe('collectDigestFacts', () => {
 
     const facts = await withBusiness(BUSINESS, (db) => collectDigestFacts(db, WINDOW, CEILINGS));
     expect(facts.documents).toEqual({ produced: 3, sent: 1, waiting: 2 });
+  });
+
+  it('counts external events per system and type in the window, and names the first field of the last five', async () => {
+    await withBusiness(BUSINESS, (bdb) =>
+      installCharter(bdb, buildCharter({ version: '2026-10-06.ext', externalSystems: [crmFixture()], connections: [crmConnection()] })),
+    );
+    const db = testDb();
+    const inWindow = (minutes: number): Date => new Date(new Date('2026-10-06T12:00:00+03:00').getTime() + minutes * 60_000);
+    const rows: Array<[string, string, string, Date]> = [
+      ['XE-1', 'customer.created', 'דנה', inWindow(1)],
+      ['XE-2', 'customer.created', 'רון', inWindow(2)],
+      ['XE-3', 'payment.failed', 'חשבונית 7', inWindow(3)],
+      ['XE-4', 'list_customers', 'מיכל', inWindow(4)],
+      ['XE-5', 'list_customers', 'יוסי', inWindow(5)],
+      ['XE-6', 'list_customers', 'אבי\n· מזויף', inWindow(6)],
+      ['XE-0', 'list_customers', 'לפני החלון', new Date('2026-10-01T12:00:00+03:00')],
+    ];
+    for (const [id, type, value, at] of rows) {
+      await db.query(
+        `INSERT INTO external_events (business_id, event_id, system_id, source, event_type, item_hash, fields, created_at)
+         VALUES ($1, $2, 'crm', 'scan', $3, $2, $4::jsonb, $5)`,
+        [BUSINESS, id, type, JSON.stringify([{ label: 'שם', value }, { label: 'מייל', value: 'x@y.example' }]), at],
+      );
+    }
+    // Learning jobs — one closed, one failed — are neither the owner's tasks
+    // nor his failed instructions; a failed job WITHOUT the marker still is.
+    await db.query(
+      `INSERT INTO jobs (job_id, business_id, title, phase, charter_version, provenance, content_ingested, closed_at)
+       VALUES ('J-learn', $1, 'למידה ממערכת חיצונית', 'closed', (SELECT charter_version FROM charter_active WHERE business_id = $1), 'unknown_external', false, $2),
+              ('J-learn-bad', $1, 'למידה ממערכת חיצונית', 'failed', (SELECT charter_version FROM charter_active WHERE business_id = $1), 'unknown_external', false, $2),
+              ('J-other-bad', $1, 'הוראה שנכשלה', 'failed', (SELECT charter_version FROM charter_active WHERE business_id = $1), 'boss', false, $2)`,
+      [BUSINESS, inWindow(10)],
+    );
+    await db.query(
+      `INSERT INTO external_learning_jobs (business_id, job_id, system_id, failed_at)
+       VALUES ($1, 'J-learn', 'crm', NULL), ($1, 'J-learn-bad', 'crm', $2)`,
+      [BUSINESS, inWindow(10)],
+    );
+
+    const facts = await withBusiness(BUSINESS, (bdb) => collectDigestFacts(bdb, WINDOW, CEILINGS));
+    expect(facts.done.jobsCompleted).toBe(0);
+    expect(facts.exceptions.map((e) => e.subject)).toEqual(['הוראה שנכשלה']);
+    expect(facts.external.total).toBe(6);
+    expect(facts.external.counts).toEqual([
+      { system: 'מערכת הלקוחות', type: 'לקוח חדש', count: 2 },
+      { system: 'מערכת הלקוחות', type: 'רשימת לקוחות', count: 3 },
+      { system: 'מערכת הלקוחות', type: 'תשלום נכשל', count: 1 },
+    ]);
+    expect(facts.external.recent).toEqual([
+      'מערכת הלקוחות · רשימת לקוחות — שם: אבי · מזויף',
+      'מערכת הלקוחות · רשימת לקוחות — שם: יוסי',
+      'מערכת הלקוחות · רשימת לקוחות — שם: מיכל',
+      'מערכת הלקוחות · תשלום נכשל — שם: חשבונית 7',
+      'מערכת הלקוחות · לקוח חדש — שם: רון',
+    ]);
   });
 });

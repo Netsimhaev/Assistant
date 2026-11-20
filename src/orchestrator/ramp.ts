@@ -4,6 +4,8 @@ import type { Plan } from '../domain/plan.js';
 import { AutonomyLevel, mostRestrictiveAutonomy, permits } from '../domain/trust.js';
 import { loadAutonomyMode, rampBoundsForMode } from '../governance/autonomy-mode.js';
 import { CEILING_EXEMPT_TOOLS, READ_ONLY_TOOLS } from '../policy/classify.js';
+import { isExternalTool, resolveExternalCall } from '../policy/external-class.js';
+import type { ExternalSystem } from '../domain/external-system.js';
 
 /**
  * The default floor `rampLevelForPlan` uses for a step that has a class but no
@@ -184,6 +186,7 @@ export async function setRampLevel(
 export async function rampLevelForPlan(
   db: BusinessDb,
   plan: Plan,
+  externalSystems: readonly ExternalSystem[],
 ): Promise<AutonomyLevel> {
   const levels: AutonomyLevel[] = [];
   // Tracks *why* a step contributed nothing to `levels`, because the two
@@ -196,6 +199,16 @@ export async function rampLevelForPlan(
     // whole plan at its ramp.
     if (CEILING_EXEMPT_TOOLS.has(step.toolName)) {
       sawExemptStep = true;
+      continue;
+    }
+    // An external-system step contributes the ramp of the class the owner
+    // SIGNED for its operation — the class the gate will judge it as — and
+    // never the placeholder in `TOOL_ACTION_CLASS`, nor whatever the planner
+    // declared. A step that names no signed operation is refused before it
+    // runs; until then it floors the plan, the strict answer.
+    if (isExternalTool(step.toolName)) {
+      const resolved = resolveExternalCall(externalSystems, step.toolName, step.input);
+      levels.push(resolved.ok ? await loadRampLevel(db, resolved.actionClass) : RAMP_FLOOR);
       continue;
     }
     if (step.expectedActionClass === null) {

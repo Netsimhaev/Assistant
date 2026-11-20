@@ -18,6 +18,7 @@ import { Proposal } from '../domain/proposal.js';
 import type { Reading } from '../domain/reading.js';
 import { classifiedToolNames, classifyAction, refineActionClass } from '../policy/classify.js';
 import type { CatalogueEntry } from './catalogue.js';
+import { isExternalTool } from '../policy/external-class.js';
 import { extractJsonObjects } from '../util/json-extract.js';
 
 export type ProposalProblem = {
@@ -29,7 +30,8 @@ export type ProposalProblem = {
     | 'tool_not_in_catalogue'
     | 'action_class_mismatch'
     | 'action_tool_cannot_be_carded'
-    | 'headline_is_tool_name';
+    | 'headline_is_tool_name'
+    | 'external_action_not_proposable';
   detail: string;
 };
 
@@ -80,6 +82,18 @@ export function proposalProblems(
   }
 
   if (action !== null) {
+    // An action in another system (`ext.read`/`ext.call`) runs ONLY on a
+    // boss command the owner confirmed (owner ruling, external-systems spec,
+    // answer 2 of 13/11). A proposal is born from a document someone else
+    // wrote, so it may never name one — whatever the catalogue offers and
+    // whatever the ramp says. Positive: the two tools by name.
+    if (isExternalTool(action.toolName)) {
+      problems.push({
+        kind: 'external_action_not_proposable',
+        detail: `פעולה במערכת חיצונית (${action.toolName}) מתבצעת רק בהוראה שלך — לא מתוך מסמך`,
+      });
+    }
+
     const entry = catalogue.find((candidate) => candidate.agent === action.agent);
     const offered = entry?.tools.some((tool) => tool.toolName === action.toolName) ?? false;
     if (!offered) {

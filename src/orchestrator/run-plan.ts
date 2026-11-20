@@ -1,16 +1,13 @@
 import type { ActionClass } from '../domain/action.js';
 import { config } from '../config.js';
 import type { ConnectionBinding } from '../domain/connection.js';
-import type { PolicyBundle } from '../domain/policy.js';
+import { DENY_CODES, type PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel } from '../domain/trust.js';
 import type { ReadOutcome, ReadRequest } from '../sdk/know-reader.js';
 import { planProblems, topologicalOrder, type Plan, type PlanStep } from '../domain/plan.js';
-import {
-  classifyAction,
-  ingestsExternalContent,
-  isOutbound,
-  refineActionClass,
-} from '../policy/classify.js';
+import { ingestsExternalContent, isOutbound } from '../policy/classify.js';
+import { classifyCall, isExternalTool, resolveExternalCall } from '../policy/external-class.js';
+import type { ExternalSystem } from '../domain/external-system.js';
 import { canonicalHash } from '../util/canonical.js';
 import { unspentApprovalFor } from '../governance/approvals.js';
 import { delegationProblems } from '../governance/delegation.js';
@@ -304,7 +301,34 @@ export async function runPlan(db: BusinessDb, request: RunPlanRequest): Promise<
         reason: `step ${step.id}: ${step.agent} may not use ${step.toolName}`,
       };
     }
-    const mismatch = classMismatch(step);
+    // An external-system step that names no signed operation is refused
+    // here, for the whole plan, before any step runs — the gate would refuse
+    // it at stage 3 anyway, but by then the steps before it would already be
+    // done. Same function the gate calls, so the two cannot disagree about
+    // which operation a step is.
+    if (isExternalTool(step.toolName)) {
+      // Ruling T7-c: the owner approved the exact request shown under the
+      // charter version this job was created with. A charter re-signed since
+      // would run another definition — another URL, another class — so the
+      // whole plan is refused before anything is bound or sent.
+      if (job.charterVersion !== bundle.charterVersion) {
+        return {
+          status: 'rejected',
+          code: 'external_definition_changed',
+          reason: `צעד ${step.id}: הגדרת המערכת החיצונית השתנתה אחרי שאישרת — צריך לבקש שוב`,
+        };
+      }
+      const resolved = resolveExternalCall(bundle.externalSystems, step.toolName, step.input);
+      if (!resolved.ok) {
+        return {
+          status: 'rejected',
+          code: DENY_CODES.externalOperationUnknown,
+          reason: `step ${step.id}: ${resolved.reason}`,
+        };
+      }
+    }
+
+    const mismatch = classMismatch(step, bundle.externalSystems);
     if (mismatch !== null) {
       // The planner's expectation is advisory, but a disagreement about what
       // an action *is* means the plan was reasoned about as something other
@@ -331,7 +355,7 @@ export async function runPlan(db: BusinessDb, request: RunPlanRequest): Promise<
     // `unavailable` is deliberately NOT rejected here: a binding that is down
     // right now is an execution-time fact, and refusing it here would lose
     // the audit trail that the second resolution leaves behind.
-    const channel = resolveChannel(bundle, request.bindings, step.toolName, targetIdOf(step));
+    const channel = resolveChannel(bundle, request.bindings, step.toolName, targetIdOf(step, bundle.externalSystems));
     if (channel.status === 'no_channel') {
       return {
         status: 'rejected',
@@ -645,7 +669,7 @@ async function performStep(
     request.bundle,
     request.bindings,
     step.toolName,
-    deriveTargetId(step.toolName, effectiveInput, actionClassOf(step)),
+    deriveTargetId(step.toolName, effectiveInput, actionClassOf(step, request.bundle.externalSystems)),
   );
   if (resolution.status !== 'resolved') {
     // Retryable. A binding that is `disconnected`, or a row that has not been
@@ -731,6 +755,9 @@ async function performStep(
       }),
       // Resolved from the effective payload above; `[]` when the step has none.
       attachments,
+      // The bundle the gate judged with, so an adapter built from a charter
+      // version can refuse a step judged under another (`external.ts`).
+      judgedCharterVersion: request.bundle.charterVersion,
       signal: AbortSignal.timeout(request.adapterTimeoutMs ?? ADAPTER_TIMEOUT_MS),
     },
     request.adapterTimeoutMs ?? ADAPTER_TIMEOUT_MS,
@@ -791,7 +818,14 @@ async function performStep(
   // Acting on the result is the whole point. Ignoring it would record an
   // unimplemented browser call as an order placed, and send the confirmation.
   if (!result.ok) {
-    throw new StepChannelError(result.code, result.message, result.retryable);
+    // `outcomeUnknown` only beside `retryable`: a final failure moves the job
+    // to `failed`, where no completion row is written in any case.
+    throw new StepChannelError(
+      result.code,
+      result.message,
+      result.retryable,
+      result.retryable && result.outcomeUnknown === true,
+    );
   }
   // `performed: true` unconditionally — reaching this line at all already
   // means the adapter returned `ok: true` (the `throw` above is the only exit
@@ -923,9 +957,11 @@ function needsChannel(toolName: string): boolean {
  * Derived here rather than trusting `expectedActionClass`, which is advisory:
  * the routing decision must follow what the call *is*.
  */
-function actionClassOf(step: PlanStep): ActionClass | null {
-  const base = classifyAction(step.toolName);
-  return base === null ? null : refineActionClass(base, step.input);
+function actionClassOf(step: PlanStep, systems: readonly ExternalSystem[]): ActionClass | null {
+  // `classifyCall` is the gate's own derivation: for `ext.read`/`ext.call`
+  // the class the owner signed for the named operation, and for every other
+  // tool the base class refined by the payload — exactly `buildFacts`.
+  return classifyCall(systems, step.toolName, step.input);
 }
 
 /** The target this step addresses, derived identically at both resolutions. */
@@ -935,8 +971,8 @@ function actionClassOf(step: PlanStep): ActionClass | null {
  * payload there is. Execution derives the target from the approved payload
  * instead; see `performStep`.
  */
-function targetIdOf(step: PlanStep): string | null {
-  return deriveTargetId(step.toolName, step.input, actionClassOf(step));
+function targetIdOf(step: PlanStep, systems: readonly ExternalSystem[]): string | null {
+  return deriveTargetId(step.toolName, step.input, actionClassOf(step, systems));
 }
 
 /**
@@ -954,10 +990,10 @@ function targetIdOf(step: PlanStep): string | null {
  * lets the instruction door run them before granting or binding anything,
  * catching the same defect earlier rather than duplicating the check.
  */
-export function classMismatch(step: PlanStep): string | null {
+export function classMismatch(step: PlanStep, systems: readonly ExternalSystem[]): string | null {
   if (step.expectedActionClass === null) return null;
 
-  const actual = actionClassOf(step);
+  const actual = actionClassOf(step, systems);
   if (actual === step.expectedActionClass) return null;
 
   return `planned as ${step.expectedActionClass}, the gate classifies it as ${actual ?? 'read-only'}`;

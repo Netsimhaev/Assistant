@@ -747,14 +747,14 @@ describe('requestHelp', () => {
         },
       ],
     });
-    const parentRamp = await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, parentPlan));
+    const parentRamp = await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, parentPlan, []));
     // The exemption's whole point: a delegation carries no outbound authority
     // of its own and must not floor the plan that contains it.
     expect(parentRamp).toBe('auto');
 
     const childPlanBody = await withBusiness(BUSINESS, (db) => loadPlanBody(db, result.childJobId));
     if (childPlanBody === null) throw new Error('expected the child\'s bound plan');
-    const childRamp = await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, childPlanBody.plan));
+    const childRamp = await withBusiness(BUSINESS, (db) => rampLevelForPlan(db, childPlanBody.plan, []));
     // `doc.fetch` is read-only and NOT ceiling-exempt, so it floors at the
     // ramp floor — genuinely computed from the child's own plan, not carried
     // over from the parent's.

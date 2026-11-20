@@ -206,7 +206,7 @@ describe('performStep and attachments', () => {
     expect((await run(plan, registry)).status).toBe('done');
     const sentName = calls[0]?.attachments[0]?.filename;
     expect(sentName).toBe('הצעה.docx');
-    const line = renderStepEcho(plan.steps[0]!, 'ILS')
+    const line = renderStepEcho(plan.steps[0]!, 'ILS', [])
       .split('\n')
       .find((l) => l.startsWith('קובץ מצורף: '));
     expect(line?.split(' · ')[0]).toBe(`קובץ מצורף: ${sentName}`);

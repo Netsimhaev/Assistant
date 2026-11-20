@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Reading } from '../domain/reading.js';
 import type { CatalogueEntry } from './catalogue.js';
+import { readFileSync } from 'node:fs';
 import { parseProposal, proposalProblems } from './proposal-parse.js';
 
 const SOURCE = { ordinal: 0, locator: null };
@@ -292,5 +293,66 @@ describe('proposalProblems', () => {
     const problems = proposalProblems({ ...outcome.proposal, action: null, stance: 'act' }, READING, CATALOGUE);
     expect(problems).toHaveLength(1);
     expect(problems[0]?.kind).toBe('act_without_action');
+  });
+});
+
+describe('the conductor can never propose an external-system action', () => {
+  // The catalogue offers both tools to `ops.systems`, so `tool_not_in_catalogue`
+  // cannot be what refuses them — the refusal below is the new rule alone.
+  const EXT_CATALOGUE: CatalogueEntry[] = [
+    ...CATALOGUE,
+    {
+      agent: 'ops.systems',
+      tools: [
+        { toolName: 'ext.call', actionClass: 'external.delete', effectiveAutonomy: 'approve_required' },
+        { toolName: 'ext.read', actionClass: 'external.read', effectiveAutonomy: 'approve_required' },
+      ],
+    },
+  ];
+
+  it.each([
+    ['ext.call', 'external.delete'],
+    ['ext.read', 'external.read'],
+  ])('refuses a proposal naming %s with external_action_not_proposable', (toolName, cls) => {
+    const proposal = {
+      ...VALID,
+      action: {
+        ...ACTION,
+        agent: 'ops.systems',
+        toolName,
+        input: { system: 'crm', operation: 'update_customer' },
+        expectedActionClass: cls,
+      },
+    };
+    const outcome = parseProposal(JSON.stringify(proposal), READING, EXT_CATALOGUE);
+    if (outcome.status !== 'unproposable') throw new Error('expected unproposable');
+    expect(outcome.reason.startsWith('external_action_not_proposable:')).toBe(true);
+  });
+
+  it('control: the same check passes a non-external action', () => {
+    const outcome = parseProposal(JSON.stringify(VALID), READING, EXT_CATALOGUE);
+    if (outcome.status !== 'proposed') throw new Error('expected a proposal');
+    expect(proposalProblems(outcome.proposal, READING, EXT_CATALOGUE)).toEqual([]);
+  });
+
+  it('the mail-reply plan builder names only mail.send, never an ext.* tool', () => {
+    // Read as text, as the erasure invariants do: the builder writes its step
+    // literally, and this pins that no `ext.` tool name can appear in it.
+    const source = readFileSync(new URL('./mail-reply.ts', import.meta.url), 'utf8');
+    const toolNames = [...source.matchAll(/toolName:\s*'([^']+)'/g)].map((m) => m[1]);
+    expect(toolNames.length).toBeGreaterThan(0);
+    expect(new Set(toolNames)).toEqual(new Set(['mail.send']));
+    expect(source).not.toMatch(/'ext\.(call|read)'/);
+    // No step there takes its tool name from anything but a literal.
+    expect(source).not.toMatch(/toolName:\s*[^'\s]/);
+  });
+
+  it('the conductor builds its plan only from a proposal parseProposal returned', () => {
+    // `proposalToPlan` copies `action.toolName`; what keeps an `ext.*` step
+    // out of a conductor plan is that its only input is a proposal that
+    // passed `proposalProblems`. Pinned as text so a second route is noticed.
+    const conduct = readFileSync(new URL('./conduct.ts', import.meta.url), 'utf8');
+    const calls = [...conduct.matchAll(/proposalToPlan\(([^,]+),/g)].map((m) => m[1]!.trim());
+    expect(calls).toEqual(['proposed.proposal']);
   });
 });

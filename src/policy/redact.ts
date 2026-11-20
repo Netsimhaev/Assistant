@@ -11,7 +11,7 @@ import type { PolicyBundle } from '../domain/policy.js';
  * would rename the field and change the payload's meaning, which is a different
  * and much more dangerous operation than blanking a value.
  */
-export function redactPayload(input: unknown, bundle: PolicyBundle): unknown {
+export function redactPayload(input: unknown, bundle: Pick<PolicyBundle, 'redactPatterns'>): unknown {
   if (bundle.redactPatterns.length === 0) return input;
 
   const patterns = compile(bundle.redactPatterns);

@@ -73,10 +73,8 @@ import {
   fetchGoogleAccount,
   fetchMicrosoftAccount,
 } from './oauth-consent.js';
-import {
-  GOOGLE_REVOKE_URL,
-  oauthProfileFor,
-} from './oauth-profiles.js';
+import { oauthProfileFor } from './oauth-profiles.js';
+import { GOOGLE_REVOKE_URL, revokeAtProvider } from '../governance/oauth-provider-revoke.js';
 
 /**
  * The provider for a ceremony start. `mailbox` and `calendar` take the
@@ -913,18 +911,11 @@ export async function handleOAuthRevoke(
     // their Microsoft account settings.
     providerOutcome = 'no_revoke_endpoint';
   } else {
-    providerOutcome = 'failed';
-    try {
-      const doFetch = options.fetchImpl ?? fetch;
-      const response = await doFetch(GOOGLE_REVOKE_URL, {
-        method: 'POST',
-        headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ token: grant.refreshToken }).toString(),
-      });
-      if (response.status >= 200 && response.status < 300) providerOutcome = 'revoked';
-    } catch {
-      providerOutcome = 'failed';
-    }
+    providerOutcome = await revokeAtProvider({
+      revokeUrl: GOOGLE_REVOKE_URL,
+      token: grant.refreshToken,
+      ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
+    });
   }
 
   const localNote = changed

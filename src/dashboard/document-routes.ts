@@ -39,6 +39,7 @@ import {
   saveDocumentSettings,
 } from '../governance/document-settings.js';
 import { renderStepEcho } from '../orchestrator/command-echo.js';
+import type { ExternalSystem } from '../domain/external-system.js';
 import type { Runtime } from '../orchestrator/runtime.js';
 import { canonicalAttachmentName, loadVersionFile, readVersionBytes } from '../production/attachments.js';
 import {
@@ -109,16 +110,22 @@ export const CHARTER_UNREADABLE_HE =
   'לא הצלחתי לקרוא את התקנון הפעיל, ולכן אינני מציגה מסמכים — בלי התקנון אינני יודעת באיזה מטבע ובאיזה אזור זמן להציג אותם. אפשר לתקן אותו בעריכת הכללים.';
 
 /**
- * The charter's zone and currency, or `null` when the active charter cannot
+ * The charter's zone, currency and signed external systems, or `null` when the active charter cannot
  * be read. Refused, never defaulted: a card whose amounts are shown in a
  * guessed currency is a card whose echo is not what will run.
  */
-async function charterContext(db: BusinessDb): Promise<{ timeZone: string; currency: string } | null> {
+async function charterContext(
+  db: BusinessDb,
+): Promise<{ timeZone: string; currency: string; systems: readonly ExternalSystem[] } | null> {
   try {
     const active = await loadActiveCharter(db);
     return active === null
       ? null
-      : { timeZone: active.charter.identity.timezone, currency: active.bundle.ceilings.currency };
+      : {
+          timeZone: active.charter.identity.timezone,
+          currency: active.bundle.ceilings.currency,
+          systems: active.bundle.externalSystems,
+        };
   } catch {
     return null;
   }
@@ -283,7 +290,7 @@ async function renderCard(
   const { card, production, version } = loaded;
   const context = await charterContext(db);
   if (context === null) return charterUnreadable(res);
-  const { currency } = context;
+  const { currency, systems } = context;
   const settings = await loadDocumentSettings(db);
   const previewPath = previewPathOf(version.check2);
   const hasPreview = previewPath !== null && (await containedFile(previewPath, documentRoot)) !== null;
@@ -311,7 +318,7 @@ async function renderCard(
       sources: await sourcesOf(db, production),
       options: card.deliveryPlans.map((option) => ({
         option,
-        echo: option.plan.steps.map((step) => renderStepEcho(step, currency)).filter((e) => e !== '').join('\n'),
+        echo: option.plan.steps.map((step) => renderStepEcho(step, currency, systems)).filter((e) => e !== '').join('\n'),
         pressable: option.option === 'send' || settings.baseFolder !== null,
       })),
       needsAddress:

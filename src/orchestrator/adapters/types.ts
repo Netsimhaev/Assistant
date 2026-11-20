@@ -148,6 +148,19 @@ export interface AdapterCall {
    * themselves are never redacted (the owner saw exactly them).
    */
   attachments: readonly OutgoingAttachment[];
+  /**
+   * The `charterVersion` of the policy bundle the gate judged this step with —
+   * `runPlan` sets it from `request.bundle` on every call.
+   *
+   * Read today only by the external-system adapter (`external.ts`), which was
+   * built from the charter active when the business runtime was assembled and
+   * refuses (`external_definition_stale`) when the step was judged under any
+   * other version: a charter re-signed mid-pass must not let a call be judged
+   * against one definition and sent against another. Optional in the type
+   * only so the many adapters and fixtures that never read it need no edit;
+   * the one reader treats an absent value as a mismatch (fail closed).
+   */
+  judgedCharterVersion?: string;
   signal: AbortSignal;
 }
 
@@ -160,7 +173,22 @@ export interface OutgoingAttachment {
 
 export type AdapterResult =
   | { ok: true; output: unknown; externalId: string | null }
-  | { ok: false; retryable: boolean; code: string; message: string };
+  | {
+      ok: false;
+      retryable: boolean;
+      code: string;
+      message: string;
+      /**
+       * The request was dispatched and no authoritative answer came back, so
+       * the far end may or may not have acted. Only meaningful beside
+       * `retryable: true`: it tells `executeStep` to write the `unknown`
+       * `job_step_results` row (`StepChannelError.outcomeUnknown`), exactly as
+       * `callWithDeadline`'s own timeout does, so a re-plan cannot change the
+       * idempotency key over a write that may already have landed. Optional
+       * and absent everywhere it does not apply; only `true` is ever set.
+       */
+      outcomeUnknown?: true;
+    };
 
 /**
  * One external system, as the orchestrator sees it.

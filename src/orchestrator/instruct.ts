@@ -118,7 +118,7 @@ import { descriptionFragment } from '../business/description-store.js';
 import { profileFragment } from '../business/profile.js';
 import { makePlan, type PlanOutcome, type PlanRequest } from '../sdk/planner.js';
 import { planStepIsFeasible } from './catalogue.js';
-import { renderConfirmationQuestion } from './command-echo.js';
+import { externalRedactionProblem, renderConfirmationQuestion } from './command-echo.js';
 import { answerScheduleQuery, runMeetingOperation } from '../meetings/door.js';
 import type { CharterOperations } from '../meetings/free-time.js';
 import type { MeetingRequest } from '../meetings/request.js';
@@ -128,6 +128,8 @@ import type { Runtime } from './runtime.js';
 import { createJob, transition } from './jobs.js';
 import { bindPlanToJob, planHashOf } from './plan-store.js';
 import { classMismatch } from './run-plan.js';
+import { isExternalTool, resolveExternalCall } from '../policy/external-class.js';
+import { buildExternalRequestFromPayload } from '../external/request.js';
 import { DocProduceInput } from '../production/produce-input.js';
 import { resolveSourceDocuments, type SourceResolution } from '../production/source-resolver.js';
 
@@ -774,7 +776,45 @@ async function planAndCheck(
       };
     }
 
-    const mismatch = classMismatch(step);
+    // An external-system step must name an operation the owner signed. The
+    // same resolver the gate and `runPlan` call, so a step refused there is
+    // refused here first, before anything is bound or granted.
+    if (isExternalTool(step.toolName)) {
+      const resolved = resolveExternalCall(door.bundle.externalSystems, step.toolName, step.input);
+      if (!resolved.ok) {
+        return {
+          kind: 'refused',
+          reason: 'התוכנית מבקשת פעולה במערכת חיצונית שאינה פעולה שנחתמה בתקנון.',
+          audit: `instruction door: step ${step.id} external operation unknown (${resolved.reason})`,
+        };
+      }
+      // The request the adapter would build, built now with the same payload
+      // reading (`buildExternalRequestFromPayload`). A step whose request the
+      // builder refuses is refused here, quoting the builder's own Hebrew
+      // sentence — before the owner is asked about it, so the question never
+      // echoes a request that could not run, and never echoes it partially.
+      const built = buildExternalRequestFromPayload(resolved.system, resolved.op, step.input, 'plan-check');
+      if (!built.ok) {
+        return {
+          kind: 'refused',
+          reason: `התוכנית כוללת בקשה למערכת חיצונית שאינה תקינה, ולכן לא רצה: ${built.message}`,
+          audit: `instruction door: step ${step.id} external request invalid (${built.code})`,
+        };
+      }
+      // Ruling T7-b: the adapter receives the REDACTED payload. A value the
+      // charter hides would reach the provider as the marker in place of what
+      // the owner approved, so such a step is refused here, before he is asked.
+      const redaction = externalRedactionProblem(step, door.bundle.redactPatterns);
+      if (redaction !== null) {
+        return {
+          kind: 'refused',
+          reason: redaction,
+          audit: `instruction door: step ${step.id} external request carries a redacted value`,
+        };
+      }
+    }
+
+    const mismatch = classMismatch(step, door.bundle.externalSystems);
     if (mismatch !== null) {
       return {
         kind: 'refused',
@@ -1059,6 +1099,8 @@ async function planPerCandidate(
   for (const option of options) ledgerEchoes.push(await ledgerEchoOf(door, option.plan));
   const rendered = renderConfirmationQuestion(options, {
     currency: door.bundle.ceilings.currency,
+    systems: door.bundle.externalSystems,
+    redactPatterns: door.bundle.redactPatterns,
     extraEchoes: ledgerEchoes,
   });
   if ('refused' in rendered) {
@@ -1134,6 +1176,8 @@ async function finishSingle(
     };
     const rendered = renderConfirmationQuestion([option], {
       currency: door.bundle.ceilings.currency,
+      systems: door.bundle.externalSystems,
+      redactPatterns: door.bundle.redactPatterns,
       extraEchoes: [single.extraEcho ?? (await ledgerEchoOf(door, plan))],
     });
     if ('refused' in rendered) {

@@ -8,6 +8,9 @@ import { saveAddress } from '../business/profile.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
 import { registerBusiness, resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
+import { saveDraft } from '../external/store.js';
+import { ExternalSystem } from '../domain/external-system.js';
+import { crmConnection, crmFixture } from '../test/external-fixtures.js';
 import { businessDetailForPanel, listBusinessesForPanel, setupDataForPanel } from './panel-reads.js';
 
 const OTHER = 'other-business';
@@ -287,5 +290,88 @@ describe('setupDataForPanel', () => {
 
     await withBusiness(TEST_BUSINESS, (db) => installCharter(db, buildCharter()));
     expect(await setupDataForPanel(TEST_BUSINESS)).toBe('locked');
+  });
+});
+
+describe('businessDetailForPanel — external systems', () => {
+  async function seedDraft(businessId: string, definition: unknown, systemId = 'crm'): Promise<void> {
+    await registerBusiness(businessId);
+    await withBusiness(businessId, (db) => saveDraft(db, { systemId, definition, staffId: TECH }));
+  }
+
+  async function seedSecret(businessId: string, ref: string): Promise<void> {
+    await seedWhatsappSecrets(businessId, [ref]);
+  }
+
+  async function systemsOf(businessId: string): Promise<unknown> {
+    return (await businessDetailForPanel(businessId))?.externalSystems;
+  }
+
+  const parsedCrm = (): unknown => ExternalSystem.parse(crmFixture());
+  const signCrm = async (): Promise<void> => {
+    await withBusiness(TEST_BUSINESS, (db) =>
+      installCharter(db, buildCharter({ externalSystems: [crmFixture()], connections: [crmConnection()] })),
+    );
+  };
+
+  it('is empty with no draft and no signed system', async () => {
+    expect(await systemsOf(TEST_BUSINESS)).toEqual([]);
+  });
+
+  it("a draft without its secrets is 'draft'; with them, 'awaiting_signature'", async () => {
+    await seedDraft(TEST_BUSINESS, parsedCrm());
+    expect(await systemsOf(TEST_BUSINESS)).toEqual([
+      { systemId: 'crm', state: 'draft', keySaved: false, hookSaved: false, verifySaved: null },
+    ]);
+    await seedSecret(TEST_BUSINESS, 'EXT_CRM_KEY');
+    expect(await systemsOf(TEST_BUSINESS)).toEqual([
+      { systemId: 'crm', state: 'draft', keySaved: true, hookSaved: false, verifySaved: null },
+    ]);
+    await seedSecret(TEST_BUSINESS, 'EXT_CRM_HOOK');
+    expect(await systemsOf(TEST_BUSINESS)).toEqual([
+      { systemId: 'crm', state: 'awaiting_signature', keySaved: true, hookSaved: true, verifySaved: null },
+    ]);
+  });
+
+  it("asks for the verify token only for a query_challenge handshake, and hook only with a webhook", async () => {
+    const challenge = crmFixture();
+    challenge.webhook = {
+      ...challenge.webhook!,
+      handshake: { kind: 'query_challenge', modeParam: 'hub.mode', modeValue: 'subscribe', tokenParam: 'hub.verify_token', challengeParam: 'hub.challenge' },
+    };
+    await seedDraft(TEST_BUSINESS, ExternalSystem.parse(challenge));
+    const noHook = { ...crmFixture(), id: 'books', webhook: null };
+    await withBusiness(TEST_BUSINESS, (db) =>
+      saveDraft(db, { systemId: 'books', definition: ExternalSystem.parse(noHook), staffId: TECH }),
+    );
+    expect(await systemsOf(TEST_BUSINESS)).toEqual([
+      { systemId: 'books', state: 'draft', keySaved: false, hookSaved: null, verifySaved: null },
+      { systemId: 'crm', state: 'draft', keySaved: false, hookSaved: false, verifySaved: false },
+    ]);
+  });
+
+  it("is 'signed' when the draft equals the signed definition (or there is none), 'unsigned_changes' when it differs", async () => {
+    await signCrm();
+    expect(await systemsOf(TEST_BUSINESS)).toMatchObject([{ systemId: 'crm', state: 'signed' }]);
+
+    // Key order and an omitted default do not count as a change: compared after parsing, by canonical hash.
+    const reordered = Object.fromEntries(Object.entries(crmFixture()).reverse());
+    await withBusiness(TEST_BUSINESS, (db) => saveDraft(db, { systemId: 'crm', definition: reordered, staffId: TECH }));
+    expect(await systemsOf(TEST_BUSINESS)).toMatchObject([{ systemId: 'crm', state: 'signed' }]);
+
+    const changed = crmFixture();
+    changed.label = 'מערכת הלקוחות החדשה';
+    await withBusiness(TEST_BUSINESS, (db) => saveDraft(db, { systemId: 'crm', definition: changed, staffId: TECH }));
+    expect(await systemsOf(TEST_BUSINESS)).toMatchObject([{ systemId: 'crm', state: 'unsigned_changes' }]);
+  });
+
+  it("never shows another business's drafts or secrets", async () => {
+    await seedDraft(OTHER, parsedCrm());
+    await seedSecret(OTHER, 'EXT_CRM_KEY');
+    expect(await systemsOf(TEST_BUSINESS)).toEqual([]);
+    await seedDraft(TEST_BUSINESS, parsedCrm());
+    expect(await systemsOf(TEST_BUSINESS)).toEqual([
+      { systemId: 'crm', state: 'draft', keySaved: false, hookSaved: false, verifySaved: null },
+    ]);
   });
 });

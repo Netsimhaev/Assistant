@@ -1,4 +1,5 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { passInFlight } from '../tenancy/business-deletion.js';
 import { __setAppPoolMaxForTest, closePool, withBusiness } from '../db/pool.js';
 import { closePlatformPool } from '../db/platform-pool.js';
 import { registerBusiness, resetDatabase, testDb } from '../test/db.js';
@@ -77,7 +78,7 @@ describe('runAllBusinesses', () => {
       },
     });
 
-    expect(report).toEqual({ ran: [A, B, C], skippedInFlight: [], failed: [], notReached: [] });
+    expect(report).toEqual({ ran: [A, B, C], skippedInFlight: [], skippedInactive: [], failed: [], notReached: [] });
     expect(passed).toEqual([A, B, C]);
   });
 
@@ -154,7 +155,7 @@ describe('runAllBusinesses', () => {
   it('zero active businesses completes and reports zero', async () => {
     const report = await runAllBusinesses(SERVER, { perBusinessDeadlineMs: 5_000, state: freshState() });
 
-    expect(report).toEqual({ ran: [], skippedInFlight: [], failed: [], notReached: [] });
+    expect(report).toEqual({ ran: [], skippedInFlight: [], skippedInactive: [], failed: [], notReached: [] });
     expect(tenantPassLines(report)[0]).toBe('0 businesses, ran 0, failed 0, skipped 0');
   });
 
@@ -263,7 +264,7 @@ describe('runAllBusinesses', () => {
   });
 
   it('the summary line is printed only when something went wrong or the count changed', () => {
-    const quiet = { ran: [A, B], skippedInFlight: [], failed: [], notReached: [] };
+    const quiet = { ran: [A, B], skippedInFlight: [], skippedInactive: [], failed: [], notReached: [] };
     expect(tenantPassIsNotable(quiet, null)).toBe(true);
     expect(tenantPassIsNotable(quiet, 2)).toBe(false);
     expect(tenantPassIsNotable(quiet, 3)).toBe(true);
@@ -294,6 +295,148 @@ describe('runAllBusinesses', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]?.row).not.toContain('ronit');
     expect(rows[0]?.row).toContain('"kind":"tool_call"');
+  });
+});
+
+/** The heartbeat columns deletion reads (`passInFlight`), straight from the registry. */
+async function heartbeat(businessId: string): Promise<{ started: Date | null; finished: Date | null }> {
+  const { rows } = await testDb().query<{ pass_started_at: Date | null; pass_finished_at: Date | null }>(
+    'SELECT pass_started_at, pass_finished_at FROM businesses WHERE business_id = $1',
+    [businessId],
+  );
+  return { started: rows[0]?.pass_started_at ?? null, finished: rows[0]?.pass_finished_at ?? null };
+}
+
+describe('the pass heartbeat (business deletion, Ruling 4)', () => {
+  it('records the start before the pass and the finish after it, finish ≥ start', async () => {
+    await registerBusiness(A);
+    let duringPass: { started: Date | null; finished: Date | null } | null = null;
+    await runAllBusinesses(SERVER, {
+      perBusinessDeadlineMs: 5_000,
+      state: freshState(),
+      pass: recordingPass([], async (id) => {
+        duringPass = await heartbeat(id);
+      }),
+    });
+    expect(duringPass).not.toBeNull();
+    expect(duringPass!.started).not.toBeNull();
+    expect(duringPass!.finished).toBeNull();
+    const after = await heartbeat(A);
+    expect(after.started).not.toBeNull();
+    expect(after.finished).not.toBeNull();
+    expect(after.finished!.getTime()).toBeGreaterThanOrEqual(after.started!.getTime());
+    expect(await passInFlight(A)).toBe(false);
+  });
+
+  it('a pass that throws still records its finish', async () => {
+    await registerBusiness(A);
+    const report = await runAllBusinesses(SERVER, {
+      perBusinessDeadlineMs: 5_000,
+      state: freshState(),
+      pass: recordingPass([], async () => {
+        throw new Error('boom');
+      }),
+    });
+    expect(report.failed).toEqual([{ businessId: A, reason: 'threw' }]);
+    const after = await heartbeat(A);
+    expect(after.finished).not.toBeNull();
+    expect(after.finished!.getTime()).toBeGreaterThanOrEqual(after.started!.getTime());
+    expect(await passInFlight(A)).toBe(false);
+  });
+
+  it('a slow pass is in flight while it runs', async () => {
+    await registerBusiness(A);
+    let inFlightDuring: boolean | null = null;
+    await runAllBusinesses(SERVER, {
+      perBusinessDeadlineMs: 5_000,
+      state: freshState(),
+      pass: recordingPass([], async (id) => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        inFlightDuring = await passInFlight(id);
+      }),
+    });
+    expect(inFlightDuring).toBe(true);
+    expect(await passInFlight(A)).toBe(false);
+  });
+
+  it('a pass that overruns its deadline has no finish until it really ends', async () => {
+    await registerBusiness(A);
+    const state = freshState();
+    let release!: () => void;
+    const stuck = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const report = await runAllBusinesses(SERVER, {
+      perBusinessDeadlineMs: 100,
+      state,
+      pass: recordingPass([], () => stuck),
+    });
+    expect(report.failed).toEqual([{ businessId: A, reason: 'deadline' }]);
+    // The deadline stopped the waiting, not the work: deletion must still wait.
+    expect((await heartbeat(A)).finished).toBeNull();
+    expect(await passInFlight(A)).toBe(true);
+
+    release();
+    await waitFor(() => !state.inFlight.has(A));
+    expect((await heartbeat(A)).finished).not.toBeNull();
+    expect(await passInFlight(A)).toBe(false);
+  });
+
+  it('a business suspended or being deleted after the list was read is not passed, and is skipped, not failed', async () => {
+    await registerBusiness(A);
+    await registerBusiness(B);
+    await registerBusiness(C);
+    const seen: string[] = [];
+    const report = await runAllBusinesses(SERVER, {
+      perBusinessDeadlineMs: 5_000,
+      state: freshState(),
+      // A's pass changes B and C after the list was read, as a deletion would.
+      pass: recordingPass(seen, async (id) => {
+        if (id !== A) return;
+        await testDb().query(`UPDATE businesses SET status = 'suspended', suspended_at = now() WHERE business_id = $1`, [B]);
+        await testDb().query(`UPDATE businesses SET status = 'deleting' WHERE business_id = $1`, [C]);
+      }),
+    });
+    expect(seen).toEqual([A]);
+    expect(report.ran).toEqual([A]);
+    expect(report.skippedInactive).toEqual([B, C]);
+    expect(report.failed).toEqual([]);
+    // Neither heartbeat was written, and no failure was audited.
+    for (const id of [B, C]) {
+      expect(await heartbeat(id)).toEqual({ started: null, finished: null });
+      expect(await auditReasons(id)).toEqual([]);
+    }
+    expect(tenantPassLines(report).join(' | ')).toContain(`business ${B}: no longer active — skipped`);
+  });
+
+  it('a heartbeat that cannot be written does not stop the pass', async () => {
+    await registerBusiness(A);
+    const seen: string[] = [];
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const report = await runAllBusinesses(SERVER, {
+        perBusinessDeadlineMs: 5_000,
+        state: freshState(),
+        pass: recordingPass(seen),
+        // Fail-open: a start that THROWS is not "inactive" — the pass runs.
+        heartbeat: {
+          start: async () => {
+            throw Object.assign(new Error('secret-ish message'), { code: '08006' });
+          },
+          end: async () => {
+            throw new TypeError('another secret-ish message');
+          },
+        },
+      });
+      expect(seen).toEqual([A]);
+      expect(report.ran).toEqual([A]);
+      const logged = JSON.stringify(errors.mock.calls);
+      expect(logged).not.toContain('secret-ish');
+      expect(logged).toContain('08006');
+      expect(logged).toContain('TypeError');
+    } finally {
+      errors.mockRestore();
+    }
   });
 });
 

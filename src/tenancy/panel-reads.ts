@@ -9,6 +9,11 @@
  * returns the data a technician typed — and only while the business has no
  * active charter; from the first signature on it answers `'locked'`.
  *
+ * One more nuance (Stage D): `businessDetailForPanel` reads external-system
+ * definitions — the drafts and the signed ones — into this module only to
+ * parse and hash them (`externalSystemStatuses`); what it returns is ids and
+ * flags. It never touches `external_events` or `external_reads`.
+ *
  * The platform login is BYPASSRLS: there is no second wall under these
  * queries. Every subquery is therefore correlated on `b.business_id` (or
  * filtered by `$1`) explicitly — a missing filter here is a cross-business
@@ -17,12 +22,16 @@
  * locks the exported names and the absence of content.
  */
 import { withPlatform } from '../db/platform-pool.js';
+import type { Queryable } from '../db/pool.js';
 import { SetupPackage, type PersonEntry } from '../business/setup-package.js';
+import { EXTERNAL_SYSTEM_ID, ExternalSystem, externalSecretRefs } from '../domain/external-system.js';
+import { canonicalHash } from '../util/canonical.js';
 
 export interface PanelBusinessRow {
   businessId: string;
   displayName: string;
-  status: 'active' | 'suspended';
+  /** `deleting`: the rows are gone, the files not yet (migration 081). */
+  status: 'active' | 'suspended' | 'deleting';
   setupState: 'setting_up' | 'live';
   basicDone: number;
   basicTotal: 4;
@@ -39,6 +48,26 @@ export interface PanelSnapshot {
   failedLast7Days: number;
 }
 
+/**
+ * Where an external system stands (Stage D). `draft`: a draft whose required
+ * secrets are not all saved yet, or that no longer parses; `awaiting_signature`:
+ * a valid draft with every secret it needs, nothing signed; `signed`: signed,
+ * with no draft or a draft equal to it; `unsigned_changes`: signed, and a draft
+ * that differs.
+ */
+export type ExternalSystemPanelState = 'draft' | 'awaiting_signature' | 'signed' | 'unsigned_changes';
+
+/** Flags only — never a label, an address, an operation or anything a system returned. */
+export interface ExternalSystemPanelStatus {
+  systemId: string;
+  state: ExternalSystemPanelState;
+  keySaved: boolean;
+  /** `null` when the definition declares no webhook. */
+  hookSaved: boolean | null;
+  /** `null` unless the webhook handshake is `query_challenge`. */
+  verifySaved: boolean | null;
+}
+
 export type PanelBusinessDetail = PanelBusinessRow & {
   whatsappSaved: boolean;
   bossNumberSet: boolean;
@@ -52,6 +81,8 @@ export type PanelBusinessDetail = PanelBusinessRow & {
   addressSet: boolean;
   logoSet: boolean;
   snapshot: PanelSnapshot;
+  /** One entry per drafted or signed external system, in id order. */
+  externalSystems: ExternalSystemPanelStatus[];
 };
 
 export interface PanelSetupData {
@@ -107,7 +138,7 @@ SELECT b.business_id,
 interface FactsRow {
   business_id: string;
   display_name: string;
-  status: 'active' | 'suspended';
+  status: 'active' | 'suspended' | 'deleting';
   live: boolean;
   whatsapp_saved: boolean;
   package_boss: boolean;
@@ -253,7 +284,87 @@ export async function businessDetailForPanel(businessId: string): Promise<PanelB
         lastActivityAt: d.last_activity_at,
         failedLast7Days: Number(d.failed_last_7_days),
       },
+      externalSystems: await externalSystemStatuses(db, businessId),
     };
+  });
+}
+
+interface ExternalDefinitionRow {
+  source: 'draft' | 'signed';
+  system_id: string | null;
+  definition: unknown;
+}
+
+/**
+ * The drafts and the active charter's signed definitions, both filtered by
+ * `$1` explicitly (BYPASSRLS). The definitions are read only to be parsed and
+ * hashed here; nothing of them leaves this function but flags.
+ */
+const EXTERNAL_DEFINITIONS_SQL = `
+SELECT 'draft' AS source, d.system_id, d.definition
+  FROM external_system_drafts d
+ WHERE d.business_id = $1
+UNION ALL
+SELECT 'signed' AS source, e.def ->> 'id' AS system_id, e.def AS definition
+  FROM charter_active ca
+  JOIN charter_versions cv ON cv.business_id = ca.business_id AND cv.charter_version = ca.charter_version
+  CROSS JOIN LATERAL jsonb_array_elements(
+    CASE WHEN jsonb_typeof(cv.charter -> 'externalSystems') = 'array'
+         THEN cv.charter -> 'externalSystems' ELSE '[]'::jsonb END) AS e(def)
+ WHERE ca.business_id = $1`;
+
+/** The parsed definition, or `null` for one that no longer parses. */
+function parsedOrNull(definition: unknown): ExternalSystem | null {
+  const parsed = ExternalSystem.safeParse(definition);
+  return parsed.success ? parsed.data : null;
+}
+
+/**
+ * "Unsigned changes" is decided on the canonical hash of the PARSED
+ * definitions, so key order and an omitted default are not a change. A
+ * definition that does not parse is hashed raw — it can never equal a signed
+ * one, which always parses.
+ */
+function definitionHash(definition: unknown): string {
+  const parsed = parsedOrNull(definition);
+  return parsed === null ? canonicalHash({ unparsed: definition }) : canonicalHash(parsed);
+}
+
+async function externalSystemStatuses(db: Queryable, businessId: string): Promise<ExternalSystemPanelStatus[]> {
+  const definitions = await db.query<ExternalDefinitionRow>(EXTERNAL_DEFINITIONS_SQL, [businessId]);
+  const secrets = await db.query<{ ref: string }>(
+    `SELECT ref FROM credentials WHERE business_id = $1 AND starts_with(ref, 'EXT_')`,
+    [businessId],
+  );
+  const saved = new Set(secrets.rows.map((r) => r.ref));
+
+  const drafts = new Map<string, unknown>();
+  const signed = new Map<string, unknown>();
+  for (const row of definitions.rows) {
+    // Positive: only a well-formed id is ever returned — never free text from a row written elsewhere.
+    if (row.system_id === null || !EXTERNAL_SYSTEM_ID.test(row.system_id)) continue;
+    (row.source === 'draft' ? drafts : signed).set(row.system_id, row.definition);
+  }
+
+  const ids = [...new Set([...drafts.keys(), ...signed.keys()])].sort();
+  return ids.map((systemId) => {
+    const refs = externalSecretRefs(systemId);
+    const draft = drafts.has(systemId) ? parsedOrNull(drafts.get(systemId)) : null;
+    const current = draft ?? (signed.has(systemId) ? parsedOrNull(signed.get(systemId)) : null);
+    const keySaved = saved.has(refs.key);
+    const hookSaved = current?.webhook ? saved.has(refs.hook) : null;
+    const verifySaved = current?.webhook?.handshake?.kind === 'query_challenge' ? saved.has(refs.verify) : null;
+
+    let state: ExternalSystemPanelState;
+    if (signed.has(systemId)) {
+      const unchanged =
+        !drafts.has(systemId) || definitionHash(drafts.get(systemId)) === definitionHash(signed.get(systemId));
+      state = unchanged ? 'signed' : 'unsigned_changes';
+    } else {
+      const ready = draft !== null && keySaved && hookSaved !== false && verifySaved !== false;
+      state = ready ? 'awaiting_signature' : 'draft';
+    }
+    return { systemId, state, keySaved, hookSaved, verifySaved };
   });
 }
 

@@ -44,6 +44,10 @@ import {
   DOCUMENT_DELIVERIES_ERASED_PREDICATE,
   DOCUMENT_PRODUCTIONS_ERASED_PREDICATE,
   DOCUMENT_VERSIONS_ERASED_PREDICATE,
+  EXTERNAL_EVENTS_ERASED_PREDICATE,
+  EXTERNAL_LEARNING_JOBS_ERASED_PREDICATE,
+  EXTERNAL_READS_ERASED_PREDICATE,
+  LEARNING_JOB_OPEN_CONDITION,
   PRODUCTION_LIVE_CONDITION,
   CHARTER_INTERVIEW_DRAFTS_ERASED_PREDICATE,
   JOBS_SCRUBBED_PREDICATE,
@@ -185,10 +189,43 @@ export async function executeErasure(
 
   const {
     jobIds, documentIds, memoryIds, digestIds, draftIds, mailIds, ledgerItemIds, ledgerRuleIds, productionIds,
-    colleagueIds, setupPackageMatched,
+    colleagueIds, setupPackageMatched, externalEventIds,
   } = plan;
   const results: ErasureItem[] = [];
   await transaction(db, async (client) => {
+
+    // The events this plan erases, locked, with the learning job each is
+    // claimed by right now. A learning pass can claim one between the preview
+    // and this transaction (`claimEventsForCuration` is an UPDATE, so the lock
+    // serialises against it): if that job is open and not in the plan, its
+    // curator is about to write from a brief that holds the content this
+    // erasure removes — refused, the same as any live job.
+    if (externalEventIds.length > 0) {
+      const { rows: lockedEvents } = await client.query<{ curation_job_id: string | null; open: boolean }>(
+        `SELECT e.curation_job_id, coalesce((${LEARNING_JOB_OPEN_CONDITION}), false) AS open
+           FROM external_events e
+           LEFT JOIN jobs ON jobs.business_id = e.business_id AND jobs.job_id = e.curation_job_id
+          WHERE e.business_id = $1 AND e.event_id = ANY ($2)
+          FOR UPDATE OF e`,
+        [businessId, externalEventIds],
+      );
+      const claimedByOpen = [
+        ...new Set(
+          lockedEvents.flatMap((row) =>
+            row.open && row.curation_job_id !== null && !jobIds.includes(row.curation_job_id)
+              ? [row.curation_job_id]
+              : [],
+          ),
+        ),
+      ];
+      if (claimedByOpen.length > 0) {
+        throw new ErasureRefusedError(
+          claimedByOpen
+            .map((jobId) => `משימה ${jobId} התחילה ללמוד מהפריטים האלה מאז שהתצוגה המקדימה הוכנה; המחיקה בוטלה.`)
+            .join(' · '),
+        );
+      }
+    }
 
     // Re-check liveness under a row lock. The plan-time refusal in
     // `buildErasurePlan` reads `jobs.phase` with no lock and is never read
@@ -213,12 +250,15 @@ export async function executeErasure(
         phase: string;
         awaiting_envelope_id: string | null;
         stranded: boolean;
+        learning_open: boolean;
       }>(
-        `SELECT job_id, phase, awaiting_envelope_id, (${STRANDED_PARENT_PREDICATE}) AS stranded
+        `SELECT job_id, phase, awaiting_envelope_id, (${STRANDED_PARENT_PREDICATE}) AS stranded,
+                (${LEARNING_JOB_OPEN_CONDITION}) AS learning_open
            FROM jobs WHERE business_id = $1 AND job_id = ANY ($2) FOR UPDATE`,
         [businessId, jobIds],
       );
-      const stillLive = lockedJobs.filter((row) => LIVE_PHASES.includes(row.phase));
+      // An open learning job is live too — see `LEARNING_JOB_OPEN_CONDITION`.
+      const stillLive = lockedJobs.filter((row) => LIVE_PHASES.includes(row.phase) || row.learning_open);
       if (stillLive.length > 0) {
         throw new ErasureRefusedError(
           stillLive
@@ -480,6 +520,38 @@ export async function executeErasure(
     await del(
       'meetings',
       `DELETE FROM meetings WHERE ${MEETINGS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    );
+    // External systems (migrations 077–079). No foreign keys between them or
+    // to `jobs`, so no cascade can run ahead of these. The records at the
+    // provider are never touched — `plan.externalSystemsKept` names them.
+    // Same predicates, same parameters, as `countItems` in `erasure-plan.ts`.
+    await del(
+      'external_reads',
+      `DELETE FROM external_reads WHERE ${EXTERNAL_READS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    );
+    // The tombstone first, in this transaction (migration 080): one row per
+    // event about to be deleted, so the provider's unchanged record cannot be
+    // stored again by the next scan or alert (`insertEvent` refuses it). It
+    // holds hashes only — no content about a person — so it is a by-product
+    // of the erasure, not erased content: not counted in the audit reason, not
+    // a discovery source, and not swept.
+    await client.query(
+      `INSERT INTO external_erased_items (business_id, system_id, item_hash)
+       SELECT business_id, system_id, item_hash FROM external_events
+        WHERE ${EXTERNAL_EVENTS_ERASED_PREDICATE}
+       ON CONFLICT (business_id, system_id, item_hash) DO NOTHING`,
+      [businessId, externalEventIds],
+    );
+    await del(
+      'external_events',
+      `DELETE FROM external_events WHERE ${EXTERNAL_EVENTS_ERASED_PREDICATE}`,
+      [businessId, externalEventIds],
+    );
+    await del(
+      'external_learning_jobs',
+      `DELETE FROM external_learning_jobs WHERE ${EXTERNAL_LEARNING_JOBS_ERASED_PREDICATE}`,
       [businessId, jobIds],
     );
     await del('job_plans', 'DELETE FROM job_plans WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);

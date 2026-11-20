@@ -55,6 +55,14 @@ export function logErrored(result: SchedulerPassResult, businessId: string | nul
   if (result.mailError !== null) {
     console.error(`mailbox poll failed: ${result.mailError}`);
   }
+  // External systems (Stage D): the scan and the learning loop. A thrown
+  // stage, and every per-system warning (an unreadable charter, a system
+  // whose scan or learning faulted) — codes and class names only, never
+  // provider text.
+  if (result.externalScanError !== null) console.error(`external scan failed: ${result.externalScanError}`);
+  for (const warning of result.externalScan?.warnings ?? []) console.error(`external scan: ${warning}`);
+  if (result.externalLearnError !== null) console.error(`external learning failed: ${result.externalLearnError}`);
+  for (const warning of result.externalLearn?.warnings ?? []) console.error(`external learning: ${warning}`);
   // Mail body retention (`mail-retention.ts`): a failed pass leaves bodies
   // past their year in place until the next one succeeds.
   if (result.mailRetentionError !== null) {
@@ -336,18 +344,25 @@ export function resetProductionNoticeForTests(): void {
  * reported by kind, not by its error message.
  */
 export function tenantPassTotal(report: TenantPassReport): number {
-  return report.ran.length + report.failed.length + report.skippedInFlight.length + report.notReached.length;
+  return (
+    report.ran.length +
+    report.failed.length +
+    report.skippedInFlight.length +
+    report.skippedInactive.length +
+    report.notReached.length
+  );
 }
 
 export function tenantPassLines(report: TenantPassReport): string[] {
   const total = tenantPassTotal(report);
   const lines = [
     `${total} businesses, ran ${report.ran.length}, failed ${report.failed.length}, ` +
-      `skipped ${report.skippedInFlight.length}` +
+      `skipped ${report.skippedInFlight.length + report.skippedInactive.length}` +
       (report.notReached.length > 0 ? `, not reached ${report.notReached.length}` : ''),
   ];
   for (const f of report.failed) lines.push(`business ${f.businessId}: pass failed (${f.reason})`);
   for (const id of report.skippedInFlight) lines.push(`business ${id}: previous pass still running — skipped`);
+  for (const id of report.skippedInactive) lines.push(`business ${id}: no longer active — skipped`);
   return lines;
 }
 
@@ -362,6 +377,7 @@ export function tenantPassIsNotable(report: TenantPassReport, previousTotal: num
   return (
     report.failed.length > 0 ||
     report.skippedInFlight.length > 0 ||
+    report.skippedInactive.length > 0 ||
     report.notReached.length > 0 ||
     tenantPassTotal(report) !== previousTotal
   );

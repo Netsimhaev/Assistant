@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { ActionClass } from './action.js';
 import { AutonomyLevel, TrustLevel } from './trust.js';
 import { CharterConnection } from './connection.js';
+import { ExternalSystem, externalConnectionSystem } from './external-system.js';
 import { normaliseDomainString } from '../util/address.js';
 
 export const Channel = z.enum([
@@ -184,6 +185,7 @@ export const KNOWN_TOOL_NAMES: ReadonlySet<string> = new Set([
   'charter.voice', 'code_execution', 'commitment.make', 'contract.sign',
   'credential.request_session', 'crm.read', 'crm.write', 'data.export',
   'discount.grant', 'doc.deliver', 'doc.fetch', 'doc.produce', 'doc.save', 'escalate_to_human',
+  'ext.call', 'ext.read',
   'file.write', 'followup.schedule', 'ledger.add', 'ledger.update',
   'mail.draft', 'mail.send',
   'media.generate_image', 'media.generate_video', 'media.inspect',
@@ -530,13 +532,20 @@ export const CharterSignature = z.object({
  * (editing location/notes of an existing meeting); charters signed under 1.2
  * declare one class fewer and must be re-signed.
  *
+ * **Bumped to '1.4' — external systems (Stage D).** `external.read` and
+ * `external.delete` joined `ActionClass`, and the charter gained
+ * `externalSystems`: each definition the owner signs (operations, the class
+ * each is judged as, money fields, webhook and scan) paired with exactly one
+ * `ext:<id>` connection serving `ext.call` and `ext.read`. Charters signed
+ * under 1.3 declare two classes fewer and must be re-signed.
+ *
  * What a bump costs, and why it is the honest price: a charter signed under
  * the old version must be **re-signed**, not reinterpreted. Filling the
  * missing class in with a restrictive default at read time would keep the
  * installation running, but it would also mean the code deciding, after the
  * fact, what a signed document says about an authority its owner never saw.
  */
-export const CURRENT_SCHEMA_VERSION = '1.3';
+export const CURRENT_SCHEMA_VERSION = '1.4';
 
 const BusinessCharterShape = z.object({
   schemaVersion: z.literal(CURRENT_SCHEMA_VERSION),
@@ -551,6 +560,11 @@ const BusinessCharterShape = z.object({
   people: z.array(CharterPerson).min(1),
   counterparties: z.array(CharterCounterparty).default([]),
   connections: z.array(CharterConnection).default([]),
+  /**
+   * External systems the owner signed for. Each one must be paired with its
+   * own `ext:<id>` connection — checked in `BusinessCharter` below.
+   */
+  externalSystems: z.array(ExternalSystem).max(20).default([]),
   money: CharterMoney,
   autonomy: CharterAutonomy,
   data: CharterData,
@@ -631,7 +645,101 @@ export const BusinessCharter = BusinessCharterShape.superRefine((charter, ctx) =
       });
     }
   }
+
+  checkExternalSystems(charter, ctx);
 });
+
+/** The exact tools an external system's connection serves, sorted. */
+const EXTERNAL_CONNECTION_TOOLS = ['ext.call', 'ext.read'] as const;
+const EXTERNAL_CONNECTION_PREFIX = 'ext:';
+
+/**
+ * Every external system is paired with exactly one connection, and every
+ * `ext:` connection with exactly one system. Both halves are checked, so a
+ * definition the gate cannot route to and a connection that routes to no
+ * definition are each refused at signing.
+ */
+function checkExternalSystems(
+  charter: z.infer<typeof BusinessCharterShape>,
+  ctx: z.RefinementCtx,
+): void {
+  const systemIds = new Set<string>();
+  for (const [index, system] of charter.externalSystems.entries()) {
+    if (systemIds.has(system.id)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['externalSystems', index, 'id'],
+        message: `duplicate external system "${system.id}"`,
+      });
+    }
+    systemIds.add(system.id);
+
+    const name = externalConnectionSystem(system.id);
+    const paired = charter.connections.filter((c) => c.system === name);
+    const connection = paired[0];
+    if (paired.length !== 1 || connection === undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['externalSystems', index],
+        message: `external system "${system.id}" needs exactly one connection named "${name}"`,
+      });
+    } else {
+      const serves = [...connection.serves].sort();
+      const servesExactly =
+        serves.length === EXTERNAL_CONNECTION_TOOLS.length &&
+        serves.every((tool, i) => tool === EXTERNAL_CONNECTION_TOOLS[i]);
+      if (!servesExactly || connection.target !== system.id || connection.channel !== 'api') {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['externalSystems', index],
+          message:
+            `connection "${name}" must serve exactly ext.call and ext.read, ` +
+            `target "${system.id}", on the api channel`,
+        });
+      }
+    }
+
+    // A money operation's amount is checked against the charter's ceilings,
+    // which are in the charter currency; an amount in another currency would
+    // be compared against a number it does not mean.
+    for (const [opIndex, op] of system.operations.entries()) {
+      if (op.amount !== null && op.amount.currency !== charter.money.currency) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['externalSystems', index, 'operations', opIndex, 'amount', 'currency'],
+          message:
+            `הפעולה "${op.label}" במערכת "${system.label}" מוגדרת במטבע ${op.amount.currency}, ` +
+            `אבל מטבע העסק בתקנון הוא ${charter.money.currency}`,
+        });
+      }
+    }
+  }
+
+  for (const [index, connection] of charter.connections.entries()) {
+    if (!connection.system.startsWith(EXTERNAL_CONNECTION_PREFIX)) {
+      // The external tools route only through a paired `ext:` connection —
+      // never through an ordinary one that happens to list them.
+      for (const tool of connection.serves) {
+        if ((EXTERNAL_CONNECTION_TOOLS as readonly string[]).includes(tool)) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['connections', index, 'serves'],
+            message: `tool "${tool}" may be served only by an "ext:" connection`,
+          });
+        }
+      }
+      continue;
+    }
+    const id = connection.system.slice(EXTERNAL_CONNECTION_PREFIX.length);
+    if (!systemIds.has(id)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['connections', index, 'system'],
+        message: `connection "${connection.system}" has no external system definition`,
+      });
+    }
+  }
+}
 
 export type BusinessCharter = z.infer<typeof BusinessCharter>;
 export type CharterPerson = z.infer<typeof CharterPerson>;

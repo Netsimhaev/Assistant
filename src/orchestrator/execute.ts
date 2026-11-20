@@ -2,7 +2,10 @@ import type { AgentId } from '../domain/audit.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { isMoneyBearing } from '../domain/action.js';
 import type { AutonomyLevel } from '../domain/trust.js';
-import { classifyAction, ingestsExternalContent, refineActionClass } from '../policy/classify.js';
+import { ingestsExternalContent } from '../policy/classify.js';
+import { classifyCall, resolveExternalCall } from '../policy/external-class.js';
+import { recordExternalRead, type ExternalFieldValue } from '../external/store.js';
+import { z } from 'zod';
 import { evaluateToolCall } from '../policy/engine.js';
 import { getApproval } from '../governance/approvals.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
@@ -11,7 +14,7 @@ import { canonicalHash } from '../util/canonical.js';
 import { markContentIngested, transition } from './jobs.js';
 import { StepChannelError } from './step-error.js';
 import type { Job } from './jobs.js';
-import type { BusinessDb } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 
 /**
  * How long a step sleeps before a retryable channel failure is tried again.
@@ -441,7 +444,17 @@ export async function executeStep(db: BusinessDb, request: StepRequest): Promise
   // The completion rides inside this transition's transaction. Recording it
   // afterwards would leave a window where the job has moved on and the step it
   // moved past is unrecorded — which a resume reads as work still to do.
-  await transition(db, job.jobId, {
+  //
+  // A completed `ext.read` stores the declared fields it returned in the SAME
+  // transaction (Stage D): a job in `verify` always has what it read, and a
+  // read whose completion rolled back leaves no fields behind. The adapter has
+  // no database; the fields travel in its `output`.
+  const externalRead = externalReadToStore(request, effectiveInput, effect.output);
+  await transaction(db, async (tx) => {
+    if (externalRead !== null) {
+      await recordExternalRead(tx, { jobId: job.jobId, stepId: request.stepId, ...externalRead });
+    }
+    await transition(tx, job.jobId, {
     to: 'verify',
     actor: request.agent,
     reason: `${request.stepId} · ${toolName}`,
@@ -456,6 +469,7 @@ export async function executeStep(db: BusinessDb, request: StepRequest): Promise
             performed: effect.performed,
           },
         }),
+    });
   });
 
   return {
@@ -482,10 +496,12 @@ async function recordStepSpend(
   request: StepRequest,
   effectiveInput: Record<string, unknown>,
 ): Promise<boolean> {
-  const base = classifyAction(request.toolName);
-  if (base === null) return false;
-
-  const actionClass = refineActionClass(base, effectiveInput);
+  // The class the gate judged this call as — for an `ext.call`, the class
+  // the owner signed for its operation (a money op is `refund.issue` or
+  // `payment.make`, never the `external.delete` placeholder, which would
+  // keep a refund out of the ledger the daily ceiling sums).
+  const actionClass = classifyCall(request.bundle.externalSystems, request.toolName, effectiveInput);
+  if (actionClass === null) return false;
 
   const amountMinor = effectiveInput['amountMinor'];
   if (typeof amountMinor !== 'number' || amountMinor <= 0) return false;
@@ -555,4 +571,32 @@ function localMinutes(at: Date, timezone: string): number {
   } catch {
     return at.getUTCHours() * 60 + at.getUTCMinutes();
   }
+}
+
+/** The adapter's declared-fields output, as `createExternalAdapter` returns it. */
+const ExternalReadOutput = z.object({
+  fields: z.array(z.object({ label: z.string(), value: z.string() })),
+});
+
+/**
+ * What a completed step stores in `external_reads`, or `null` when it is not
+ * an `ext.read` that resolves against the signed systems. The system and
+ * operation come from the same resolver the gate used, on the payload the
+ * gate judged; the fields are exactly the adapter's output. An output that is
+ * not the declared shape stores no fields rather than guessing at them.
+ */
+function externalReadToStore(
+  request: Pick<StepRequest, 'toolName' | 'bundle'>,
+  effectiveInput: Record<string, unknown>,
+  output: unknown,
+): { systemId: string; operation: string; fields: ExternalFieldValue[] } | null {
+  if (request.toolName !== 'ext.read') return null;
+  const resolved = resolveExternalCall(request.bundle.externalSystems, request.toolName, effectiveInput);
+  if (!resolved.ok) return null;
+  const parsed = ExternalReadOutput.safeParse(output);
+  return {
+    systemId: resolved.system.id,
+    operation: resolved.op.name,
+    fields: parsed.success ? parsed.data.fields : [],
+  };
 }

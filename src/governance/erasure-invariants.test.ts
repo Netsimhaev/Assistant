@@ -144,14 +144,26 @@ describe('what an erasure leaves behind', () => {
    * content. `business_profiles` holds the business's own address and logo,
    * not a counterparty, and is not wired.
    *
-   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen, then twenty, then twenty-one, then twenty-two, then twenty-three" count is spec §5.1's own
+   * **A twenty-fourth and a twenty-fifth, also outside spec §5.1: external
+   * systems (migrations 077–079)** — `external_reads.fields` (what an
+   * `ext.*` read step returned) and `external_events.fields` (what a webhook
+   * or a scan delivered). Each is seeded on its own: the read on a job that
+   * names nothing, so only the read's own discovery can bring the job in;
+   * the event with a learning job and the `ext:<systemId>` chunk it wrote,
+   * so the event's discovery must pull that job in for the chunk to go.
+   * `external_learning_jobs` holds ids only and is asserted deleted directly;
+   * `external_system_drafts`, `external_calls` and `external_system_state`
+   * hold no person and are not wired. The records at the provider are never
+   * deleted, and the preview is asserted to name the system.
+   *
+   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen, then twenty, then twenty-one, then twenty-two, then twenty-three, then twenty-five" count is spec §5.1's own
    * original content-store enumeration, growing as new content-bearing
    * tables were added to it — it is a DIFFERENT number from "how many
-   * tables `countItems`/the executor each name today" (36 since migration 073 added `business_colleagues` and `setup_packages`; CLAUDE.md states
+   * tables `countItems`/the executor each name today" (39 since migrations 077–079 added `external_reads`, `external_events` and `external_learning_jobs`; CLAUDE.md states
    * that figure, because it is the one a reader can grep `erasure-plan.ts`
    * and count directly). The two will not generally match: this file's
    * count tracks a design document's own enumeration of content-bearing
-   * stores, while the 36 also includes tables scrubbed as a consequence of
+   * stores, while the 39 also includes tables scrubbed as a consequence of
    * a kept-vs-erased JOB rather than discovered as a content store in their
    * own right (`jobs`, `job_steps`, `job_step_results`), and counts a table
    * once per table name regardless of how many `action`s `countItems` runs
@@ -672,7 +684,51 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS, JSON.stringify([{ name: `לקוח "ותיק" ${PROBE}`, role: 'לקוח', phone: '+972503334444' }])],
     );
 
+    // --- Migrations 077–079: external systems. --------------------------
+    //
+    // A read on a job that names nothing, so only the read's own discovery
+    // can bring the job in. An event whose learning job (also nameless)
+    // curated an `ext:crm` chunk that does NOT carry the probe: nothing in the
+    // chunk matches the contact, so it goes only because the event pulls its
+    // learning job in (`written_by_job`). Asserted gone directly below — the
+    // sweep cannot see a row with no probe in it.
+    const readJob = await withBusiness(BUSINESS, (db) => createJob(db, {
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      title: 'קריאה ממערכת',
+    }));
+    await db.query(
+      `INSERT INTO external_reads (business_id, read_id, job_id, step_id, system_id, operation, fields)
+       VALUES ($1, 'XR-probe', $2, 's1', 'crm', 'list_customers', $3::jsonb)`,
+      [BUSINESS, readJob.jobId, JSON.stringify({ customers: [{ name: `לקוח "ותיק"`, email: PROBE }] })],
+    );
+    const learningJob = await withBusiness(BUSINESS, (db) => createJob(db, {
+      charterVersion: bundle.charterVersion,
+      provenance: 'unknown_external',
+      title: 'למידה ממערכת חיצונית',
+    }));
+    await db.query(
+      `INSERT INTO external_learning_jobs (business_id, job_id, system_id) VALUES ($1, $2, 'crm')`,
+      [BUSINESS, learningJob.jobId],
+    );
+    await db.query(
+      `INSERT INTO external_events (business_id, event_id, system_id, source, event_type, item_hash, fields, curation_job_id)
+       VALUES ($1, 'XE-probe', 'crm', 'webhook', 'customer.created', 'h-probe', $2::jsonb, $3)`,
+      [BUSINESS, JSON.stringify({ customer: { email: PROBE } }), learningJob.jobId],
+    );
+    await withBusiness(BUSINESS, (bdb) =>
+      writeMemory(bdb, { jobId: learningJob.jobId, kind: 'chunk', subjectKey: 'ext:crm', body: { text: 'נרשם לקוח חדש' } }),
+    );
+    await withBusiness(BUSINESS, (bdb) => transition(bdb, learningJob.jobId, { to: 'understand', actor: 'orchestrator', reason: 't' }));
+    await withBusiness(BUSINESS, (bdb) => transition(bdb, learningJob.jobId, { to: 'closed', actor: 'orchestrator', reason: 't' }));
+
     const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PROBE }));
+    for (const table of ['external_reads', 'external_events', 'external_learning_jobs']) {
+      expect(plan.items.find((item) => item.table === table && item.action === 'delete')?.count, table).toBe(1);
+    }
+    expect(plan.jobIds).toEqual(expect.arrayContaining([readJob.jobId, learningJob.jobId]));
+    // The records at the provider outlive the erasure and the preview says so.
+    expect(plan.externalSystemsKept).toEqual(['crm']);
     for (const table of ['business_colleagues', 'setup_packages']) {
       expect(plan.items.find((item) => item.table === table && item.action === 'delete')?.count, table).toBe(1);
     }
@@ -715,6 +771,20 @@ describe('what an erasure leaves behind', () => {
     const otherDraft = await db.query('SELECT 1 FROM charter_interview_drafts WHERE draft_id = $1', ['DR-unrelated']);
     expect(otherDraft.rows).toHaveLength(1);
     await db.query(`DELETE FROM charter_interview_drafts WHERE draft_id = 'DR-unrelated'`);
+
+    // The learning job's chunk, gone only through the event's pull-in.
+    const learnedChunk = await db.query('SELECT 1 FROM memories WHERE business_id = $1 AND written_by_job = $2', [
+      BUSINESS,
+      learningJob.jobId,
+    ]);
+    expect(learnedChunk.rows).toHaveLength(0);
+
+    // `external_learning_jobs` holds no content — asserted gone directly.
+    const learningRecord = await db.query('SELECT 1 FROM external_learning_jobs WHERE business_id = $1 AND job_id = $2', [
+      BUSINESS,
+      learningJob.jobId,
+    ]);
+    expect(learningRecord.rows).toHaveLength(0);
 
     const claims = await db.query('SELECT 1 FROM confirmed_step_claims WHERE business_id = $1 AND job_id = $2', [
       BUSINESS,

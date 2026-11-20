@@ -69,7 +69,7 @@ function namedExceptionsList(items: readonly DigestException[], hiddenCount: num
 }
 
 export function renderDigest(facts: DigestFacts): RenderedDigest {
-  const { window: w, waiting, done, exceptions, permissionChanges, cost, timeZone, ledger, documents } = facts;
+  const { window: w, waiting, done, exceptions, permissionChanges, cost, timeZone, ledger, documents, external } = facts;
   const lines: string[] = [];
 
   lines.push(`${KIND_LABEL[w.kind]} · ${day(w.start, timeZone)}–${day(w.end, timeZone)}`);
@@ -141,6 +141,18 @@ export function renderDigest(facts: DigestFacts): RenderedDigest {
     );
   }
 
+  // External systems (Stage D): what arrived or was scanned in the window —
+  // counts by system and type, then the newest items' first field. Every
+  // value here was written outside the business, so each goes through `safe`.
+  if (external.total > 0) {
+    lines.push('', 'ממערכות חיצוניות:');
+    for (const c of external.counts) lines.push(`· ${safe(c.system)} · ${safe(c.type)}: ${c.count}`);
+    if (external.recent.length > 0) {
+      lines.push('· האחרונים:');
+      for (const item of external.recent) lines.push(`  · ${safe(item)}`);
+    }
+  }
+
   // §3.5 — both measures: what it cost, and how much is left.
   //
   // **"ב-30 הימים האחרונים", never "החודש".** The ceiling beside it is
@@ -177,7 +189,10 @@ export function renderDigest(facts: DigestFacts): RenderedDigest {
     ledger.closedByEvidence > 0 ||
     // Like open ledger rows: cards merely waiting are listed, not news.
     documents.produced > 0 ||
-    documents.sent > 0;
+    documents.sent > 0 ||
+    // New events from an external system are news: they say something
+    // happened out there that he has not heard about.
+    external.total > 0;
 
   // Spec §2 decision 3: an empty day is SAID. The screen still gets it so the
   // record stays continuous; `hadContent` is what keeps it out of his inbox.

@@ -1,4 +1,5 @@
 import { closePlatformPool, withPlatform } from '../db/platform-pool.js';
+import { isValidBusinessId } from '../db/pool.js';
 import { verifyKeyState } from '../governance/master-key.js';
 import { normaliseLogin } from './login.js';
 
@@ -94,4 +95,29 @@ export async function cleanupOAuthStates(): Promise<number> {
  */
 export async function verifyServerKeyState(key: Buffer): Promise<void> {
   await withPlatform((db) => verifyKeyState(key, db));
+}
+
+/**
+ * Whether the business a webhook URL names is registered, and whether it is
+ * active — before there is any business connection to ask (Stage D, the
+ * signed webhook receiver). The URL is all the caller gives, so this is the
+ * one question that cannot run under that business's RLS: whether it exists
+ * at all.
+ *
+ * Returns `{ active }` and nothing else — no name, no status text, no
+ * timestamps. Everything the receiver then does (the charter, the secret,
+ * the event row) runs inside the business's own `withBusiness`, on the app
+ * role, never here. A malformed id is `null` before any query: it is not an
+ * id any business could have been registered under.
+ */
+export async function resolveBusinessForHook(businessId: string): Promise<{ active: boolean } | null> {
+  if (!isValidBusinessId(businessId)) return null;
+  return withPlatform(async (db) => {
+    const { rows } = await db.query<{ status: string }>(
+      'SELECT status FROM businesses WHERE business_id = $1',
+      [businessId],
+    );
+    const row = rows[0];
+    return row ? { active: row.status === 'active' } : null;
+  });
 }

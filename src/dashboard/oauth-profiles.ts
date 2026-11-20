@@ -15,6 +15,7 @@ import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
 import type { MailProvider } from '../mail/mailbox.js';
 import { MICROSOFT_TOKEN_ENDPOINT } from '../orchestrator/adapters/microsoft-token-http.js';
+import { GOOGLE_REVOKE_URL } from '../governance/oauth-provider-revoke.js';
 
 export interface OAuthProfile {
   provider: MailProvider;
@@ -27,7 +28,9 @@ export interface OAuthProfile {
 
 export const GOOGLE_AUTHORIZE_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 export const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
-export const GOOGLE_REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
+// One constant with the provider-revoke module, so a ceremony's profile and a
+// deletion's revocation cannot name different endpoints.
+export { GOOGLE_REVOKE_URL };
 export const MICROSOFT_AUTHORIZE_URL = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize';
 export const MICROSOFT_TOKEN_URL = MICROSOFT_TOKEN_ENDPOINT;
 

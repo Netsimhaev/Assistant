@@ -15,6 +15,7 @@ import type { InterviewAnswers } from './answers.js';
 import { INTERVIEW_NEVER_PREFIX, buildCharterFromInterview, prefillFromCharter } from './build.js';
 import { INTERVIEW_ROWS, MONEY_ROWS } from './rows.js';
 import { completeAnswers } from './test-answers.js';
+import { crmConnection, crmFixture } from '../../test/external-fixtures.js';
 
 const BUSINESS = 'test-business';
 const FROZEN = new Date('2026-10-31T10:00:00.000Z');
@@ -278,6 +279,22 @@ describe('buildCharterFromInterview', () => {
     expect(c.forbidden.filter((r) => !r.id.startsWith('interview_')).map((r) => r.id)).toEqual(
       previous.forbidden.map((r) => r.id),
     );
+    expect(() => compileCharter(c)).not.toThrow();
+  });
+
+  it('a first charter declares external.read auto and external.delete approve_required', () => {
+    const charter = build(completeAnswers());
+    expect(charter.autonomy.base['external.read']).toBe('auto');
+    expect(charter.autonomy.base['external.delete']).toBe('approve_required');
+    expect(charter.externalSystems).toEqual([]);
+  });
+
+  it('an edit keeps the external systems and their ext: connection the owner signed', () => {
+    const previous = buildCharter({ externalSystems: [crmFixture()], connections: [crmConnection()] });
+    expect(previous.externalSystems).toHaveLength(1);
+    const c = sign(build(completed(prefillFromCharter(previous)), previous));
+    expect(c.externalSystems).toEqual(previous.externalSystems);
+    expect(c.connections).toContainEqual(crmConnection());
     expect(() => compileCharter(c)).not.toThrow();
   });
 

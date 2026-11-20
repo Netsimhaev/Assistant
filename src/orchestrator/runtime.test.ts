@@ -17,6 +17,9 @@ import { upsertBinding } from './bindings.js';
 import { DEFAULT_CREDENTIAL_ENV_PREFIX } from './credentials.js';
 import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
+import { crmConnection, crmFixture } from '../test/external-fixtures.js';
+import type { ExternalHttp, ExternalRequest } from '../external/http.js';
+import { createCredentialHandle } from './adapters/types.js';
 import { createFakeGateway } from '../whatsapp/fake-gateway.js';
 import {
   GREEN_API_INSTANCE_ID_REF,
@@ -1041,5 +1044,66 @@ describe('buildServerRuntime + businessRuntime', () => {
     // …and the right one still builds, so the refusal above is the key and
     // not something that makes every build fail.
     await expect(buildServerRuntime(FULL)).resolves.toBeDefined();
+  });
+});
+
+describe('businessRuntime — external systems (Stage D)', () => {
+  async function installCrm(): Promise<string> {
+    const bundle = await withBusiness(BUSINESS, (bdb) =>
+      installCharter(bdb, buildCharter({ externalSystems: [crmFixture()], connections: [crmConnection()] })),
+    );
+    return bundle.charterVersion;
+  }
+
+  it('registers one ext:<id> adapter per signed system, through the injected guarded client', async () => {
+    const version = await installCrm();
+    const sent: ExternalRequest[] = [];
+    const http: ExternalHttp = {
+      async send(req) {
+        sent.push(req);
+        return { kind: 'response', status: 200, body: '{"data":{"name":"Dana","id":"c-9"}}' };
+      },
+    };
+    const runtime = await build({ overrides: { externalHttp: http } });
+    const adapter = runtime.registry.resolve('ext:crm', 'api', 'ext.read');
+    expect(adapter).not.toBeNull();
+    expect(runtime.registry.resolve('ext:crm', 'api', 'ext.call')).toBe(adapter);
+    expect(runtime.registry.resolve('ext:crm', 'browser', 'ext.read')).toBeNull();
+
+    const result = await adapter!.execute({
+      toolName: 'ext.read',
+      input: { system: 'crm', operation: 'get_customer', params: { customer_id: 'c-9' } },
+      credential: createCredentialHandle('EXT_CRM_KEY', 'test-key'),
+      endpoint: null,
+      businessId: BUSINESS,
+      idempotencyKey: 'k',
+      attachments: [],
+      judgedCharterVersion: version,
+      signal: new AbortController().signal,
+    });
+    expect(result).toEqual({ ok: true, output: { fields: [{ label: 'שם', value: 'Dana' }] }, externalId: 'c-9' });
+    expect(sent[0]?.url.href).toBe('https://api.crm.example.com/v1/customers/c-9');
+    // The attempt was counted for THIS business, on its own connection.
+    const { rows } = await testDb().query<{ system_id: string; outcome: string; business_id: string }>(
+      'SELECT system_id, outcome, business_id FROM external_calls',
+    );
+    expect(rows).toEqual([{ system_id: 'crm', outcome: 'ok', business_id: BUSINESS }]);
+  });
+
+  it('registers nothing for a charter with no external systems', async () => {
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+    const runtime = await build();
+    expect(runtime.registry.systems().some((s) => s.startsWith('ext:'))).toBe(false);
+  });
+
+  it('registers none, and warns, when the active charter cannot be read', async () => {
+    await installCrm();
+    await testDb().query(
+      `UPDATE charter_versions SET charter = jsonb_set(charter, '{schemaVersion}', '"0.1"') WHERE business_id = $1`,
+      [BUSINESS],
+    );
+    const runtime = await build();
+    expect(runtime.registry.get('ext:crm')).toBeNull();
+    expect(runtime.warnings.some((w) => w.includes('external-system adapters'))).toBe(true);
   });
 });

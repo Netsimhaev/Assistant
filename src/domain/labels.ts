@@ -17,6 +17,7 @@
 import type { ActionClass } from './action.js';
 import type { DocumentCardState, DocumentFormat, DocumentKind, ProductionStage } from './document-spec.js';
 import type { LedgerFamily, LedgerStatus } from './ledger.js';
+import type { OperationKind } from './external-system.js';
 import type { AutonomyLevel, TrustLevel } from './trust.js';
 
 export const ACTION_CLASS_HE: Readonly<Record<ActionClass, string>> = Object.freeze({
@@ -46,6 +47,8 @@ export const ACTION_CLASS_HE: Readonly<Record<ActionClass, string>> = Object.fre
   'memory.write_longterm': 'רישום בזיכרון',
   'charter.amend': 'שינוי התקנון',
   'agent.delegate': 'בקשת עזרה מסוכן אחר',
+  'external.read': 'קריאה ממערכת חיצונית',
+  'external.delete': 'מחיקה במערכת חיצונית',
 });
 
 export const AUTONOMY_LEVEL_HE: Readonly<Record<AutonomyLevel, string>> = Object.freeze({
@@ -144,4 +147,16 @@ export const documentCardStateLabel: Readonly<Record<DocumentCardState, string>>
   saved: 'אושר לשמירה',
   superseded: 'הוחלף בגרסה חדשה',
   failed_send: 'המסירה לא הושלמה',
+});
+
+/**
+ * An external system's operation kind (Stage D), as the technician's preview
+ * and the owner's sign page name it. A new kind is a compile error here until
+ * it has Hebrew.
+ */
+export const externalOperationKindLabel: Readonly<Record<OperationKind, string>> = Object.freeze({
+  read: 'קריאה',
+  change: 'שינוי',
+  delete: 'מחיקה',
+  money: 'כסף',
 });
