@@ -25,9 +25,10 @@
  * the action, and the business's own audit chain is one of the things deleted.
  *
  * Cross-business by nature, so it runs on the platform pool and is one of the
- * named functions in the closed list (CLAUDE.md, "ריבוי עסקים"). It is the
- * only production file that names `delete_business_rows` (pinned by
- * `business-deletion.test.ts`).
+ * named functions in the closed list (CLAUDE.md, "ריבוי עסקים"). It and
+ * `businesses.ts` (whose `createBusiness` purges residue before an id is
+ * reused) are the only production files that name `delete_business_rows`
+ * (pinned by `business-deletion.test.ts`).
  */
 import { lstat, rm } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
