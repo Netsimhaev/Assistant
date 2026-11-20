@@ -39,7 +39,8 @@ import {
 import { deleteDraft, loadDrafts, loadSignedDefinition, saveDraft } from '../external/store.js';
 import { describeForTechnician } from '../external/describe.js';
 import { putSecret } from '../governance/credential-store.js';
-import { getBusiness } from '../tenancy/businesses.js';
+import { BusinessDeletingError, getBusiness } from '../tenancy/businesses.js';
+import { withBusinessWriteGuard } from '../tenancy/business-deletion.js';
 import { businessDetailForPanel, type ExternalSystemPanelStatus } from '../tenancy/panel-reads.js';
 import { escapeHtml } from '../util/html.js';
 import { stripBidiControls } from '../util/bidi.js';
@@ -142,7 +143,13 @@ export async function handleExternalRoute(ctx: ExternalRouteContext): Promise<bo
   }
   const handler = ACTIONS.get(target.action);
   if (ctx.method !== 'POST' || handler === undefined) return false;
-  await handler(ctx, target.id, target.system);
+  try {
+    await handler(ctx, target.id, target.system);
+  } catch (err) {
+    // The deletion took the business between the pre-check and the write.
+    if (!(err instanceof BusinessDeletingError)) throw err;
+    ctx.sendHtml(409, renderDeletingNotice(ctx.viewer, target.id));
+  }
   return true;
 }
 
@@ -153,6 +160,7 @@ export async function handleExternalRoute(ctx: ExternalRouteContext): Promise<bo
 async function showList(ctx: ExternalRouteContext, businessId: string): Promise<void> {
   const detail = await businessDetailForPanel(businessId);
   if (detail === null) return ctx.sendHtml(404, renderNotFound());
+  if (detail.status === 'deleting') return ctx.sendHtml(200, renderDeletingNotice(ctx.viewer, businessId));
   // "Open a system" is a GET form: `?system=<id>` goes to that system's editor.
   const requested = new URL(ctx.req.url ?? '/', 'http://admin.local').searchParams.get('system');
   let error: string | undefined;
@@ -223,6 +231,7 @@ async function showEditor(
 ): Promise<void> {
   const detail = await businessDetailForPanel(businessId);
   if (detail === null) return ctx.sendHtml(404, renderNotFound());
+  if (detail.status === 'deleting') return ctx.sendHtml(200, renderDeletingNotice(ctx.viewer, businessId));
   const systemStatus = detail.externalSystems.find((s) => s.systemId === systemId) ?? null;
   // The technician's own draft — or, without one, the signed definition — on
   // the business's connection under RLS.
@@ -376,7 +385,7 @@ async function handleSave(ctx: ExternalRouteContext, businessId: string, systemI
   }
 
   // The parsed form, defaults filled: what the owner will be shown and sign.
-  await withBusiness(businessId, (db) =>
+  await withBusinessWriteGuard(businessId, (db) =>
     saveDraft(db, { systemId, definition: parsed.data, staffId: ctx.staff.staffId }),
   );
   await recordStaffAction(ctx.staff, 'external_draft_saved', businessId, {
@@ -390,7 +399,7 @@ async function handleSave(ctx: ExternalRouteContext, businessId: string, systemI
 async function handleDelete(ctx: ExternalRouteContext, businessId: string, systemId: string): Promise<void> {
   const form = await ctx.readForm();
   if (!(await admitted(ctx, form, businessId))) return;
-  const deleted = await withBusiness(businessId, (db) => deleteDraft(db, systemId));
+  const deleted = await withBusinessWriteGuard(businessId, (db) => deleteDraft(db, systemId));
   // Logged only when a draft actually went.
   if (deleted > 0) await recordStaffAction(ctx.staff, 'external_draft_deleted', businessId);
   ctx.seeOther(`/businesses/${businessId}/external/${systemId}`);
@@ -418,7 +427,7 @@ async function handleSecret(ctx: ExternalRouteContext, businessId: string, syste
   }
 
   const ref = externalSecretRefs(systemId)[kind];
-  await withBusiness(businessId, (db) =>
+  await withBusinessWriteGuard(businessId, (db) =>
     putSecret(db, { ref, value, updatedBy: `staff:${ctx.staff.staffId}` }, ctx.masterKey),
   );
   await recordStaffAction(ctx.staff, 'external_secret_saved', businessId, { kind });

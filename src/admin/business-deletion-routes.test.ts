@@ -22,7 +22,17 @@ import { createServer as createDashboardServer } from '../dashboard/server.js';
 import { writeGrant } from '../governance/oauth-grants.js';
 import { writeKeyState } from '../governance/master-key.js';
 import { logStaffAction } from '../tenancy/activity-log.js';
-import { DELETION_REFUSAL_HE } from '../tenancy/business-deletion.js';
+import {
+  assertNotDeleting,
+  DELETION_REFUSAL_HE,
+  deleteBusinessFiles,
+  deleteBusinessRows,
+  finishDeletion,
+  withBusinessWriteGuard,
+} from '../tenancy/business-deletion.js';
+import { BusinessDeletingError, setBusinessStatus } from '../tenancy/businesses.js';
+import { putSecret } from '../governance/credential-store.js';
+import { withBusinessTransaction } from '../db/pool.js';
 import { businessFolders } from '../tenancy/paths.js';
 import {
   createHeadStaff,
@@ -178,6 +188,24 @@ async function putFile(path: string): Promise<void> {
   await writeFile(path, 'x');
 }
 
+async function googleGrant(businessId: string): Promise<void> {
+  await withBusiness(businessId, (db) =>
+    writeGrant(
+      db,
+      {
+        system: 'calendar',
+        provider: 'google',
+        credentialRef: 'CALENDAR',
+        account: 'owner@example.com',
+        scopes: ['s'],
+        refreshToken: `refresh-token-${businessId}`,
+        grantedBy: 'owner',
+      },
+      TEST_MASTER_KEY,
+    ),
+  );
+}
+
 /** Some rows and files for ACME: an owner, a Google grant, an audit row, files in both folders. */
 async function seedAcme(): Promise<void> {
   await withBusiness(ACME, (db) => createOwner(db, { username: 'owner', login: 'owner@acme.example', password: 'owner password long enough' }));
@@ -220,8 +248,14 @@ describe('who sees the button', () => {
     expect(page).not.toContain(`/businesses/${ACME}/delete`);
     expect((await get(baseUrl, `/businesses/${ACME}/delete`, cookie)).status).toBe(403);
     const csrf = await csrfFor(baseUrl, cookie);
-    expect((await post(baseUrl, `/businesses/${ACME}/delete`, { csrf, name: ACME_NAME }, cookie)).status).toBe(403);
+    await googleGrant(ACME);
+    // A WRONG name: without the route's head gate this would be a 400
+    // name_mismatch (the name check comes before the tenancy calls).
+    const refused = await post(baseUrl, `/businesses/${ACME}/delete`, { csrf, name: 'not the name' }, cookie);
+    expect(refused.status).toBe(403);
+    expect(await refused.text()).not.toContain(DELETION_REFUSAL_HE.name_mismatch);
     expect((await post(baseUrl, `/businesses/${ACME}/delete/files`, { csrf }, cookie)).status).toBe(403);
+    expect(fetchCalls).toHaveLength(0);
     expect(await statusOf(ACME)).toBe('suspended');
   });
 
@@ -232,9 +266,13 @@ describe('who sees the button', () => {
     expect(res.status).toBe(409);
     expect(await res.text()).not.toContain('name="name"');
     const csrf = await csrfFor(baseUrl, cookie);
-    const refused = await post(baseUrl, `/businesses/${OTHER}/delete`, { csrf, name: OTHER }, cookie);
+    await googleGrant(OTHER);
+    // A WRONG name: the status refusal must come first, with no provider call.
+    const refused = await post(baseUrl, `/businesses/${OTHER}/delete`, { csrf, name: 'not the name' }, cookie);
     expect(refused.status).toBe(409);
-    expect(await refused.text()).toContain(DELETION_REFUSAL_HE.not_suspended);
+    const body = await refused.text();
+    expect(body).toContain(DELETION_REFUSAL_HE.not_suspended);
+    expect(body).not.toContain(DELETION_REFUSAL_HE.name_mismatch);
     expect(await statusOf(OTHER)).toBe('active');
     expect(fetchCalls).toHaveLength(0);
   });
@@ -344,7 +382,10 @@ describe('a file failure', () => {
     const res = await post(baseUrl, `/businesses/${ACME}/delete`, { csrf, name: ACME_NAME }, cookie);
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain('השורות נמחקו, אבל 1 קבצים לא נמחקו');
+    expect(html).toContain('השורות נמחקו, אבל 1 תיקיות לא נמחקו');
+    expect(html).toContain('תיקיית המסמכים: 1');
+    expect(html).not.toContain('DOCUMENT_ROOT');
+    expect(html).toContain('רשומות שנמחקו');
     expect(html).toContain(`action="/businesses/${ACME}/delete/files"`);
     expect(await statusOf(ACME)).toBe('deleting');
 
@@ -414,5 +455,75 @@ describe('an old owner cookie', () => {
     // The dashboard's redirect is a 302 — a redirect to sign-in, never a 500.
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');
+  });
+});
+
+describe('serialising panel writes with the deletion', () => {
+  it('setBusinessStatus never resumes a business being deleted', async () => {
+    await testDb().query(`UPDATE businesses SET status = 'deleting' WHERE business_id = $1`, [ACME]);
+    await expect(setBusinessStatus(ACME, 'active')).rejects.toBeInstanceOf(BusinessDeletingError);
+    await expect(setBusinessStatus(ACME, 'suspended')).rejects.toBeInstanceOf(BusinessDeletingError);
+    expect(await statusOf(ACME)).toBe('deleting');
+  });
+
+  it('a write holding the guard makes the deletion wait, and its row is deleted with the rest', async () => {
+    const { staffId } = await head();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const inside = new Promise<void>((r) => (entered = r));
+    const write = withBusinessWriteGuard(ACME, async (tx) => {
+      await putSecret(tx, { ref: 'GREEN_API_TOKEN', value: 'late-secret', updatedBy: 'test' }, TEST_MASTER_KEY);
+      entered();
+      await gate;
+    });
+    await inside;
+    let settled = false;
+    const deletion = deleteBusinessRows({ businessId: ACME, staffId, typedName: ACME_NAME }).finally(() => {
+      settled = true;
+    });
+    await new Promise((r) => setTimeout(r, 400));
+    expect(settled).toBe(false);
+    release();
+    await write;
+    const result = await deletion;
+    expect(result.ok).toBe(true);
+    expect(await count('SELECT count(*) AS n FROM credentials WHERE business_id = $1', [ACME])).toBe(0);
+  });
+
+  it('a write after the deletion is refused and writes nothing', async () => {
+    const { staffId, cookie } = await head();
+    expect((await deleteBusinessRows({ businessId: ACME, staffId, typedName: ACME_NAME })).ok).toBe(true);
+    await expect(
+      withBusinessWriteGuard(ACME, (tx) =>
+        putSecret(tx, { ref: 'GREEN_API_TOKEN', value: 'late-secret', updatedBy: 'test' }, TEST_MASTER_KEY),
+      ),
+    ).rejects.toBeInstanceOf(BusinessDeletingError);
+    const baseUrl = await startPanel();
+    const csrf = await csrfFor(baseUrl, cookie);
+    const res = await post(baseUrl, `/businesses/${ACME}/whatsapp`, { csrf, instanceId: 'i', token: 't' }, cookie);
+    expect(res.status).toBe(409);
+    const ext = await post(baseUrl, `/businesses/${ACME}/external/crm/secret`, { csrf, kind: 'key', value: 'v' }, cookie);
+    expect(ext.status).toBe(409);
+    expect(await count('SELECT count(*) AS n FROM credentials WHERE business_id = $1', [ACME])).toBe(0);
+    expect(await statusOf(ACME)).toBe('deleting');
+  });
+
+  it('the guard refuses to run outside a transaction', async () => {
+    await expect(withBusiness(ACME, (db) => assertNotDeleting(db))).rejects.toThrow(/inside a transaction/);
+    await withBusinessTransaction(ACME, (tx) => assertNotDeleting(tx));
+  });
+
+  it('finishDeletion removes a row that slipped in before it frees the id', async () => {
+    const { staffId } = await head();
+    expect((await deleteBusinessRows({ businessId: ACME, staffId, typedName: ACME_NAME })).ok).toBe(true);
+    await testDb().query(
+      `INSERT INTO business_profiles (business_id, display_name, updated_by) VALUES ($1, 'יתום', 'test')`,
+      [ACME],
+    );
+    expect((await deleteBusinessFiles(ACME)).ok).toBe(true);
+    expect(await finishDeletion(ACME)).toBe(true);
+    expect(await count('SELECT count(*) AS n FROM business_profiles WHERE business_id = $1', [ACME])).toBe(0);
+    expect(await statusOf(ACME)).toBeNull();
   });
 });

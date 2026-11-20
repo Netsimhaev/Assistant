@@ -32,11 +32,12 @@
 import { lstat, rm } from 'node:fs/promises';
 import { basename, dirname, relative, resolve, sep } from 'node:path';
 import { config } from '../config.js';
-import { isValidBusinessId, withBusiness } from '../db/pool.js';
+import { isValidBusinessId, withBusiness, withBusinessTransaction, type BusinessDb } from '../db/pool.js';
 import { listGrants, readGrantBySystem } from '../governance/oauth-grants.js';
 import { revokeAtProvider, revokeUrlForProvider } from '../governance/oauth-provider-revoke.js';
 import { withPlatform } from '../db/platform-pool.js';
 import { businessFolders, countFilesUnder } from './paths.js';
+import { BusinessDeletingError, getBusiness } from './businesses.js';
 
 export type DeletionRefusal = 'not_head' | 'not_suspended' | 'name_mismatch' | 'pass_in_flight' | 'unknown_business';
 
@@ -48,6 +49,49 @@ export const DELETION_REFUSAL_HE: Readonly<Record<DeletionRefusal, string>> = {
   pass_in_flight: 'העוזרת עובדת על העסק הזה ברגע זה. כדאי לנסות שוב בעוד כמה דקות.',
   unknown_business: 'העסק לא נמצא.',
 };
+
+/**
+ * The advisory-lock key shared by the deletion (exclusive) and every
+ * per-business panel write (shared): `hashtext(BUSINESS_DELETE_LOCK_PREFIX || id)`.
+ * Advisory locks are database-wide, so a write on the app pool and the
+ * deletion on the platform pool serialise: either the write commits before
+ * the deletion takes the lock (and its rows are deleted with the rest), or
+ * the deletion has committed and the write sees `deleting` and refuses.
+ */
+export const BUSINESS_DELETE_LOCK_PREFIX = 'business-delete:';
+
+const LOCK_EXCLUSIVE_SQL = 'SELECT pg_advisory_xact_lock(hashtext($1 || $2))';
+const LOCK_SHARED_SQL = 'SELECT pg_advisory_xact_lock_shared(hashtext($1 || $2))';
+
+/**
+ * Inside the caller's writing transaction: take the shared deletion lock,
+ * then re-read the status and throw `BusinessDeletingError` when the business
+ * is being deleted or no longer registered. Throws if `tx` is not inside a
+ * transaction — a transaction-scoped lock taken outside one is released at
+ * once and guards nothing.
+ *
+ * The status re-read runs on the PLATFORM pool while `tx` holds an APP-pool
+ * connection: two different pools, so this is not hold-and-wait within one
+ * pool (CLAUDE.md, "ריבוי עסקים"). The read is a plain SELECT and does not
+ * wait on the deletion's row lock.
+ */
+export async function assertNotDeleting(tx: BusinessDb): Promise<void> {
+  if (!tx.inTransaction) throw new Error('assertNotDeleting: must run inside a transaction');
+  await tx.query(LOCK_SHARED_SQL, [BUSINESS_DELETE_LOCK_PREFIX, tx.businessId]);
+  const biz = await getBusiness(tx.businessId);
+  if (biz === null || biz.status === 'deleting') throw new BusinessDeletingError(tx.businessId);
+}
+
+/**
+ * One business transaction that starts with `assertNotDeleting`: the form
+ * every per-business panel write takes.
+ */
+export async function withBusinessWriteGuard<T>(businessId: string, fn: (tx: BusinessDb) => Promise<T>): Promise<T> {
+  return withBusinessTransaction(businessId, async (tx) => {
+    await assertNotDeleting(tx);
+    return fn(tx);
+  });
+}
 
 /**
  * Ruling 4: a pass is in flight when it started after the last one finished,
@@ -139,6 +183,9 @@ export async function deleteBusinessRows(input: DeleteBusinessRowsInput): Promis
         await db.query('ROLLBACK');
         return { ok: false, refusal };
       };
+      // Exclusive: waits for every panel write that holds the shared lock to
+      // commit, and holds new ones off until this transaction ends.
+      await db.query(LOCK_EXCLUSIVE_SQL, [BUSINESS_DELETE_LOCK_PREFIX, businessId]);
       const { rows: bizRows } = await db.query<{ display_name: string; status: string; in_flight: boolean }>(
         `SELECT display_name, status, ${PASS_IN_FLIGHT_SQL} AS in_flight
            FROM businesses WHERE business_id = $1 FOR UPDATE`,
@@ -293,11 +340,30 @@ export async function finishDeletion(businessId: string): Promise<boolean> {
     if (await folderExists(folder)) return false;
   }
   return withPlatform(async (db) => {
-    const { rowCount } = await db.query(
-      `DELETE FROM businesses WHERE business_id = $1 AND status = 'deleting'`,
-      [businessId],
-    );
-    return (rowCount ?? 0) > 0;
+    await db.query('BEGIN');
+    try {
+      // Belt and braces: under the exclusive lock, any row that slipped in
+      // since the row step is removed before the id is freed for reuse.
+      await db.query(LOCK_EXCLUSIVE_SQL, [BUSINESS_DELETE_LOCK_PREFIX, businessId]);
+      const { rows } = await db.query<{ status: string }>(
+        'SELECT status FROM businesses WHERE business_id = $1 FOR UPDATE',
+        [businessId],
+      );
+      if (rows[0]?.status !== 'deleting') {
+        await db.query('ROLLBACK');
+        return false;
+      }
+      await db.query('SELECT table_name, deleted FROM delete_business_rows($1)', [businessId]);
+      const { rowCount } = await db.query(
+        `DELETE FROM businesses WHERE business_id = $1 AND status = 'deleting'`,
+        [businessId],
+      );
+      await db.query('COMMIT');
+      return (rowCount ?? 0) > 0;
+    } catch (err) {
+      await db.query('ROLLBACK').catch(() => {});
+      throw err;
+    }
   });
 }
 

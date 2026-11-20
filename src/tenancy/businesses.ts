@@ -36,6 +36,17 @@ export class BusinessExistsError extends TenancyError {
   }
 }
 
+/**
+ * The business is being deleted (status `deleting`, migration 081): its rows
+ * are gone, so nothing may change its status or write for it again.
+ */
+export class BusinessDeletingError extends TenancyError {
+  constructor(id: string) {
+    super(`העסק ${id} נמצא באמצע מחיקה — אי אפשר לשנות אותו`);
+    this.name = 'BusinessDeletingError';
+  }
+}
+
 function malformedIdMessage(id: string): string {
   return `מזהה עסק לא תקין "${id}" — אותיות אנגליות קטנות, ספרות ומקפים בלבד, באורך 3 עד 63`;
 }
@@ -141,10 +152,16 @@ export async function setBusinessStatus(id: string, status: BusinessStatus): Pro
       `UPDATE businesses
           SET status = $2::text,
               suspended_at = CASE WHEN $2::text = 'suspended' THEN now() ELSE NULL END
-        WHERE business_id = $1`,
+        WHERE business_id = $1 AND status <> 'deleting'`,
       [id, status],
     );
-    if (rowCount === 0) throw new BusinessIdError(`העסק ${id} לא קיים`);
+    if (rowCount !== 0) return;
+    // Conditional, not read-then-write: a resume that read `suspended` and
+    // lands after the row step committed must never mark a row-less business
+    // active (business deletion, fix round 1).
+    const { rows } = await db.query<{ status: string }>('SELECT status FROM businesses WHERE business_id = $1', [id]);
+    if (rows[0]?.status === 'deleting') throw new BusinessDeletingError(id);
+    throw new BusinessIdError(`העסק ${id} לא קיים`);
   });
 }
 

@@ -27,7 +27,7 @@
  * address is corrected: a new invite retires every unused one first.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { isValidBusinessId, RESERVED_BUSINESS_IDS, withBusiness, withBusinessTransaction } from '../db/pool.js';
+import { isValidBusinessId, RESERVED_BUSINESS_IDS, withBusiness } from '../db/pool.js';
 import { ADDRESS_MAX_CHARS, ProfileValidationError, saveAddress, saveLogo } from '../business/profile.js';
 import { LOGO_MAX_BYTES } from '../business/logo.js';
 import { assertSetupUnlocked, saveSetupPackage, SetupLockedError, SetupPackage } from '../business/setup-package.js';
@@ -38,6 +38,7 @@ import { saveRuntimeSettings } from '../tenancy/runtime-settings.js';
 import { issueOwnerLink, retireUnusedOwnerLinks } from '../dashboard/owner-links.js';
 import { EMAIL_SHAPE } from '../governance/typed-recipients.js';
 import {
+  BusinessDeletingError,
   BusinessExistsError,
   createBusiness,
   getBusiness,
@@ -45,6 +46,7 @@ import {
   TenancyError,
 } from '../tenancy/businesses.js';
 import { normaliseLogin } from '../tenancy/login.js';
+import { withBusinessWriteGuard } from '../tenancy/business-deletion.js';
 import { businessDetailForPanel, listBusinessesForPanel, setupDataForPanel } from '../tenancy/panel-reads.js';
 import { resolveLogin } from '../tenancy/platform.js';
 import { recordStaffAction, type RecordingStaff } from './record.js';
@@ -178,7 +180,14 @@ export async function handleBusinessRoute(ctx: BusinessRouteContext): Promise<bo
   if (method !== 'POST') return false;
   const handler = target.action === null ? undefined : ACTIONS.get(target.action);
   if (handler === undefined) return false;
-  await handler(ctx, target.id);
+  try {
+    await handler(ctx, target.id);
+  } catch (err) {
+    // The deletion took the business between the pre-check and the write:
+    // the write's guard (or the conditional status update) refused it.
+    if (!(err instanceof BusinessDeletingError)) throw err;
+    ctx.sendHtml(409, renderDeletingNotice(ctx.viewer, target.id));
+  }
   return true;
 }
 
@@ -228,7 +237,7 @@ async function ownerEmailProblem(email: string): Promise<string | null> {
  * unused invite of the business, and issue one for `login`.
  */
 async function issueInvite(businessId: string, login: string, staff: RecordingStaff, address?: string): Promise<string> {
-  return withBusinessTransaction(businessId, async (tx) => {
+  return withBusinessWriteGuard(businessId, async (tx) => {
     if (address !== undefined && address.trim() !== '') await saveAddress(tx, address, `staff:${staff.staffId}`);
     await retireUnusedOwnerLinks(tx, 'invite');
     return issueOwnerLink(tx, { kind: 'invite', login, issuedBy: `staff:${staff.staffId}` });
@@ -385,7 +394,7 @@ async function handleWhatsapp(ctx: BusinessRouteContext, businessId: string): Pr
     return showBusiness(ctx, businessId, 400, WHATSAPP_FIELD_TOO_LONG);
   }
   const updatedBy = `staff:${ctx.staff.staffId}`;
-  await withBusinessTransaction(businessId, async (tx) => {
+  await withBusinessWriteGuard(businessId, async (tx) => {
     await putSecret(tx, { ref: WHATSAPP_REFS.instanceId, value: instanceId, updatedBy }, ctx.masterKey);
     await putSecret(tx, { ref: WHATSAPP_REFS.token, value: token, updatedBy }, ctx.masterKey);
     await saveRuntimeSettings(tx, { whatsappEnabled: true });
@@ -434,7 +443,7 @@ async function handleSetup(ctx: BusinessRouteContext, businessId: string): Promi
     return showBusiness(ctx, businessId, 400, phone?.message ?? SETUP_ROW_INVALID);
   }
   try {
-    await withBusiness(businessId, (db) => saveSetupPackage(db, parsed.data, `staff:${ctx.staff.staffId}`));
+    await withBusinessWriteGuard(businessId, (tx) => saveSetupPackage(tx, parsed.data, `staff:${ctx.staff.staffId}`));
   } catch (err) {
     if (err instanceof SetupLockedError) return showBusiness(ctx, businessId, 409, SETUP_LOCKED);
     throw err;
@@ -455,7 +464,7 @@ async function handleSetup(ctx: BusinessRouteContext, businessId: string): Promi
  */
 async function writeWhileUnsigned<T>(businessId: string, write: (tx: BusinessDb) => Promise<T>): Promise<T | 'locked'> {
   try {
-    return await withBusinessTransaction(businessId, async (tx) => {
+    return await withBusinessWriteGuard(businessId, async (tx) => {
       await assertSetupUnlocked(tx);
       return write(tx);
     });
@@ -528,7 +537,7 @@ async function ownerLoginOf(db: BusinessDb): Promise<string | null> {
 async function handleResetLink(ctx: BusinessRouteContext, businessId: string): Promise<void> {
   const form = await ctx.readForm();
   if (!(await admitted(ctx, form, businessId))) return;
-  const token = await withBusinessTransaction(businessId, async (tx) => {
+  const token = await withBusinessWriteGuard(businessId, async (tx) => {
     const login = await ownerLoginOf(tx);
     if (login === null) return null;
     return issueOwnerLink(tx, { kind: 'password_reset', login, issuedBy: `staff:${ctx.staff.staffId}` });
@@ -543,7 +552,7 @@ async function handleResetLink(ctx: BusinessRouteContext, businessId: string): P
 async function handleTotpReset(ctx: BusinessRouteContext, businessId: string): Promise<void> {
   const form = await ctx.readForm();
   if (!(await admitted(ctx, form, businessId))) return;
-  const done = await withBusinessTransaction(businessId, async (tx) => {
+  const done = await withBusinessWriteGuard(businessId, async (tx) => {
     if ((await ownerLoginOf(tx)) === null) return false;
     await resetSecondFactor(tx, OWNER_USERNAME);
     return true;

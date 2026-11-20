@@ -536,7 +536,7 @@ export const DELETED_ITEMS: readonly string[] = [
 /** What the deletion does not reach (spec, "What is not deleted"). */
 export const NOT_DELETED_ITEMS: readonly string[] = [
   'מה שנמצא אצל הספקים ושייך ללקוח: המיילים בתיבה שלו, האירועים ביומן שלו והרשומות במערכות החיצוניות שלו.',
-  'חשבון הוואטסאפ (GREEN-API) וההודעות שבו.',
+  'חשבון הוואטסאפ של העסק וההודעות שבו.',
   'הקבצים בתיקיית השמירה של העסק — הם של הלקוח ונשארים.',
   'מפתחות הגישה למערכות חיצוניות נשארים פעילים אצל הספק, עד שהלקוח יבטל אותם שם.',
   'גיבויים: אם השרת או בסיס הנתונים מגובים, העסק יישאר בגיבויים ישנים עד שיוחלפו.',
@@ -613,7 +613,7 @@ export interface DeletionResultView {
   /** Summed over every table; absent on a retry of the file step. */
   rowsDeleted?: number;
   filesRemoved: number;
-  /** Folders that could not be removed, each relative to its root. */
+  /** Folders that could not be removed, each relative to its root; only the root's label is printed. */
   failed: string[];
   /** The Google revocations, when this request ran them. */
   revocation?: { attempted: number; failed: number; grantsUnreadable: boolean };
@@ -621,15 +621,32 @@ export interface DeletionResultView {
   finished: boolean;
 }
 
+/** A failed folder's root, in words; the business id under it is never printed. */
+function folderRootLabel(failed: string): string {
+  if (failed.startsWith('DOCUMENT_INBOX_ROOT/')) return 'תיקיית הקליטה';
+  if (failed.startsWith('DOCUMENT_ROOT/')) return 'תיקיית המסמכים';
+  return 'תיקייה אחרת';
+}
+
+/** One line per root: its label and how many of its folders were not removed. */
+function failedFolderLines(failed: string[]): string[] {
+  const counts = new Map<string, number>();
+  for (const f of failed) {
+    const label = folderRootLabel(f);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  return [...counts].map(([label, n]) => `${label}: ${n}`);
+}
+
 /** The result: counts only — no business name, no id outside the retry form. */
 export function renderDeletionResult(viewer: PanelViewer, r: DeletionResultView): string {
   const heading = r.finished
     ? 'העסק נמחק'
     : r.failed.length > 0
-      ? `השורות נמחקו, אבל ${r.failed.length} קבצים לא נמחקו`
+      ? `השורות נמחקו, אבל ${r.failed.length} תיקיות לא נמחקו`
       : 'השורות נמחקו, אבל המחיקה עוד לא הסתיימה';
   const lines: string[] = [];
-  if (r.rowsDeleted !== undefined) lines.push(`<dt>שורות שנמחקו</dt><dd>${r.rowsDeleted}</dd>`);
+  if (r.rowsDeleted !== undefined) lines.push(`<dt>רשומות שנמחקו</dt><dd>${r.rowsDeleted}</dd>`);
   lines.push(`<dt>קבצים שנמחקו</dt><dd>${r.filesRemoved}</dd>`);
   if (r.revocation !== undefined) {
     lines.push(`<dt>ניסיונות ביטול גישה ב-Google</dt><dd>${r.revocation.attempted}</dd>`);
@@ -644,7 +661,9 @@ export function renderDeletionResult(viewer: PanelViewer, r: DeletionResultView)
   const failedList =
     r.failed.length === 0
       ? ''
-      : `<h2>תיקיות שלא נמחקו</h2>\n<ul>\n${r.failed.map((f) => `<li dir="ltr">${escLabel(f)}</li>`).join('\n')}\n</ul>`;
+      : `<h2>תיקיות שלא נמחקו</h2>\n<ul>\n${failedFolderLines(r.failed)
+          .map((line) => `<li>${esc(line)}</li>`)
+          .join('\n')}\n</ul>`;
   const retry = r.finished ? '' : retryForm(viewer, r.businessId);
   return page(
     heading,
