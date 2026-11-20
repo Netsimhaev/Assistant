@@ -42,6 +42,7 @@ import { appendAudit } from '../audit/log.js';
 import { activeCharterVersion } from '../charter/store.js';
 import { withBusiness } from '../db/pool.js';
 import { withDeadline } from '../governance/notify.js';
+import { recordPassEnd, recordPassStart } from '../tenancy/business-deletion.js';
 import { listActiveBusinesses } from '../tenancy/platform.js';
 import { canonicalHash } from '../util/canonical.js';
 import { businessRuntime, type Runtime, type ServerRuntime } from './runtime.js';
@@ -52,6 +53,9 @@ export const SCHEDULER_BUSINESS_DEADLINE_MS = 120_000;
 
 /** The default interval, and so the default time budget of one loop. */
 export const SCHEDULER_INTERVAL_MS = 30_000;
+
+/** How long one heartbeat write may take; it is best-effort. */
+const HEARTBEAT_TIMEOUT_MS = 5_000;
 
 /** How long recording a failure may take; it is best-effort. */
 const FAILURE_AUDIT_TIMEOUT_MS = 5_000;
@@ -90,6 +94,8 @@ export interface RunAllBusinessesOptions {
   onPass?: (businessId: string, result: SchedulerPassResult, warnings: readonly string[]) => void;
   /** Test seam: replaces `schedulerPass`. Production leaves it unset. */
   pass?: TenantPass;
+  /** Test seam: replaces the heartbeat writes. Production leaves it unset. */
+  heartbeat?: { start: (businessId: string) => Promise<void>; end: (businessId: string) => Promise<void> };
 }
 
 /**
@@ -139,6 +145,22 @@ async function recordPassFailure(businessId: string, reason: 'threw' | 'deadline
   }
 }
 
+/**
+ * One heartbeat write (business deletion's "is a pass in flight?",
+ * `passInFlight`), best effort: bounded by its own timeout, and a failure is
+ * logged by its error code or class only — never its message, which can carry
+ * whatever the connection was holding — and never stops the pass.
+ */
+async function beat(write: (businessId: string) => Promise<void>, businessId: string, which: 'start' | 'end'): Promise<void> {
+  try {
+    await withDeadline(write(businessId), HEARTBEAT_TIMEOUT_MS, 'דופק הסבב');
+  } catch (err) {
+    const code = (err as { code?: unknown } | null)?.code;
+    const label = typeof code === 'string' ? code : err instanceof Error ? err.constructor.name : typeof err;
+    console.error(`[scheduler] ${businessId}: pass heartbeat (${which}) not recorded: ${label}`);
+  }
+}
+
 type Outcome = { ok: true; result: SchedulerPassResult; warnings: readonly string[] } | { ok: false };
 
 export async function runAllBusinesses(
@@ -148,6 +170,7 @@ export async function runAllBusinesses(
   const { state } = options;
   const pass: TenantPass = options.pass ?? schedulerPass;
   const budgetMs = options.budgetMs ?? SCHEDULER_INTERVAL_MS;
+  const heartbeat = options.heartbeat ?? { start: recordPassStart, end: recordPassEnd };
 
   const report: TenantPassReport = { ran: [], skippedInFlight: [], failed: [], notReached: [] };
   const order = rotate(await listActiveBusinesses(), state.resumeFrom);
@@ -170,14 +193,23 @@ export async function runAllBusinesses(
 
     state.inFlight.add(businessId);
     const work: Promise<Outcome> = (async (): Promise<Outcome> => {
-      // The runtime's connection is released before the pass starts: nothing
-      // is held across the pass (see the bound in the docblock).
-      const runtime = await withBusiness(businessId, (db) => businessRuntime(server, db));
-      const result = await pass(businessId, {
-        runtime,
-        ...(options.now !== undefined ? { now: options.now } : {}),
-      });
-      return { ok: true as const, result, warnings: runtime.warnings };
+      // The heartbeat brackets the REAL pass: its end is written when the
+      // pass actually settles, never when the deadline below fires — a pass
+      // that overruns its deadline is still in flight, and deleting the
+      // business must keep waiting for it.
+      await beat(heartbeat.start, businessId, 'start');
+      try {
+        // The runtime's connection is released before the pass starts: nothing
+        // is held across the pass (see the bound in the docblock).
+        const runtime = await withBusiness(businessId, (db) => businessRuntime(server, db));
+        const result = await pass(businessId, {
+          runtime,
+          ...(options.now !== undefined ? { now: options.now } : {}),
+        });
+        return { ok: true as const, result, warnings: runtime.warnings };
+      } finally {
+        await beat(heartbeat.end, businessId, 'end');
+      }
     })()
       .catch((): Outcome => ({ ok: false }))
       .finally(() => {

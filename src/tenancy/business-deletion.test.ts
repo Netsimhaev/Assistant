@@ -28,7 +28,15 @@ import {
   passInFlight,
   recordPassEnd,
   recordPassStart,
+  revokeBusinessGrants,
 } from './business-deletion.js';
+import { randomBytes } from 'node:crypto';
+import { vi } from 'vitest';
+import { withBusiness } from '../db/pool.js';
+import { writeKeyState } from '../governance/master-key.js';
+import { revokeGrant, writeGrant } from '../governance/oauth-grants.js';
+import { revokeUrlForProvider } from '../governance/oauth-provider-revoke.js';
+import { oauthProfileFor } from '../dashboard/oauth-profiles.js';
 import { BusinessExistsError, createBusiness, getBusiness, TenancyError } from './businesses.js';
 import { businessFolders, countFilesUnder } from './paths.js';
 
@@ -497,6 +505,183 @@ describe('the whole chain, then the same id again', () => {
     expect(await countFilesUnder(f.document)).toBe(0);
     expect(await countFilesUnder(f.inbox)).toBe(0);
     expect(await countFilesUnder(f.save)).toBe(0);
+  });
+});
+
+describe('revokeBusinessGrants — at the provider, before the rows go', () => {
+  const KEY = randomBytes(32);
+  const TOKENS = ['refresh-token-AAA-secret', 'refresh-token-BBB-secret', 'refresh-token-MS-secret'];
+
+  interface Call {
+    url: string;
+    init: RequestInit | undefined;
+  }
+
+  function stubFetch(calls: Call[], fail: (n: number) => boolean = () => false): typeof fetch {
+    return (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      if (fail(calls.length)) return new Response('nope', { status: 400 });
+      return new Response('', { status: 200 });
+    }) as typeof fetch;
+  }
+
+  async function grant(system: string, provider: string, refreshToken: string): Promise<void> {
+    await withBusiness(ACME, (bdb) =>
+      writeGrant(
+        bdb,
+        { system, provider, credentialRef: system.toUpperCase().replace(/-/g, '_'), account: 'owner@example.com', scopes: ['s'], refreshToken, grantedBy: 'owner' },
+        KEY,
+      ),
+    );
+  }
+
+  beforeEach(async () => {
+    await writeKeyState(KEY, 'KEY-test', testDb());
+  });
+
+  it('POSTs each live Google grant once, the token only in the body, and skips a revoked grant', async () => {
+    await grant('mailbox', 'google', TOKENS[0]!);
+    await grant('calendar', 'google', TOKENS[1]!);
+    await grant('office-calendar', 'google', 'refresh-token-REVOKED');
+    await withBusiness(ACME, (bdb) => revokeGrant(bdb, 'office-calendar', 'owner'));
+    const calls: Call[] = [];
+    const result = await revokeBusinessGrants({ businessId: ACME, staffId: headId, key: KEY }, { fetchImpl: stubFetch(calls) });
+    expect(result).toEqual({ ok: true, attempted: 2, failed: 0, grantsUnreadable: false });
+    expect(calls).toHaveLength(2);
+    const bodies = calls.map((c) => String(c.init?.body));
+    for (const [i, c] of calls.entries()) {
+      expect(c.url).toBe('https://oauth2.googleapis.com/revoke');
+      expect(c.init?.method).toBe('POST');
+      const headers = JSON.stringify(c.init?.headers ?? {});
+      for (const t of TOKENS) {
+        expect(c.url).not.toContain(t);
+        expect(headers).not.toContain(t);
+      }
+      expect(bodies[i]).toMatch(/^token=refresh-token-/);
+    }
+    expect(bodies.some((b) => b.includes(TOKENS[0]!))).toBe(true);
+    expect(bodies.some((b) => b.includes(TOKENS[1]!))).toBe(true);
+    expect(bodies.some((b) => b.includes('REVOKED'))).toBe(false);
+  });
+
+  it('sends no POST for a Microsoft grant, and does not count it as attempted', async () => {
+    await grant('mailbox', 'microsoft', TOKENS[2]!);
+    const calls: Call[] = [];
+    const result = await revokeBusinessGrants({ businessId: ACME, staffId: headId, key: KEY }, { fetchImpl: stubFetch(calls) });
+    expect(result).toEqual({ ok: true, attempted: 0, failed: 0, grantsUnreadable: false });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a failing POST, a throwing fetch, and an unopenable grant count as failed; nothing throws', async () => {
+    await grant('mailbox', 'google', TOKENS[0]!);
+    await grant('calendar', 'google', TOKENS[1]!);
+    const calls: Call[] = [];
+    expect(
+      await revokeBusinessGrants({ businessId: ACME, staffId: headId, key: KEY }, { fetchImpl: stubFetch(calls, (n) => n === 2) }),
+    ).toEqual({ ok: true, attempted: 2, failed: 1, grantsUnreadable: false });
+
+    const throwing = (async () => {
+      throw new Error(`network down ${TOKENS[0]}`);
+    }) as typeof fetch;
+    expect(await revokeBusinessGrants({ businessId: ACME, staffId: headId, key: KEY }, { fetchImpl: throwing })).toEqual({
+      ok: true,
+      attempted: 2,
+      failed: 2,
+      grantsUnreadable: false,
+    });
+
+    // A wrong key: each grant fails to decrypt — attempted and failed, no POST.
+    const none: Call[] = [];
+    expect(
+      await revokeBusinessGrants({ businessId: ACME, staffId: headId, key: randomBytes(32) }, { fetchImpl: stubFetch(none) }),
+    ).toEqual({ ok: true, attempted: 2, failed: 2, grantsUnreadable: false });
+    expect(none).toHaveLength(0);
+  });
+
+  it('stops waiting at the deadline and counts the hung POST as failed', async () => {
+    await grant('mailbox', 'google', TOKENS[0]!);
+    let aborted = false;
+    const hanging = ((_u: string, init?: RequestInit) =>
+      new Promise<Response>(() => {
+        init?.signal?.addEventListener('abort', () => {
+          aborted = true;
+        });
+      })) as unknown as typeof fetch;
+    const result = await revokeBusinessGrants(
+      { businessId: ACME, staffId: headId, key: KEY },
+      { fetchImpl: hanging, deadlineMs: 50 },
+    );
+    expect(result).toEqual({ ok: true, attempted: 1, failed: 1, grantsUnreadable: false });
+    expect(aborted).toBe(true);
+  });
+
+  it('never writes a token to the console', async () => {
+    await grant('mailbox', 'google', TOKENS[0]!);
+    await grant('calendar', 'google', TOKENS[1]!);
+    const spies = (['log', 'error', 'warn', 'info', 'debug'] as const).map((m) =>
+      vi.spyOn(console, m).mockImplementation(() => {}),
+    );
+    try {
+      const throwing = (async () => {
+        throw new Error(`boom ${TOKENS[0]} ${TOKENS[1]}`);
+      }) as typeof fetch;
+      await revokeBusinessGrants({ businessId: ACME, staffId: headId, key: KEY }, { fetchImpl: throwing });
+      await revokeBusinessGrants({ businessId: ACME, staffId: headId, key: KEY }, { fetchImpl: stubFetch([], () => true) });
+      const logged = JSON.stringify(spies.flatMap((s) => s.mock.calls));
+      for (const t of TOKENS) expect(logged).not.toContain(t);
+    } finally {
+      for (const s of spies) s.mockRestore();
+    }
+  });
+
+  it('refuses an active business, a staff member who is not a head admin, an unknown id and a malformed one — never calling the provider', async () => {
+    await grant('mailbox', 'google', TOKENS[0]!);
+    await withBusiness(ACME2, (bdb) =>
+      writeGrant(
+        bdb,
+        { system: 'mailbox', provider: 'google', credentialRef: 'MAILBOX', account: 'o@example.com', scopes: ['s'], refreshToken: TOKENS[1]!, grantedBy: 'owner' },
+        KEY,
+      ),
+    );
+    const plain = `ST-${ulid()}`;
+    await testDb().query(`INSERT INTO platform_staff (staff_id, login, display_name) VALUES ($1, $2, 'טכנאי')`, [
+      plain,
+      `tech-${ulid().toLowerCase()}@example.com`,
+    ]);
+    const calls: Call[] = [];
+    const fetchImpl = stubFetch(calls);
+    expect(await revokeBusinessGrants({ businessId: ACME2, staffId: headId, key: KEY }, { fetchImpl })).toEqual({
+      ok: false,
+      refusal: 'not_suspended',
+    });
+    expect(await revokeBusinessGrants({ businessId: ACME, staffId: plain, key: KEY }, { fetchImpl })).toEqual({
+      ok: false,
+      refusal: 'not_head',
+    });
+    expect(await revokeBusinessGrants({ businessId: 'nobody-here', staffId: headId, key: KEY }, { fetchImpl })).toEqual({
+      ok: false,
+      refusal: 'unknown_business',
+    });
+    expect(await revokeBusinessGrants({ businessId: '../x', staffId: headId, key: KEY }, { fetchImpl })).toEqual({
+      ok: false,
+      refusal: 'unknown_business',
+    });
+    expect(calls).toHaveLength(0);
+    for (const r of ['not_suspended', 'not_head', 'unknown_business'] as const) expect(DELETION_REFUSAL_HE[r]).toBeTruthy();
+  });
+
+  it('the provider revoke URL agrees with every OAuth profile', () => {
+    for (const provider of ['google', 'microsoft'] as const) {
+      for (const connection of [
+        { system: 'mailbox', serves: ['mail.send'] },
+        { system: 'calendar', serves: ['calendar.read', 'calendar.write'] },
+      ]) {
+        const profile = oauthProfileFor(connection as never, provider);
+        expect(profile).not.toBeNull();
+        expect(revokeUrlForProvider(profile!.provider)).toBe(profile!.revokeUrl);
+      }
+    }
+    expect(revokeUrlForProvider('something-else')).toBeNull();
   });
 });
 

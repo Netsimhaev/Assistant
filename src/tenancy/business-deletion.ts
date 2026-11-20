@@ -2,9 +2,12 @@
  * Deleting a whole business — the tenancy half (spec
  * docs/superpowers/specs/2026-11-19-business-deletion-design.md).
  *
- * Three steps, in this order, each one its own call so a retry can re-run
+ * Four steps, in this order, each one its own call so a retry can re-run
  * only what did not finish:
  *
+ * 0. `revokeBusinessGrants` — before the rows go: each live Google grant's
+ *    token is revoked at the provider, so the customer's account does not
+ *    keep a live grant to an application that no longer holds its row.
  * 1. `deleteBusinessRows` — in ONE platform transaction: lock the registry
  *    row, re-check every guard against what the database says now (the head
  *    admin, the suspension, the exact name, no scheduler pass in flight), run
@@ -29,7 +32,9 @@
 import { lstat, rm } from 'node:fs/promises';
 import { basename, dirname, relative, resolve, sep } from 'node:path';
 import { config } from '../config.js';
-import { isValidBusinessId } from '../db/pool.js';
+import { isValidBusinessId, withBusiness } from '../db/pool.js';
+import { listGrants, readGrantBySystem } from '../governance/oauth-grants.js';
+import { revokeAtProvider, revokeUrlForProvider } from '../governance/oauth-provider-revoke.js';
 import { withPlatform } from '../db/platform-pool.js';
 import { businessFolders, countFilesUnder } from './paths.js';
 
@@ -284,4 +289,126 @@ export async function finishDeletion(businessId: string): Promise<boolean> {
     );
     return (rowCount ?? 0) > 0;
   });
+}
+
+/** How long one provider revocation may take before it counts as failed. */
+export const PROVIDER_REVOKE_DEADLINE_MS = 10_000;
+
+export interface RevokeBusinessGrantsInput {
+  businessId: string;
+  /** The staff member asking — re-checked here as a live head admin. */
+  staffId: string;
+  /** The server's master key: the grants' refresh tokens are sealed under it. */
+  key: Buffer;
+}
+
+export interface RevokeBusinessGrantsDeps {
+  fetchImpl?: typeof fetch;
+  /** Defaults to `PROVIDER_REVOKE_DEADLINE_MS`. */
+  deadlineMs?: number;
+}
+
+export type RevokeBusinessGrantsResult =
+  | {
+      ok: true;
+      attempted: number;
+      failed: number;
+      /** The grants could not be read at all — how many there were, and so whether any stays live at a provider, is unknown. */
+      grantsUnreadable: boolean;
+    }
+  | { ok: false; refusal: Extract<DeletionRefusal, 'not_head' | 'not_suspended' | 'unknown_business'> };
+
+/**
+ * The step before the rows go: revoke each live OAuth grant of the business
+ * at its provider.
+ *
+ * **Gated on the database, like the file step.** This revokes the customer's
+ * Google access, so it refuses — touching nothing and calling no provider —
+ * unless the registry says the business is `suspended` and `staffId` is a
+ * live head admin, both read here on the platform pool. A route that forgets
+ * to check cannot reach an active business through this function. A
+ * malformed id is refused as `unknown_business`, without throwing.
+ *
+ * **It does not mark anything revoked locally.** The grant rows are deleted
+ * by `deleteBusinessRows` right after; a local mark would only be one more
+ * write to undo if the deletion is abandoned.
+ *
+ * Per live grant (`listGrants`, `revokedAt === null`): a provider with no
+ * revocation endpoint (Microsoft, `revokeUrlForProvider` → `null`) is skipped
+ * and not counted; otherwise the refresh token is opened (the same
+ * `readGrantBySystem` the owner's disconnect uses — a grant stores only a
+ * refresh token) and POSTed to the provider within `deadlineMs`. A grant that
+ * will not open counts as attempted and failed. `failed` is how many of the
+ * attempted did not come back 2xx.
+ *
+ * Never throws once the gate has passed, and never logs: a token or a
+ * provider's error text must not reach a log line.
+ */
+export async function revokeBusinessGrants(
+  input: RevokeBusinessGrantsInput,
+  deps: RevokeBusinessGrantsDeps = {},
+): Promise<RevokeBusinessGrantsResult> {
+  const { businessId, staffId, key } = input;
+  if (!isValidBusinessId(businessId)) return { ok: false, refusal: 'unknown_business' };
+
+  const gate = await withPlatform(async (db) => {
+    const { rows: bizRows } = await db.query<{ status: string }>(
+      'SELECT status FROM businesses WHERE business_id = $1',
+      [businessId],
+    );
+    const biz = bizRows[0];
+    if (biz === undefined) return 'unknown_business' as const;
+    const { rows: staffRows } = await db.query(
+      'SELECT 1 FROM platform_staff WHERE staff_id = $1 AND removed_at IS NULL AND is_head',
+      [staffId],
+    );
+    if (staffRows.length === 0) return 'not_head' as const;
+    if (biz.status !== 'suspended') return 'not_suspended' as const;
+    return null;
+  });
+  if (gate !== null) return { ok: false, refusal: gate };
+
+  const deadlineMs = deps.deadlineMs ?? PROVIDER_REVOKE_DEADLINE_MS;
+  let attempted = 0;
+  let failed = 0;
+  let grantsUnreadable = false;
+  try {
+    // The tokens are opened inside the business's own wall, and held only
+    // here; the network calls happen after the connection is released.
+    const tokens = await withBusiness(businessId, async (db) => {
+      const out: Array<{ revokeUrl: string; token: string | null }> = [];
+      for (const summary of await listGrants(db)) {
+        if (summary.revokedAt !== null) continue;
+        const revokeUrl = revokeUrlForProvider(summary.provider);
+        if (revokeUrl === null) continue;
+        let token: string | null = null;
+        try {
+          token = (await readGrantBySystem(db, summary.system, key))?.refreshToken ?? null;
+        } catch {
+          token = null;
+        }
+        out.push({ revokeUrl, token });
+      }
+      return out;
+    });
+    for (const { revokeUrl, token } of tokens) {
+      attempted += 1;
+      if (token === null) {
+        failed += 1;
+        continue;
+      }
+      const outcome = await revokeAtProvider({
+        revokeUrl,
+        token,
+        deadlineMs,
+        ...(deps.fetchImpl !== undefined ? { fetchImpl: deps.fetchImpl } : {}),
+      });
+      if (outcome !== 'revoked') failed += 1;
+    }
+  } catch {
+    // Reading the grants failed outright: say so, rather than a zero that
+    // reads as "nothing to revoke". The caller decides whether to go on.
+    grantsUnreadable = true;
+  }
+  return { ok: true, attempted, failed, grantsUnreadable };
 }
