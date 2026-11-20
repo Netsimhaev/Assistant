@@ -1,8 +1,7 @@
 import { mkdir } from 'node:fs/promises';
 import { withPlatform } from '../db/platform-pool.js';
 import { isValidBusinessId, RESERVED_BUSINESS_IDS } from '../db/pool.js';
-import { countFilesUnder } from './business-deletion.js';
-import { businessFolders, businessSaveRoot } from './paths.js';
+import { businessFolders, businessSaveRoot, countFilesUnder } from './paths.js';
 
 /** A refusal meant for the platform operator; the message is Hebrew. */
 export class TenancyError extends Error {

@@ -26,12 +26,12 @@
  * only production file that names `delete_business_rows` (pinned by
  * `business-deletion.test.ts`).
  */
-import { lstat, readdir, rm } from 'node:fs/promises';
-import { relative, sep } from 'node:path';
+import { lstat, rm } from 'node:fs/promises';
+import { basename, dirname, relative, resolve, sep } from 'node:path';
 import { config } from '../config.js';
 import { isValidBusinessId } from '../db/pool.js';
 import { withPlatform } from '../db/platform-pool.js';
-import { businessFolders } from './paths.js';
+import { businessFolders, countFilesUnder } from './paths.js';
 
 export type DeletionRefusal = 'not_head' | 'not_suspended' | 'name_mismatch' | 'pass_in_flight' | 'unknown_business';
 
@@ -78,11 +78,20 @@ export async function passInFlight(businessId: string): Promise<boolean> {
   });
 }
 
+/**
+ * Trims ASCII whitespace (space, tab, CR, LF) from both ends — and nothing
+ * else. `String.prototype.trim` also strips U+FEFF and other Unicode spaces,
+ * which would let a name carrying an invisible mark match.
+ */
+function trimAscii(value: string): string {
+  return value.replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, '');
+}
+
 export interface DeleteBusinessRowsInput {
   businessId: string;
   /** The staff member asking — re-checked here as a live head admin. */
   staffId: string;
-  /** The business's name as the head admin typed it. Only its ends are trimmed. */
+  /** The business's name as the head admin typed it. Only ASCII whitespace at its ends is trimmed. */
   typedName: string;
 }
 
@@ -96,7 +105,7 @@ export type DeleteBusinessRowsResult =
  * decides nothing: a head role removed since, a business resumed since, a
  * pass that started since — each refuses.
  *
- * The name must match exactly after trimming both ends: no case folding, no
+ * The name must match exactly after trimming ASCII whitespace at both ends: no case folding, no
  * collapsing of inner spaces, no stripping of invisible marks. A name typed
  * with a doubled space or a hidden direction mark is not the name.
  *
@@ -131,7 +140,7 @@ export async function deleteBusinessRows(input: DeleteBusinessRowsInput): Promis
       );
       if (staffRows.length === 0) return await refuse('not_head');
       if (biz.status !== 'suspended') return await refuse('not_suspended');
-      if (typedName.trim() !== biz.display_name.trim()) return await refuse('name_mismatch');
+      if (trimAscii(typedName) !== trimAscii(biz.display_name)) return await refuse('name_mismatch');
       if (biz.in_flight) return await refuse('pass_in_flight');
 
       const { rows: deleted } = await db.query<{ table_name: string; deleted: string }>(
@@ -151,21 +160,6 @@ export async function deleteBusinessRows(input: DeleteBusinessRowsInput): Promis
   });
 }
 
-/**
- * How many files (anything that is not a directory, links included) sit
- * under `folder`, recursively. A missing folder holds none.
- */
-export async function countFilesUnder(folder: string): Promise<number> {
-  let entries;
-  try {
-    entries = await readdir(folder, { recursive: true, withFileTypes: true });
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 0;
-    throw err;
-  }
-  return entries.filter((e) => !e.isDirectory()).length;
-}
-
 type RmFn = (path: string, options: { recursive: true; force: true }) => Promise<void>;
 
 /** Test seam only; ignored outside tests. */
@@ -173,7 +167,21 @@ export interface DeleteFilesTestSeam {
   rm?: RmFn;
 }
 
-/** The document and inbox folders of a business, each with a label for its root. */
+export type FileDeletionRefusal = 'not_deleting';
+
+/** What the head admin reads when the file step is refused. Plain Hebrew. */
+export const FILE_DELETION_REFUSAL_HE: Readonly<Record<FileDeletionRefusal, string>> = {
+  not_deleting: 'אפשר למחוק את הקבצים רק של עסק שמחיקת הנתונים שלו כבר בוצעה.',
+};
+
+export type DeleteBusinessFilesResult =
+  | { ok: true; removed: number; failed: string[] }
+  | { ok: false; refusal: FileDeletionRefusal };
+
+/**
+ * The document and inbox folders of a business, each with a label for its
+ * root. Only for an id that already passed `isValidBusinessId`.
+ */
 function deletableFolders(businessId: string): Array<{ label: string; root: string; folder: string }> {
   const folders = businessFolders(businessId);
   const out = [{ label: 'DOCUMENT_ROOT', root: config.documentRoot, folder: folders.document }];
@@ -184,30 +192,68 @@ function deletableFolders(businessId: string): Array<{ label: string; root: stri
 }
 
 /**
+ * Is `folder` exactly `<root>/<businessId>` — the root its direct parent, the
+ * id its last segment? Checked again right before each `rm`, as a second wall
+ * behind `businessFolders`: a recursive removal that ever reached the root
+ * itself, or a sibling, would delete other businesses' files.
+ */
+function isBusinessFolderUnder(folder: string, root: string, businessId: string): boolean {
+  const resolved = resolve(folder);
+  return dirname(resolved) === resolve(root) && basename(resolved) === businessId;
+}
+
+/**
  * The file step: removes `<DOCUMENT_ROOT>/<id>` and `<DOCUMENT_INBOX_ROOT>/<id>`
- * whole. Never the save folder. `removed` counts the files under each folder
- * that was removed (counted before removing); `failed` names each folder that
- * could not be removed by its root's name and the path under it — never an
- * absolute server path, since it reaches a screen.
+ * whole. Never the save folder.
+ *
+ * Gated on the database: only a business whose registry row says `deleting`
+ * — its rows already gone (`deleteBusinessRows`) — loses its files. Any other
+ * status, a missing row or a malformed id is refused and nothing is touched.
+ * The row is held `FOR SHARE` until the folders are removed, so it cannot be
+ * finished and the id re-created in between.
+ *
+ * `removed` counts the files under each folder that was removed (counted
+ * before removing); `failed` names each folder that could not be removed by
+ * its root's name and the path under it — never an absolute server path,
+ * since it reaches a screen.
  */
 export async function deleteBusinessFiles(
   businessId: string,
   testSeam?: DeleteFilesTestSeam,
-): Promise<{ removed: number; failed: string[] }> {
+): Promise<DeleteBusinessFilesResult> {
+  if (!isValidBusinessId(businessId)) return { ok: false, refusal: 'not_deleting' };
   const remove: RmFn = (config.isTest ? testSeam?.rm : undefined) ?? rm;
-  let removed = 0;
-  const failed: string[] = [];
-  for (const { label, root, folder } of deletableFolders(businessId)) {
-    const under = relative(root, folder).split(sep).join('/');
+  return withPlatform(async (db) => {
+    await db.query('BEGIN');
     try {
-      const count = await countFilesUnder(folder);
-      await remove(folder, { recursive: true, force: true });
-      removed += count;
-    } catch {
-      failed.push(`${label}/${under}`);
+      const { rows } = await db.query<{ status: string }>(
+        'SELECT status FROM businesses WHERE business_id = $1 FOR SHARE',
+        [businessId],
+      );
+      if (rows[0]?.status !== 'deleting') {
+        await db.query('ROLLBACK');
+        return { ok: false, refusal: 'not_deleting' };
+      }
+      let removed = 0;
+      const failed: string[] = [];
+      for (const { label, root, folder } of deletableFolders(businessId)) {
+        const under = relative(root, folder).split(sep).join('/');
+        try {
+          if (!isBusinessFolderUnder(folder, root, businessId)) throw new Error('folder is not <root>/<id>');
+          const count = await countFilesUnder(folder);
+          await remove(folder, { recursive: true, force: true });
+          removed += count;
+        } catch {
+          failed.push(`${label}/${under}`);
+        }
+      }
+      await db.query('COMMIT');
+      return { ok: true, removed, failed };
+    } catch (err) {
+      await db.query('ROLLBACK').catch(() => {});
+      throw err;
     }
-  }
-  return { removed, failed };
+  });
 }
 
 async function folderExists(folder: string): Promise<boolean> {

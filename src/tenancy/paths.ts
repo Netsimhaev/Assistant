@@ -20,6 +20,7 @@
  * filesystem path, and `..` or a separator in it would be a traversal. The
  * shape check (`isValidBusinessId`) admits neither.
  */
+import { readdir } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import { config } from '../config.js';
 import { isValidBusinessId } from '../db/pool.js';
@@ -86,4 +87,19 @@ export function businessFolders(businessId: string): BusinessFolders {
     inbox: config.documentInboxRoot === null ? null : join(config.documentInboxRoot, id),
     save: config.documentSaveRoot === null ? null : join(config.documentSaveRoot, id),
   };
+}
+
+/**
+ * How many files (anything that is not a directory, links included) sit
+ * under `folder`, recursively. A missing folder holds none.
+ */
+export async function countFilesUnder(folder: string): Promise<number> {
+  let entries;
+  try {
+    entries = await readdir(folder, { recursive: true, withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+    throw err;
+  }
+  return entries.filter((e) => !e.isDirectory()).length;
 }

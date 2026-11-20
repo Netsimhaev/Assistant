@@ -23,13 +23,14 @@ import {
   DELETION_REFUSAL_HE,
   deleteBusinessFiles,
   deleteBusinessRows,
+  FILE_DELETION_REFUSAL_HE,
   finishDeletion,
   passInFlight,
   recordPassEnd,
   recordPassStart,
 } from './business-deletion.js';
 import { BusinessExistsError, createBusiness, getBusiness, TenancyError } from './businesses.js';
-import { businessFolders } from './paths.js';
+import { businessFolders, countFilesUnder } from './paths.js';
 
 const ACME = 'acme';
 const ACME2 = 'acme-2';
@@ -172,6 +173,14 @@ describe('the pass heartbeat (Ruling 4)', () => {
     expect(await passInFlight(ACME)).toBe(false);
   });
 
+  it('a pass started 29 minutes ago and never ended is still in flight (pins the 30-minute bound)', async () => {
+    await testDb().query(
+      `UPDATE businesses SET pass_started_at = now() - interval '29 minutes', pass_finished_at = NULL WHERE business_id = $1`,
+      [ACME],
+    );
+    expect(await passInFlight(ACME)).toBe(true);
+  });
+
   it('an unknown business has no pass in flight', async () => {
     expect(await passInFlight('nobody-here')).toBe(false);
   });
@@ -239,6 +248,9 @@ describe('deleteBusinessRows — refusals', () => {
     await expectRefused({ typedName: `Acme​Shop` }, 'name_mismatch');
     await expectRefused({ typedName: ACME }, 'name_mismatch');
     await expectRefused({ typedName: '' }, 'name_mismatch');
+    // String.prototype.trim would strip these; the ASCII-only trim does not.
+    await expectRefused({ typedName: `${ACME_NAME}﻿` }, 'name_mismatch');
+    await expectRefused({ typedName: ` ${ACME_NAME}` }, 'name_mismatch');
   });
 
   it('refuses while a pass is in flight', async () => {
@@ -318,10 +330,53 @@ describe('deleteBusinessFiles', () => {
     await putFile(join(a.save, 'owner-copy.docx'));
   }
 
+  async function markDeleting(id: string): Promise<void> {
+    await testDb().query(`UPDATE businesses SET status = 'deleting' WHERE business_id = $1`, [id]);
+  }
+
+  async function allSeededFilesExist(): Promise<boolean> {
+    const a = folders(ACME);
+    for (const f of [
+      join(a.document, 'DOC-1', 'original.txt'),
+      join(a.document, 'produced-copy.pdf'),
+      join(a.inbox, 'working', 'scan.pdf'),
+    ]) {
+      if (!(await exists(f))) return false;
+    }
+    return true;
+  }
+
+  it('refuses, removing nothing, for a suspended business that is not yet deleting', async () => {
+    await seedFiles();
+    expect(await deleteBusinessFiles(ACME)).toEqual({ ok: false, refusal: 'not_deleting' });
+    expect(await allSeededFilesExist()).toBe(true);
+  });
+
+  it('refuses, removing nothing, for an active business', async () => {
+    await seedFiles();
+    await testDb().query(`UPDATE businesses SET status = 'active', suspended_at = NULL WHERE business_id = $1`, [ACME]);
+    expect(await deleteBusinessFiles(ACME)).toEqual({ ok: false, refusal: 'not_deleting' });
+    expect(await allSeededFilesExist()).toBe(true);
+  });
+
+  it('refuses, removing nothing, for an unregistered id, and for a malformed one without throwing', async () => {
+    await seedFiles();
+    await testDb().query('DELETE FROM businesses WHERE business_id = $1', [ACME]);
+    expect(await deleteBusinessFiles(ACME)).toEqual({ ok: false, refusal: 'not_deleting' });
+    expect(await allSeededFilesExist()).toBe(true);
+    expect(await deleteBusinessFiles('../acme')).toEqual({ ok: false, refusal: 'not_deleting' });
+    expect(await deleteBusinessFiles('')).toEqual({ ok: false, refusal: 'not_deleting' });
+  });
+
+  it('has a plain Hebrew message for its refusal', () => {
+    expect(FILE_DELETION_REFUSAL_HE.not_deleting).toMatch(/[֐-׿]/);
+  });
+
   it("removes acme's document and inbox folders, and nothing of acme-2 nor acme's save folder", async () => {
     await seedFiles();
+    await markDeleting(ACME);
     const result = await deleteBusinessFiles(ACME);
-    expect(result).toEqual({ removed: 3, failed: [] });
+    expect(result).toEqual({ ok: true, removed: 3, failed: [] });
     expect(await exists(folders(ACME).document)).toBe(false);
     expect(await exists(folders(ACME).inbox)).toBe(false);
     expect(await exists(join(folders(ACME).save, 'owner-copy.docx'))).toBe(true);
@@ -330,11 +385,13 @@ describe('deleteBusinessFiles', () => {
   });
 
   it('is a no-op on missing folders', async () => {
-    expect(await deleteBusinessFiles(ACME)).toEqual({ removed: 0, failed: [] });
+    await markDeleting(ACME);
+    expect(await deleteBusinessFiles(ACME)).toEqual({ ok: true, removed: 0, failed: [] });
   });
 
   it('reports a failure by a path relative to its root, never an absolute server path', async () => {
     await seedFiles();
+    await markDeleting(ACME);
     const docFolder = folders(ACME).document;
     const result = await deleteBusinessFiles(ACME, {
       rm: async (path, options) => {
@@ -342,6 +399,7 @@ describe('deleteBusinessFiles', () => {
         await rm(path, options);
       },
     });
+    if (!result.ok) throw new Error(`refused: ${result.refusal}`);
     expect(result.removed).toBe(1);
     expect(result.failed).toEqual([`DOCUMENT_ROOT/${ACME}`]);
     for (const f of result.failed) {
@@ -416,6 +474,29 @@ describe('createBusiness — reusing a deleted id', () => {
     await rm(folders(ACME).inbox, { recursive: true, force: true });
     await createBusiness(ACME, 'חדש');
     expect(await getBusiness(ACME)).not.toBeNull();
+  });
+});
+
+describe('the whole chain, then the same id again', () => {
+  it('rows, files, registry row, then createBusiness: the new business starts empty', async () => {
+    expect((await seedEveryTable(tables, ACME)).failed).toEqual([]);
+    const f = folders(ACME);
+    await putFile(join(f.document, 'DOC-1', 'original.txt'));
+    await putFile(join(f.inbox, 'working', 'scan.pdf'));
+
+    const rows = await deleteBusinessRows({ businessId: ACME, staffId: headId, typedName: ACME_NAME });
+    expect(rows.ok).toBe(true);
+    expect(await deleteBusinessFiles(ACME)).toEqual({ ok: true, removed: 2, failed: [] });
+    expect(await finishDeletion(ACME)).toBe(true);
+
+    await createBusiness(ACME, 'עסק חדש');
+    expect(await getBusiness(ACME)).toEqual({ businessId: ACME, displayName: 'עסק חדש', status: 'active' });
+    // createBusiness writes only its profile row.
+    const after = await totalRows(ACME);
+    expect(Object.entries(after).filter(([, n]) => n > 0)).toEqual([['business_profiles', 1]]);
+    expect(await countFilesUnder(f.document)).toBe(0);
+    expect(await countFilesUnder(f.inbox)).toBe(0);
+    expect(await countFilesUnder(f.save)).toBe(0);
   });
 });
 
