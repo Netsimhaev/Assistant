@@ -72,6 +72,7 @@ import {
   type PanelViewer,
 } from './views.js';
 import { handleBusinessRoute, type UploadBody } from './business-routes.js';
+import { handleDeletionRoute, type DeletionTestSeams } from './business-deletion-routes.js';
 import { handleExternalRoute, tooLargeMessageFor } from './external-routes.js';
 import { adminBaseUrlFor, handleStaffRoute } from './staff-routes.js';
 import { readBoundedMultipart } from '../dashboard/multipart.js';
@@ -101,6 +102,11 @@ export interface AdminOptions {
    * business notification seam.
    */
   ownerNotice?: OwnerNoticeSender;
+  /**
+   * Test-only hooks for deleting a business (the provider fetch, the file
+   * removal). Production leaves this unset, and it is ignored outside tests.
+   */
+  deletionTestSeams?: DeletionTestSeams;
 }
 
 const SESSION_COOKIE = 'asid';
@@ -388,6 +394,7 @@ interface RouteOptions {
   documentRoot: string;
   dashboardBaseUrl: string;
   ownerNotice: OwnerNoticeSender;
+  deletionTestSeams?: DeletionTestSeams;
 }
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse, options: RouteOptions): Promise<void> {
@@ -446,6 +453,20 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, options:
   });
   if (staffHandled) return;
 
+  // Before the business routes: `/businesses/<id>/delete` would otherwise read as one of their actions.
+  const deletionHandled = await handleDeletionRoute({
+    method,
+    pathname,
+    staff: { staffId: session.staffId, displayName: session.displayName },
+    viewer: viewerOf(session),
+    masterKey: options.masterKey,
+    ...(options.deletionTestSeams !== undefined ? { testSeams: options.deletionTestSeams } : {}),
+    readForm: () => readFormBody(req),
+    csrfOk: (form) => verifyCsrfToken(session.token, form.get('csrf')),
+    sendHtml: (status, html) => sendHtml(res, status, html),
+  });
+  if (deletionHandled) return;
+
   const externalHandled = await handleExternalRoute({
     req,
     method,
@@ -494,6 +515,7 @@ export function createAdminServer(options: AdminOptions): Server {
       documentRoot: options.documentRoot,
       dashboardBaseUrl: options.dashboardBaseUrl,
       ownerNotice: options.ownerNotice ?? NO_OWNER_NOTICE,
+      ...(options.deletionTestSeams !== undefined ? { deletionTestSeams: options.deletionTestSeams } : {}),
     }).catch((err: unknown) => {
       if (err instanceof FormBodyTooLargeError) {
         const message = tooLargeMessageFor(new URL(req.url ?? '/', 'http://admin.local').pathname);

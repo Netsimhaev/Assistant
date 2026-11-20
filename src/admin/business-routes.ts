@@ -52,6 +52,7 @@ import { noticeOwner, type OwnerNoticeSender } from './owner-notice.js';
 import {
   renderBusinessList,
   renderBusinessPage,
+  renderDeletingNotice,
   renderForbidden,
   renderInviteIssued,
   renderNewBusiness,
@@ -199,6 +200,8 @@ async function charterCurrency(businessId: string): Promise<string | null> {
 async function showBusiness(ctx: BusinessRouteContext, businessId: string, status: number, error?: string): Promise<void> {
   const detail = await businessDetailForPanel(businessId);
   if (detail === null) return ctx.sendHtml(404, renderNotFound());
+  // Its rows are gone: only the note and (for a head) the file retry.
+  if (detail.status === 'deleting') return ctx.sendHtml(status, renderDeletingNotice(ctx.viewer, businessId));
   const setup = await setupDataForPanel(businessId);
   const currency = await charterCurrency(businessId);
   ctx.sendHtml(
@@ -297,6 +300,7 @@ async function handleInvite(ctx: BusinessRouteContext, businessId: string): Prom
   if (!ctx.csrfOk(form)) return ctx.sendHtml(403, renderForbidden());
   const detail = await businessDetailForPanel(businessId);
   if (detail === null) return ctx.sendHtml(404, renderNotFound());
+  if (detail.status === 'deleting') return ctx.sendHtml(409, renderDeletingNotice(ctx.viewer, businessId));
   if (detail.ownerExists) return showBusiness(ctx, businessId, 409, OWNER_ALREADY_EXISTS);
   const email = form.get('email') ?? '';
   const problem = await ownerEmailProblem(email);
@@ -317,7 +321,10 @@ async function handleInvite(ctx: BusinessRouteContext, businessId: string): Prom
 async function handleStatus(ctx: BusinessRouteContext, businessId: string, action: 'suspend' | 'resume'): Promise<void> {
   const form = await ctx.readForm();
   if (!ctx.csrfOk(form)) return ctx.sendHtml(403, renderForbidden());
-  if ((await getBusiness(businessId)) === null) return ctx.sendHtml(404, renderNotFound());
+  const biz = await getBusiness(businessId);
+  if (biz === null) return ctx.sendHtml(404, renderNotFound());
+  // A business being deleted is never resumed or re-suspended: its rows are gone.
+  if (biz.status === 'deleting') return ctx.sendHtml(409, renderDeletingNotice(ctx.viewer, businessId));
   await setBusinessStatus(businessId, action === 'suspend' ? 'suspended' : 'active');
   await recordStaffAction(ctx.staff, action === 'suspend' ? 'business_suspend' : 'business_resume', businessId);
   ctx.seeOther(`/businesses/${businessId}`);
@@ -348,8 +355,14 @@ async function admitted(ctx: BusinessRouteContext, form: URLSearchParams, busine
     ctx.sendHtml(403, renderForbidden());
     return false;
   }
-  if ((await getBusiness(businessId)) === null) {
+  const biz = await getBusiness(businessId);
+  if (biz === null) {
     ctx.sendHtml(404, renderNotFound());
+    return false;
+  }
+  // Nothing is written for a business whose rows were deleted.
+  if (biz.status === 'deleting') {
+    ctx.sendHtml(409, renderDeletingNotice(ctx.viewer, businessId));
     return false;
   }
   return true;

@@ -92,6 +92,16 @@ function trimAscii(value: string): string {
   return value.replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, '');
 }
 
+/**
+ * Does the typed name match the business's name? The one comparison every
+ * caller uses: ASCII whitespace trimmed at both ends, then exact equality.
+ * The panel calls it before anything is revoked (a typo must not revoke the
+ * customer's Google access); `deleteBusinessRows` calls it again under lock.
+ */
+export function namesMatch(typedName: string, displayName: string): boolean {
+  return trimAscii(typedName) === trimAscii(displayName);
+}
+
 export interface DeleteBusinessRowsInput {
   businessId: string;
   /** The staff member asking — re-checked here as a live head admin. */
@@ -145,7 +155,7 @@ export async function deleteBusinessRows(input: DeleteBusinessRowsInput): Promis
       );
       if (staffRows.length === 0) return await refuse('not_head');
       if (biz.status !== 'suspended') return await refuse('not_suspended');
-      if (trimAscii(typedName) !== trimAscii(biz.display_name)) return await refuse('name_mismatch');
+      if (!namesMatch(typedName, biz.display_name)) return await refuse('name_mismatch');
       if (biz.in_flight) return await refuse('pass_in_flight');
 
       const { rows: deleted } = await db.query<{ table_name: string; deleted: string }>(

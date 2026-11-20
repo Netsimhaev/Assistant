@@ -49,6 +49,7 @@ import {
   page,
   renderExternalStatusTable,
   renderForbidden,
+  renderDeletingNotice,
   renderNotFound,
   secretCell,
   type PanelViewer,
@@ -336,8 +337,14 @@ async function admitted(ctx: ExternalRouteContext, form: URLSearchParams, busine
     ctx.sendHtml(403, renderForbidden());
     return false;
   }
-  if ((await getBusiness(businessId)) === null) {
+  const biz = await getBusiness(businessId);
+  if (biz === null) {
     ctx.sendHtml(404, renderNotFound());
+    return false;
+  }
+  // Nothing is written for a business whose rows were deleted.
+  if (biz.status === 'deleting') {
+    ctx.sendHtml(409, renderDeletingNotice(ctx.viewer, businessId));
     return false;
   }
   return true;

@@ -30,7 +30,8 @@ import { canonicalHash } from '../util/canonical.js';
 export interface PanelBusinessRow {
   businessId: string;
   displayName: string;
-  status: 'active' | 'suspended';
+  /** `deleting`: the rows are gone, the files not yet (migration 081). */
+  status: 'active' | 'suspended' | 'deleting';
   setupState: 'setting_up' | 'live';
   basicDone: number;
   basicTotal: 4;
@@ -137,7 +138,7 @@ SELECT b.business_id,
 interface FactsRow {
   business_id: string;
   display_name: string;
-  status: 'active' | 'suspended';
+  status: 'active' | 'suspended' | 'deleting';
   live: boolean;
   whatsapp_saved: boolean;
   package_boss: boolean;
