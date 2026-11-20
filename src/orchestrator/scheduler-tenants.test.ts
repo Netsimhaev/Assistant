@@ -78,7 +78,7 @@ describe('runAllBusinesses', () => {
       },
     });
 
-    expect(report).toEqual({ ran: [A, B, C], skippedInFlight: [], failed: [], notReached: [] });
+    expect(report).toEqual({ ran: [A, B, C], skippedInFlight: [], skippedInactive: [], failed: [], notReached: [] });
     expect(passed).toEqual([A, B, C]);
   });
 
@@ -155,7 +155,7 @@ describe('runAllBusinesses', () => {
   it('zero active businesses completes and reports zero', async () => {
     const report = await runAllBusinesses(SERVER, { perBusinessDeadlineMs: 5_000, state: freshState() });
 
-    expect(report).toEqual({ ran: [], skippedInFlight: [], failed: [], notReached: [] });
+    expect(report).toEqual({ ran: [], skippedInFlight: [], skippedInactive: [], failed: [], notReached: [] });
     expect(tenantPassLines(report)[0]).toBe('0 businesses, ran 0, failed 0, skipped 0');
   });
 
@@ -264,7 +264,7 @@ describe('runAllBusinesses', () => {
   });
 
   it('the summary line is printed only when something went wrong or the count changed', () => {
-    const quiet = { ran: [A, B], skippedInFlight: [], failed: [], notReached: [] };
+    const quiet = { ran: [A, B], skippedInFlight: [], skippedInactive: [], failed: [], notReached: [] };
     expect(tenantPassIsNotable(quiet, null)).toBe(true);
     expect(tenantPassIsNotable(quiet, 2)).toBe(false);
     expect(tenantPassIsNotable(quiet, 3)).toBe(true);
@@ -382,6 +382,33 @@ describe('the pass heartbeat (business deletion, Ruling 4)', () => {
     expect(await passInFlight(A)).toBe(false);
   });
 
+  it('a business suspended or being deleted after the list was read is not passed, and is skipped, not failed', async () => {
+    await registerBusiness(A);
+    await registerBusiness(B);
+    await registerBusiness(C);
+    const seen: string[] = [];
+    const report = await runAllBusinesses(SERVER, {
+      perBusinessDeadlineMs: 5_000,
+      state: freshState(),
+      // A's pass changes B and C after the list was read, as a deletion would.
+      pass: recordingPass(seen, async (id) => {
+        if (id !== A) return;
+        await testDb().query(`UPDATE businesses SET status = 'suspended', suspended_at = now() WHERE business_id = $1`, [B]);
+        await testDb().query(`UPDATE businesses SET status = 'deleting' WHERE business_id = $1`, [C]);
+      }),
+    });
+    expect(seen).toEqual([A]);
+    expect(report.ran).toEqual([A]);
+    expect(report.skippedInactive).toEqual([B, C]);
+    expect(report.failed).toEqual([]);
+    // Neither heartbeat was written, and no failure was audited.
+    for (const id of [B, C]) {
+      expect(await heartbeat(id)).toEqual({ started: null, finished: null });
+      expect(await auditReasons(id)).toEqual([]);
+    }
+    expect(tenantPassLines(report).join(' | ')).toContain(`business ${B}: no longer active — skipped`);
+  });
+
   it('a heartbeat that cannot be written does not stop the pass', async () => {
     await registerBusiness(A);
     const seen: string[] = [];
@@ -391,6 +418,7 @@ describe('the pass heartbeat (business deletion, Ruling 4)', () => {
         perBusinessDeadlineMs: 5_000,
         state: freshState(),
         pass: recordingPass(seen),
+        // Fail-open: a start that THROWS is not "inactive" — the pass runs.
         heartbeat: {
           start: async () => {
             throw Object.assign(new Error('secret-ish message'), { code: '08006' });

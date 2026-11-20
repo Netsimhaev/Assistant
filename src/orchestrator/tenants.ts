@@ -71,6 +71,13 @@ export interface TenantLoopState {
 export interface TenantPassReport {
   ran: string[];
   skippedInFlight: string[];
+  /**
+   * Listed as active, but no longer active when its pass was about to start
+   * (suspended or being deleted since the list was read): the start heartbeat
+   * is conditional on `status = 'active'` and wrote nothing, so the pass did
+   * not run. Not a failure — nothing went wrong, the business just left.
+   */
+  skippedInactive: string[];
   failed: { businessId: string; reason: 'threw' | 'deadline' }[];
   notReached: string[];
 }
@@ -95,7 +102,7 @@ export interface RunAllBusinessesOptions {
   /** Test seam: replaces `schedulerPass`. Production leaves it unset. */
   pass?: TenantPass;
   /** Test seam: replaces the heartbeat writes. Production leaves it unset. */
-  heartbeat?: { start: (businessId: string) => Promise<void>; end: (businessId: string) => Promise<void> };
+  heartbeat?: { start: (businessId: string) => Promise<boolean>; end: (businessId: string) => Promise<void> };
 }
 
 /**
@@ -150,18 +157,28 @@ async function recordPassFailure(businessId: string, reason: 'threw' | 'deadline
  * `passInFlight`), best effort: bounded by its own timeout, and a failure is
  * logged by its error code or class only — never its message, which can carry
  * whatever the connection was holding — and never stops the pass.
+ *
+ * Returns what the write returned, or `'error'` when it threw or timed out.
  */
-async function beat(write: (businessId: string) => Promise<void>, businessId: string, which: 'start' | 'end'): Promise<void> {
+async function beat<T>(
+  write: (businessId: string) => Promise<T>,
+  businessId: string,
+  which: 'start' | 'end',
+): Promise<T | 'error'> {
   try {
-    await withDeadline(write(businessId), HEARTBEAT_TIMEOUT_MS, 'דופק הסבב');
+    return await withDeadline(write(businessId), HEARTBEAT_TIMEOUT_MS, 'דופק הסבב');
   } catch (err) {
     const code = (err as { code?: unknown } | null)?.code;
     const label = typeof code === 'string' ? code : err instanceof Error ? err.constructor.name : typeof err;
     console.error(`[scheduler] ${businessId}: pass heartbeat (${which}) not recorded: ${label}`);
+    return 'error';
   }
 }
 
-type Outcome = { ok: true; result: SchedulerPassResult; warnings: readonly string[] } | { ok: false };
+type Outcome =
+  | { ok: true; result: SchedulerPassResult; warnings: readonly string[] }
+  | { ok: false }
+  | { ok: 'inactive' };
 
 export async function runAllBusinesses(
   server: ServerRuntime,
@@ -172,7 +189,7 @@ export async function runAllBusinesses(
   const budgetMs = options.budgetMs ?? SCHEDULER_INTERVAL_MS;
   const heartbeat = options.heartbeat ?? { start: recordPassStart, end: recordPassEnd };
 
-  const report: TenantPassReport = { ran: [], skippedInFlight: [], failed: [], notReached: [] };
+  const report: TenantPassReport = { ran: [], skippedInFlight: [], skippedInactive: [], failed: [], notReached: [] };
   const order = rotate(await listActiveBusinesses(), state.resumeFrom);
   state.resumeFrom = null;
   // The budget is for running businesses, so its clock starts once the list is in.
@@ -197,7 +214,17 @@ export async function runAllBusinesses(
       // pass actually settles, never when the deadline below fires — a pass
       // that overruns its deadline is still in flight, and deleting the
       // business must keep waiting for it.
-      await beat(heartbeat.start, businessId, 'start');
+      //
+      // The start is conditional on the business still being `active`
+      // (`recordPassStart`): one suspended — or whose deletion committed —
+      // since the list was read gets no pass, and no end heartbeat either.
+      //
+      // FAIL-OPEN, on purpose: a start that THREW (or timed out) is not
+      // "inactive", and the pass runs as before — a flaky platform pool must
+      // not stop every business on the server. In that case the deletion
+      // does not see this pass (documented in CLAUDE.md, "מחיקת עסק שלם").
+      const started = await beat(heartbeat.start, businessId, 'start');
+      if (started === false) return { ok: 'inactive' as const };
       try {
         // The runtime's connection is released before the pass starts: nothing
         // is held across the pass (see the bound in the docblock).
@@ -225,7 +252,11 @@ export async function runAllBusinesses(
       outcome = 'deadline';
     }
 
-    if (outcome === 'deadline' || !outcome.ok) {
+    if (outcome !== 'deadline' && outcome.ok === 'inactive') {
+      report.skippedInactive.push(businessId);
+      continue;
+    }
+    if (outcome === 'deadline' || outcome.ok === false) {
       const reason = outcome === 'deadline' ? 'deadline' : 'threw';
       report.failed.push({ businessId, reason });
       await recordPassFailure(businessId, reason);

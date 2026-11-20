@@ -624,6 +624,8 @@ export interface DeletionResultView {
 /** A failed folder's root, in words; the business id under it is never printed. */
 function folderRootLabel(failed: string): string {
   if (failed.startsWith('DOCUMENT_INBOX_ROOT/')) return 'תיקיית הקליטה';
+  // Before the plain document root: its label is a prefix of this one.
+  if (failed.startsWith('DOCUMENT_ROOT/produced/')) return 'תיקיית המסמכים שהעוזרת הפיקה';
   if (failed.startsWith('DOCUMENT_ROOT/')) return 'תיקיית המסמכים';
   return 'תיקייה אחרת';
 }

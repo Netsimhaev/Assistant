@@ -13,11 +13,11 @@
  *    admin, the suspension, the exact name, no scheduler pass in flight), run
  *    `delete_business_rows` (migration 081 — every table, found at call time),
  *    and set the status to `deleting`. A refusal changes nothing.
- * 2. `deleteBusinessFiles` — the document and inbox folders. Never the save
+ * 2. `deleteBusinessFiles` — the document, produced and inbox folders. Never the save
  *    folder: those are the owner's own copies on her machine's share
  *    (`doc.save`), and a business re-created with the same id is refused
  *    while it still holds a file (`createBusiness`).
- * 3. `finishDeletion` — the registry row, last, and only once both folders
+ * 3. `finishDeletion` — the registry row, last, and only once those folders
  *    are gone. Until then the status `deleting` keeps the id taken and lets
  *    the head admin retry the file step.
  *
@@ -30,14 +30,14 @@
  * `business-deletion.test.ts`).
  */
 import { lstat, rm } from 'node:fs/promises';
-import { basename, dirname, relative, resolve, sep } from 'node:path';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { config } from '../config.js';
-import { isValidBusinessId, withBusiness, withBusinessTransaction, type BusinessDb } from '../db/pool.js';
+import { isValidBusinessId, withBusiness, withBusinessTransaction, type BusinessDb, type Queryable } from '../db/pool.js';
 import { listGrants, readGrantBySystem } from '../governance/oauth-grants.js';
 import { revokeAtProvider, revokeUrlForProvider } from '../governance/oauth-provider-revoke.js';
 import { withPlatform } from '../db/platform-pool.js';
 import { businessFolders, countFilesUnder } from './paths.js';
-import { BusinessDeletingError, getBusiness } from './businesses.js';
+import { BUSINESS_DELETE_LOCK_PREFIX, BusinessDeletingError, getBusiness } from './businesses.js';
 
 export type DeletionRefusal = 'not_head' | 'not_suspended' | 'name_mismatch' | 'pass_in_flight' | 'unknown_business';
 
@@ -51,14 +51,17 @@ export const DELETION_REFUSAL_HE: Readonly<Record<DeletionRefusal, string>> = {
 };
 
 /**
- * The advisory-lock key shared by the deletion (exclusive) and every
- * per-business panel write (shared): `hashtext(BUSINESS_DELETE_LOCK_PREFIX || id)`.
- * Advisory locks are database-wide, so a write on the app pool and the
- * deletion on the platform pool serialise: either the write commits before
- * the deletion takes the lock (and its rows are deleted with the rest), or
- * the deletion has committed and the write sees `deleting` and refuses.
+ * The advisory-lock key shared by the deletion (exclusive), `createBusiness`
+ * (exclusive) and every per-business panel write (shared):
+ * `hashtext(BUSINESS_DELETE_LOCK_PREFIX || id)`. Defined in `businesses.ts`
+ * (which this module imports) so `createBusiness` can take it without an
+ * import cycle. Advisory locks are database-wide, so a write on the app pool
+ * and the deletion on the platform pool serialise: either the write commits
+ * before the deletion takes the lock (and its rows are deleted with the
+ * rest), or the deletion has committed and the write sees `deleting` and
+ * refuses.
  */
-export const BUSINESS_DELETE_LOCK_PREFIX = 'business-delete:';
+export { BUSINESS_DELETE_LOCK_PREFIX };
 
 const LOCK_EXCLUSIVE_SQL = 'SELECT pg_advisory_xact_lock(hashtext($1 || $2))';
 const LOCK_SHARED_SQL = 'SELECT pg_advisory_xact_lock_shared(hashtext($1 || $2))';
@@ -102,11 +105,22 @@ const PASS_IN_FLIGHT_SQL = `(pass_started_at IS NOT NULL
    AND pass_started_at > coalesce(pass_finished_at, '-infinity'::timestamptz)
    AND pass_started_at > now() - interval '30 minutes')`;
 
-/** The scheduler's heartbeat at the start of one business's pass. */
-export async function recordPassStart(businessId: string): Promise<void> {
-  await withPlatform((db) =>
-    db.query('UPDATE businesses SET pass_started_at = now() WHERE business_id = $1', [businessId]),
-  );
+/**
+ * The scheduler's heartbeat at the start of one business's pass — written
+ * only while the business is still `active`. Returns whether it was: `false`
+ * means the business was suspended, or its deletion committed, after the
+ * scheduler read its list, and the pass must not run (it would write rows
+ * under an id the deletion has just emptied). Throws on a database error;
+ * the scheduler then runs the pass anyway (fail-open, `tenants.ts`).
+ */
+export async function recordPassStart(businessId: string): Promise<boolean> {
+  return withPlatform(async (db) => {
+    const { rows } = await db.query(
+      `UPDATE businesses SET pass_started_at = now() WHERE business_id = $1 AND status = 'active' RETURNING 1`,
+      [businessId],
+    );
+    return rows.length > 0;
+  });
 }
 
 /** The scheduler's heartbeat at the end of one business's pass. */
@@ -241,12 +255,18 @@ export type DeleteBusinessFilesResult =
   | { ok: false; refusal: FileDeletionRefusal };
 
 /**
- * The document and inbox folders of a business, each with a label for its
- * root. Only for an id that already passed `isValidBusinessId`.
+ * The folders the deletion removes, each with a label for its root: the
+ * document folder, the produced-files folder (`<DOCUMENT_ROOT>/produced/<id>`
+ * — the production loop's tree, `produced/<businessId>/<productionId>/…`,
+ * which sits beside the business folders and not inside its own), and the
+ * inbox folder. Only for an id that already passed `isValidBusinessId`.
  */
 function deletableFolders(businessId: string): Array<{ label: string; root: string; folder: string }> {
   const folders = businessFolders(businessId);
-  const out = [{ label: 'DOCUMENT_ROOT', root: config.documentRoot, folder: folders.document }];
+  const out = [
+    { label: 'DOCUMENT_ROOT', root: config.documentRoot, folder: folders.document },
+    { label: 'DOCUMENT_ROOT/produced', root: join(config.documentRoot, 'produced'), folder: folders.produced },
+  ];
   if (folders.inbox !== null && config.documentInboxRoot !== null) {
     out.push({ label: 'DOCUMENT_INBOX_ROOT', root: config.documentInboxRoot, folder: folders.inbox });
   }
@@ -265,8 +285,8 @@ function isBusinessFolderUnder(folder: string, root: string, businessId: string)
 }
 
 /**
- * The file step: removes `<DOCUMENT_ROOT>/<id>` and `<DOCUMENT_INBOX_ROOT>/<id>`
- * whole. Never the save folder.
+ * The file step: removes `<DOCUMENT_ROOT>/<id>`, `<DOCUMENT_ROOT>/produced/<id>`
+ * and `<DOCUMENT_INBOX_ROOT>/<id>` whole. Never the save folder.
  *
  * Gated on the database: only a business whose registry row says `deleting`
  * — its rows already gone (`deleteBusinessRows`) — loses its files. Any other
@@ -330,7 +350,7 @@ async function folderExists(folder: string): Promise<boolean> {
 
 /**
  * The last step: deletes the registry row — only while its status is
- * `deleting` and only once the document and inbox folders no longer exist.
+ * `deleting` and only once the document, produced and inbox folders no longer exist.
  * The save folder is not checked (it is never removed). Returns whether it
  * removed the row.
  */
@@ -365,6 +385,24 @@ export async function finishDeletion(businessId: string): Promise<boolean> {
       throw err;
     }
   });
+}
+
+async function headOnPlatform(db: Queryable, staffId: string): Promise<boolean> {
+  const { rows } = await db.query(
+    'SELECT 1 FROM platform_staff WHERE staff_id = $1 AND removed_at IS NULL AND is_head',
+    [staffId],
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Is `staffId` a live head admin, as the database says NOW — not as the
+ * session said when the request began? The deletion routes call it before a
+ * step that is not gated on head by itself (the file retry); the row step and
+ * the revocation re-check it on their own.
+ */
+export async function isActiveHead(staffId: string): Promise<boolean> {
+  return withPlatform((db) => headOnPlatform(db, staffId));
 }
 
 /** How long one provider revocation may take before it counts as failed. */
@@ -434,11 +472,7 @@ export async function revokeBusinessGrants(
     );
     const biz = bizRows[0];
     if (biz === undefined) return 'unknown_business' as const;
-    const { rows: staffRows } = await db.query(
-      'SELECT 1 FROM platform_staff WHERE staff_id = $1 AND removed_at IS NULL AND is_head',
-      [staffId],
-    );
-    if (staffRows.length === 0) return 'not_head' as const;
+    if (!(await headOnPlatform(db, staffId))) return 'not_head' as const;
     if (biz.status !== 'suspended') return 'not_suspended' as const;
     return null;
   });

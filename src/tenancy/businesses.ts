@@ -47,6 +47,13 @@ export class BusinessDeletingError extends TenancyError {
   }
 }
 
+/**
+ * The advisory-lock key of a business's deletion: `hashtext(prefix || id)`.
+ * Taken exclusively by the deletion and by `createBusiness`, shared by every
+ * per-business panel write (`business-deletion.ts`, which re-exports it).
+ */
+export const BUSINESS_DELETE_LOCK_PREFIX = 'business-delete:';
+
 function malformedIdMessage(id: string): string {
   return `מזהה עסק לא תקין "${id}" — אותיות אנגליות קטנות, ספרות ומקפים בלבד, באורך 3 עד 63`;
 }
@@ -85,7 +92,7 @@ export async function createBusiness(id: string, displayName: string): Promise<v
   }
   // A business re-created with an old id starts empty (deletion spec). While
   // the old one is still being deleted its id is taken; once its row is gone,
-  // a file it left in any of its three folders — the save folder above all,
+  // a file it left in any of its four folders — the save folder above all,
   // which deletion never removes — would become the new business's. An empty
   // or missing folder does not block.
   const existing = await getBusiness(id);
@@ -96,7 +103,7 @@ export async function createBusiness(id: string, displayName: string): Promise<v
   }
   if (existing === null) {
     const folders = businessFolders(id);
-    for (const folder of [folders.document, folders.inbox, folders.save]) {
+    for (const folder of [folders.document, folders.produced, folders.inbox, folders.save]) {
       if (folder !== null && (await countFilesUnder(folder)) > 0) {
         throw new TenancyError(
           `בשרת נשארו קבצים בתיקייה של המזהה ${id} מעסק קודם. ` +
@@ -106,23 +113,54 @@ export async function createBusiness(id: string, displayName: string): Promise<v
     }
   }
   await withPlatform(async (db) => {
-    // One statement, so the registry row and the profile copy of the name
-    // (migration 075 — what a business connection reads for its letterhead
-    // and official messages) are written together or not at all. A refused
-    // duplicate inserts nothing in `b`, so the existing profile is untouched.
-    const { rows } = await db.query<{ business_id: string }>(
-      `WITH b AS (
-         INSERT INTO businesses (business_id, display_name) VALUES ($1, $2)
-         ON CONFLICT (business_id) DO NOTHING
-         RETURNING business_id
-       )
-       INSERT INTO business_profiles (business_id, display_name, updated_by)
-       SELECT business_id, $2, 'platform' FROM b
-       ON CONFLICT (business_id) DO UPDATE SET display_name = EXCLUDED.display_name
-       RETURNING business_id`,
-      [id, name],
-    );
-    if (rows.length === 0) throw new BusinessExistsError(`העסק ${id} כבר קיים`);
+    await db.query('BEGIN');
+    try {
+      // Exclusive, like the deletion: a deletion of this id and this creation
+      // never interleave.
+      await db.query('SELECT pg_advisory_xact_lock(hashtext($1 || $2))', [BUSINESS_DELETE_LOCK_PREFIX, id]);
+      // Re-checked under the lock: the purge below may run ONLY for an id that
+      // has no registry row — a live business, or one still being deleted,
+      // keeps every row it has.
+      const { rows: present } = await db.query<{ status: string }>(
+        'SELECT status FROM businesses WHERE business_id = $1',
+        [id],
+      );
+      if (present[0] !== undefined) {
+        if (present[0].status === 'deleting') {
+          throw new TenancyError(
+            `העסק ${id} נמצא באמצע מחיקה. אפשר לפתוח עסק עם המזהה הזה רק אחרי שהמחיקה תסתיים.`,
+          );
+        }
+        throw new BusinessExistsError(`העסק ${id} כבר קיים`);
+      }
+      // Owner ruling (business deletion, final review): a late writer — a
+      // dashboard request already past its session check, a webhook, the CLI,
+      // a pass that started before the suspension — can leave rows under an
+      // id after its deletion finished. Whatever the race, a new customer
+      // never inherits them: every row under the id is purged here, in the
+      // same transaction as the INSERT, before the id is handed out again.
+      await db.query('SELECT table_name, deleted FROM delete_business_rows($1)', [id]);
+      // One statement, so the registry row and the profile copy of the name
+      // (migration 075 — what a business connection reads for its letterhead
+      // and official messages) are written together or not at all.
+      const { rows } = await db.query<{ business_id: string }>(
+        `WITH b AS (
+           INSERT INTO businesses (business_id, display_name) VALUES ($1, $2)
+           ON CONFLICT (business_id) DO NOTHING
+           RETURNING business_id
+         )
+         INSERT INTO business_profiles (business_id, display_name, updated_by)
+         SELECT business_id, $2, 'platform' FROM b
+         ON CONFLICT (business_id) DO UPDATE SET display_name = EXCLUDED.display_name
+         RETURNING business_id`,
+        [id, name],
+      );
+      if (rows.length === 0) throw new BusinessExistsError(`העסק ${id} כבר קיים`);
+      await db.query('COMMIT');
+    } catch (err) {
+      await db.query('ROLLBACK').catch(() => {});
+      throw err;
+    }
   });
   // The business's save folder on the server (spec §5.8). `saveDocumentSettings`
   // accepts a base folder only inside it, so a business without it could

@@ -344,18 +344,25 @@ export function resetProductionNoticeForTests(): void {
  * reported by kind, not by its error message.
  */
 export function tenantPassTotal(report: TenantPassReport): number {
-  return report.ran.length + report.failed.length + report.skippedInFlight.length + report.notReached.length;
+  return (
+    report.ran.length +
+    report.failed.length +
+    report.skippedInFlight.length +
+    report.skippedInactive.length +
+    report.notReached.length
+  );
 }
 
 export function tenantPassLines(report: TenantPassReport): string[] {
   const total = tenantPassTotal(report);
   const lines = [
     `${total} businesses, ran ${report.ran.length}, failed ${report.failed.length}, ` +
-      `skipped ${report.skippedInFlight.length}` +
+      `skipped ${report.skippedInFlight.length + report.skippedInactive.length}` +
       (report.notReached.length > 0 ? `, not reached ${report.notReached.length}` : ''),
   ];
   for (const f of report.failed) lines.push(`business ${f.businessId}: pass failed (${f.reason})`);
   for (const id of report.skippedInFlight) lines.push(`business ${id}: previous pass still running — skipped`);
+  for (const id of report.skippedInactive) lines.push(`business ${id}: no longer active — skipped`);
   return lines;
 }
 
@@ -370,6 +377,7 @@ export function tenantPassIsNotable(report: TenantPassReport, previousTotal: num
   return (
     report.failed.length > 0 ||
     report.skippedInFlight.length > 0 ||
+    report.skippedInactive.length > 0 ||
     report.notReached.length > 0 ||
     tenantPassTotal(report) !== previousTotal
   );

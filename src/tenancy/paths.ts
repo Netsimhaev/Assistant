@@ -3,11 +3,12 @@
  *
  * Three server-wide roots, one folder per business under each:
  *
- * - `DOCUMENT_ROOT/<businessId>` — every ingested document and every
- *   produced file (`produced/<businessId>/...` is ALREADY the shape of a
- *   stored path, so that tree is not re-rooted here — `stored_path` values
- *   begin with the business and are joined to `config.documentRoot` as they
- *   always were). What changes is the READER: `know.reader`'s subprocess
+ * - `DOCUMENT_ROOT/<businessId>` — every ingested document. Produced files
+ *   are NOT under it: they live in `DOCUMENT_ROOT/produced/<businessId>/…`
+ *   (the production loop's stored-path shape, `produced/<businessId>/
+ *   <productionId>/…`, joined to `config.documentRoot` as it always was), a
+ *   sibling tree that `businessFolders(...).produced` names and whole-business
+ *   deletion removes. What changes is the READER: `know.reader`'s subprocess
  *   `cwd` and the SDK gate's `isPathWithin` take the business folder, not the
  *   root, so a reader for one business cannot open another's document.
  * - `DOCUMENT_INBOX_ROOT/<businessId>` — the folder the inbox scan watches,
@@ -65,8 +66,10 @@ export function isFolderOfBusiness(folder: string, businessId: string): boolean 
 
 /** The three folders of one business on the server; `null` where the server has no such root. */
 export interface BusinessFolders {
-  /** `<DOCUMENT_ROOT>/<businessId>` — ingested documents, produced files, the logo. */
+  /** `<DOCUMENT_ROOT>/<businessId>` — ingested documents and the logo. */
   document: string;
+  /** `<DOCUMENT_ROOT>/produced/<businessId>` — the files the production loop wrote. */
+  produced: string;
   /** `<DOCUMENT_INBOX_ROOT>/<businessId>`, or `null` when the server has no inbox root. */
   inbox: string | null;
   /** `<DOCUMENT_SAVE_ROOT>/<businessId>`, or `null` when the server has no save root. */
@@ -84,6 +87,7 @@ export function businessFolders(businessId: string): BusinessFolders {
   const id = checkedId(businessId);
   return {
     document: join(config.documentRoot, id),
+    produced: join(config.documentRoot, 'produced', id),
     inbox: config.documentInboxRoot === null ? null : join(config.documentInboxRoot, id),
     save: config.documentSaveRoot === null ? null : join(config.documentSaveRoot, id),
   };

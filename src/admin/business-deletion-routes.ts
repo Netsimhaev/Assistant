@@ -30,6 +30,7 @@ import {
   deleteBusinessRows,
   FILE_DELETION_REFUSAL_HE,
   finishDeletion,
+  isActiveHead,
   namesMatch,
   passInFlight,
   revokeBusinessGrants,
@@ -159,6 +160,12 @@ function refusal(
 async function handleRetry(ctx: DeletionRouteContext, businessId: string): Promise<void> {
   const form = await ctx.readForm();
   if (!ctx.csrfOk(form)) return ctx.sendHtml(403, renderForbidden());
+  // The file step is gated on `deleting`, not on head: re-read head from the
+  // database here, so a head role removed since the session was read stops
+  // the retry (the session's `isHead` above decided only what to show).
+  if (!(await isActiveHead(ctx.staff.staffId))) {
+    return ctx.sendHtml(403, renderDeleteRefused(ctx.viewer, DELETION_REFUSAL_HE.not_head));
+  }
   await finishFiles(ctx, businessId, {});
 }
 

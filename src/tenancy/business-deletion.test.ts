@@ -44,8 +44,12 @@ const ACME = 'acme';
 const ACME2 = 'acme-2';
 const ACME_NAME = 'Acme Shop';
 
-const mutableConfig = config as { documentRoot: string; documentInboxRoot: string | null };
-const original = { documentRoot: config.documentRoot, documentInboxRoot: config.documentInboxRoot };
+const mutableConfig = config as { documentRoot: string; documentInboxRoot: string | null; documentSaveRoot: string | null };
+const original = {
+  documentRoot: config.documentRoot,
+  documentInboxRoot: config.documentInboxRoot,
+  documentSaveRoot: config.documentSaveRoot,
+};
 let tempRoots: string[] = [];
 
 let headId = '';
@@ -102,20 +106,23 @@ async function putFile(path: string, body = 'x'): Promise<void> {
   await writeFile(path, body);
 }
 
-function folders(businessId: string): { document: string; inbox: string; save: string } {
+function folders(businessId: string): { document: string; produced: string; inbox: string; save: string } {
   const f = businessFolders(businessId);
   if (f.inbox === null || f.save === null) throw new Error('the test sets every root');
-  return { document: f.document, inbox: f.inbox, save: f.save };
+  return { document: f.document, produced: f.produced, inbox: f.inbox, save: f.save };
 }
 
 beforeAll(async () => {
   await ensureSchema();
   const docRoot = await mkdtemp(join(tmpdir(), 'bizdel-doc-'));
   const inboxRoot = await mkdtemp(join(tmpdir(), 'bizdel-inbox-'));
-  tempRoots = [docRoot, inboxRoot];
+  // A save root of its own: the ids here are fixed, and the real test save
+  // root is shared with every other suite.
+  const saveRoot = await mkdtemp(join(tmpdir(), 'bizdel-save-'));
+  tempRoots = [docRoot, inboxRoot, saveRoot];
   mutableConfig.documentRoot = docRoot;
   mutableConfig.documentInboxRoot = inboxRoot;
-  if (config.documentSaveRoot === null) throw new Error('DOCUMENT_SAVE_ROOT is set for tests (vitest.config.ts)');
+  mutableConfig.documentSaveRoot = saveRoot;
 });
 
 beforeEach(async () => {
@@ -137,9 +144,9 @@ beforeEach(async () => {
 });
 
 afterAll(async () => {
-  for (const id of [ACME, ACME2]) await rm(folders(id).save, { recursive: true, force: true }).catch(() => {});
   mutableConfig.documentRoot = original.documentRoot;
   mutableConfig.documentInboxRoot = original.documentInboxRoot;
+  mutableConfig.documentSaveRoot = original.documentSaveRoot;
   for (const root of tempRoots) await rm(root, { recursive: true, force: true });
   await closePlatformPool();
   await closePool();
@@ -150,6 +157,7 @@ describe('businessFolders', () => {
     const a = folders(ACME);
     const b = folders(ACME2);
     expect(a.document).toBe(join(config.documentRoot, ACME));
+    expect(a.produced).toBe(join(config.documentRoot, 'produced', ACME));
     expect(a.inbox).toBe(join(config.documentInboxRoot ?? '', ACME));
     expect(a.save).toBe(join(config.documentSaveRoot ?? '', ACME));
     expect(b.document).toBe(join(config.documentRoot, ACME2));
@@ -163,14 +171,29 @@ describe('businessFolders', () => {
 
 describe('the pass heartbeat (Ruling 4)', () => {
   it('a started pass is in flight until it ends', async () => {
-    expect(await passInFlight(ACME)).toBe(false);
-    await recordPassStart(ACME);
-    expect(await passInFlight(ACME)).toBe(true);
-    await recordPassEnd(ACME);
-    expect(await passInFlight(ACME)).toBe(false);
+    // acme is suspended (its start would write nothing), so acme-2 runs here.
+    expect(await passInFlight(ACME2)).toBe(false);
+    expect(await recordPassStart(ACME2)).toBe(true);
+    expect(await passInFlight(ACME2)).toBe(true);
+    await recordPassEnd(ACME2);
+    expect(await passInFlight(ACME2)).toBe(false);
     // Another business's pass is not this one's.
-    await recordPassStart(ACME2);
+    expect(await recordPassStart(ACME2)).toBe(true);
     expect(await passInFlight(ACME)).toBe(false);
+  });
+
+  it('a start is written only for an active business: suspended, deleting and unknown write nothing', async () => {
+    expect(await recordPassStart(ACME)).toBe(false);
+    expect(await passInFlight(ACME)).toBe(false);
+    await testDb().query(`UPDATE businesses SET status = 'deleting' WHERE business_id = $1`, [ACME]);
+    expect(await recordPassStart(ACME)).toBe(false);
+    expect(await passInFlight(ACME)).toBe(false);
+    expect(await recordPassStart('nobody-here')).toBe(false);
+    const { rows } = await testDb().query<{ s: Date | null }>(
+      'SELECT pass_started_at AS s FROM businesses WHERE business_id = $1',
+      [ACME],
+    );
+    expect(rows[0]?.s).toBeNull();
   });
 
   it('a pass started more than 30 minutes ago and never ended no longer counts', async () => {
@@ -332,6 +355,9 @@ describe('deleteBusinessFiles', () => {
     const b = folders(ACME2);
     await putFile(join(a.document, 'DOC-1', 'original.txt'));
     await putFile(join(a.document, 'produced-copy.pdf'));
+    // The production loop's real path: <DOCUMENT_ROOT>/produced/<id>/<productionId>/...
+    await putFile(join(config.documentRoot, 'produced', ACME, 'PROD-1', 'x.pdf'));
+    await putFile(join(config.documentRoot, 'produced', ACME2, 'PROD-2', 'y.pdf'));
     await putFile(join(a.inbox, 'working', 'scan.pdf'));
     await putFile(join(b.document, 'DOC-2', 'original.txt'));
     await putFile(join(b.inbox, 'working', 'other.pdf'));
@@ -347,6 +373,7 @@ describe('deleteBusinessFiles', () => {
     for (const f of [
       join(a.document, 'DOC-1', 'original.txt'),
       join(a.document, 'produced-copy.pdf'),
+      join(config.documentRoot, 'produced', ACME, 'PROD-1', 'x.pdf'),
       join(a.inbox, 'working', 'scan.pdf'),
     ]) {
       if (!(await exists(f))) return false;
@@ -380,13 +407,16 @@ describe('deleteBusinessFiles', () => {
     expect(FILE_DELETION_REFUSAL_HE.not_deleting).toMatch(/[֐-׿]/);
   });
 
-  it("removes acme's document and inbox folders, and nothing of acme-2 nor acme's save folder", async () => {
+  it("removes acme's document, produced and inbox folders, and nothing of acme-2 nor acme's save folder", async () => {
     await seedFiles();
     await markDeleting(ACME);
     const result = await deleteBusinessFiles(ACME);
-    expect(result).toEqual({ ok: true, removed: 3, failed: [] });
+    expect(result).toEqual({ ok: true, removed: 4, failed: [] });
     expect(await exists(folders(ACME).document)).toBe(false);
+    expect(await exists(folders(ACME).produced)).toBe(false);
     expect(await exists(folders(ACME).inbox)).toBe(false);
+    // The produced root itself stays, with acme-2's folder in it.
+    expect(await exists(join(config.documentRoot, 'produced', ACME2, 'PROD-2', 'y.pdf'))).toBe(true);
     expect(await exists(join(folders(ACME).save, 'owner-copy.docx'))).toBe(true);
     expect(await exists(join(folders(ACME2).document, 'DOC-2', 'original.txt'))).toBe(true);
     expect(await exists(join(folders(ACME2).inbox, 'working', 'other.pdf'))).toBe(true);
@@ -408,7 +438,7 @@ describe('deleteBusinessFiles', () => {
       },
     });
     if (!result.ok) throw new Error(`refused: ${result.refusal}`);
-    expect(result.removed).toBe(1);
+    expect(result.removed).toBe(2);
     expect(result.failed).toEqual([`DOCUMENT_ROOT/${ACME}`]);
     for (const f of result.failed) {
       for (const root of tempRoots) expect(f.includes(root)).toBe(false);
@@ -430,6 +460,9 @@ describe('finishDeletion', () => {
     expect(await finishDeletion(ACME)).toBe(false);
 
     await rm(folders(ACME).document, { recursive: true, force: true });
+    await putFile(join(folders(ACME).produced, 'PROD-1', 'x.pdf'));
+    expect(await finishDeletion(ACME)).toBe(false);
+    await rm(folders(ACME).produced, { recursive: true, force: true });
     // The save folder is not part of the check.
     await putFile(join(folders(ACME).save, 'kept.docx'));
     expect(await finishDeletion(ACME)).toBe(true);
@@ -472,7 +505,7 @@ describe('createBusiness — reusing a deleted id', () => {
     expect(await getBusiness(ACME)).toEqual({ businessId: ACME, displayName: 'חדש', status: 'active' });
   });
 
-  it('is refused while the document or the inbox folder holds a file', async () => {
+  it('is refused while the document, the inbox or the produced folder holds a file', async () => {
     await testDb().query('DELETE FROM businesses WHERE business_id = $1', [ACME]);
     await putFile(join(folders(ACME).document, 'a.txt'));
     await expect(createBusiness(ACME, 'חדש')).rejects.toBeInstanceOf(TenancyError);
@@ -480,8 +513,51 @@ describe('createBusiness — reusing a deleted id', () => {
     await putFile(join(folders(ACME).inbox, 'working', 'b.txt'));
     await expect(createBusiness(ACME, 'חדש')).rejects.toBeInstanceOf(TenancyError);
     await rm(folders(ACME).inbox, { recursive: true, force: true });
+    await putFile(join(config.documentRoot, 'produced', ACME, 'PROD-1', 'x.pdf'));
+    await expect(createBusiness(ACME, 'חדש')).rejects.toBeInstanceOf(TenancyError);
+    expect(await getBusiness(ACME)).toBeNull();
+    await rm(folders(ACME).produced, { recursive: true, force: true });
     await createBusiness(ACME, 'חדש');
     expect(await getBusiness(ACME)).not.toBeNull();
+  });
+});
+
+describe('createBusiness: purging residue under an unregistered id', () => {
+  it('stray rows left under an id with no registry row are gone once the id is created, and the business works', async () => {
+    const id = 'ghost-biz';
+    // A live neighbour, seeded first so it owns every shared parent row.
+    expect((await seedEveryTable(tables, ACME2)).failed).toEqual([]);
+    const neighbour = await totalRows(ACME2);
+    // Late writers' residue: rows under an id the registry does not hold.
+    await seedEveryTable(tables, id);
+    const stray = await totalRows(id);
+    expect(stray['audit_log']).toBeGreaterThan(0);
+    expect(await getBusiness(id)).toBeNull();
+
+    await createBusiness(id, 'עסק חדש');
+    expect(await getBusiness(id)).toEqual({ businessId: id, displayName: 'עסק חדש', status: 'active' });
+    const after = await totalRows(id);
+    expect(Object.entries(after).filter(([, n]) => n > 0)).toEqual([['business_profiles', 1]]);
+    expect(await totalRows(ACME2)).toEqual(neighbour);
+    // And it works: a write through its own wall lands.
+    await withBusiness(id, (db) =>
+      db.query(`INSERT INTO business_runtime_settings (business_id, notify_to) VALUES ($1, 'new@example.com')`, [id]),
+    );
+    expect((await totalRows(id))['business_runtime_settings']).toBe(1);
+  });
+
+  it('on an id that is registered it still refuses, and purges nothing', async () => {
+    expect((await seedEveryTable(tables, ACME2)).failed).toEqual([]);
+    const before = await totalRows(ACME2);
+    await expect(createBusiness(ACME2, 'מתחזה')).rejects.toBeInstanceOf(BusinessExistsError);
+    expect(await totalRows(ACME2)).toEqual(before);
+    expect((await getBusiness(ACME2))?.status).toBe('active');
+    // A suspended one too (acme), with its rows.
+    await seedEveryTable(tables, ACME);
+    const acmeBefore = await sumRows(ACME);
+    expect(acmeBefore).toBeGreaterThan(0);
+    await expect(createBusiness(ACME, 'מתחזה')).rejects.toBeInstanceOf(BusinessExistsError);
+    expect(await sumRows(ACME)).toBe(acmeBefore);
   });
 });
 
@@ -698,12 +774,12 @@ describe('the delete function has one caller', () => {
     return out;
   }
 
-  it('only src/tenancy/business-deletion.ts names delete_business_rows outside migrations and tests', () => {
+  it('only business-deletion.ts and createBusiness (businesses.ts) name delete_business_rows outside migrations and tests', () => {
     const files = sourceFiles(SRC).filter((f) => !f.includes(`${sep}migrations${sep}`));
     expect(files.length).toBeGreaterThan(300);
     const naming = files
       .filter((f) => readFileSync(f, 'utf8').includes('delete_business_rows'))
       .map((f) => relative(SRC, f).split(sep).join('/'));
-    expect(naming).toEqual(['tenancy/business-deletion.ts']);
+    expect(naming.sort()).toEqual(['tenancy/business-deletion.ts', 'tenancy/businesses.ts']);
   });
 });

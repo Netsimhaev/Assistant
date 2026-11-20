@@ -42,14 +42,19 @@ import {
   staffConfirmEnrolment,
   startStaffSession,
 } from '../tenancy/staff.js';
+import { handleDeletionRoute } from './business-deletion-routes.js';
 import { createAdminServer, type AdminOptions } from './server.js';
 
 const ACME = 'acme-del';
 const ACME_NAME = 'מספרת אקמי';
 const OTHER = 'other-biz';
 
-const mutableConfig = config as { documentRoot: string; documentInboxRoot: string | null };
-const original = { documentRoot: config.documentRoot, documentInboxRoot: config.documentInboxRoot };
+const mutableConfig = config as { documentRoot: string; documentInboxRoot: string | null; documentSaveRoot: string | null };
+const original = {
+  documentRoot: config.documentRoot,
+  documentInboxRoot: config.documentInboxRoot,
+  documentSaveRoot: config.documentSaveRoot,
+};
 let tempRoots: string[] = [];
 
 let server: Server | null = null;
@@ -67,9 +72,12 @@ const stubFetch = (async (input: string | URL | Request) => {
 beforeAll(async () => {
   const docRoot = await mkdtemp(join(tmpdir(), 'paneldel-doc-'));
   const inboxRoot = await mkdtemp(join(tmpdir(), 'paneldel-inbox-'));
-  tempRoots = [docRoot, inboxRoot];
+  // Its own save root too, so no other suite's fixed ids can collide with these.
+  const saveRoot = await mkdtemp(join(tmpdir(), 'paneldel-save-'));
+  tempRoots = [docRoot, inboxRoot, saveRoot];
   mutableConfig.documentRoot = docRoot;
   mutableConfig.documentInboxRoot = inboxRoot;
+  mutableConfig.documentSaveRoot = saveRoot;
 });
 
 beforeEach(async () => {
@@ -91,13 +99,14 @@ afterEach(async () => {
   dashboard = null;
   for (const id of [ACME, OTHER]) {
     const f = businessFolders(id);
-    for (const p of [f.document, f.inbox, f.save]) if (p !== null) await rm(p, { recursive: true, force: true });
+    for (const p of [f.document, f.produced, f.inbox, f.save]) if (p !== null) await rm(p, { recursive: true, force: true });
   }
 });
 
 afterAll(async () => {
   mutableConfig.documentRoot = original.documentRoot;
   mutableConfig.documentInboxRoot = original.documentInboxRoot;
+  mutableConfig.documentSaveRoot = original.documentSaveRoot;
   for (const root of tempRoots) await rm(root, { recursive: true, force: true });
   await closePlatformPool();
   await closePool();
@@ -206,7 +215,7 @@ async function googleGrant(businessId: string): Promise<void> {
   );
 }
 
-/** Some rows and files for ACME: an owner, a Google grant, an audit row, files in both folders. */
+/** Some rows and files for ACME: an owner, a Google grant, an audit row, files in its three folders. */
 async function seedAcme(): Promise<void> {
   await withBusiness(ACME, (db) => createOwner(db, { username: 'owner', login: 'owner@acme.example', password: 'owner password long enough' }));
   await withBusiness(ACME, (db) =>
@@ -226,6 +235,8 @@ async function seedAcme(): Promise<void> {
   );
   const f = businessFolders(ACME);
   await putFile(join(f.document, 'a', 'one.txt'));
+  // Where the production loop really writes: <DOCUMENT_ROOT>/produced/<id>/<prod>/…
+  await putFile(join(config.documentRoot, 'produced', ACME, 'PROD-1', 'x.pdf'));
   if (f.inbox !== null) await putFile(join(f.inbox, 'working', 'two.txt'));
 }
 
@@ -356,6 +367,7 @@ describe('a successful delete', () => {
     expect(await count('SELECT count(*) AS n FROM audit_log WHERE business_id = $1', [ACME])).toBe(0);
     expect(await count('SELECT count(*) AS n FROM dashboard_users WHERE business_id = $1', [ACME])).toBe(0);
     expect(await exists(businessFolders(ACME).document)).toBe(false);
+    expect(await exists(join(config.documentRoot, 'produced', ACME))).toBe(false);
     // Nothing recorded for the deletion itself, anywhere.
     expect(await count('SELECT count(*) AS n FROM platform_activity_log', [])).toBe(0);
 
@@ -408,6 +420,55 @@ describe('a file failure', () => {
     expect(await retry.text()).toContain('העסק נמחק');
     expect(await statusOf(ACME)).toBeNull();
     expect(await exists(docFolder)).toBe(false);
+  });
+
+  it('a produced folder that will not go is named in plain Hebrew', async () => {
+    await seedAcme();
+    const producedFolder = join(config.documentRoot, 'produced', ACME);
+    const baseUrl = await startPanel({
+      fetchImpl: stubFetch,
+      rm: async (path, options) => {
+        if (path === producedFolder) throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+        await rm(path, options);
+      },
+    });
+    const { cookie } = await head();
+    const csrf = csrfIn(await (await get(baseUrl, `/businesses/${ACME}/delete`, cookie)).text());
+    const html = await (await post(baseUrl, `/businesses/${ACME}/delete`, { csrf, name: ACME_NAME }, cookie)).text();
+    expect(html).toContain('תיקיית המסמכים שהעוזרת הפיקה: 1');
+    expect(html).not.toContain('תיקיית המסמכים: 1');
+    expect(html).not.toContain('DOCUMENT_ROOT');
+    expect(await statusOf(ACME)).toBe('deleting');
+  });
+
+  it('a retry by a staff member whose head role was removed after the session was read is 403', async () => {
+    // The panel reads `is_head` with the session, so the race is a role
+    // removed between that read and the retry: drive the route with a viewer
+    // the session called head while the database now says otherwise.
+    await seedAcme();
+    const { staffId } = await head();
+    const rows = await deleteBusinessRows({ businessId: ACME, staffId, typedName: ACME_NAME });
+    expect(rows.ok).toBe(true);
+    await testDb().query('UPDATE platform_staff SET is_head = false WHERE staff_id = $1', [staffId]);
+    let sent: { status: number; html: string } | null = null;
+    const handled = await handleDeletionRoute({
+      method: 'POST',
+      pathname: `/businesses/${ACME}/delete/files`,
+      staff: { staffId, displayName: 'טכנאי ראשי' },
+      viewer: { displayName: 'טכנאי ראשי', isHead: true, csrf: 'x' },
+      masterKey: TEST_MASTER_KEY,
+      readForm: async () => new URLSearchParams({ csrf: 'x' }),
+      csrfOk: () => true,
+      sendHtml: (status, html) => {
+        sent = { status, html };
+      },
+    });
+    expect(handled).toBe(true);
+    expect(sent).not.toBeNull();
+    expect(sent!.status).toBe(403);
+    expect(sent!.html).toContain(DELETION_REFUSAL_HE.not_head);
+    expect(await statusOf(ACME)).toBe('deleting');
+    expect(await exists(join(businessFolders(ACME).document, 'a', 'one.txt'))).toBe(true);
   });
 
   it('the retry on a business that is not being deleted is refused', async () => {
