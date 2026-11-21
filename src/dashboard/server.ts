@@ -148,7 +148,14 @@ import {
   handleLedgerSettingsPost,
 } from './ledger-routes.js';
 import { DESCRIPTION_SETTINGS_PATH, handleDescriptionGet, handleDescriptionPost } from './description-routes.js';
-import { PEOPLE_ACTION_PATH, PEOPLE_SETTINGS_PATH, handlePeopleAction, handlePeopleGet } from './people-routes.js';
+import {
+  PEOPLE_ACTION_PATH,
+  PEOPLE_INVOICE_PATH,
+  PEOPLE_SETTINGS_PATH,
+  handlePeopleAction,
+  handlePeopleGet,
+  handlePeopleInvoicePost,
+} from './people-routes.js';
 import {
   PROFILE_LOGO_PATH,
   PROFILE_SETTINGS_PATH,
@@ -3597,6 +3604,9 @@ async function route(
     return handleLogoPost(req, res, db, session, documentRoot ?? config.documentRoot);
   }
   if (method === 'GET' && pathname === PEOPLE_SETTINGS_PATH) return handlePeopleGet(res, db, session);
+  if (method === 'POST' && pathname === PEOPLE_INVOICE_PATH) {
+    return handlePeopleInvoicePost(req, res, db, session, documentRoot ?? config.documentRoot);
+  }
   const peopleActionMatch = PEOPLE_ACTION_PATH.exec(pathname);
   if (method === 'POST' && peopleActionMatch?.[1] !== undefined && peopleActionMatch[2] !== undefined) {
     const list = peopleActionMatch[1] as 'colleague' | 'contact';

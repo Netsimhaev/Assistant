@@ -1,4 +1,7 @@
 import { once } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -21,8 +24,10 @@ const PASSWORD = 'correct horse battery staple';
 const PEOPLE = '/settings/people';
 
 let server: Server | null = null;
+let docRoot = '';
 
 beforeEach(async () => {
+  docRoot = await mkdtemp(join(tmpdir(), 'people-docs-'));
   await resetDatabase();
   await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
   await withBusiness(BUSINESS, (db) => installCharter(db, buildCharter({ version: 'v-people-1' })));
@@ -33,6 +38,7 @@ afterEach(async () => {
     await new Promise<void>((resolve) => server?.close(() => resolve()));
     server = null;
   }
+  await rm(docRoot, { recursive: true, force: true });
 });
 
 afterAll(async () => {
@@ -40,7 +46,7 @@ afterAll(async () => {
 });
 
 async function start(): Promise<{ baseUrl: string; cookie: string }> {
-  server = createServer({ masterKey: TEST_MASTER_KEY, port: 0 });
+  server = createServer({ masterKey: TEST_MASTER_KEY, port: 0, documentRoot: docRoot });
   await once(server, 'listening');
   const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const cookie = await loginWithSecondFactor(baseUrl, BUSINESS, { username: USERNAME, password: PASSWORD });
@@ -384,5 +390,53 @@ describe('/settings/people — contact kind and email', () => {
     });
     expect(res.status).toBe(303);
     expect((await entities())[0]?.body).toEqual({ name: 'דנה', role: 'לקוחה', phone: '+972501110009' });
+  });
+});
+
+describe('attach invoice to a contact', () => {
+  const PHONE = '+972501110009';
+
+  async function addContact(baseUrl: string, cookie: string): Promise<string> {
+    await post(baseUrl, cookie, `${PEOPLE}/contact/add`, {
+      csrf: await csrf(baseUrl, cookie),
+      name: 'דנה',
+      role: 'לקוחה',
+      phone: PHONE,
+      kind: 'client',
+    });
+    return PHONE;
+  }
+
+  async function uploadInvoice(baseUrl: string, cookie: string, fields: Record<string, string>) {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(fields)) form.append(k, v);
+    form.append('invoice', new Blob(['חשבונית 1234 סכום 500']), 'inv.txt');
+    return fetch(`${baseUrl}${PEOPLE}/contact/invoice`, { method: 'POST', headers: { cookie }, body: form, redirect: 'manual' });
+  }
+
+  const rowsOf = async () =>
+    (
+      await testDb().query<{ contact_key: string; assigned_by: string }>(
+        `SELECT contact_key, assigned_by FROM contact_documents WHERE business_id = $1`,
+        [BUSINESS],
+      )
+    ).rows;
+
+  it('an upload assigned in the dashboard appears for that contact', async () => {
+    const { baseUrl, cookie } = await start();
+    const key = await addContact(baseUrl, cookie);
+    const res = await uploadInvoice(baseUrl, cookie, { csrf: await csrf(baseUrl, cookie), key });
+    expect(res.status).toBe(303);
+    expect(await rowsOf()).toEqual([{ contact_key: '972501110009', assigned_by: 'owner_upload' }]);
+  });
+
+  it('assigning requires CSRF and a managed contact key', async () => {
+    const { baseUrl, cookie } = await start();
+    const key = await addContact(baseUrl, cookie);
+    const bad = await uploadInvoice(baseUrl, cookie, { csrf: 'deadbeef', key });
+    expect(bad.status).toBe(403);
+    const unknown = await uploadInvoice(baseUrl, cookie, { csrf: await csrf(baseUrl, cookie), key: '+972509999999' });
+    expect(unknown.status).toBe(404);
+    expect(await rowsOf()).toEqual([]);
   });
 });

@@ -15,7 +15,13 @@
  * have been typed by a technician, and a bidi control in them changes what the
  * owner reads.
  */
-import type { ServerResponse } from 'node:http';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ingestDocument, MAX_ORIGINAL_BYTES } from '../documents/ingest.js';
+import { authorityNumberKey } from '../governance/principal-number.js';
+import { readBoundedMultipart } from './multipart.js';
 import { addColleague, listColleagues, removeColleague, updateColleague } from '../business/colleagues.js';
 import {
   addManagedContact,
@@ -40,6 +46,13 @@ export const PERSON_NOT_FOUND = 'לא מצאתי את האדם הזה — אול
 
 /** `POST /settings/people/<colleague|contact>/<add|edit|remove>`. */
 export const PEOPLE_ACTION_PATH = /^\/settings\/people\/(colleague|contact)\/(add|edit|remove)$/;
+
+/** `POST /settings/people/contact/invoice` — attach an invoice file to a managed contact. */
+export const PEOPLE_INVOICE_PATH = '/settings/people/contact/invoice';
+
+export const INVOICE_FILE_MISSING = 'לא נבחר קובץ.';
+export const INVOICE_TOO_LARGE = 'הקובץ גדול מדי.';
+export const INVOICE_UPLOAD_MALFORMED = 'לא הצלחתי לקרוא את הטופס.';
 
 export interface PeopleSession {
   sessionId: string;
@@ -137,6 +150,11 @@ async function renderPeople(
   ${hidden}<input type="hidden" name="key" value="${esc(c.subjectKey)}">
   <button type="submit">הסר</button>
 </form>
+<form method="post" action="${PEOPLE_INVOICE_PATH}" enctype="multipart/form-data">
+  ${hidden}<input type="hidden" name="key" value="${esc(c.subjectKey)}">
+  <label>צרף חשבונית <input type="file" name="invoice"></label>
+  <button type="submit">צרף</button>
+</form>
 </div>`,
     )
     .join('');
@@ -226,5 +244,57 @@ export async function handlePeopleAction(
     throw err;
   }
   if (!updated) return renderPeople(res, 404, db, session, PERSON_NOT_FOUND);
+  seeOther(res, PEOPLE_SETTINGS_PATH);
+}
+
+/**
+ * `POST /settings/people/contact/invoice` — ingest one file and assign it to
+ * a managed contact as an owner-uploaded invoice. CSRF is checked after the
+ * bounded read (the token is a form field) and before anything is written;
+ * only a key that `listManagedContacts` returns is accepted.
+ */
+export async function handlePeopleInvoicePost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  db: BusinessDb,
+  session: PeopleSession,
+  documentRoot: string | undefined,
+): Promise<void> {
+  const parsed = await readBoundedMultipart(req, MAX_ORIGINAL_BYTES);
+  if (!parsed.ok) {
+    if (parsed.code === 'over_cap') res.setHeader('Connection', 'close');
+    const tooLarge = parsed.code === 'over_cap' || parsed.code === 'file_too_large';
+    return renderPeople(res, tooLarge ? 413 : 400, db, session, tooLarge ? INVOICE_TOO_LARGE : INVOICE_UPLOAD_MALFORMED);
+  }
+  if (!verifyCsrfToken(session.sessionId, parsed.fields.get('csrf'))) return html(res, 403, renderForbidden());
+
+  const key = parsed.fields.get('key') ?? '';
+  const contact = (await listManagedContacts(db)).find((c) => c.subjectKey === key);
+  const contactKey = contact === undefined ? null : authorityNumberKey(contact.phone);
+  if (contact === undefined || contactKey === null) return renderPeople(res, 404, db, session, PERSON_NOT_FOUND);
+  const file = parsed.file;
+  if (file === null || file.bytes.length === 0) return renderPeople(res, 400, db, session, INVOICE_FILE_MISSING);
+
+  const dir = await mkdtemp(join(tmpdir(), 'people-invoice-'));
+  try {
+    const path = join(dir, 'upload');
+    await writeFile(path, file.bytes, { flag: 'wx' });
+    const record = await ingestDocument(
+      db,
+      { path, source: 'manual', originalName: file.filename },
+      { ...(documentRoot !== undefined ? { documentRoot } : {}) },
+    );
+    if (record.status === 'rejected' || (record.status === 'stored' && record.reason !== null)) {
+      return renderPeople(res, 400, db, session, `הקובץ לא נקלט: ${record.reason ?? 'הקובץ נדחה בקליטה.'}`);
+    }
+    await db.query(
+      `INSERT INTO contact_documents (business_id, document_id, contact_key, kind, assigned_by)
+       VALUES ($1, $2, $3, 'invoice', 'owner_upload')
+       ON CONFLICT DO NOTHING`,
+      [db.businessId, record.documentId, contactKey],
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
   seeOther(res, PEOPLE_SETTINGS_PATH);
 }
