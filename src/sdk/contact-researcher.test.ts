@@ -25,10 +25,10 @@ function request(question = 'מה המחיר?') {
 }
 
 describe('contact researcher', () => {
-  it('call options carry only Read/Glob/Grep, env PATH, cwd under the business folder', () => {
+  it('call options carry only Read (the only file tool know.reader owns), env PATH, cwd under the business folder', () => {
     const req = request();
     const options = buildResearchOptions(req, buildResearchCall(req, 'n0nce'), () => undefined);
-    expect([...(options.tools as string[])].sort()).toEqual(['Glob', 'Grep', 'Read']);
+    expect([...(options.tools as string[])].sort()).toEqual(['Read']);
     expect(options.cwd).toBe(businessDocumentRoot(TEST_BUSINESS));
     expect(Object.keys(options.env ?? {})).toEqual(process.env['PATH'] === undefined ? [] : ['PATH']);
     expect(options.settingSources).toEqual([]);
