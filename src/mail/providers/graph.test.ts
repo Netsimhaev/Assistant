@@ -418,7 +418,7 @@ describe('graph searchSent', () => {
           {
             id: 'S1',
             subject: 'חשבונית',
-            sentDateTime: '2026-10-01T08:00:00Z',
+            sentDateTime: new Date(Date.now() - 86_400_000).toISOString(),
             attachments: [{ id: 'a1', name: 'inv.pdf', contentType: 'application/pdf' }],
           },
         ],
@@ -428,18 +428,26 @@ describe('graph searchSent', () => {
     const raw = calls[0]!.url;
     expect(raw.startsWith('https://graph.microsoft.com/v1.0/me/mailFolders/sentitems/messages?')).toBe(true);
     const url = new URL(raw);
-    expect(url.searchParams.get('$filter')).toMatch(/^sentDateTime ge \d{4}-\d\d-\d\dT/);
+    expect(url.searchParams.has('$filter')).toBe(false);
     expect(url.searchParams.get('$search')).toBe('"to:dana@x.co.il"');
     expect(url.searchParams.get('$top')).toBe('20');
     expect(url.searchParams.get('$expand')).toBe('attachments($select=id,name,contentType)');
     expect(res).toEqual([
       {
         providerMessageId: 'S1',
-        sentAt: '2026-10-01T08:00:00.000Z',
+        sentAt: expect.any(String),
         subject: 'חשבונית',
         attachments: [{ attachmentId: 'a1', filename: 'inv.pdf', mediaType: 'application/pdf' }],
       },
     ]);
+  });
+
+  it('drops messages older than sinceDays', async () => {
+    const { http } = fake(() => ({
+      status: 200,
+      body: { value: [{ id: 'old', subject: 'x', sentDateTime: '2020-01-01T00:00:00Z', attachments: [] }] },
+    }));
+    expect(await createGraphClient(http).searchSent('tok', q, signal)).toEqual([]);
   });
 
   it('refuses a malformed to without HTTP', async () => {

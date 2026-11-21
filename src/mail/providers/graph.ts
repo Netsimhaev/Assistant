@@ -237,11 +237,11 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
       return guarded(async () => {
         const problem = sentQueryProblem(query);
         if (problem !== null) return problem;
-        const since = new Date(Date.now() - query.sinceDays * 86_400_000).toISOString();
+        // Graph cannot combine $filter with $search on messages: the age bound is applied in code below.
+        const sinceMs = Date.now() - query.sinceDays * 86_400_000;
         const url =
           `${BASE}/me/mailFolders/sentitems/messages` +
-          `?$filter=${encodeURIComponent(`sentDateTime ge ${since}`)}` +
-          `&$search=${encodeURIComponent(`"to:${query.to}"`)}` +
+          `?$search=${encodeURIComponent(`"to:${query.to}"`)}` +
           `&$top=${query.limit}` +
           `&$expand=${encodeURIComponent('attachments($select=id,name,contentType)')}`;
         const res = await http.request({ method: 'GET', url, accessToken: token, signal });
@@ -252,6 +252,7 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
           const rec = asRecord(m);
           if (typeof rec['id'] !== 'string') continue;
           const sent = Date.parse(String(rec['sentDateTime']));
+          if (Number.isFinite(sent) && sent < sinceMs) continue;
           const attachments: SentMail['attachments'] = [];
           for (const a of Array.isArray(rec['attachments']) ? rec['attachments'] : []) {
             const ar = asRecord(a);
