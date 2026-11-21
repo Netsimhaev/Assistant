@@ -142,6 +142,7 @@ function fakeClient(
     },
     sendReply: async () => ({ externalId: 'SENT-1' }),
     sendNew: async () => ({ externalId: 'SENT-NEW-1' }),
+    searchSent: async () => [],
   };
   return state;
 }

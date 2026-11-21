@@ -50,6 +50,36 @@ export interface OutgoingMessage {
   attachments?: readonly OutgoingAttachment[];
 }
 
+/** One mail from the Sent folder, as `searchSent` reports it (read-only; invoices to one recipient). */
+export interface SentMail {
+  providerMessageId: string;
+  sentAt: string;
+  subject: string;
+  attachments: { attachmentId: string; filename: string; mediaType: string }[];
+}
+
+/** Bounds of a `searchSent` call; `to` must be a plain address (checked before any HTTP). */
+export interface SentSearchQuery {
+  to: string;
+  sinceDays: number;
+  limit: number;
+}
+
+/** A recipient address the sent-mail search accepts: plain shape, nothing that could widen the query. */
+const SENT_TO_SHAPE = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
+
+/** The refusal for a `to` that is not a plain address or bounds out of range; `null` when the query is fine. */
+export function sentQueryProblem(query: SentSearchQuery): MailboxFailure | null {
+  if (!SENT_TO_SHAPE.test(query.to)) {
+    return { failure: 'rejected', status: 0, message: 'sent-mail search recipient is not a plain address' };
+  }
+  const ok = (n: number, max: number): boolean => Number.isInteger(n) && n >= 1 && n <= max;
+  if (!ok(query.sinceDays, 3650) || !ok(query.limit, 100)) {
+    return { failure: 'rejected', status: 0, message: 'sent-mail search bounds are out of range' };
+  }
+  return null;
+}
+
 export interface MailboxClient {
   /** Throws `MailboxCursorError` on failure: this signature has no failure arm. */
   initialCursor(token: string, signal: AbortSignal): Promise<string>;
@@ -81,6 +111,11 @@ export interface MailboxClient {
     reply: OutgoingReply,
     signal: AbortSignal,
   ): Promise<{ externalId: string | null } | MailboxFailure>;
+  /**
+   * Read-only search of mail the owner SENT to one address, attachments listed
+   * (not fetched). At most `limit`.
+   */
+  searchSent(token: string, query: SentSearchQuery, signal: AbortSignal): Promise<SentMail[] | MailboxFailure>;
   /** Send a new message — straight out, never via a saved draft. */
   sendNew(
     token: string,

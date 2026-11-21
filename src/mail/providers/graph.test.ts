@@ -406,3 +406,46 @@ describe('graph attachments (document production §8.2)', () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+describe('graph searchSent', () => {
+  const q = { to: 'dana@x.co.il', sinceDays: 365, limit: 20 };
+
+  it('searches the sent folder with attachments expanded', async () => {
+    const { http, calls } = fake(() => ({
+      status: 200,
+      body: {
+        value: [
+          {
+            id: 'S1',
+            subject: 'חשבונית',
+            sentDateTime: '2026-10-01T08:00:00Z',
+            attachments: [{ id: 'a1', name: 'inv.pdf', contentType: 'application/pdf' }],
+          },
+        ],
+      },
+    }));
+    const res = await createGraphClient(http).searchSent('tok', q, signal);
+    const raw = calls[0]!.url;
+    expect(raw.startsWith('https://graph.microsoft.com/v1.0/me/mailFolders/sentitems/messages?')).toBe(true);
+    const url = new URL(raw);
+    expect(url.searchParams.get('$filter')).toMatch(/^sentDateTime ge \d{4}-\d\d-\d\dT/);
+    expect(url.searchParams.get('$search')).toBe('"to:dana@x.co.il"');
+    expect(url.searchParams.get('$top')).toBe('20');
+    expect(url.searchParams.get('$expand')).toBe('attachments($select=id,name,contentType)');
+    expect(res).toEqual([
+      {
+        providerMessageId: 'S1',
+        sentAt: '2026-10-01T08:00:00.000Z',
+        subject: 'חשבונית',
+        attachments: [{ attachmentId: 'a1', filename: 'inv.pdf', mediaType: 'application/pdf' }],
+      },
+    ]);
+  });
+
+  it('refuses a malformed to without HTTP', async () => {
+    const { http, calls } = fake(() => ({ status: 200, body: {} }));
+    const res = await createGraphClient(http).searchSent('tok', { ...q, to: 'x"y@z.co' }, signal);
+    expect(res).toMatchObject({ failure: 'rejected' });
+    expect(calls).toHaveLength(0);
+  });
+});

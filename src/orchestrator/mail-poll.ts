@@ -114,8 +114,7 @@ import {
   type StoredMail,
 } from '../mail/inbox-store.js';
 import { MAIL_LABELS, MAILBOX_SYSTEM, type MailCategory, type MailProvider } from '../mail/mailbox.js';
-import { createGmailClient } from '../mail/providers/gmail.js';
-import { createGraphClient } from '../mail/providers/graph.js';
+import { clientFor } from '../mail/providers/client-for.js';
 import { MailboxCursorError, isFailure, type MailboxClient } from '../mail/providers/types.js';
 import { renderMailNotice } from '../mail/whatsapp-notice.js';
 import {
@@ -186,7 +185,7 @@ export interface PollMailboxOptions {
   attachmentBudgetMs?: number;
 }
 
-const MAILBOX_CREDENTIAL_REF = 'OAUTH_MAILBOX';
+export const MAILBOX_CREDENTIAL_REF = 'OAUTH_MAILBOX';
 const CALL_TIMEOUT_MS = 30_000;
 const DEFAULT_TRIAGE_LIMIT = 20;
 /** A claim older than this is a crashed poller's, not a slow one's: a pass triages at most 20 mails. */
@@ -229,10 +228,6 @@ function emptyResult(status: MailPollResult['status']): MailPollResult {
     reraised: 0,
     failed: 0,
   };
-}
-
-function clientFor(provider: MailProvider): MailboxClient {
-  return provider === 'google' ? createGmailClient() : createGraphClient();
 }
 
 export async function pollMailbox(db: BusinessDb, options: PollMailboxOptions): Promise<MailPollResult | null> {
