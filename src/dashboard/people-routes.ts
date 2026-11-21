@@ -281,7 +281,7 @@ export async function handlePeopleInvoicePost(
     await writeFile(path, file.bytes, { flag: 'wx' });
     const record = await ingestDocument(
       db,
-      { path, source: 'manual', originalName: file.filename },
+      { path, source: 'instruction', originalName: file.filename },
       { ...(documentRoot !== undefined ? { documentRoot } : {}) },
     );
     if (record.status === 'rejected' || (record.status === 'stored' && record.reason !== null)) {

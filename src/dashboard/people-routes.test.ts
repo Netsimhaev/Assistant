@@ -17,6 +17,7 @@ import { createServer } from './server.js';
 import { PEOPLE_INTRO } from './people-routes.js';
 import { CONTACT_PHONE_TAKEN } from '../business/settings-contacts.js';
 import { escapeHtml } from './views.js';
+import { documentsAwaitingRead } from '../documents/store.js';
 
 const BUSINESS = 'people-business';
 const USERNAME = 'owner';
@@ -428,6 +429,9 @@ describe('attach invoice to a contact', () => {
     const res = await uploadInvoice(baseUrl, cookie, { csrf: await csrf(baseUrl, cookie), key });
     expect(res.status).toBe(303);
     expect(await rowsOf()).toEqual([{ contact_key: '972501110009', assigned_by: 'owner_upload' }]);
+    const { rows } = await testDb().query<{ source: string }>(`SELECT source FROM documents WHERE business_id = $1`, [BUSINESS]);
+    expect(rows.map((r) => r.source)).toEqual(['instruction']);
+    expect(await withBusiness(BUSINESS, (db) => documentsAwaitingRead(db, 10))).toEqual([]);
   });
 
   it('assigning requires CSRF and a managed contact key', async () => {
