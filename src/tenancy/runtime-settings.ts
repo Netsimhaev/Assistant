@@ -35,6 +35,7 @@ export const CAP_NAMES = [
   'whatsappInstructionsPerDay',
   'whatsappQuestionWindowMinutes',
   'whatsappMaxAudioSeconds',
+  'contactWaReadsPerDay',
 ] as const;
 export type CapName = (typeof CAP_NAMES)[number];
 
@@ -57,6 +58,7 @@ export const CAP_COLUMNS: Readonly<Record<CapName, string>> = {
   whatsappInstructionsPerDay: 'whatsapp_instructions_per_day',
   whatsappQuestionWindowMinutes: 'whatsapp_question_window_minutes',
   whatsappMaxAudioSeconds: 'whatsapp_max_audio_seconds',
+  contactWaReadsPerDay: 'contact_wa_reads_per_day',
 };
 
 export interface RuntimeSettings {

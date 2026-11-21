@@ -93,7 +93,7 @@ describe('runtime settings', () => {
         WHERE table_name = 'business_runtime_settings'`,
     );
     const columns = new Set(rows.map((r) => r.column_name));
-    expect(CAP_NAMES).toHaveLength(13);
+    expect(CAP_NAMES).toHaveLength(14);
     for (const name of CAP_NAMES) expect(columns.has(CAP_COLUMNS[name])).toBe(true);
   });
 });

@@ -121,6 +121,9 @@ const CANNOT_UNDERSTAND = 'לא הצלחתי להבין את ההקלטה, תו�
 const SENDER_LABEL: Record<SenderKind, string> = {
   principal: 'הבעלים',
   other: 'אחר',
+  contact: 'לקוח או ספק',
+  colleague: 'עמית',
+  unknown: 'אחר',
 };
 
 /**
@@ -240,6 +243,10 @@ function provenanceOf(senderKind: SenderKind): TrustLevel {
 const DAILY_CAP: Record<SenderKind, CapName> = {
   principal: 'whatsappTranscribeBossPerDay',
   other: 'whatsappTranscribeOtherPerDay',
+  // Everyone who is not the owner draws from the stranger budget.
+  contact: 'whatsappTranscribeOtherPerDay',
+  colleague: 'whatsappTranscribeOtherPerDay',
+  unknown: 'whatsappTranscribeOtherPerDay',
 };
 
 /**

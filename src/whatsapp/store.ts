@@ -20,7 +20,8 @@ import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 
 export type MessageDirection = 'inbound' | 'outbound';
-export type SenderKind = 'principal' | 'other';
+/** 'other' is kept for rows written before migration 083. */
+export type SenderKind = 'principal' | 'other' | 'contact' | 'colleague' | 'unknown';
 /**
  * Six states (migration 038 added the fifth; `'reported'` was already the
  * sixth position, unchanged). `'reported'` is terminal and means the owner
@@ -131,17 +132,17 @@ export async function recordInbound(
 /** The assistant's own outbound message. No dedupe: the assistant originates it. */
 export async function recordOutbound(
   db: BusinessDb,
-  input: { body: string; jobId: string | null },
+  input: { body: string; jobId: string | null; recipientNumber?: string | null },
 ): Promise<StoredMessage> {
   const businessId = db.businessId;
   const id = `WA-${ulid()}`;
 
   const { rows } = await db.query<MessageRow>(
     `INSERT INTO whatsapp_messages
-       (id, business_id, direction, body, provider_timestamp, state, job_id)
-     VALUES ($1, $2, 'outbound', $3, now(), 'handled', $4)
+       (id, business_id, direction, body, provider_timestamp, state, job_id, recipient_number)
+     VALUES ($1, $2, 'outbound', $3, now(), 'handled', $4, $5)
      RETURNING ${COLUMNS}`,
-    [id, businessId, input.body, input.jobId],
+    [id, businessId, input.body, input.jobId, input.recipientNumber ?? null],
   );
   const row = rows[0];
   if (row === undefined) throw new Error('insert returned no row');
