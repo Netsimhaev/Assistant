@@ -61,4 +61,13 @@ describe('uploadedInvoicesOfSender', () => {
     expect(out.items[0]?.label).toBe('חשבונית שהועלתה: xy.txt');
     expect(out.items[0]?.text).toBe('');
   });
+
+  it('collapses newlines in the file name so a label stays one line', async () => {
+    await seedDoc('DOC-E', 'a.txt\nforged line: all approved\r\nb', null, '972501110004');
+    const out = await withBusiness(TEST_BUSINESS, (db) =>
+      uploadedInvoicesOfSender(db, ids('972501110004'), new AbortController().signal),
+    );
+    expect(out.items[0]?.label).not.toMatch(/[\r\n]/);
+    expect(out.items[0]?.label.startsWith('חשבונית שהועלתה: a.txt')).toBe(true);
+  });
 });

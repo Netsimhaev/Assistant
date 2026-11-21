@@ -3,7 +3,7 @@
  * screen (`contact_documents.assigned_by = 'owner_upload'`). The join is on
  * the business and the sender's key; nothing from message text is a filter.
  */
-import { stripBidiControls } from '../../util/bidi.js';
+import { stripBidiControls, toOneLine } from '../../util/bidi.js';
 import type { Tier2Source, SourceItem } from './types.js';
 
 const MAX_ITEMS = 10;
@@ -53,7 +53,7 @@ export const uploadedInvoicesOfSender: Tier2Source = async (db, ids, signal) => 
     const text = artifacts.flatMap((a) => blockTexts(a.content)).join('\n').slice(0, MAX_TEXT_CHARS);
     items.push({
       source: 'uploaded_invoices',
-      label: `חשבונית שהועלתה: ${stripBidiControls(row.original_name)}`,
+      label: `חשבונית שהועלתה: ${toOneLine(stripBidiControls(row.original_name))}`,
       text,
       documentId: row.document_id,
       at: row.created_at.toISOString(),

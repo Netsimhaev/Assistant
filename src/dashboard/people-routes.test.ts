@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
-import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -18,6 +18,18 @@ import { PEOPLE_INTRO } from './people-routes.js';
 import { CONTACT_PHONE_TAKEN } from '../business/settings-contacts.js';
 import { escapeHtml } from './views.js';
 import { documentsAwaitingRead } from '../documents/store.js';
+
+const ingestOverride = vi.hoisted(() => ({ reason: null as string | null }));
+vi.mock('../documents/ingest.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../documents/ingest.js')>();
+  return {
+    ...actual,
+    ingestDocument: (...args: Parameters<typeof actual.ingestDocument>) =>
+      ingestOverride.reason === null
+        ? actual.ingestDocument(...args)
+        : Promise.resolve({ status: 'rejected', reason: ingestOverride.reason, documentId: 'DOC-X' }),
+  };
+});
 
 const BUSINESS = 'people-business';
 const USERNAME = 'owner';
@@ -442,5 +454,20 @@ describe('attach invoice to a contact', () => {
     const unknown = await uploadInvoice(baseUrl, cookie, { csrf: await csrf(baseUrl, cookie), key: '+972509999999' });
     expect(unknown.status).toBe(404);
     expect(await rowsOf()).toEqual([]);
+  });
+
+  it('renders an ingest rejection reason HTML-escaped', async () => {
+    const { baseUrl, cookie } = await start();
+    const key = await addContact(baseUrl, cookie);
+    ingestOverride.reason = '<script>alert(1)</script>';
+    try {
+      const res = await uploadInvoice(baseUrl, cookie, { csrf: await csrf(baseUrl, cookie), key });
+      expect(res.status).toBe(400);
+      const body = await res.text();
+      expect(body).not.toContain('<script>alert(1)');
+      expect(body).toContain('&lt;script&gt;');
+    } finally {
+      ingestOverride.reason = null;
+    }
   });
 });
