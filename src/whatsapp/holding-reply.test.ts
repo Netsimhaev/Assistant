@@ -155,6 +155,49 @@ describe('holding reply', () => {
     expect(gw.sent).toHaveLength(1);
   });
 
+  it('a throw after the claim releases it and defers the retry', async () => {
+    const gw = createFakeGateway();
+    const id = await conv(ago(5));
+    let countQueries = 0;
+    const out = await withBusiness(TEST_BUSINESS, (db) => {
+      const flaky = Object.create(db) as typeof db;
+      flaky.query = ((sql: string, params?: unknown[]) => {
+        if (/count\(\*\)[\s\S]*FROM contact_conversations/.test(sql)) {
+          countQueries += 1;
+          if (countQueries === 2) throw new Error('db blip');
+        }
+        return db.query(sql, params as never);
+      }) as typeof db.query;
+      return sendHoldingReply(flaky, { gateway: gw, bundle: open, now: new Date() }, id);
+    });
+    expect(out).toBe('failed');
+    expect(gw.sent).toHaveLength(0);
+    const c = await withBusiness(TEST_BUSINESS, (db) => loadConversation(db, id));
+    expect(c?.holdingSentAt).toBeNull();
+    expect(c?.holdingDueAt).not.toBeNull();
+    expect(await run(gw, id)).toBe('sent');
+  });
+
+  it('retries stop once the contact has been silent for 24 hours', async () => {
+    const gw = createFakeGateway();
+    const id = await conv(ago(5));
+    gw.throwNextSend();
+    const t0 = new Date();
+    expect(await run(gw, id, open, t0)).toBe('failed');
+    const later = new Date(t0.getTime() + 25 * 3600_000);
+    const r = await withBusiness(TEST_BUSINESS, (db) =>
+      sendDueHoldingReplies(db, { gateway: gw, bundle: open, now: later }),
+    );
+    expect(r).toEqual({ sent: 0, failed: 0 });
+    const c = await withBusiness(TEST_BUSINESS, (db) => loadConversation(db, id));
+    expect(c?.holdingDueAt).toBeNull();
+    expect(gw.sent).toHaveLength(0);
+    // And a failure after 24h does not defer again.
+    const old = await conv(ago(25 * 60), '972501110002');
+    gw.throwNextSend();
+    expect(await run(gw, old, open, new Date())).toBe('stale');
+  });
+
   it('two concurrent calls send exactly once', async () => {
     const gw = createFakeGateway();
     const id = await conv(ago(5));

@@ -33,6 +33,7 @@ export const HOLDING_REPLY_REASON = 'contact_holding_reply';
 export const HOLDING_MAX_PER_DAY = 3;
 export const HOLDING_FRESHNESS_MS = 60 * 60 * 1000;
 export const HOLDING_RETRY_MS = 5 * 60 * 1000;
+export const HOLDING_GIVE_UP_MS = 24 * 60 * 60 * 1000;
 export const HOLDING_NAME_FALLBACK = 'העסק';
 
 export const HOLDING_REPLY_TEXT = (businessName: string): string =>
@@ -84,6 +85,19 @@ export async function sendHoldingReply(
   if (conv === null) return 'stale';
   if (conv.holdingSentAt !== null) return 'already';
 
+  // Retries are bounded: a conversation untouched for 24 hours is given up on.
+  const giveUp = async (): Promise<void> => {
+    await db.query(
+      `UPDATE contact_conversations SET holding_due_at = NULL
+        WHERE business_id = $1 AND conversation_id = $2 AND holding_sent_at IS NULL`,
+      [db.businessId, conversationId],
+    );
+  };
+  if (now.getTime() - conv.lastInboundAt.getTime() > HOLDING_GIVE_UP_MS) {
+    await giveUp();
+    return 'stale';
+  }
+
   const kill = await checkKillSwitch(db, 'comms.whatsapp', true);
   if (kill.blocked) return 'halted';
 
@@ -99,42 +113,35 @@ export async function sendHoldingReply(
     return 'deferred';
   }
 
-  // Claim before sending: exactly one runner gets the row back, and only it sends.
-  const claim = await db.query(
-    `UPDATE contact_conversations SET holding_sent_at = $3
-      WHERE business_id = $1 AND conversation_id = $2 AND holding_sent_at IS NULL RETURNING 1`,
-    [db.businessId, conversationId, now],
-  );
-  if (claim.rows.length === 0) return 'already';
-  const release = async (): Promise<void> => {
-    // Clear only our own claim.
-    await db.query(
-      `UPDATE contact_conversations SET holding_sent_at = NULL
-        WHERE business_id = $1 AND conversation_id = $2 AND holding_sent_at = $3`,
+  const name = await displayName(db);
+  let claimed = false;
+  try {
+    // Claim before sending: exactly one runner gets the row back, and only it sends.
+    const claim = await db.query(
+      `UPDATE contact_conversations SET holding_sent_at = $3
+        WHERE business_id = $1 AND conversation_id = $2 AND holding_sent_at IS NULL RETURNING 1`,
       [db.businessId, conversationId, now],
     );
-  };
-  // Best effort against a race on the daily cap: recount with our claim included.
-  if ((await holdingsToday(db, conv.contactKey, bundle, now)) > HOLDING_MAX_PER_DAY) {
-    await release();
-    return 'capped';
-  }
+    if (claim.rows.length === 0) return 'already';
+    claimed = true;
 
-  const name = await displayName(db);
-  let state: string;
-  try {
+    // Best effort against a race on the daily cap: recount with our claim included.
+    if ((await holdingsToday(db, conv.contactKey, bundle, now)) > HOLDING_MAX_PER_DAY) {
+      await release(db, conversationId, now);
+      return 'capped';
+    }
+
     const result = await gateway.sendMessage({
       contactId: conv.contactKey,
       body: HOLDING_REPLY_TEXT(name),
       idempotencyKey: `holding:${conversationId}`,
     });
-    state = result.state;
+    if (result.state === 'rejected') throw new Error('rejected');
   } catch {
-    state = 'rejected';
-  }
-  if (state === 'rejected') {
-    await release();
-    await deferHolding(db, conversationId, new Date(now.getTime() + HOLDING_RETRY_MS));
+    // Anything before the send completed: free our claim and try again later.
+    if (claimed) await release(db, conversationId, now);
+    if (now.getTime() - conv.lastInboundAt.getTime() > HOLDING_GIVE_UP_MS) await giveUp();
+    else await deferHolding(db, conversationId, new Date(now.getTime() + HOLDING_RETRY_MS));
     return 'failed';
   }
 
@@ -149,6 +156,15 @@ export async function sendHoldingReply(
     reason: HOLDING_REPLY_REASON,
   });
   return 'sent';
+}
+
+/** Clear only our own claim. */
+async function release(db: BusinessDb, conversationId: string, claimedAt: Date): Promise<void> {
+  await db.query(
+    `UPDATE contact_conversations SET holding_sent_at = NULL
+      WHERE business_id = $1 AND conversation_id = $2 AND holding_sent_at = $3`,
+    [db.businessId, conversationId, claimedAt],
+  );
 }
 
 /** Scheduler entry: every conversation whose deferred reply is now due and unsent. */
