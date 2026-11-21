@@ -11,6 +11,8 @@ export interface SenderIds {
   email: string | null;
   /** The managed-contact subject key ('+digits'). */
   subjectKey: string;
+  /** The contact's ids in signed external systems, keyed by system id. */
+  externalIds?: Record<string, string>;
 }
 
 export interface SourceItem {

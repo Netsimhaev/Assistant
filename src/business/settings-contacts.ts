@@ -56,6 +56,7 @@ export interface ManagedContact {
   phone: string;
   kind: 'client' | 'supplier' | null;
   email: string | null;
+  externalIds: Record<string, string>;
 }
 
 interface ContactRow {
@@ -66,6 +67,14 @@ interface ContactRow {
 function readString(body: Record<string, unknown>, field: string): string {
   const value = body[field];
   return typeof value === 'string' ? value : '';
+}
+
+function readExternalIds(body: Record<string, unknown>): Record<string, string> {
+  const value = body['externalIds'];
+  const out: Record<string, string> = {};
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return out;
+  for (const [k, v] of Object.entries(value)) if (typeof v === 'string' && v !== '') out[k] = v;
+  return out;
 }
 
 function readKind(body: Record<string, unknown>): 'client' | 'supplier' | null {
@@ -88,6 +97,7 @@ export async function listManagedContacts(db: BusinessDb): Promise<ManagedContac
     phone: readString(row.body, 'phone'),
     kind: readKind(row.body),
     email: readString(row.body, 'email') || null,
+    externalIds: readExternalIds(row.body),
   }));
 }
 
@@ -129,6 +139,9 @@ function writeContact(tx: BusinessDb, jobId: string, entry: PersonEntry) {
       phone: entry.phone,
       ...(entry.kind === undefined ? {} : { kind: entry.kind }),
       ...(entry.email === undefined ? {} : { email: entry.email }),
+      ...(entry.externalIds === undefined || Object.keys(entry.externalIds).length === 0
+        ? {}
+        : { externalIds: entry.externalIds }),
     },
     sourceRef: SETTINGS_PEOPLE_SOURCE_REF,
   });

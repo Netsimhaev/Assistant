@@ -157,6 +157,11 @@ import {
   handlePeopleInvoicePost,
 } from './people-routes.js';
 import {
+  CONTACT_WHATSAPP_SETTINGS_PATH,
+  handleContactWhatsappGet,
+  handleContactWhatsappPost,
+} from './contact-whatsapp-settings.js';
+import {
   PROFILE_LOGO_PATH,
   PROFILE_SETTINGS_PATH,
   handleAddressPost,
@@ -3604,6 +3609,10 @@ async function route(
     return handleLogoPost(req, res, db, session, documentRoot ?? config.documentRoot);
   }
   if (method === 'GET' && pathname === PEOPLE_SETTINGS_PATH) return handlePeopleGet(res, db, session);
+  if (method === 'GET' && pathname === CONTACT_WHATSAPP_SETTINGS_PATH) return handleContactWhatsappGet(res, db, session);
+  if (method === 'POST' && pathname === CONTACT_WHATSAPP_SETTINGS_PATH) {
+    return handleContactWhatsappPost(res, db, session, await readFormBody(req));
+  }
   if (method === 'POST' && pathname === PEOPLE_INVOICE_PATH) {
     return handlePeopleInvoicePost(req, res, db, session, documentRoot ?? config.documentRoot);
   }

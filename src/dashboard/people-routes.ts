@@ -42,6 +42,7 @@ export const PEOPLE_INTRO =
 
 export const PERSON_FIELDS_REQUIRED = `שם ותפקיד הם שדות חובה (עד ${PERSON_FIELD_MAX_CHARS} תווים).`;
 export const PERSON_EMAIL_INVALID = 'כתובת המייל אינה תקינה.';
+export const PERSON_EXTERNAL_IDS_INVALID = 'המזהים במערכות חיצוניות אינם תקינים (עד חמישה, בצורה מזהה_מערכת=מזהה).';
 export const PERSON_NOT_FOUND = 'לא מצאתי את האדם הזה — אולי הוא כבר הוסר. רענן את העמוד.';
 
 /** `POST /settings/people/<colleague|contact>/<add|edit|remove>`. */
@@ -78,14 +79,19 @@ function personFrom(
 ): { ok: true; entry: PersonEntry } | { ok: false; error: string } {
   const kind = withContactFields ? (form.get('kind') ?? '') : '';
   const email = withContactFields ? (form.get('email') ?? '').trim() : '';
+  const externalIds = withContactFields ? parseExternalIds(form.get('externalIds') ?? '') : {};
   const parsed = PersonEntry.safeParse({
     name: form.get('name') ?? '',
     role: form.get('role') ?? '',
     phone: form.get('phone') ?? '',
     ...(kind === '' ? {} : { kind }),
     ...(email === '' ? {} : { email }),
+    ...(Object.keys(externalIds).length === 0 ? {} : { externalIds }),
   });
   if (parsed.success) return { ok: true, entry: parsed.data };
+  if (parsed.error.issues.some((i) => i.path[0] === 'externalIds')) {
+    return { ok: false, error: PERSON_EXTERNAL_IDS_INVALID };
+  }
   if (parsed.error.issues.some((i) => i.path[0] === 'email')) return { ok: false, error: PERSON_EMAIL_INVALID };
   // The phone's own issue is already Hebrew (`InternationalPhone`); the
   // name/role issues are zod's English defaults, replaced here.
@@ -93,10 +99,27 @@ function personFrom(
   return { ok: false, error: phoneIssue?.message ?? PERSON_FIELDS_REQUIRED };
 }
 
-function contactInputs(values: { kind: string | null; email: string | null }): string {
+/** One `system=id` per line; whatever `PersonEntry` refuses is reported by `personFrom`. */
+function parseExternalIds(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const line of text.split(/\r?\n/)) {
+    const at = line.indexOf('=');
+    if (at < 0) continue;
+    const key = line.slice(0, at).trim();
+    const value = line.slice(at + 1).trim();
+    if (key !== '' && value !== '') out[key] = value;
+  }
+  return out;
+}
+
+function contactInputs(values: { kind: string | null; email: string | null; externalIds: Record<string, string> }): string {
+  const idLines = Object.entries(values.externalIds)
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
   const opt = (v: string, label: string) => `<option value="${v}"${values.kind === v || (v === '' && values.kind === null) ? ' selected' : ''}>${label}</option>`;
   return `<label>סוג <select name="kind">${opt('', '—')}${opt('client', 'לקוח')}${opt('supplier', 'ספק')}</select></label>
-  <label>מייל <input type="email" name="email" value="${esc(values.email ?? '')}" maxlength="254" dir="ltr"></label>`;
+  <label>מייל <input type="email" name="email" value="${esc(values.email ?? '')}" maxlength="254" dir="ltr"></label>
+  <label>מזהים במערכות חיצוניות (שורה לכל מערכת: מזהה_מערכת=מזהה) <textarea name="externalIds" rows="2" dir="ltr">${esc(idLines)}</textarea></label>`;
 }
 
 function personInputs(values: { name: string; role: string; phone: string }): string {
@@ -186,7 +209,7 @@ ${contactRows === '' ? '<p class="muted">אין אנשי קשר.</p>' : contactR
 <form method="post" action="${PEOPLE_SETTINGS_PATH}/contact/add">
   ${hidden}
   ${personInputs(EMPTY)}
-  ${contactInputs({ kind: null, email: null })}
+  ${contactInputs({ kind: null, email: null, externalIds: {} })}
   <button type="submit">הוסף</button>
 </form>
 </div>`,
