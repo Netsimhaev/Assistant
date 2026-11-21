@@ -143,4 +143,29 @@ describe('holding reply', () => {
     expect(blob).not.toContain('קיבלתי');
     expect(rows[0]?.reason).toBe('contact_holding_reply');
   });
+
+  it('a deferred reply goes out at quiet-hours end while the question is open, once', async () => {
+    const gw = createFakeGateway();
+    const night = new Date(Date.UTC(2026, 0, 15, 21, 30));
+    const id = await conv(night);
+    const quiet = { ...baseBundle, quietHours: { from: '20:00', to: '07:00', timezone: 'Asia/Jerusalem', appliesTo: ['whatsapp'] } } as typeof baseBundle;
+    expect(await run(gw, id, quiet, night)).toBe('deferred');
+    const morning = new Date(Date.UTC(2026, 0, 16, 5, 0));
+    const pass = () => withBusiness(TEST_BUSINESS, (db) => sendDueHoldingReplies(db, { gateway: gw, bundle: quiet, businessName: NAME, now: morning }));
+    expect(await pass()).toEqual({ sent: 1, failed: 0 });
+    expect(await pass()).toEqual({ sent: 0, failed: 0 });
+    expect(gw.sent).toHaveLength(1);
+  });
+
+  it('a deferred reply is not sent when the conversation was closed meanwhile', async () => {
+    const gw = createFakeGateway();
+    const night = new Date(Date.UTC(2026, 0, 15, 21, 30));
+    const id = await conv(night);
+    const quiet = { ...baseBundle, quietHours: { from: '20:00', to: '07:00', timezone: 'Asia/Jerusalem', appliesTo: ['whatsapp'] } } as typeof baseBundle;
+    expect(await run(gw, id, quiet, night)).toBe('deferred');
+    await testDb().query(`UPDATE contact_conversations SET state = 'closed' WHERE conversation_id = $1`, [id]);
+    const morning = new Date(Date.UTC(2026, 0, 16, 5, 0));
+    await withBusiness(TEST_BUSINESS, (db) => sendDueHoldingReplies(db, { gateway: gw, bundle: quiet, businessName: NAME, now: morning }));
+    expect(gw.sent).toHaveLength(0);
+  });
 });

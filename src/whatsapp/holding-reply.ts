@@ -66,7 +66,11 @@ export async function sendHoldingReply(
   const kill = await checkKillSwitch(db, 'comms.whatsapp', true);
   if (kill.blocked) return 'halted';
 
-  if (now.getTime() - conv.lastInboundAt.getTime() > HOLDING_FRESHNESS_MS) return 'stale';
+  // A deferred reply (holding_due_at set) is still wanted while the question is open;
+  // a first attempt must be fresh.
+  if (conv.holdingDueAt !== null) {
+    if (conv.state !== 'open' && conv.state !== 'carded') return 'stale';
+  } else if (now.getTime() - conv.lastInboundAt.getTime() > HOLDING_FRESHNESS_MS) return 'stale';
   if ((await holdingsToday(db, conv.contactKey, bundle, now)) >= HOLDING_MAX_PER_DAY) return 'capped';
 
   if (inQuietHours(bundle.quietHours, now)) {
