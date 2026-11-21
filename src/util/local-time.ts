@@ -107,3 +107,56 @@ export function addBusinessDays(
   const hh = String(opts.hour).padStart(2, '0');
   return localToInstant(date, `${hh}:00`, opts.timeZone);
 }
+
+/**
+ * The next moment at `hh:mm` in `timezone` that is strictly after `from`.
+ *
+ * Computed by probing forward in minute-resolution steps rather than by
+ * constructing a local date: constructing one requires knowing the zone's UTC
+ * offset *at that future instant*, which is exactly what DST makes unsafe to
+ * assume. Probing asks Intl, which knows.
+ */
+export function nextTimeAt(hhmm: string, timezone: string, from: Date): Date {
+  const target = parseHhMm(hhmm);
+  if (target === null) return new Date(from.getTime() + 60 * 60 * 1000);
+
+  // A whole day of minutes is 1440 probes at worst; this runs once per deferred
+  // step, not per request.
+  for (let minutes = 1; minutes <= 60 * 24 + 60; minutes += 1) {
+    const candidate = new Date(from.getTime() + minutes * 60 * 1000);
+    if (localMinutes(candidate, timezone) === target) return candidate;
+  }
+  return new Date(from.getTime() + 60 * 60 * 1000);
+}
+
+function parseHhMm(hhmm: string): number | null {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim());
+  if (!match) return null;
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+function localMinutes(at: Date, timezone: string): number {
+  try {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: timezone,
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(at);
+    return (
+      Number(parts.find((p) => p.type === 'hour')?.value ?? '0') * 60 +
+      Number(parts.find((p) => p.type === 'minute')?.value ?? '0')
+    );
+  } catch {
+    return at.getUTCHours() * 60 + at.getUTCMinutes();
+  }
+}
+
+/**
+ * The end of the charter's quiet window (its 'to' time) strictly after 'now'.
+ * With no quiet hours there is no window to wait out, so 'now' itself.
+ */
+export function nextQuietEnd(bundle: { quietHours: { to: string; timezone: string } | null }, now: Date): Date {
+  if (bundle.quietHours === null) return now;
+  return nextTimeAt(bundle.quietHours.to, bundle.quietHours.timezone, now);
+}
