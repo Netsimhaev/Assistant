@@ -318,9 +318,13 @@ export function createGmailClient(http: MailboxHttp = defaultMailboxHttp()): Mai
             signal,
           });
           if (res.status === 404) continue;
-          if (!ok2xx(res.status)) return failureFromStatus(res.status, res.body);
+          // One failing message read must not discard the rest.
+          if (!ok2xx(res.status)) continue;
           const msg = asRecord(res.body);
           const payload = asRecord(msg['payload']) as GmailPart;
+          const recipients = ['To', 'Cc', 'Bcc'].flatMap((h) =>
+            parseAddressList(headerOf(payload.headers, h) ?? '').map((a) => a.address.toLowerCase()),
+          );
           const attachments: SentMail['attachments'] = [];
           walk(payload, (p) => {
             if (p.filename !== undefined && p.filename !== '' && p.body?.attachmentId !== undefined) {
@@ -336,6 +340,7 @@ export function createGmailClient(http: MailboxHttp = defaultMailboxHttp()): Mai
             providerMessageId: id,
             sentAt: new Date(Number.isFinite(internal) && internal > 0 ? internal : Date.now()).toISOString(),
             subject: decodeHeader(headerOf(payload.headers, 'Subject') ?? ''),
+            recipients,
             attachments,
           });
         }

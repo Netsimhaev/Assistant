@@ -55,6 +55,8 @@ export interface SentMail {
   providerMessageId: string;
   sentAt: string;
   subject: string;
+  /** Lower-cased To + Cc + Bcc addresses (Bcc only when the provider exposes it). */
+  recipients: string[];
   attachments: { attachmentId: string; filename: string; mediaType: string }[];
 }
 

@@ -418,6 +418,8 @@ describe('graph searchSent', () => {
           {
             id: 'S1',
             subject: 'חשבונית',
+            toRecipients: [{ emailAddress: { address: 'Dana@X.co.il' } }],
+            ccRecipients: [{ emailAddress: { address: 'b@y.com' } }],
             sentDateTime: new Date(Date.now() - 86_400_000).toISOString(),
             attachments: [{ id: 'a1', name: 'inv.pdf', contentType: 'application/pdf' }],
           },
@@ -437,6 +439,7 @@ describe('graph searchSent', () => {
         providerMessageId: 'S1',
         sentAt: expect.any(String),
         subject: 'חשבונית',
+        recipients: ['dana@x.co.il', 'b@y.com'],
         attachments: [{ attachmentId: 'a1', filename: 'inv.pdf', mediaType: 'application/pdf' }],
       },
     ]);

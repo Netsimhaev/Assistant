@@ -79,6 +79,9 @@ export function createSentInvoicesSource(deps: SentInvoicesDeps): Tier2Source {
       if (isFailure(sent)) return none;
       const items: SourceItem[] = [];
       for (const mail of sent) {
+        // Provider search is fuzzy (Gmail to: also matches Cc/Bcc): keep only mail sent to this contact alone.
+        const target = ids.email.toLowerCase();
+        if (mail.recipients.length === 0 || !mail.recipients.every((a) => a.toLowerCase() === target)) continue;
         for (const att of mail.attachments) {
           if (signal.aborted || items.length >= MAX_ITEMS) return { items, ownershipViolation: false };
           if (!isPdf(att.mediaType, att.filename)) continue;

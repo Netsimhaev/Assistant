@@ -253,6 +253,12 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
           if (typeof rec['id'] !== 'string') continue;
           const sent = Date.parse(String(rec['sentDateTime']));
           if (Number.isFinite(sent) && sent < sinceMs) continue;
+          const recipients = ['toRecipients', 'ccRecipients', 'bccRecipients'].flatMap((k) =>
+            (Array.isArray(rec[k]) ? (rec[k] as unknown[]) : []).flatMap((x) => {
+              const address = asRecord(asRecord(x)['emailAddress'])['address'];
+              return typeof address === 'string' ? [address.trim().toLowerCase()] : [];
+            }),
+          );
           const attachments: SentMail['attachments'] = [];
           for (const a of Array.isArray(rec['attachments']) ? rec['attachments'] : []) {
             const ar = asRecord(a);
@@ -267,6 +273,7 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
             providerMessageId: rec['id'],
             sentAt: new Date(Number.isFinite(sent) ? sent : Date.now()).toISOString(),
             subject: typeof rec['subject'] === 'string' ? rec['subject'] : '',
+            recipients,
             attachments,
           });
         }

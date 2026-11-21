@@ -21,6 +21,7 @@ const sent: SentMail[] = [
     providerMessageId: 'M1',
     sentAt: '2026-10-01T08:00:00.000Z',
     subject: 'מצורפת חשבונית',
+    recipients: ['dana@x.co.il'],
     attachments: [
       { attachmentId: 'A1', filename: 'inv.pdf', mediaType: 'application/pdf' },
       { attachmentId: 'A2', filename: 'logo.png', mediaType: 'image/png' },
@@ -31,6 +32,7 @@ const sent: SentMail[] = [
     providerMessageId: 'M2',
     sentAt: '2026-10-02T08:00:00.000Z',
     subject: 'שלום',
+    recipients: ['Dana@X.co.il'],
     attachments: [
       { attachmentId: 'B1', filename: 'brochure.pdf', mediaType: 'application/pdf' },
       { attachmentId: 'B2', filename: 'קבלה 12.pdf', mediaType: 'application/pdf' },
@@ -38,13 +40,21 @@ const sent: SentMail[] = [
   },
 ];
 
+function extraSent(): SentMail[] {
+  const att = [{ attachmentId: 'C1', filename: 'invoice.pdf', mediaType: 'application/pdf' }];
+  return [
+    { providerMessageId: 'M3', sentAt: '2026-10-03T08:00:00.000Z', subject: 'invoice', recipients: ['dana@x.co.il', 'other@y.com'], attachments: att },
+    { providerMessageId: 'M4', sentAt: '2026-10-03T08:00:00.000Z', subject: 'invoice', recipients: ['dana@x.co.il.evil.com'], attachments: [{ ...att[0]!, attachmentId: 'C2' }] },
+  ];
+}
+
 function fakeClient() {
   const searches: unknown[] = [];
   const fetched: string[] = [];
   const client = {
     async searchSent(_t: string, q: unknown) {
       searches.push(q);
-      return sent;
+      return [...sent, ...extraSent()];
     },
     async fetchAttachment(_t: string, _m: string, a: string) {
       fetched.push(a);
@@ -70,7 +80,7 @@ describe('sentInvoicesOfSender', () => {
   it('only PDF attachments that look like invoices are ingested', async () => {
     const { out, fake } = await run('dana@x.co.il');
     expect(fake.searches).toEqual([{ to: 'dana@x.co.il', sinceDays: 365, limit: 20 }]);
-    expect(fake.fetched.sort()).toEqual(['A1', 'B2']);
+    expect(fake.fetched.sort()).toEqual(['A1', 'B2']); // M3 (extra Cc) and M4 (lookalike) are dropped
     expect(out.ownershipViolation).toBe(false);
     expect(out.items).toHaveLength(2);
     expect(out.items.every((i) => i.source === 'sent_invoices' && i.documentId !== null)).toBe(true);
