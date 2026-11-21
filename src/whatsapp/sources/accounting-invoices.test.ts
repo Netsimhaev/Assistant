@@ -138,6 +138,58 @@ describe('createAccountingInvoicesSource', () => {
     expect(out.items[0]?.text.split('\n')).toHaveLength(3);
   });
 
+  it('a response that is not a list (wrapper object) yields nothing and a violation', async () => {
+    await setup();
+    const http = fakeHttp({
+      query: { customer_id: 'C-7' },
+      customer_id: 'C-7',
+      records: [{ number: 'INV-9', customer_id: 'C-70' }],
+    });
+    const out = await run(http, { crm: 'C-7' });
+    expect(out).toEqual({ items: [], ownershipViolation: true });
+  });
+
+  it('an object or array field value is dropped and is a violation', async () => {
+    await setup();
+    const out = await run(
+      fakeHttp([{ number: 'INV-1', customer_id: 'C-7', total: { other: [{ customer_id: 'C-70' }] } }]),
+      { crm: 'C-7' },
+    );
+    expect(out.ownershipViolation).toBe(true);
+    expect(out.items[0]?.text).toBe('מספר חשבונית: INV-1\nמזהה לקוח: C-7');
+    expect(JSON.stringify(out)).not.toContain('C-70');
+  });
+
+  it('compares exactly: no trimming, numbers by String(n), other types never match', async () => {
+    await setup();
+    const trailing = await run(fakeHttp([{ number: 'A', customer_id: 'C-7 ', total: 1 }]), { crm: 'C-7' });
+    expect(trailing).toEqual({ items: [], ownershipViolation: true });
+    const num = await run(fakeHttp([{ number: 'A', customer_id: 42, total: 1 }]), { crm: '42' });
+    expect(num.items).toHaveLength(1);
+    expect(num.ownershipViolation).toBe(false);
+    const bool = await run(fakeHttp([{ number: 'A', customer_id: true, total: 1 }]), { crm: 'true' });
+    expect(bool).toEqual({ items: [], ownershipViolation: true });
+  });
+
+  it('sends no phone digits to the provider', async () => {
+    await setup();
+    const http = fakeHttp([{ number: 'A', customer_id: 'C-7', total: 1 }]);
+    await run(http, { crm: 'C-7' });
+    const req = http.requests[0];
+    expect(JSON.stringify([req?.url.href, req?.headers, req?.body])).not.toContain('972501110001');
+  });
+
+  it('does nothing when the signal is already aborted', async () => {
+    await setup();
+    const http = fakeHttp([]);
+    const source = createAccountingInvoicesSource({ http, credentials: storedCredentials(TEST_MASTER_KEY) });
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const out = await withBusiness(BUSINESS, (db) => source(db, ids({ crm: 'C-7' }), ctrl.signal));
+    expect(out).toEqual({ items: [], ownershipViolation: false });
+    expect(http.requests).toHaveLength(0);
+  });
+
   it('no config, no externalId or no live binding → empty, no HTTP', async () => {
     const cases: { name: string; opts: { configure?: boolean; connect?: boolean }; externalIds?: Record<string, string> }[] = [
       { name: 'no config', opts: { configure: false }, externalIds: { crm: 'C-7' } },
@@ -176,6 +228,10 @@ describe('saveInvoiceSettings', () => {
       saveInvoiceSettings(db, { ...base, operation: 'list_invoices', customerField: 'secret' }),
     );
     expect(badField).toEqual({ ok: false, error: INVOICE_SETTINGS_REFUSALS.unknownField });
+    const indexed = await withBusiness(BUSINESS, (db) =>
+      saveInvoiceSettings(db, { ...base, operation: 'list_invoices', customerField: 'rows.0.customer_id' }),
+    );
+    expect(indexed).toEqual({ ok: false, error: INVOICE_SETTINGS_REFUSALS.indexedField });
     const { rows } = await testDb().query(`SELECT 1 FROM contact_whatsapp_settings WHERE business_id = $1`, [BUSINESS]);
     expect(rows).toHaveLength(0);
   });

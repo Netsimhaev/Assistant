@@ -25,6 +25,7 @@ export const INVOICE_SETTINGS_REFUSALS = {
   unknownOperation: 'הפעולה הזו אינה קיימת במערכת שנבחרה.',
   notRead: 'אפשר לבחור רק פעולת קריאה.',
   unknownParam: 'הפרמטר הזה אינו מוצהר בפעולה שנבחרה.',
+  indexedField: 'שדה המזהה אינו יכול לעבור דרך מערך (מקטע מספרי בנתיב).',
   unknownField: 'השדה הזה אינו מוצהר כשדה תשובה בפעולה שנבחרה.',
 } as const;
 
@@ -75,6 +76,9 @@ export async function saveInvoiceSettings(db: BusinessDb, input: InvoiceSettings
   if (op === undefined) return { ok: false, error: refusals.unknownOperation };
   if (op.kind !== 'read') return { ok: false, error: refusals.notRead };
   if (!op.params.some((p) => p.name === input.customerParam)) return { ok: false, error: refusals.unknownParam };
+  if (input.customerField.split('.').some((segment) => /^\d+$/.test(segment))) {
+    return { ok: false, error: refusals.indexedField };
+  }
   if (!op.fields.some((f) => f.path === input.customerField)) return { ok: false, error: refusals.unknownField };
   await db.query(
     `INSERT INTO contact_whatsapp_settings
