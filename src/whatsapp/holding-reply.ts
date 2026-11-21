@@ -5,11 +5,14 @@
  * straight to the gateway, not through `evaluateToolCall`, because a contact's
  * first message is `unknown_external` and the gate would refuse every outbound
  * action there. What stands in for the gate, all positive checks:
- *   - the text is a constant (`HOLDING_REPLY_TEXT`) — the sending function has
- *     no text parameter, so nothing a contact wrote can reach the wire;
+ *   - the text is a constant (`HOLDING_REPLY_TEXT`) around the business's own
+ *     display name, read here and made one bidi-free line — the sending
+ *     function has no text parameter, so nothing a contact wrote can reach the
+ *     wire;
  *   - the recipient is the conversation's own `contact_key`, read from the row;
- *   - once per conversation, at most 3 per number per business day, only when
- *     the contact wrote within the last 60 minutes;
+ *   - once per conversation (claimed in the row before sending), at most 3 per
+ *     number per business day, only when the contact wrote within the last 60
+ *     minutes (a deferred reply stays valid while the question is open);
  *   - never inside quiet hours (deferred to their end) and stopped by the
  *     `outbound` kill switch;
  *   - an audit row that carries a hash and a constant reason, never the number.
@@ -19,6 +22,7 @@ import type { PolicyBundle } from '../domain/policy.js';
 import { appendAudit } from '../audit/log.js';
 import { checkKillSwitch } from '../governance/killswitch.js';
 import { inQuietHours } from '../policy/redact.js';
+import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import { canonicalHash } from '../util/canonical.js';
 import { localParts, localToInstant, nextQuietEnd } from '../util/local-time.js';
 import { deferHolding, loadConversation, markHoldingSent } from './contact-conversations.js';
@@ -28,6 +32,8 @@ import { recordOutbound } from './store.js';
 export const HOLDING_REPLY_REASON = 'contact_holding_reply';
 export const HOLDING_MAX_PER_DAY = 3;
 export const HOLDING_FRESHNESS_MS = 60 * 60 * 1000;
+export const HOLDING_RETRY_MS = 5 * 60 * 1000;
+export const HOLDING_NAME_FALLBACK = 'העסק';
 
 export const HOLDING_REPLY_TEXT = (businessName: string): string =>
   `שלום, כאן העוזרת הדיגיטלית של ${businessName}. קיבלתי את הודעתך — בודקת ומעדכנת בהקדם.`;
@@ -35,22 +41,37 @@ export const HOLDING_REPLY_TEXT = (businessName: string): string =>
 export interface HoldingDeps {
   gateway: WhatsAppGateway;
   bundle: PolicyBundle;
-  businessName: string;
   now: Date;
 }
 
 export type HoldingOutcome = 'sent' | 'deferred' | 'already' | 'stale' | 'capped' | 'halted' | 'failed';
 
+/** The business's display name, read here (never passed in) and made one safe line. */
+async function displayName(db: BusinessDb): Promise<string> {
+  const { rows } = await db.query<{ display_name: string | null }>(
+    'SELECT display_name FROM business_profiles WHERE business_id = $1',
+    [db.businessId],
+  );
+  const name = toOneLine(stripBidiControls(rows[0]?.display_name ?? '')).trim();
+  return name === '' ? HOLDING_NAME_FALLBACK : name;
+}
+
+/** Holdings to this number today (business timezone): the larger of audited sends and claimed rows. */
 async function holdingsToday(db: BusinessDb, key: string, bundle: PolicyBundle, now: Date): Promise<number> {
-  // The business day, in the charter's timezone (UTC when no quiet window names one).
+  // The charter's timezone (UTC when no quiet window names one).
   const tz = bundle.quietHours?.timezone ?? 'UTC';
   const dayStart = localToInstant(localParts(now, tz).date, '00:00', tz);
-  const { rows } = await db.query<{ n: string }>(
+  const audited = await db.query<{ n: string }>(
     `SELECT count(*) AS n FROM audit_log
       WHERE business_id = $1 AND kind = 'tool_call' AND reason = $2 AND input_hash = $3 AND at >= $4`,
     [db.businessId, HOLDING_REPLY_REASON, canonicalHash({ key }), dayStart],
   );
-  return Number(rows[0]?.n ?? 0);
+  const claimed = await db.query<{ n: string }>(
+    `SELECT count(*) AS n FROM contact_conversations
+      WHERE business_id = $1 AND contact_key = $2 AND holding_sent_at >= $3`,
+    [db.businessId, key, dayStart],
+  );
+  return Math.max(Number(audited.rows[0]?.n ?? 0), Number(claimed.rows[0]?.n ?? 0));
 }
 
 export async function sendHoldingReply(
@@ -58,7 +79,7 @@ export async function sendHoldingReply(
   deps: HoldingDeps,
   conversationId: string,
 ): Promise<HoldingOutcome> {
-  const { gateway, bundle, businessName, now } = deps;
+  const { gateway, bundle, now } = deps;
   const conv = await loadConversation(db, conversationId);
   if (conv === null) return 'stale';
   if (conv.holdingSentAt !== null) return 'already';
@@ -78,23 +99,49 @@ export async function sendHoldingReply(
     return 'deferred';
   }
 
+  // Claim before sending: exactly one runner gets the row back, and only it sends.
+  const claim = await db.query(
+    `UPDATE contact_conversations SET holding_sent_at = $3
+      WHERE business_id = $1 AND conversation_id = $2 AND holding_sent_at IS NULL RETURNING 1`,
+    [db.businessId, conversationId, now],
+  );
+  if (claim.rows.length === 0) return 'already';
+  const release = async (): Promise<void> => {
+    // Clear only our own claim.
+    await db.query(
+      `UPDATE contact_conversations SET holding_sent_at = NULL
+        WHERE business_id = $1 AND conversation_id = $2 AND holding_sent_at = $3`,
+      [db.businessId, conversationId, now],
+    );
+  };
+  // Best effort against a race on the daily cap: recount with our claim included.
+  if ((await holdingsToday(db, conv.contactKey, bundle, now)) > HOLDING_MAX_PER_DAY) {
+    await release();
+    return 'capped';
+  }
+
+  const name = await displayName(db);
   let state: string;
   try {
     const result = await gateway.sendMessage({
       contactId: conv.contactKey,
-      body: HOLDING_REPLY_TEXT(businessName),
+      body: HOLDING_REPLY_TEXT(name),
       idempotencyKey: `holding:${conversationId}`,
     });
     state = result.state;
   } catch {
+    state = 'rejected';
+  }
+  if (state === 'rejected') {
+    await release();
+    await deferHolding(db, conversationId, new Date(now.getTime() + HOLDING_RETRY_MS));
     return 'failed';
   }
-  if (state === 'rejected') return 'failed';
 
   await markHoldingSent(db, conversationId, now);
-  await recordOutbound(db, { body: HOLDING_REPLY_TEXT(businessName), jobId: null, recipientNumber: conv.contactKey });
+  await recordOutbound(db, { body: HOLDING_REPLY_TEXT(name), jobId: null, recipientNumber: conv.contactKey });
   await appendAudit(db, {
-    actor: 'agent' as never,
+    actor: 'comms.whatsapp',
     kind: 'tool_call',
     charterVersion: bundle.charterVersion,
     provenance: 'unknown_external',

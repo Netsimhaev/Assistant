@@ -13,6 +13,7 @@ import { HOLDING_REPLY_TEXT, sendDueHoldingReplies, sendHoldingReply } from './h
 
 beforeEach(async () => {
   await resetDatabase();
+  await setName(NAME);
 });
 afterAll(async () => {
   await closePool();
@@ -20,6 +21,13 @@ afterAll(async () => {
 
 const KEY = '972501110001';
 const NAME = 'דוגמה';
+async function setName(name: string | null): Promise<void> {
+  await testDb().query(
+    `INSERT INTO business_profiles (business_id, display_name, updated_by) VALUES ($1, $2, 'test')
+     ON CONFLICT (business_id) DO UPDATE SET display_name = EXCLUDED.display_name`,
+    [TEST_BUSINESS, name],
+  );
+}
 const baseBundle = compileCharter(buildCharter());
 const open: PolicyBundle = { ...baseBundle, quietHours: null };
 const ago = (m: number) => new Date(Date.now() - m * 60_000);
@@ -32,7 +40,7 @@ async function conv(inboundAt: Date, key = KEY): Promise<string> {
 }
 const run = (gw: ReturnType<typeof createFakeGateway>, id: string, bundle = open, now = new Date()) =>
   withBusiness(TEST_BUSINESS, (db) =>
-    sendHoldingReply(db, { gateway: gw, bundle, businessName: NAME, now }, id),
+    sendHoldingReply(db, { gateway: gw, bundle, now }, id),
   );
 
 describe('holding reply', () => {
@@ -113,7 +121,7 @@ describe('holding reply', () => {
       [due],
     );
     const r = await withBusiness(TEST_BUSINESS, (db) =>
-      sendDueHoldingReplies(db, { gateway: gw, bundle: open, businessName: NAME, now: new Date() }),
+      sendDueHoldingReplies(db, { gateway: gw, bundle: open, now: new Date() }),
     );
     expect(r).toEqual({ sent: 1, failed: 0 });
     expect(gw.sent).toHaveLength(1);
@@ -131,6 +139,44 @@ describe('holding reply', () => {
     expect(await run(gw, id)).toBe('sent');
     expect(await run(gw, id)).toBe('already');
     expect(gw.sent).toHaveLength(1);
+  });
+
+  it('a failed first attempt is retried by the scheduler pass five minutes later, once', async () => {
+    const gw = createFakeGateway();
+    const id = await conv(ago(5));
+    const t0 = new Date();
+    gw.throwNextSend();
+    expect(await run(gw, id, open, t0)).toBe('failed');
+    const sweep = (at: Date) =>
+      withBusiness(TEST_BUSINESS, (db) => sendDueHoldingReplies(db, { gateway: gw, bundle: open, now: at }));
+    expect(await sweep(new Date(t0.getTime() + 60_000))).toEqual({ sent: 0, failed: 0 });
+    expect(await sweep(new Date(t0.getTime() + 5 * 60_000 + 1000))).toEqual({ sent: 1, failed: 0 });
+    expect(await sweep(new Date(t0.getTime() + 10 * 60_000))).toEqual({ sent: 0, failed: 0 });
+    expect(gw.sent).toHaveLength(1);
+  });
+
+  it('two concurrent calls send exactly once', async () => {
+    const gw = createFakeGateway();
+    const id = await conv(ago(5));
+    const outcomes = await Promise.all([run(gw, id), run(gw, id)]);
+    expect(outcomes.filter((o) => o === 'sent')).toHaveLength(1);
+    expect(gw.sent).toHaveLength(1);
+  });
+
+  it('the business name is read from the profile and made one clean line', async () => {
+    await setName('אלפא‮\nבע"מ');
+    const gw = createFakeGateway();
+    await run(gw, await conv(ago(5)));
+    const body = gw.sent[0]?.body ?? '';
+    expect(body).not.toMatch(/[‮\n]/);
+    expect(body).toContain('אלפא');
+  });
+
+  it('falls back to a generic name when the profile has none', async () => {
+    await setName(null);
+    const gw = createFakeGateway();
+    await run(gw, await conv(ago(5)));
+    expect(gw.sent[0]?.body).toBe(HOLDING_REPLY_TEXT('העסק'));
   });
 
   it('audit row carries no number or text', async () => {
@@ -151,7 +197,7 @@ describe('holding reply', () => {
     const quiet = { ...baseBundle, quietHours: { from: '20:00', to: '07:00', timezone: 'Asia/Jerusalem', appliesTo: ['whatsapp'] } } as typeof baseBundle;
     expect(await run(gw, id, quiet, night)).toBe('deferred');
     const morning = new Date(Date.UTC(2026, 0, 16, 5, 0));
-    const pass = () => withBusiness(TEST_BUSINESS, (db) => sendDueHoldingReplies(db, { gateway: gw, bundle: quiet, businessName: NAME, now: morning }));
+    const pass = () => withBusiness(TEST_BUSINESS, (db) => sendDueHoldingReplies(db, { gateway: gw, bundle: quiet, now: morning }));
     expect(await pass()).toEqual({ sent: 1, failed: 0 });
     expect(await pass()).toEqual({ sent: 0, failed: 0 });
     expect(gw.sent).toHaveLength(1);
@@ -165,7 +211,7 @@ describe('holding reply', () => {
     expect(await run(gw, id, quiet, night)).toBe('deferred');
     await testDb().query(`UPDATE contact_conversations SET state = 'closed' WHERE conversation_id = $1`, [id]);
     const morning = new Date(Date.UTC(2026, 0, 16, 5, 0));
-    await withBusiness(TEST_BUSINESS, (db) => sendDueHoldingReplies(db, { gateway: gw, bundle: quiet, businessName: NAME, now: morning }));
+    await withBusiness(TEST_BUSINESS, (db) => sendDueHoldingReplies(db, { gateway: gw, bundle: quiet, now: morning }));
     expect(gw.sent).toHaveLength(0);
   });
 });
