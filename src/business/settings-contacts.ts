@@ -16,7 +16,7 @@
  * `writeMemory` reads the provenance from the job, never from its input — in
  * one transaction with the job's transitions to `closed`. The key is the
  * canonical `+<digits>` phone, the same derivation `applySetupPeople` uses,
- * and the body is `{name, role, phone}`. Writing a key supersedes the live
+ * and the body is `{name, role, phone}` plus optional `kind`/`email`. Writing a key supersedes the live
  * row on it (soft retire, `writeMemory`) — but only a LEARNED entity (one
  * this screen does not manage) may be superseded that way: a write onto a
  * phone that a DIFFERENT managed contact (`setup_package`/`settings_people`)
@@ -54,6 +54,8 @@ export interface ManagedContact {
   name: string;
   role: string;
   phone: string;
+  kind: 'client' | 'supplier' | null;
+  email: string | null;
 }
 
 interface ContactRow {
@@ -64,6 +66,11 @@ interface ContactRow {
 function readString(body: Record<string, unknown>, field: string): string {
   const value = body[field];
   return typeof value === 'string' ? value : '';
+}
+
+function readKind(body: Record<string, unknown>): 'client' | 'supplier' | null {
+  const value = body['kind'];
+  return value === 'client' || value === 'supplier' ? value : null;
 }
 
 export async function listManagedContacts(db: BusinessDb): Promise<ManagedContact[]> {
@@ -79,6 +86,8 @@ export async function listManagedContacts(db: BusinessDb): Promise<ManagedContac
     name: readString(row.body, 'name'),
     role: readString(row.body, 'role'),
     phone: readString(row.body, 'phone'),
+    kind: readKind(row.body),
+    email: readString(row.body, 'email') || null,
   }));
 }
 
@@ -114,7 +123,13 @@ function writeContact(tx: BusinessDb, jobId: string, entry: PersonEntry) {
     jobId,
     kind: 'entity',
     subjectKey: entry.phone,
-    body: { name: entry.name, role: entry.role, phone: entry.phone },
+    body: {
+      name: entry.name,
+      role: entry.role,
+      phone: entry.phone,
+      ...(entry.kind === undefined ? {} : { kind: entry.kind }),
+      ...(entry.email === undefined ? {} : { email: entry.email }),
+    },
     sourceRef: SETTINGS_PEOPLE_SOURCE_REF,
   });
 }

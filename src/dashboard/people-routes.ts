@@ -35,6 +35,7 @@ export const PEOPLE_INTRO =
   'העוזרת מכירה את האנשים כאן ויודעת מה התפקיד שלהם. הוראות היא מקבלת רק ממך. כדי שאיש קשר ייחשב "מוכר" (מענה בלי כרטיס אישור), הוסף אותו ב"ערוך את הכללים".';
 
 export const PERSON_FIELDS_REQUIRED = `שם ותפקיד הם שדות חובה (עד ${PERSON_FIELD_MAX_CHARS} תווים).`;
+export const PERSON_EMAIL_INVALID = 'כתובת המייל אינה תקינה.';
 export const PERSON_NOT_FOUND = 'לא מצאתי את האדם הזה — אולי הוא כבר הוסר. רענן את העמוד.';
 
 /** `POST /settings/people/<colleague|contact>/<add|edit|remove>`. */
@@ -58,17 +59,31 @@ function seeOther(res: ServerResponse, location: string): void {
 }
 
 /** The fields of one person, parsed; or the Hebrew reason they are refused. */
-function personFrom(form: URLSearchParams): { ok: true; entry: PersonEntry } | { ok: false; error: string } {
+function personFrom(
+  form: URLSearchParams,
+  withContactFields: boolean,
+): { ok: true; entry: PersonEntry } | { ok: false; error: string } {
+  const kind = withContactFields ? (form.get('kind') ?? '') : '';
+  const email = withContactFields ? (form.get('email') ?? '').trim() : '';
   const parsed = PersonEntry.safeParse({
     name: form.get('name') ?? '',
     role: form.get('role') ?? '',
     phone: form.get('phone') ?? '',
+    ...(kind === '' ? {} : { kind }),
+    ...(email === '' ? {} : { email }),
   });
   if (parsed.success) return { ok: true, entry: parsed.data };
+  if (parsed.error.issues.some((i) => i.path[0] === 'email')) return { ok: false, error: PERSON_EMAIL_INVALID };
   // The phone's own issue is already Hebrew (`InternationalPhone`); the
   // name/role issues are zod's English defaults, replaced here.
   const phoneIssue = parsed.error.issues.find((i) => i.path[0] === 'phone' && i.code === 'custom');
   return { ok: false, error: phoneIssue?.message ?? PERSON_FIELDS_REQUIRED };
+}
+
+function contactInputs(values: { kind: string | null; email: string | null }): string {
+  const opt = (v: string, label: string) => `<option value="${v}"${values.kind === v || (v === '' && values.kind === null) ? ' selected' : ''}>${label}</option>`;
+  return `<label>סוג <select name="kind">${opt('', '—')}${opt('client', 'לקוח')}${opt('supplier', 'ספק')}</select></label>
+  <label>מייל <input type="email" name="email" value="${esc(values.email ?? '')}" maxlength="254" dir="ltr"></label>`;
 }
 
 function personInputs(values: { name: string; role: string; phone: string }): string {
@@ -115,6 +130,7 @@ async function renderPeople(
 <form method="post" action="${PEOPLE_SETTINGS_PATH}/contact/edit">
   ${hidden}<input type="hidden" name="key" value="${esc(c.subjectKey)}">
   ${personInputs(c)}
+  ${contactInputs(c)}
   <button type="submit">שמור</button>
 </form>
 <form method="post" action="${PEOPLE_SETTINGS_PATH}/contact/remove">
@@ -152,6 +168,7 @@ ${contactRows === '' ? '<p class="muted">אין אנשי קשר.</p>' : contactR
 <form method="post" action="${PEOPLE_SETTINGS_PATH}/contact/add">
   ${hidden}
   ${personInputs(EMPTY)}
+  ${contactInputs({ kind: null, email: null })}
   <button type="submit">הוסף</button>
 </form>
 </div>`,
@@ -184,7 +201,7 @@ export async function handlePeopleAction(
     return seeOther(res, PEOPLE_SETTINGS_PATH);
   }
 
-  const person = personFrom(form);
+  const person = personFrom(form, list === 'contact');
   if (!person.ok) return renderPeople(res, 400, db, session, person.error);
 
   try {

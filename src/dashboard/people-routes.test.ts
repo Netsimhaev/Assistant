@@ -337,3 +337,52 @@ describe('/settings/people', () => {
     expect(await entities()).toEqual([]);
   });
 });
+
+describe('/settings/people — contact kind and email', () => {
+  it('saves kind and email, re-renders them, and stores them in the entity body', async () => {
+    const { baseUrl, cookie } = await start();
+    const add = await post(baseUrl, cookie, `${PEOPLE}/contact/add`, {
+      csrf: await csrf(baseUrl, cookie),
+      name: 'דנה',
+      role: 'לקוחה',
+      phone: '+972501110009',
+      kind: 'supplier',
+      email: 'dana@example.com',
+    });
+    expect(add.status).toBe(303);
+    const row = (await entities())[0];
+    expect(row?.body).toMatchObject({ kind: 'supplier', email: 'dana@example.com' });
+    const html = await (await get(baseUrl, cookie, PEOPLE)).text();
+    expect(html).toContain('value="dana@example.com"');
+    expect(html).toMatch(/<option value="supplier" selected>/);
+  });
+
+  it('rejects an invalid email with a Hebrew message and writes nothing', async () => {
+    const { baseUrl, cookie } = await start();
+    const res = await post(baseUrl, cookie, `${PEOPLE}/contact/add`, {
+      csrf: await csrf(baseUrl, cookie),
+      name: 'דנה',
+      role: 'לקוחה',
+      phone: '+972501110009',
+      kind: 'client',
+      email: 'not-an-email',
+    });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('כתובת המייל אינה תקינה');
+    expect(await entities()).toEqual([]);
+  });
+
+  it('a contact without kind or email still saves', async () => {
+    const { baseUrl, cookie } = await start();
+    const res = await post(baseUrl, cookie, `${PEOPLE}/contact/add`, {
+      csrf: await csrf(baseUrl, cookie),
+      name: 'דנה',
+      role: 'לקוחה',
+      phone: '+972501110009',
+      kind: '',
+      email: '',
+    });
+    expect(res.status).toBe(303);
+    expect((await entities())[0]?.body).toEqual({ name: 'דנה', role: 'לקוחה', phone: '+972501110009' });
+  });
+});
