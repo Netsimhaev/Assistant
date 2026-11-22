@@ -332,8 +332,10 @@ export function renderStepEcho(
   for (const { key, name } of KNOWN_FIELDS) {
     if (!Object.hasOwn(step.input, key)) continue;
     const value = step.input[key];
-    if (whatsapp && key === 'sendAt') {
-      lines.push(`${name}: ${renderSendAt(value, wa)}`);
+    if (key === 'sendAt') {
+      // "בשעה" is a WhatsApp send time and nothing else: on any other tool
+      // the field is shown raw under "שדה נוסף" below, never as a schedule.
+      if (whatsapp) lines.push(`${name}: ${renderSendAt(value, wa)}`);
       continue;
     }
     const note = whatsapp && key === 'to' && typeof value === 'string' ? (wa?.recipientNote(value) ?? null) : null;
@@ -343,7 +345,7 @@ export function renderStepEcho(
     lines.push(...attachmentLines(step.input[ATTACHMENTS_KEY]));
   }
   const extras = Object.keys(step.input)
-    .filter((key) => !KNOWN_KEYS.has(key) && key !== ATTACHMENTS_KEY)
+    .filter((key) => (!KNOWN_KEYS.has(key) || (key === 'sendAt' && !whatsapp)) && key !== ATTACHMENTS_KEY)
     .sort();
   for (const key of extras) {
     lines.push(`שדה נוסף: ${inlineValue(key)} = ${renderValue(step.input[key])}`);

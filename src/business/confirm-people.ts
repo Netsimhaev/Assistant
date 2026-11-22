@@ -32,7 +32,7 @@ import { loadDraft, saveSection } from '../charter/interview/draft-store.js';
 import { activeCharterVersion } from '../charter/store.js';
 import { transaction, type BusinessDb } from '../db/pool.js';
 import { authorityNumberKey } from '../governance/principal-number.js';
-import { writeMemory } from '../memory/store.js';
+import { writeManagedContactMemory, type ReservedSourceRef } from '../memory/store.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
 import { canonicalHash } from '../util/canonical.js';
 import { addColleague, listColleagues } from './colleagues.js';
@@ -40,7 +40,7 @@ import { loadSetupPackage, type SetupPackage } from './setup-package.js';
 
 export const CONFIRM_PEOPLE_JOB_TITLE = 'אישור אנשי קשר מההקמה';
 /** The `memories.source_ref` that marks a contact confirmed from the setup package. */
-export const SETUP_PACKAGE_SOURCE_REF = 'setup_package';
+export const SETUP_PACKAGE_SOURCE_REF = 'setup_package' satisfies ReservedSourceRef;
 
 export class SetupPeopleInputError extends Error {
   constructor(messageHe: string) {
@@ -173,12 +173,11 @@ export async function applySetupPeople(
   // The owner's own act: the provenance is a literal, never a parameter.
   const job = await createJob(tx, { charterVersion, provenance: 'boss', title: CONFIRM_PEOPLE_JOB_TITLE });
   for (const c of snapshot.contacts) {
-    await writeMemory(tx, {
+    await writeManagedContactMemory(tx, {
       jobId: job.jobId,
-      kind: 'entity',
       subjectKey: c.phone,
       body: { name: c.name, role: c.role, phone: c.phone },
-      sourceRef: SETUP_PACKAGE_SOURCE_REF,
+      source: SETUP_PACKAGE_SOURCE_REF,
     });
   }
   const existing = await listColleagues(tx);

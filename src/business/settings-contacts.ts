@@ -28,12 +28,12 @@
  */
 import { transaction, type BusinessDb } from '../db/pool.js';
 import { activeCharterVersion } from '../charter/store.js';
-import { retireMemories, writeMemory } from '../memory/store.js';
+import { retireMemories, writeManagedContactMemory, type ReservedSourceRef } from '../memory/store.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
 import { SETUP_PACKAGE_SOURCE_REF } from './confirm-people.js';
 import type { PersonEntry } from './setup-package.js';
 
-export const SETTINGS_PEOPLE_SOURCE_REF = 'settings_people';
+export const SETTINGS_PEOPLE_SOURCE_REF = 'settings_people' satisfies ReservedSourceRef;
 
 /** Shown when the phone typed belongs to another contact on this screen. */
 export const CONTACT_PHONE_TAKEN = 'כבר יש איש קשר עם המספר הזה.';
@@ -87,6 +87,9 @@ export async function listManagedContacts(db: BusinessDb): Promise<ManagedContac
     `SELECT subject_key, body FROM memories
       WHERE business_id = $1 AND kind = 'entity' AND retired_at IS NULL
         AND source_ref = ANY($2::text[])
+        -- Belt and braces beside the write-side guard (writeMemory strips the
+        -- reserved refs): only the owner's own writes are boss jobs.
+        AND provenance = 'boss'
       ORDER BY created_at, memory_id`,
     [db.businessId, [...MANAGED_CONTACT_SOURCES]],
   );
@@ -105,7 +108,7 @@ async function isManaged(db: BusinessDb, subjectKey: string): Promise<boolean> {
   const { rows } = await db.query(
     `SELECT 1 FROM memories
       WHERE business_id = $1 AND kind = 'entity' AND subject_key = $2 AND retired_at IS NULL
-        AND source_ref = ANY($3::text[])
+        AND source_ref = ANY($3::text[]) AND provenance = 'boss'
       FOR UPDATE`,
     [db.businessId, subjectKey, [...MANAGED_CONTACT_SOURCES]],
   );
@@ -129,9 +132,8 @@ async function asOwner<T>(db: BusinessDb, title: string, fn: (tx: BusinessDb, jo
 }
 
 function writeContact(tx: BusinessDb, jobId: string, entry: PersonEntry) {
-  return writeMemory(tx, {
+  return writeManagedContactMemory(tx, {
     jobId,
-    kind: 'entity',
     subjectKey: entry.phone,
     body: {
       name: entry.name,
@@ -143,7 +145,7 @@ function writeContact(tx: BusinessDb, jobId: string, entry: PersonEntry) {
         ? {}
         : { externalIds: entry.externalIds }),
     },
-    sourceRef: SETTINGS_PEOPLE_SOURCE_REF,
+    source: SETTINGS_PEOPLE_SOURCE_REF,
   });
 }
 

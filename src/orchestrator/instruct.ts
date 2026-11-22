@@ -113,8 +113,7 @@ import { recallForPlanning } from '../memory/recall-planning.js';
 import { classifyAction } from '../policy/classify.js';
 import { readEmails, readPhones } from '../policy/facts.js';
 import { listManagedContacts } from '../business/settings-contacts.js';
-import { hasSendAt, MAX_SEND_AHEAD_MS, readSendAt } from '../util/send-at.js';
-import { WA_RECIPIENT_REFUSAL, waRecipientNote, waRecipientSource } from './whatsapp-recipient.js';
+import { waRecipientNote, waRecipientSource, waStepProblem } from './whatsapp-recipient.js';
 import type { WhatsAppEchoContext } from './command-echo.js';
 import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import { nameCarriesCancelWord } from './command-confirm.js';
@@ -865,8 +864,9 @@ async function planAndCheck(
 /**
  * Task 13 (H2, H15): an owner-ordered WhatsApp message goes only to a contact
  * he saved or a number he TYPED in this instruction (`waRecipientSource`:
- * exact `authorityNumberKey`, `textOrigin === 'typed'` for the typed arm), and
- * a `sendAt` must be an ISO instant in the future, at most 30 days ahead.
+ * exact `authorityNumberKey`, `textOrigin === 'typed'` for the typed arm), a
+ * `sendAt` must be an ISO instant in the future, at most 30 days ahead, and no
+ * other tool may carry a `sendAt` at all (`waStepProblem`).
  * Refused here, before the owner is asked, so the question never shows a send
  * that could not be allowed. Null when the step is fine (or not WhatsApp).
  */
@@ -874,42 +874,8 @@ async function whatsAppStepProblem(
   door: DoorContext,
   step: Plan['steps'][number],
 ): Promise<{ reason: string; audit: string } | null> {
-  if (step.toolName !== 'wa.send_message') return null;
-  const contacts = await listManagedContacts(door.db);
-  const source = waRecipientSource(Object.hasOwn(step.input, 'to') ? step.input['to'] : undefined, {
-    contacts,
-    instructionText: door.instruction.text,
-    textOrigin: door.textOrigin,
-  });
-  if (source === null) {
-    return {
-      reason: WA_RECIPIENT_REFUSAL,
-      audit: `instruction door: step ${step.id} wa.send_message recipient neither a saved contact nor typed`,
-    };
-  }
-  if (hasSendAt(step.input)) {
-    const at = readSendAt(step.input);
-    const now = Date.now();
-    if (at === null) {
-      return {
-        reason: 'מועד השליחה בוואטסאפ אינו תקין.',
-        audit: `instruction door: step ${step.id} wa.send_message sendAt unparsable`,
-      };
-    }
-    if (at.getTime() <= now) {
-      return {
-        reason: 'מועד השליחה בוואטסאפ כבר עבר.',
-        audit: `instruction door: step ${step.id} wa.send_message sendAt in the past`,
-      };
-    }
-    if (at.getTime() - now > MAX_SEND_AHEAD_MS) {
-      return {
-        reason: 'אפשר לתזמן הודעת וואטסאפ עד 30 יום קדימה.',
-        audit: `instruction door: step ${step.id} wa.send_message sendAt more than 30 days ahead`,
-      };
-    }
-  }
-  return null;
+  const problem = await waStepProblem(door.db, step, { text: door.instruction.text, textOrigin: door.textOrigin });
+  return problem === null ? null : { reason: problem.reason, audit: `instruction door: ${problem.audit}` };
 }
 
 /**

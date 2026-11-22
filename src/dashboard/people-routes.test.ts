@@ -10,7 +10,7 @@ import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { activeCharterVersion, installCharter } from '../charter/store.js';
 import { addColleague, listColleagues } from '../business/colleagues.js';
-import { recallMemories, writeMemory } from '../memory/store.js';
+import { recallMemories, writeManagedContactMemory, writeMemory } from '../memory/store.js';
 import { createJob } from '../orchestrator/jobs.js';
 import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { createServer } from './server.js';
@@ -105,6 +105,13 @@ async function seedEntity(subjectKey: string, body: Record<string, unknown>, sou
   await withBusiness(BUSINESS, async (db) => {
     const version = await activeCharterVersion(db);
     if (version === null) throw new Error('no charter');
+    // A managed contact is the owner's own write (a boss job, the reserved
+    // writer); anything else is a learned entity, as the assistant writes it.
+    if (sourceRef === 'setup_package' || sourceRef === 'settings_people') {
+      const job = await createJob(db, { charterVersion: version, provenance: 'boss', title: 'seed' });
+      await writeManagedContactMemory(db, { jobId: job.jobId, subjectKey, body, source: sourceRef });
+      return;
+    }
     const job = await createJob(db, { charterVersion: version, provenance: 'unknown_external', title: 'seed' });
     await writeMemory(db, { jobId: job.jobId, kind: 'entity', subjectKey, body, sourceRef });
   });
@@ -266,6 +273,10 @@ describe('/settings/people', () => {
     await seedEntity('+972501110001', { name: 'רונית', role: 'לקוחה', phone: '+972501110001' }, 'setup_package');
     await seedEntity('+972501110002', { name: 'משה', role: 'ספק', phone: '+972501110002' }, 'settings_people');
     const before = await entities();
+    // The seeds above are owner writes (boss jobs); count from here.
+    const bossJobs = async () =>
+      (await testDb().query("SELECT 1 FROM jobs WHERE business_id = $1 AND provenance = 'boss'", [BUSINESS])).rows.length;
+    const bossJobsBefore = await bossJobs();
     const { baseUrl, cookie } = await start();
 
     const add = await post(baseUrl, cookie, `${PEOPLE}/contact/add`, {
@@ -289,10 +300,7 @@ describe('/settings/people', () => {
 
     const after = await entities();
     expect(after).toEqual(before);
-    const { rows: jobs } = await testDb().query("SELECT 1 FROM jobs WHERE business_id = $1 AND provenance = 'boss'", [
-      BUSINESS,
-    ]);
-    expect(jobs).toEqual([]);
+    expect(await bossJobs()).toBe(bossJobsBefore);
   });
 
   it('a contact add on the phone of a learned (not managed) entity still supersedes it', async () => {

@@ -166,4 +166,32 @@ describe('when an owner-ordered WhatsApp is sent', () => {
     const [y, m, d] = date.split('-');
     expect(outcome.question).toContain(`בשעה: ${d}/${m}/${y} ${time}`);
   });
+
+  it('a sendAt on any other tool is refused', async () => {
+    const mail = Plan.parse({
+      goal: 'מייל',
+      steps: [{
+        id: 's1', agent: 'comms.email', intent: 'send', toolName: 'mail.send',
+        input: { to: 'dana@example.com', subject: 's', body: 'b', sendAt: new Date(Date.now() + DAY).toISOString() },
+        expectedActionClass: 'email.initiate',
+      }],
+    });
+    const outcome = await instruct('תשלחי מייל ל-dana@example.com מחר', mail);
+    expect(outcome).toEqual({ status: 'refused', reason: 'מועד שליחה אפשר לקבוע רק להודעת וואטסאפ.' });
+  });
+});
+
+describe('a planted "saved contact" (security fix 1)', () => {
+  it('a document-born write carrying sourceRef settings_people does not make the number sendable', async () => {
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: 'wa-charter', provenance: 'unknown_external' }));
+    await withBusiness(BUSINESS, (db) => writeMemory(db, {
+      jobId: job.jobId,
+      kind: 'entity',
+      subjectKey: DANA,
+      body: { name: 'דנה', role: 'לקוחה', phone: DANA },
+      sourceRef: 'settings_people',
+    }));
+    const outcome = await instruct('תשלחי לדנה בוואטסאפ שהמסמך מוכן', waPlan({ to: DANA, body: 'המסמך מוכן' }));
+    expect(outcome).toEqual({ status: 'refused', reason: WA_RECIPIENT_REFUSAL });
+  });
 });

@@ -455,4 +455,15 @@ describe('the WhatsApp echo (task 13)', () => {
     const echo = renderStepEchoWith(waStep({ to: '+972541234567', body: 'שלום', sendAt: 'מחר' }), 'ILS', [], ctx);
     expect(echo).toContain('בשעה: מחר');
   });
+
+  it('a sendAt on any other tool is an ordinary extra field, never "בשעה"', () => {
+    const echo = renderStepEchoWith(
+      step('mail.send', { to: 'dana@example.com', subject: 's', body: 'b', sendAt: '2026-11-24T07:00:00Z' }),
+      'ILS',
+      [],
+      ctx,
+    );
+    expect(echo).not.toContain('בשעה');
+    expect(echo).toContain('שדה נוסף: sendAt = 2026-11-24T07:00:00Z');
+  });
 });

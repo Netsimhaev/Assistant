@@ -35,7 +35,8 @@ import type { GateContext } from './engine.js';
  *   - its `instruction_confirmations` row is `confirmed`, and was decided
  *     within the last 24 hours (§10.7) — a "yes" from last week does not
  *     carry a transfer the owner may no longer want. One extension, and only
- *     one (task 13, H15): a matched step whose OWN input carries a parsable
+ *     one (task 13, H15): a matched `wa.send_message` step (that tool only)
+ *     whose OWN input carries a parsable
  *     ISO `sendAt` (a scheduled WhatsApp) is covered until `sendAt + 24h`,
  *     when the "yes" was given before `sendAt` and no more than 30 days
  *     before it, AND the job's `charter_version` still equals the active
@@ -124,7 +125,7 @@ export async function confirmedCommandCovers(
   if (step.toolName !== facts.toolName) return null;
   if (canonicalHash(step.input) !== facts.inputHash) return null;
 
-  if (!withinConfirmationWindow(row, step.input, ctx.bundle.charterVersion)) return null;
+  if (!withinConfirmationWindow(row, step.toolName, step.input, ctx.bundle.charterVersion)) return null;
 
   return { stepId: step.id, planHash: row.plan_hash };
 }
@@ -138,6 +139,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  */
 function withinConfirmationWindow(
   row: { decided_at: Date | null; db_now: Date; job_charter_version: string; active_charter_version: string | null },
+  stepToolName: string,
   stepInput: Record<string, unknown>,
   bundleCharterVersion: string,
 ): boolean {
@@ -147,6 +149,9 @@ function withinConfirmationWindow(
   if (!Number.isFinite(decided) || !Number.isFinite(now)) return false;
   if (now - decided < DAY_MS) return true;
 
+  // The extension is a scheduled WhatsApp's and nothing else's: a `sendAt`
+  // on any other tool is an ordinary payload field and buys no time.
+  if (stepToolName !== 'wa.send_message') return false;
   const sendAt = readSendAt(stepInput);
   if (sendAt === null) return false;
   const at = sendAt.getTime();

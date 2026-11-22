@@ -604,4 +604,11 @@ describe('a scheduled WhatsApp keeps its confirmation until sendAt + 24h', () =>
     await decidedHoursAgo(s.jobId, 1);
     await expectExempt(await evaluateFor('wa.send_message', input, s.ctx), s, input);
   });
+
+  it('a sendAt on any other tool gives no extension', async () => {
+    const input = { ...SEND, sendAt: new Date(Date.now() - 60 * 1000).toISOString() };
+    const s = await setup({ input });
+    await decidedHoursAgo(s.jobId, 72);
+    await expectNormalPathDraftOnly(await evaluateFor('mail.send', input, s.ctx), s.jobId);
+  });
 });

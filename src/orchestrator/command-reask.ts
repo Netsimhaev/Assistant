@@ -50,7 +50,10 @@
  * RESIDUAL plan: the chosen plan's steps that have no `completed` row, with
  * `dependsOn` edges to the dropped steps pruned (they are satisfied), checked
  * by `Plan.safeParse` and `planProblems`. A "כן" therefore never re-sends a
- * step that is recorded as done. Its hash is the store's (`createConfirmation`
+ * step that is recorded as done. A scheduled WhatsApp's lapsed or unreadable `sendAt`
+ * is dropped from the residual and the question says so
+ * (`LAPSED_SEND_AT_NOTE`), and the door's own check (`waStepProblem`) runs
+ * again on what is left — a recipient no longer saved is refused, not asked. Its hash is the store's (`createConfirmation`
  * recomputes it), and that is the hash the exemption later binds.
  *
  * **The prefix follows the record, not the path that found the job.**
@@ -101,9 +104,9 @@ import { WHATSAPP_MESSAGE_MAX_CHARS, WHATSAPP_QUESTION_TOO_LONG } from './comman
 import { PhaseMovedError, createJob, linkWhatsAppMessage, transition } from './jobs.js';
 import { bindPlanToJob, completedSteps, loadStoredPlan, planHashOf } from './plan-store.js';
 import { withSessionLock } from './session-lock.js';
-import { readSendAt } from '../util/send-at.js';
+import { hasSendAt, readSendAt } from '../util/send-at.js';
 import { listManagedContacts } from '../business/settings-contacts.js';
-import { waRecipientNote, waRecipientSource } from './whatsapp-recipient.js';
+import { waRecipientNote, waRecipientSource, waStepProblem } from './whatsapp-recipient.js';
 
 /**
  * The reason an old job is moved to `failed` with when it is re-asked. The
@@ -348,7 +351,12 @@ async function reaskOne(
     );
   }
   const done = await completedSteps(db, oldJobId, chosen.planHash);
-  const residual = residualPlan(chosen.plan, new Set(done.keys()));
+  const rawResidual = residualPlan(chosen.plan, new Set(done.keys()));
+  // A scheduled WhatsApp whose time has passed (or cannot be read) is never
+  // shown as a past time and sent at once on the new "כן": its `sendAt` is
+  // dropped from the step, and the question says so in words (task 13).
+  const scheduled = rawResidual === null ? null : withoutLapsedSendAt(rawResidual);
+  const residual = scheduled === null ? null : scheduled.plan;
   if (residual === null) {
     // Nothing left to run, so nothing to ask. A `followup` job is closed;
     // one already `failed` stays where it is.
@@ -363,6 +371,15 @@ async function reaskOne(
     return null;
   }
   const option: ConfirmationOption = { ...chosen, plan: residual, planHash: planHashOf(residual) };
+
+  // The door's own check, again, on what is left: a saved contact removed
+  // since, or a time now out of range, is refused rather than re-asked.
+  for (const step of residual.steps) {
+    const problem = await waStepProblem(db, step, { text: instruction.text, textOrigin: instruction.textOrigin });
+    if (problem !== null) {
+      throw new Error(`command re-ask: job ${oldJobId}'s residual plan is refused (${problem.audit}): ${problem.reason}`);
+    }
+  }
 
   const active = await loadActiveCharter(db);
   if (active === null) throw new Error(`command re-ask: no active charter for business ${businessId}`);
@@ -383,7 +400,11 @@ async function reaskOne(
     currency: active.bundle.ceilings.currency,
     systems: active.bundle.externalSystems,
     redactPatterns: active.bundle.redactPatterns,
-    extraEchoes: [ledgerEcho],
+    extraEchoes: [
+      scheduled?.dropped === true
+        ? [LAPSED_SEND_AT_NOTE, ...(ledgerEcho === null ? [] : [ledgerEcho])].join('\n')
+        : ledgerEcho,
+    ],
     ...(recipientCtx === null
       ? {}
       : {
@@ -491,6 +512,28 @@ async function reaskOne(
   // Only now does a WhatsApp "כן" answer it (`openConfirmations`).
   await markConfirmationDelivered(db, job.jobId);
   return { reasked, delivery: 'sent' };
+}
+
+/** Shown above the step echo when a lapsed `sendAt` was dropped from the re-asked step. */
+export const LAPSED_SEND_AT_NOTE = 'מועד השליחה המקורי בוואטסאפ כבר עבר — אם תאשרי, ההודעה תישלח מיד.';
+
+/**
+ * `plan` with every `wa.send_message` step's `sendAt` removed when it has
+ * passed or does not parse, and whether anything was removed. A future
+ * `sendAt` is kept as it is.
+ */
+export function withoutLapsedSendAt(plan: Plan, now: Date = new Date()): { plan: Plan; dropped: boolean } {
+  let dropped = false;
+  const steps = plan.steps.map((step) => {
+    if (step.toolName !== 'wa.send_message' || !hasSendAt(step.input)) return step;
+    const at = readSendAt(step.input);
+    if (at !== null && at.getTime() > now.getTime()) return step;
+    dropped = true;
+    const { sendAt: _lapsed, ...rest } = step.input;
+    return { ...step, input: rest };
+  });
+  if (!dropped) return { plan, dropped };
+  return { plan: Plan.parse({ ...plan, steps }), dropped };
 }
 
 /**

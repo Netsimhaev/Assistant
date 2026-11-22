@@ -23,7 +23,7 @@ import type { TrustLevel } from '../domain/trust.js';
 import type { AutonomyLevel } from '../domain/trust.js';
 import { createJob, loadJob, transition } from './jobs.js';
 import { bindPlanToJob, planHashOf } from './plan-store.js';
-import { SCHEDULED_SEND_REASON, WA_INITIATE_NOT_COMMAND, executeStep } from './execute.js';
+import { SCHEDULED_SEND_REASON, WA_INITIATE_NOT_COMMAND, WA_SEND_AT_UNREADABLE, executeStep } from './execute.js';
 
 const BUSINESS = 'test-business';
 // 09:00 UTC is noon in Asia/Jerusalem, outside the fixture's quiet hours.
@@ -148,6 +148,19 @@ describe('a scheduled WhatsApp', () => {
   });
 });
 
+describe('an unreadable sendAt', () => {
+  it('is refused, never sent now', async () => {
+    const input = { to: '+972541234567', body: 'תזכורת', sendAt: 'מחר בבוקר' };
+    const s = await jobInExecute({ instruction: true, confirm: true, input });
+    const calls = { n: 0 };
+    const outcome = await run(s, input, calls);
+    expect(outcome).toMatchObject({ status: 'refused', code: WA_SEND_AT_UNREADABLE });
+    expect(calls.n).toBe(0);
+    expect(await intents(s.job.jobId)).toBe(0);
+    expect(await phaseOf(s.job.jobId)).toBe('failed');
+  });
+});
+
 describe('a proactive WhatsApp runs only as a confirmed boss command (R13a)', () => {
   const INPUT = { to: '+972541234567', body: 'שלום דנה' };
 
@@ -231,5 +244,19 @@ describe('a proactive WhatsApp runs only as a confirmed boss command (R13a)', ()
     const outcome = await run(s, input, calls);
     expect(outcome).toMatchObject({ status: 'refused', code: 'draft_only:persist_as_draft' });
     expect(calls.n).toBe(0);
+  });
+
+  it('a confirmed command whose window has lapsed is refused before the gate', async () => {
+    const s = await jobInExecute({ instruction: true, confirm: true, input: INPUT });
+    await testDb().query(
+      `UPDATE instruction_confirmations SET decided_at = now() - interval '25 hours' WHERE job_id = $1`,
+      [s.job.jobId],
+    );
+    const calls = { n: 0 };
+    // `auto` ramp: without the window check the call would reach the gate.
+    const outcome = await run(s, INPUT, calls, { rampLevel: 'auto' });
+    expect(outcome).toMatchObject({ status: 'refused', code: WA_INITIATE_NOT_COMMAND });
+    expect(calls.n).toBe(0);
+    expect(await intents(s.job.jobId)).toBe(0);
   });
 });
