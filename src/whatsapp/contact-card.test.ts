@@ -11,6 +11,8 @@ import {
   CONTACT_CARD_GONE,
   ContactCardBusyError,
   CONTACT_CARD_INSTRUCTION,
+  CONTACT_CARD_NO_DRAFT,
+  CONTACT_CARD_NO_DRAFT_SHOWN,
   EXTERNAL_FILE_WARNING,
   handleContactCardMessage,
   openContactCards,
@@ -240,6 +242,56 @@ describe('raiseContactCard', () => {
     expect(jobs.rows.map((r) => r.phase)).toEqual(['failed']);
   });
 
+  it('a lost compare-and-swap behaves as busy: its own approval cancelled, its own job failed, no orphan (R11b)', async () => {
+    const h = await harness();
+    const first = await raise(h, 'ראשונה');
+    // A concurrent raise re-points the conversation between this raise's
+    // inspection and its swap — simulated from inside the notify hook, which
+    // runs in exactly that window.
+    const notify = {
+      dashboardBaseUrl: 'http://dash.test',
+      notifier: {
+        channel: 'email' as const,
+        notify: async () => {
+          await testDb().query(
+            `UPDATE contact_conversations SET card_job_id = 'JOB-CONCURRENT' WHERE business_id = $1 AND conversation_id = $2`,
+            [BUSINESS, h.conversation.conversationId],
+          );
+          return { ok: true };
+        },
+      },
+    };
+    await expect(
+      withBusiness(BUSINESS, (db) =>
+        raiseContactCard(
+          db,
+          {
+            conversation: h.conversation,
+            draft: { body: 'שנייה', attachDocumentId: null },
+            reasonHe: 'r',
+            sourcesHe: [],
+            bundle: h.bundle,
+            contactLabel: 'דנה',
+          },
+          { notify },
+        ),
+      ),
+    ).rejects.toBeInstanceOf(ContactCardBusyError);
+
+    const conv = await withBusiness(BUSINESS, (db) => loadConversation(db, h.conversation.conversationId));
+    expect(conv?.cardJobId).toBe('JOB-CONCURRENT');
+    // The first card's cancel rolled back with the lost swap.
+    expect((await approvalsFor(first.jobId))[0]?.state).toBe('pending');
+    const { rows } = await testDb().query<{ job_id: string; phase: string }>(
+      `SELECT job_id, phase FROM jobs WHERE business_id = $1 AND job_id <> $2`,
+      [BUSINESS, first.jobId],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.phase).toBe('failed');
+    const own = await approvalsFor(rows[0]!.job_id);
+    expect(own.map((a) => a.state)).toEqual(['cancelled']);
+  });
+
   it('refuses, leaving no job and no card, when the attached document cannot be loaded', async () => {
     const h = await harness();
     await expect(raise(h, 'עם קובץ', 'DOC-MISSING')).rejects.toThrow(/cannot be loaded/);
@@ -336,6 +388,16 @@ describe('answering on WhatsApp', () => {
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('execute');
     const conv = await withBusiness(BUSINESS, (db) => loadConversation(db, h.conversation.conversationId));
     expect(conv?.state).toBe('carded');
+  });
+
+  it('a card without a draft shows so, and "שלח" on it is refused', async () => {
+    const h = await harness();
+    const { jobId, approvalId } = await raise(h, '');
+    await present(h, approvalId);
+    expect(h.gateway.sent.at(-1)?.body).toContain(CONTACT_CARD_NO_DRAFT_SHOWN);
+    expect(await answer(h, 'שלח')).toBe('refused');
+    expect(h.gateway.sent.at(-1)?.body).toBe(CONTACT_CARD_NO_DRAFT);
+    expect((await approvalsFor(jobId))[0]?.state).toBe('pending');
   });
 
   it('"שלח" with another open thing is refused and nothing is decided', async () => {

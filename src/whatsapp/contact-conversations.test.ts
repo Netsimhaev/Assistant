@@ -64,11 +64,22 @@ describe('contact conversations', () => {
 
   it('setCard marks carded and is found by its job', async () => {
     const a = await withBusiness(TEST_BUSINESS, (db) => openOrAppend(db, input(0)));
-    await withBusiness(TEST_BUSINESS, (db) => setCard(db, a.conversation.conversationId, 'job-1', at(2)));
+    await withBusiness(TEST_BUSINESS, (db) => setCard(db, a.conversation.conversationId, 'job-1', at(2), null));
     const c = await withBusiness(TEST_BUSINESS, (db) => conversationByCardJob(db, 'job-1'));
     expect(c).toMatchObject({ state: 'carded', cardJobId: 'job-1', cardPresentedAt: at(2) });
     const b = await withBusiness(TEST_BUSINESS, (db) => openOrAppend(db, input(3)));
     expect(b.created).toBe(false);
+  });
+
+  it('setCard is a compare-and-swap on the previous card job (R11b)', async () => {
+    const a = await withBusiness(TEST_BUSINESS, (db) => openOrAppend(db, input(0)));
+    const id = a.conversation.conversationId;
+    expect(await withBusiness(TEST_BUSINESS, (db) => setCard(db, id, 'job-1', null, null))).toBe(true);
+    // A stale expectation (null, but job-1 is there now) loses and changes nothing.
+    expect(await withBusiness(TEST_BUSINESS, (db) => setCard(db, id, 'job-2', null, null))).toBe(false);
+    expect((await withBusiness(TEST_BUSINESS, (db) => loadConversation(db, id)))?.cardJobId).toBe('job-1');
+    expect(await withBusiness(TEST_BUSINESS, (db) => setCard(db, id, 'job-2', null, 'job-1'))).toBe(true);
+    expect((await withBusiness(TEST_BUSINESS, (db) => loadConversation(db, id)))?.cardJobId).toBe('job-2');
   });
 
   it('recentMessages returns both directions, newest 10, oldest first', async () => {

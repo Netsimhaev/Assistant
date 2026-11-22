@@ -10,6 +10,16 @@
  * channel, and a reply composed for a stranger would be this assistant acting
  * on behalf of someone who never asked it to.
  *
+ * **One exception, opted into by the owner's signature (WhatsApp contacts,
+ * phase 1).** When the business signed the `whatsapp-contacts` connection,
+ * the scheduler hands this door `contactFlow`, and a message from a managed
+ * contact or an unknown number goes to `whatsapp/contact-flow.ts`: the fixed
+ * holding reply (its own documented gate bypass) and a card to the OWNER with
+ * a drafted reply. Nothing else reaches that sender — the draft leaves only on
+ * the owner's "שלח", through the gate — and still nothing here ever speaks
+ * for the owner's authority: the owner's messenger stays fixed on his number.
+ * A colleague's message is recorded only, with or without the flow.
+ *
  * **The sender's trust is read off the signed charter, once, before the
  * queue is touched at all — never guessed per message.** The active charter
  * is the only thing that can say who the owner is on this channel
@@ -128,7 +138,7 @@
 import type { InstructionRecord } from '../governance/instructions.js';
 import { loadActiveCharter } from '../charter/store.js';
 import type { BusinessCharter } from '../domain/charter.js';
-import { authorityNumberKey, isPrincipalSender } from '../governance/principal-number.js';
+import { authorityNumberKey } from '../governance/principal-number.js';
 import { stripBidiControls } from '../util/bidi.js';
 import type { InstructionTextOrigin } from '../governance/typed-recipients.js';
 import type { NormalizedInboundMessage, WhatsAppGateway } from '../whatsapp/gateway.js';
@@ -183,6 +193,13 @@ import {
 } from './whatsapp-routing.js';
 import type { BusinessDb } from '../db/pool.js';
 import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
+import { resolveSender } from '../whatsapp/contact-identity.js';
+import { handleContactCardMessage, isContactCardAction } from '../whatsapp/contact-card.js';
+import {
+  handleContactMessages,
+  type ContactFlowDeps,
+  type ContactMessageInput,
+} from '../whatsapp/contact-flow.js';
 
 export interface DoorResult {
   /** However many messages `pollOnce` delivered to this pass, redeliveries included. */
@@ -263,6 +280,19 @@ export interface DoorResult {
    * counts only toward `recordedOnly`, unchanged.
    */
   malformedSenderCount: number;
+  /**
+   * Messages from a contact or an unknown number that reached the contact
+   * flow (`whatsapp/contact-flow.ts`) and ended on a card with a draft — or
+   * on a card already approved and being sent (ruling R11a). Zero whenever
+   * the flow is not wired (`contactFlow` unset).
+   */
+  contactHandled: number;
+  /** Contact messages that got a card without a draft: over a daily cap. */
+  contactCapped: number;
+  /** Contact messages whose flow threw; settled `failed`. */
+  contactFailed: number;
+  /** The owner answered an open contact card ("שלח" / "נוסח: ..."). */
+  contactCardReplies: number;
 }
 
 /** Shown to the owner's own recording, quoted back verbatim, ahead of whatever happened next. */
@@ -475,6 +505,10 @@ interface ProcessContext {
   production?: Runtime['production'];
   /** Calendar access for the schedule answer — see `RunInstructionOptions.calendar`. */
   calendar?: RunInstructionOptions['calendar'];
+  /** Present only when the business signed `whatsapp-contacts`; see `runWhatsAppDoor`. */
+  contactFlow?: ContactFlowDeps;
+  /** Non-owner messages of this pass, handed to the contact flow together after the loop. */
+  pendingContacts: ContactMessageInput[];
 }
 
 type ProcessOutcome =
@@ -486,6 +520,8 @@ type ProcessOutcome =
   | 'confirmation'
   | 'ledger'
   | 'documentCard'
+  | 'contactCard'
+  | 'contactQueued'
   | 'skipped';
 
 /** Spec §10.11, verbatim: more than one thing is open, and the answer cannot say which. */
@@ -683,9 +719,10 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
   let text = '';
 
   try {
-    const senderKind: SenderKind = isPrincipalSender(ctx.charter, msg.senderNumber)
-      ? 'principal'
-      : 'other';
+    // Who wrote, deterministically (ruling R11d): the principal, a colleague,
+    // a managed contact, or unknown — never the old catch-all 'other'.
+    const sender = await resolveSender(ctx.db, ctx.charter, msg.senderNumber);
+    const senderKind: SenderKind = sender.kind;
 
     stored = await recordInbound(
       ctx.db,
@@ -717,12 +754,22 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       ctx.reportMalformedSender();
     }
 
-    if (senderKind === 'other') {
-      // Decision 4. Recorded for the conversation screen and closed out
-      // immediately — no claim, because nothing on this branch will ever plan
-      // or spend anything, and no reply, ever. `established` stays `false`:
-      // even if the settle below throws, a stranger gets no message from
-      // this assistant, full stop.
+    if (sender.kind !== 'principal') {
+      // Never the owner's authority: `established` stays `false`, so even a
+      // crash below sends this sender nothing from the owner's messenger.
+      //
+      // With the contact flow wired (the business signed `whatsapp-contacts`),
+      // a contact's or an unknown number's message is handed to it AFTER the
+      // loop, together with the rest of this pass's burst — one holding reply
+      // and one card per conversation (`contact-flow.ts`). A colleague's
+      // message is recorded only, there as here.
+      //
+      // Without it, Decision 4 as before: recorded for the conversation
+      // screen and closed out, no claim, no reply, ever.
+      if (ctx.contactFlow !== undefined) {
+        ctx.pendingContacts.push({ msg, storedId: stored.id, sender });
+        return 'contactQueued';
+      }
       await settleMessage(ctx.db, stored.id, 'handled', {});
       return 'recordedOnly';
     }
@@ -846,6 +893,37 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
           othersOpen: openNow.contactCards.length,
         });
         if (handled === 'decided' || handled === 'replaced') return 'mailCard';
+        if (handled !== 'passthrough') return handled;
+      }
+    }
+
+    // An open CONTACT card (a reply drafted to a client/supplier) is read
+    // right after the mail card, on the same terms: typed text only, one of
+    // the two actions ("שלח" / "נוסח: ..."), presented before this message and
+    // inside the window. Every other open thing counts against it — "שלח"
+    // cannot say which. With no contact card open the message falls through
+    // to the ordinary door untouched.
+    if (msg.mediaKind === null && msg.body !== null && isContactCardAction(msg.body)) {
+      const openNow = await openOnWhatsApp(ctx.db, {
+        excludeMessageId: stored.id,
+        inboundAt: msg.providerTimestamp,
+        ...(ctx.questionWindowMinutes !== undefined
+          ? { windowMinutes: ctx.questionWindowMinutes }
+          : {}),
+      });
+      if (openNow.contactCards.length > 0) {
+        const handled = await handleContactCardMessage(ctx.db, {
+          msg,
+          storedId: stored.id,
+          cards: openNow.contactCards,
+          messenger: ctx.messenger,
+          othersOpen:
+            openNow.mailCards.length +
+            openNow.questions.length +
+            openNow.confirmations.length +
+            openNow.documentCards.length,
+        });
+        if (handled === 'decided' || handled === 'replaced') return 'contactCard';
         if (handled !== 'passthrough') return handled;
       }
     }
@@ -1279,6 +1357,13 @@ export async function runWhatsAppDoor(db: BusinessDb, options: {
   production?: Runtime['production'];
   /** Calendar access for the schedule answer ("מה יש לי מחר?"); absent: no schedule routing. */
   calendar?: RunInstructionOptions['calendar'];
+  /**
+   * The contact flow's dependencies — passed by the scheduler only when the
+   * business signed the `whatsapp-contacts` connection (its adapter is
+   * registered). Absent: every non-owner message is recorded only, exactly
+   * as before the flow existed.
+   */
+  contactFlow?: ContactFlowDeps;
 }): Promise<DoorResult> {
   const businessId = db.businessId;
   const { gateway, messenger } = options;
@@ -1326,6 +1411,10 @@ export async function runWhatsAppDoor(db: BusinessDb, options: {
     documentCardReplies: 0,
     confirmErrored: [],
     malformedSenderCount: 0,
+    contactHandled: 0,
+    contactCapped: 0,
+    contactFailed: 0,
+    contactCardReplies: 0,
   };
 
   const ctx: ProcessContext = {
@@ -1348,6 +1437,8 @@ export async function runWhatsAppDoor(db: BusinessDb, options: {
       : {}),
     ...(options.production !== undefined ? { production: options.production } : {}),
     ...(options.calendar !== undefined ? { calendar: options.calendar } : {}),
+    ...(options.contactFlow !== undefined ? { contactFlow: options.contactFlow } : {}),
+    pendingContacts: [],
   };
 
   for (const msg of ordered) {
@@ -1371,8 +1462,29 @@ export async function runWhatsAppDoor(db: BusinessDb, options: {
     else if (outcome === 'confirmation') result.confirmationReplies += 1;
     else if (outcome === 'ledger') result.ledgerReplies += 1;
     else if (outcome === 'documentCard') result.documentCardReplies += 1;
+    else if (outcome === 'contactCard') result.contactCardReplies += 1;
+    // 'contactQueued' is counted below, once the contact flow ran.
     // 'skipped' — a redelivery, a race on the claim, or a failure before the
     // message was ever claimed — adds to none of the four buckets.
+  }
+
+  // The contact flow, once per pass over every non-owner message the loop
+  // queued — so a burst from one number is one conversation, one holding
+  // reply and one draft (Review Focus 1). `handleContactMessages` never
+  // throws; the `catch` is the same last-resort net the loop has.
+  if (options.contactFlow !== undefined && ctx.pendingContacts.length > 0) {
+    let outcomes: Awaited<ReturnType<typeof handleContactMessages>> = [];
+    try {
+      outcomes = await handleContactMessages(db, options.contactFlow, ctx.pendingContacts);
+    } catch {
+      result.contactFailed += ctx.pendingContacts.length;
+    }
+    for (const outcome of outcomes) {
+      if (outcome === 'recordedOnly') result.recordedOnly += 1;
+      else if (outcome === 'carded' || outcome === 'busy') result.contactHandled += 1;
+      else if (outcome === 'capped') result.contactCapped += 1;
+      else if (outcome === 'failed') result.contactFailed += 1;
+    }
   }
 
   return result;

@@ -70,6 +70,10 @@ export const CONTACT_CARD_EDIT_REFUSAL = 'בכרטיס הזה אפשר לשנו�
 export const CONTACT_CARD_GONE = 'הטיוטה הזו כבר הוכרעה או שפג תוקפה — לא שיניתי דבר.';
 export const EXTERNAL_FILE_WARNING = '⚠️ הקובץ התקבל מגורם חיצוני';
 export const REPLACED_JOB_REASON = 'replaced by newer draft';
+/** "שלח" on a card raised without a draft (cap, failure): there is nothing to send yet. */
+export const CONTACT_CARD_NO_DRAFT = 'בכרטיס הזה אין עדיין טיוטה לשליחה — כתבי "נוסח: <הטקסט>".';
+/** Shown in place of the proposed reply when the card carries no draft. */
+export const CONTACT_CARD_NO_DRAFT_SHOWN = '(לא נוסחה הצעה)';
 
 const KIND_HE: Record<ContactKind, string> = { client: 'לקוח', supplier: 'ספק', unknown: 'לא מוכר' };
 const SOURCE_HE: Record<string, string> = {
@@ -191,6 +195,23 @@ async function inspectPreviousCard(db: BusinessDb, conversationId: string): Prom
   return { jobId: conv.cardJobId, pendingApprovalId: pending };
 }
 
+/**
+ * Read-only: whether a new card for this conversation would be refused right
+ * now (`ContactCardBusyError`) — the previous card is approved but unsent, or
+ * its job is past `await_approval`. The door asks BEFORE spending model calls
+ * on a draft nobody could raise (ruling R11a); `raiseContactCard` still
+ * decides for itself, since the answer can change between the two.
+ */
+export async function cardTakeoverBlocked(db: BusinessDb, conversationId: string): Promise<boolean> {
+  try {
+    await inspectPreviousCard(db, conversationId);
+    return false;
+  } catch (error) {
+    if (error instanceof ContactCardBusyError) return true;
+    throw error;
+  }
+}
+
 export async function raiseContactCard(
   db: BusinessDb,
   input: RaiseContactCardInput,
@@ -291,7 +312,15 @@ export async function raiseContactCard(
           throw new ContactCardBusyError(conversation.conversationId);
         }
       }
-      if (!(await setCard(tx, conversation.conversationId, job.jobId, null))) {
+      // Compare-and-swap on the card pointer this raise inspected (R11b): a
+      // concurrent raise that re-pointed the conversation since then wins,
+      // and this one withdraws its own card (the catch below) — no live
+      // approval is left that no conversation points at.
+      if (!(await setCard(tx, conversation.conversationId, job.jobId, null, previous?.jobId ?? null))) {
+        const current = await loadConversation(tx, conversation.conversationId);
+        if (current !== null && (current.state === 'open' || current.state === 'carded')) {
+          throw new ContactCardBusyError(conversation.conversationId);
+        }
         throw new Error('contact card: the conversation is no longer open');
       }
     });
@@ -364,11 +393,13 @@ export async function presentContactCard(
 
   const { header } = splitDetail(approval.detail);
   const reply = bodyOf(approval.editedInput ?? approval.proposedInput);
-  const card = `${header}\n\nהתשובה המוצעת:\n${reply}\n\n${CONTACT_CARD_INSTRUCTION}`;
+  const shown = reply.trim() === '' ? CONTACT_CARD_NO_DRAFT_SHOWN : reply;
+  const card = `${header}\n\nהתשובה המוצעת:\n${shown}\n\n${CONTACT_CARD_INSTRUCTION}`;
   const ok = await send(options.lead !== undefined ? `${options.lead}\n\n${card}` : card, approval.jobId);
   if (!ok) return false;
-  await setCard(db, conversation.conversationId, approval.jobId, new Date());
-  return true;
+  // Same job on both sides: only the presentation time changes, and only while
+  // this card is still the conversation's.
+  return setCard(db, conversation.conversationId, approval.jobId, new Date(), approval.jobId);
 }
 
 // --- What is open -------------------------------------------------------------
@@ -523,6 +554,9 @@ async function approveCard(db: BusinessDb, card: ApprovalRequest, ctx: StepConte
   if (staged !== undefined && !contactReplyEditAllowed(card.proposedInput, staged)) {
     return ctx.refuse(CONTACT_CARD_EDIT_REFUSAL);
   }
+  // A card raised without a draft carries an empty body: approving it would
+  // only fail at the send. The owner writes the reply with "נוסח:".
+  if (bodyOf(staged ?? card.proposedInput).trim() === '') return ctx.refuse(CONTACT_CARD_NO_DRAFT);
   let decided: ApprovalRequest;
   try {
     decided = await decide(db, card.approvalId, 'approved', {

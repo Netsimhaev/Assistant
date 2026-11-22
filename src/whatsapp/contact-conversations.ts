@@ -88,18 +88,29 @@ export async function openOrAppend(
   return { conversation: toContactConversation(row), created: row.inserted };
 }
 
+/**
+ * Point the conversation at a card job — a compare-and-swap (ruling R11b):
+ * the row changes only while its `card_job_id` is still `expectedPrevious`
+ * (`IS NOT DISTINCT FROM`, so `null` matches a conversation that never had a
+ * card). Two concurrent raises therefore cannot both win: the loser sees
+ * `false` and withdraws its own card, and no live approval is left that no
+ * conversation points at.
+ */
 export async function setCard(
   db: BusinessDb,
   conversationId: string,
   jobId: string,
   presentedAt: Date | null,
+  expectedPrevious: string | null,
 ): Promise<boolean> {
   const res = await db.query(
     `UPDATE contact_conversations SET state = 'carded', card_job_id = $2, card_presented_at = $3
-      WHERE business_id = $4 AND conversation_id = $1 AND state IN ('open', 'carded')`,
-    [conversationId, jobId, presentedAt, db.businessId],
+      WHERE business_id = $4 AND conversation_id = $1 AND state IN ('open', 'carded')
+        AND card_job_id IS NOT DISTINCT FROM $5`,
+    [conversationId, jobId, presentedAt, db.businessId, expectedPrevious],
   );
-  // False when the conversation is closed/expired (or gone): nothing was set.
+  // False when the conversation is closed/expired (or gone), or its card
+  // pointer moved since the caller read it: nothing was set.
   return (res.rowCount ?? 0) === 1;
 }
 

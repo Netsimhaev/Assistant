@@ -42,6 +42,17 @@ import { learnFromExternalEvents, type LearnResult as ExternalLearnResult } from
 import type { ExternalHttp } from '../external/http.js';
 import type { Curator } from '../sdk/curator.js';
 import { sharedGuardedHttps } from './runtime.js';
+import { config } from '../config.js';
+import { profileFragment } from '../business/profile.js';
+import { WHATSAPP_CONTACTS_SYSTEM } from '../charter/amend-whatsapp-contacts.js';
+import { runContactResearcher, type ContactResearcher } from '../sdk/contact-researcher.js';
+import { runContactDrafter, type ContactDrafter } from '../sdk/contact-drafter.js';
+import type { ContactFlowDeps } from '../whatsapp/contact-flow.js';
+import { HOLDING_NAME_FALLBACK } from '../whatsapp/holding-reply.js';
+import type { Tier2Source } from '../whatsapp/sources/types.js';
+import { uploadedInvoicesOfSender } from '../whatsapp/sources/uploaded-invoices.js';
+import { createSentInvoicesSource } from '../whatsapp/sources/sent-invoices.js';
+import { createAccountingInvoicesSource } from '../whatsapp/sources/accounting-invoices.js';
 import type { MailPollResult, PollMailboxOptions } from './mail-poll.js';
 import type { ResumeResult } from './resume-delegated.js';
 import { runDueJobs } from './run-due.js';
@@ -939,6 +950,11 @@ export async function schedulerPass(
     /** Test seam only; production leaves it unset and `runInstruction` uses the real planner. */
     whatsappPlanner?: RunInstructionOptions['planner'];
     whatsappProvider?: Parameters<typeof runWhatsAppDoor>[1]['provider'];
+    /** Test seams; production leaves them unset and the contact flow uses the billed researcher/drafter (`refuseUnderTest` guards both). */
+    contactResearcher?: ContactResearcher;
+    contactDrafter?: ContactDrafter;
+    /** Test seam: replaces the contact flow's tier-2 sources. */
+    contactSources?: Tier2Source[];
     /** Test seams only; production leaves them unset and the poll uses the real client, triage and drafter. */
     mailClient?: PollMailboxOptions['client'];
     mailTriage?: PollMailboxOptions['triage'];
@@ -1061,6 +1077,38 @@ export async function schedulerPass(
 
       const doorGateway = runtime.whatsapp.gateway;
       const doorMessenger = whatsappMessenger;
+      // The contact flow (clients, suppliers, unknown numbers) runs only when
+      // the business signed the `whatsapp-contacts` connection AND its adapter
+      // was registered this pass (live binding, gateway present) — the same
+      // switch that lets an approved reply go out at all. Unsigned: every
+      // non-owner message is recorded only, as before the flow existed.
+      let contactFlow: ContactFlowDeps | undefined;
+      if (runtime.registry.get(WHATSAPP_CONTACTS_SYSTEM) !== null) {
+        const profile = await stage((db) => profileFragment(db));
+        const http = options.externalHttp ?? runtime.externalHttp ?? sharedGuardedHttps();
+        contactFlow = {
+          gateway: doorGateway,
+          messenger: doorMessenger,
+          bundle: active.bundle,
+          charter: active.charter,
+          businessName: profile.businessProfile?.name ?? HOLDING_NAME_FALLBACK,
+          researcher: options.contactResearcher ?? runContactResearcher,
+          drafter: options.contactDrafter ?? runContactDrafter,
+          sources: options.contactSources ?? [
+            uploadedInvoicesOfSender,
+            createSentInvoicesSource({
+              credentials: runtime.credentials,
+              documentRoot: options.documentRoot ?? config.documentRoot,
+            }),
+            createAccountingInvoicesSource({ http, credentials: runtime.credentials }),
+          ],
+          ...(options.whatsappProvider !== undefined ? { transcribe: options.whatsappProvider } : {}),
+          ...(runtime.notify !== undefined
+            ? { notify: { notifier: runtime.notify.notifier, dashboardBaseUrl: runtime.notify.dashboardBaseUrl } }
+            : {}),
+          now: () => options.now ?? new Date(),
+        };
+      }
       whatsappDoor = await stage((db) => runWhatsAppDoor(db, {
         gateway: doorGateway,
         messenger: doorMessenger,
@@ -1080,6 +1128,7 @@ export async function schedulerPass(
         ...(runtime.production !== undefined ? { production: runtime.production } : {}),
         // The schedule answer reads the calendar through the runtime's credentials.
         calendar: { runtime },
+        ...(contactFlow !== undefined ? { contactFlow } : {}),
       }));
     } catch (err) {
       whatsappError = err instanceof Error ? err.message : String(err);
