@@ -8,6 +8,8 @@ import { presentContactCard, raiseContactCard } from './contact-card.js';
 import { contactHousekeeping, sourceTiersFromDetail, CARD_REMINDER_LEAD } from './contact-housekeeping.js';
 import { loadConversation, openOrAppend, type ContactConversation } from './contact-conversations.js';
 import { createFakeGateway, type FakeGateway } from './fake-gateway.js';
+import { tick } from '../orchestrator/scheduler.js';
+import { loadJob } from '../orchestrator/jobs.js';
 import { createBossMessenger, type BossMessenger } from './messenger.js';
 
 const BUSINESS = 'test-business';
@@ -145,15 +147,45 @@ describe('contact housekeeping', () => {
     expect(byApproval.get(first.approvalId)?.source_tiers).toEqual(['tier2', 'tier3']);
   });
 
-  it('closes the conversation when the approval expired', async () => {
+  it('closes the conversation after the real expiry sequence (tick parks the job in followup)', async () => {
     const h = await harness();
     const card = await raise(h);
     await testDb().query(
-      `UPDATE approval_requests SET state = 'expired' WHERE business_id = $1 AND approval_id = $2`,
+      `UPDATE approval_requests SET expires_at = now() - interval '1 minute' WHERE business_id = $1 AND approval_id = $2`,
       [BUSINESS, card.approvalId],
     );
+    const ticked = await withBusiness(BUSINESS, (db) => tick(db));
+    expect(ticked.expiredApprovals).toContain(card.approvalId);
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, card.jobId)))?.phase).toBe('followup');
     expect((await run(h)).expired).toBe(1);
     expect(await state(h)).toBe('expired');
+  });
+
+  it('closes a conversation whose approved send finished with the job closed and nothing performed', async () => {
+    const h = await harness();
+    const card = await raise(h);
+    await withBusiness(BUSINESS, (db) => decide(db, card.approvalId, 'approved', { by: 'whatsapp:test', channel: 'whatsapp' }));
+    await testDb().query(
+      `UPDATE approval_requests SET consumed_at = now(), consumed_by_step = 'reply' WHERE business_id = $1 AND approval_id = $2`,
+      [BUSINESS, card.approvalId],
+    );
+    await setPhase(card.jobId, 'closed');
+    await run(h);
+    expect(await state(h)).toBe('closed');
+  });
+
+  it('a failed reminder send leaves reminder_sent_at null and the next pass retries', async () => {
+    const h = await harness();
+    const card = await raise(h);
+    await present(h, card.approvalId);
+    await cardPresentedAgo(h, 6 * HOUR);
+    h.gateway.failNextSend();
+    expect((await run(h)).reminded).toBe(0);
+    const conv = await withBusiness(BUSINESS, (db) => loadConversation(db, h.conversation.conversationId));
+    expect(conv?.reminderSentAt).toBeNull();
+    expect((await run(h)).reminded).toBe(1);
+    const after = await withBusiness(BUSINESS, (db) => loadConversation(db, h.conversation.conversationId));
+    expect(after?.reminderSentAt).not.toBeNull();
   });
 
   it('closes the conversation when the card was denied', async () => {

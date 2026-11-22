@@ -135,12 +135,19 @@ async function settleCarded(db: BusinessDb): Promise<{ expired: number; answered
   for (const r of rows) {
     let to: 'answered' | 'closed' | 'expired' | null = null;
     if (r.phase === 'closed' && r.performed) to = 'answered';
-    else if (!r.live && (r.phase === 'await_approval' || r.phase === 'closed' || r.phase === 'failed' || r.phase === null)) {
-      // Only a card whose latest approval ended without a send, and whose job
-      // is not mid-send (R12b): approved-and-consumed jobs in execute/followup/
-      // verify/remember keep the conversation carded.
-      if (r.latest === 'expired') to = 'expired';
-      else if (r.latest === 'denied' || r.latest === 'cancelled') to = 'closed';
+    else if (!r.live) {
+      // Nothing live remains on the card job. `followup` is where the real
+      // expiry path (scheduler `expireApprovals`) leaves a job whose approval
+      // lapsed. Jobs mid-send (execute/verify/remember) are never matched here
+      // (R12b), and an approved-and-consumed job in `followup` (a send that
+      // timed out) keeps its conversation: only denied/cancelled/expired end it.
+      const settledPhase = r.phase === 'await_approval' || r.phase === 'followup'
+        || r.phase === 'closed' || r.phase === 'failed' || r.phase === null;
+      if (settledPhase && r.latest === 'expired') to = 'expired';
+      else if (settledPhase && (r.latest === 'denied' || r.latest === 'cancelled')) to = 'closed';
+      // The approved send is finished (job closed, nothing performed): R12b
+      // no longer protects the conversation.
+      else if (r.phase === 'closed' && (r.latest === 'approved' || r.latest === 'approved_with_edit')) to = 'closed';
     }
     if (to === null) continue;
     // Conditional on the card pointer (R12a), carded still.
