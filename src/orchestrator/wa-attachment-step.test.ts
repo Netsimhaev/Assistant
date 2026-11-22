@@ -122,7 +122,7 @@ describe('wa.send_message attachDocumentId in runPlan', () => {
           agent: 'comms.whatsapp',
           intent: 'send',
           toolName: 'wa.send_message',
-          input: { to: '+972501234567', phone: '+972501234567', body: 'מצורף', attachDocumentId: documentId },
+          input: { to: '+972501234567', body: 'מצורף', attachDocumentId: documentId },
         },
       ],
     });
