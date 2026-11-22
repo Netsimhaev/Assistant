@@ -64,7 +64,11 @@ export async function approvedReplyCovers(
 ): Promise<boolean> {
   if (ctx.approval === undefined) return false;
   if (typeof ctx.jobId !== 'string') return false;
-  if (facts.actionClass !== 'email.reply') return false;
+  // The job condition depends on the class: a mailbox reply job for mail, a
+  // contact-conversation card job for WhatsApp. `whatsapp.initiate` (no real
+  // `conversationId`) is never covered.
+  const mail = facts.actionClass === 'email.reply';
+  if (!mail && facts.actionClass !== 'whatsapp.reply') return false;
 
   const db = ctx.db;
   const businessId = db.businessId;
@@ -79,11 +83,17 @@ export async function approvedReplyCovers(
         AND expires_at > now()
         AND proposed_tool = $4
         AND input_hash_at_decision = $5
-        AND EXISTS (
-          SELECT 1 FROM mail_messages m
-           WHERE m.business_id = $2 AND m.reply_job_id = $3
+        AND (
+          ($6::boolean AND EXISTS (
+            SELECT 1 FROM mail_messages m
+             WHERE m.business_id = $2 AND m.reply_job_id = $3
+          ))
+          OR (NOT $6::boolean AND EXISTS (
+            SELECT 1 FROM contact_conversations c
+             WHERE c.business_id = $2 AND c.card_job_id = $3
+          ))
         )`,
-    [ctx.approval.approvalId, businessId, ctx.jobId, toolName, liveInputHash],
+    [ctx.approval.approvalId, businessId, ctx.jobId, toolName, liveInputHash, mail],
   );
   return rows[0] !== undefined;
 }

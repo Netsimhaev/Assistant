@@ -514,3 +514,98 @@ describe('the exemption skips nothing but the two ceilings it names', () => {
     expect(await intentRows(s.jobId)).toBe(1);
   });
 });
+
+describe('an owner-approved WhatsApp reply to a contact card', () => {
+  const WA = {
+    to: '+972501234567',
+    body: 'תודה, נחזור אליך מחר.',
+    conversationId: 'conv-1',
+  };
+
+  async function waSetup(linked: boolean): Promise<Setup> {
+    const s = await setup({}, { mailboxReplyJob: false });
+    if (linked) {
+      await testDb().query(
+        `INSERT INTO contact_conversations
+           (business_id, conversation_id, contact_key, contact_kind, state, last_inbound_at, card_job_id)
+         VALUES ($1, 'conv-1', '972501234567', 'client', 'carded', now(), $2)`,
+        [BUSINESS, s.jobId],
+      );
+    }
+    const rampLevel = await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'whatsapp.reply'));
+    return { ...s, ctx: { ...s.ctx, agent: 'comms.whatsapp', rampLevel } };
+  }
+
+  it('is allowed under mode off when a conversation names the job as its card job', async () => {
+    const s = await waSetup(true);
+    const approvalId = await approvedCard(s, { toolName: 'wa.send_message', input: WA });
+
+    const decision = await evaluateFor('wa.send_message', WA, {
+      ...s.ctx, approval: { approvalId, stepId: STEP_ID },
+    });
+
+    expect(decision.outcome).toBe('allow');
+    expect(await consumedAt(approvalId)).not.toBeNull();
+    const { rows } = await testDb().query<{ reason: string }>(
+      `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'approval'`,
+      [s.jobId],
+    );
+    expect(rows[0]?.reason.endsWith(` ${APPROVED_REPLY_EXEMPTION_MARKER}`)).toBe(true);
+  });
+
+  it('is denied draft_only at stage 8 without the card-job link', async () => {
+    const s = await waSetup(false);
+    const approvalId = await approvedCard(s, { toolName: 'wa.send_message', input: WA });
+
+    const decision = await evaluateFor('wa.send_message', WA, {
+      ...s.ctx, approval: { approvalId, stepId: STEP_ID },
+    });
+
+    await expectDeniedAtStage8(decision, s.jobId);
+    expect(await consumedAt(approvalId)).toBeNull();
+  });
+
+  it('is denied at stage 8 when the linking conversation belongs to another business', async () => {
+    const s = await waSetup(false);
+    await testDb().query(
+      `INSERT INTO contact_conversations
+         (business_id, conversation_id, contact_key, contact_kind, state, last_inbound_at, card_job_id)
+       VALUES ('other-business', 'conv-1', '972501234567', 'client', 'carded', now(), $1)`,
+      [s.jobId],
+    );
+    const approvalId = await approvedCard(s, { toolName: 'wa.send_message', input: WA });
+
+    const decision = await evaluateFor('wa.send_message', WA, {
+      ...s.ctx, approval: { approvalId, stepId: STEP_ID },
+    });
+
+    await expectDeniedAtStage8(decision, s.jobId);
+  });
+
+  it('whatsapp.initiate (no conversationId) is never covered', async () => {
+    const s = await waSetup(true);
+    const { conversationId: _c, ...initiate } = WA;
+    const approvalId = await approvedCard(s, { toolName: 'wa.send_message', input: initiate });
+
+    const decision = await evaluateFor('wa.send_message', initiate, {
+      ...s.ctx, approval: { approvalId, stepId: STEP_ID },
+    });
+
+    expect(decision.outcome).not.toBe('allow');
+    expect(await consumedAt(approvalId)).toBeNull();
+  });
+
+  it('edited bytes that differ from the approved hash are denied at stage 8', async () => {
+    const s = await waSetup(true);
+    const approvalId = await approvedCard(s, { toolName: 'wa.send_message', input: WA });
+
+    const decision = await evaluateFor(
+      'wa.send_message',
+      { ...WA, body: 'נוסח שהבעלים לא ראה' },
+      { ...s.ctx, approval: { approvalId, stepId: STEP_ID } },
+    );
+
+    await expectDeniedAtStage8(decision, s.jobId);
+    expect(await consumedAt(approvalId)).toBeNull();
+  });
+});
