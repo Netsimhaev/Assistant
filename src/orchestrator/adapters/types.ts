@@ -166,6 +166,8 @@ export interface AdapterCall {
 
 /** One resolved file on an outbound send. `mediaType` comes from the produced format, never from the name. */
 export interface OutgoingAttachment {
+  /** The `documents.document_id` these bytes were resolved from, when they came from a stored document (WhatsApp sends). */
+  documentId?: string;
   filename: string;
   mediaType: string;
   bytes: Buffer;

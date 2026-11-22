@@ -85,11 +85,30 @@ describe('whatsapp-contacts adapter', () => {
     const r = await adapter.execute(
       call(
         { to: '+972501234567', body: 'הנה', attachDocumentId: 'D1' },
-        { attachments: [{ filename: 'a.pdf', mediaType: 'application/pdf', bytes: Buffer.from('x') }] },
+        { attachments: [{ documentId: 'D1', filename: 'a.pdf', mediaType: 'application/pdf', bytes: Buffer.from('x') }] },
       ),
     );
     expect(r.ok).toBe(true);
     expect(files).toMatchObject([{ contactId: '972501234567', caption: 'הנה', filename: 'a.pdf' }]);
+  });
+
+  it('refuses an attachment whose document id is not the one named', async () => {
+    const { adapter } = setup();
+    const r = await adapter.execute(
+      call(
+        { to: '+972501234567', body: 'x', attachDocumentId: 'D1' },
+        { attachments: [{ documentId: 'D2', filename: 'a.pdf', mediaType: 'application/pdf', bytes: Buffer.from('x') }] },
+      ),
+    );
+    expect(r).toMatchObject({ ok: false, code: 'attachment_missing' });
+  });
+
+  it('refuses an attachment present when none was named', async () => {
+    const { adapter } = setup();
+    const r = await adapter.execute(
+      call({ to: '+972501234567', body: 'x' }, { attachments: [{ documentId: 'D1', filename: 'a.pdf', mediaType: 'application/pdf', bytes: Buffer.from('x') }] }),
+    );
+    expect(r).toMatchObject({ ok: false, code: 'attachment_missing' });
   });
 
   it('maps a rejected send to whatsapp_rejected, not retryable', async () => {

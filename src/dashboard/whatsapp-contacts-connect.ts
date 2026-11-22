@@ -22,7 +22,9 @@ import {
 import { probeActiveCharter } from '../charter/store.js';
 import type { BusinessCharter } from '../domain/charter.js';
 import { transaction, type BusinessDb } from '../db/pool.js';
+import { listSecretRefs } from '../governance/credential-store.js';
 import { loadBindings, upsertBinding } from '../orchestrator/bindings.js';
+import { GREEN_API_INSTANCE_ID_REF, GREEN_API_TOKEN_REF } from '../orchestrator/runtime.js';
 import { verifyCsrfToken } from './csrf.js';
 import { STALE_MESSAGE, errorPage, installSigned, page, seeOther, sendHtml, type MailboxSession } from './mailbox-connect.js';
 import { escapeHtml as esc } from './views.js';
@@ -98,6 +100,8 @@ ${subprocessor}
   }
 
   const bindings = await loadBindings(db);
+  const refs = new Set((await listSecretRefs(db)).map((r) => r.ref));
+  const hasSecrets = refs.has(GREEN_API_INSTANCE_ID_REF) && refs.has(GREEN_API_TOKEN_REF);
   const live = bindings.find((b) => b.system === WHATSAPP_CONTACTS_SYSTEM)?.status === 'live';
   sendHtml(
     res,
@@ -105,7 +109,7 @@ ${subprocessor}
     page(
       TITLE,
       `<h1>${esc(TITLE)}</h1>
-<p>מצב: <b>${live ? 'פעיל' : 'נחתם בתקנון — החיבור אינו פעיל'}</b>.</p>
+<p>מצב: <b>${live && hasSecrets ? 'פעיל' : live ? 'חתום — ממתין לחיבור וואטסאפ' : 'נחתם בתקנון — החיבור אינו פעיל'}</b>.</p>
 <div class="card"><p>${esc(WHATSAPP_CONTACTS_AUTHORISATION_TEXT)}</p></div>
 <div class="card">
 <h2>בטל את החיבור</h2>

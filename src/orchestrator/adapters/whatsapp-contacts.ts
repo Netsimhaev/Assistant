@@ -61,9 +61,13 @@ export function createWhatsAppContactsAdapter(options: WhatsAppContactsOptions):
         }
       }
 
+      // Exactly one attachment, and it must be the very document named.
+      if (input.attachDocumentId === undefined && call.attachments.length > 0) {
+        return refuse('attachment_missing', 'צורף קובץ שלא אושר לשליחה.');
+      }
       const file = input.attachDocumentId !== undefined ? call.attachments[0] : undefined;
-      if (input.attachDocumentId !== undefined && file === undefined) {
-        return refuse('attachment_missing', 'הקובץ שאושר לשליחה לא נמצא.');
+      if (input.attachDocumentId !== undefined && (call.attachments.length !== 1 || file === undefined || file.documentId !== input.attachDocumentId)) {
+        return refuse('attachment_missing', 'הקובץ שאושר לשליחה לא נמצא או אינו הקובץ שצוין.');
       }
       if (file !== undefined && gateway.sendFile === undefined) {
         return refuse('attachment_unsupported', 'ערוץ הוואטסאפ אינו תומך בשליחת קבצים.');
@@ -96,6 +100,7 @@ export function createWhatsAppContactsAdapter(options: WhatsAppContactsOptions):
         await options.recordOutbound(call.businessId, { body: input.body, jobId: null, recipientNumber: key });
       } catch {
         // The message left; a history write failing must not turn a delivery into a failure.
+        console.error('whatsapp-contacts: could not record the outbound message in the history');
       }
       return { ok: true, output: { messageId: result.messageId, state: result.state }, externalId: result.messageId };
     },

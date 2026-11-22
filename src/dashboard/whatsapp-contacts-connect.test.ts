@@ -12,6 +12,8 @@ import { WHATSAPP_CONTACTS_SYSTEM } from '../charter/amend-whatsapp-contacts.js'
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { closePool, withBusiness } from '../db/pool.js';
 import { KEY_BYTES, writeKeyState } from '../governance/master-key.js';
+import { putSecret } from '../governance/credential-store.js';
+import { GREEN_API_INSTANCE_ID_REF, GREEN_API_TOKEN_REF } from '../orchestrator/runtime.js';
 import { loadBindings } from '../orchestrator/bindings.js';
 import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase, testDb } from '../test/db.js';
@@ -27,12 +29,14 @@ const PASSWORD = 'correct horse battery staple';
 let server: Server | null = null;
 let keyDir: string;
 let keyPath: string;
+let masterKey: Buffer;
 
 beforeEach(async () => {
   await resetDatabase();
   keyDir = await mkdtemp(join(tmpdir(), 'wac-connect-'));
   keyPath = join(keyDir, 'master.key');
   const key = randomBytes(KEY_BYTES);
+  masterKey = key;
   await writeFile(keyPath, key, { mode: 0o600 });
   await writeKeyState(key, 'KEY-test', testDb());
   await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
@@ -94,6 +98,21 @@ describe('whatsapp-contacts connection', () => {
     expect(res.status).toBe(409);
     expect((await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.connections.map((c) => c.system)).not.toContain(WHATSAPP_CONTACTS_SYSTEM);
     expect(await withBusiness(BUSINESS, (bdb) => loadBindings(bdb))).toEqual([]);
+  });
+
+  it('does not say active until the GREEN-API secrets are stored', async () => {
+    const b = await startServer();
+    const cookie = await login(b);
+    await post(b, cookie, '/connections/whatsapp-contacts/sign', { csrf: csrfFor(cookie), base: await activeVersion() });
+    const before = await (await fetch(`${b}/connections/whatsapp-contacts`, { headers: { cookie } })).text();
+    expect(before).toContain('חתום — ממתין לחיבור וואטסאפ');
+    expect(before).not.toContain('<b>פעיל</b>');
+    await withBusiness(BUSINESS, async (bdb) => {
+      await putSecret(bdb, { ref: GREEN_API_INSTANCE_ID_REF, value: 'i', updatedBy: 'test' }, masterKey);
+      await putSecret(bdb, { ref: GREEN_API_TOKEN_REF, value: 't', updatedBy: 'test' }, masterKey);
+    });
+    const after = await (await fetch(`${b}/connections/whatsapp-contacts`, { headers: { cookie } })).text();
+    expect(after).toContain('<b>פעיל</b>');
   });
 
   it('refuses a bad CSRF token', async () => {

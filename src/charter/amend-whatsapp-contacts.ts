@@ -42,7 +42,7 @@ export function whatsAppContactsConnection(): CharterConnection {
     label: WHATSAPP_CONTACTS_LABEL,
     channel: 'api',
     serves: ['wa.send_message'],
-    target: WHATSAPP_CONTACTS_SYSTEM,
+    target: null,
     subprocessor: WHATSAPP_CONTACTS_SUBPROCESSOR,
   };
 }
