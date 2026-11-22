@@ -4,7 +4,7 @@
  * and the mail-card reader (`whatsapp-door.ts`), so their collision counts
  * cannot drift apart.
  *
- * Four kinds, each by its own owner's definition and nothing re-derived here:
+ * Five kinds (the fifth, `contactCards`, below), each by its own owner's definition and nothing re-derived here:
  *
  *   - `confirmations` — boss-command questions delivered on WhatsApp before
  *     the message (`openConfirmations`);
@@ -13,7 +13,9 @@
  *   - `questions` — clarifying questions answerable on WhatsApp now
  *     (`answerableWhatsAppQuestions`);
  *   - `documentCards` — document cards delivered on WhatsApp before the
- *     message (`openDocumentCards`).
+ *     message (`openDocumentCards`);
+ *   - `contactCards` — WhatsApp contact reply cards presented before the
+ *     message (`openContactCards`).
  *
  * Read-only. Each reader decides what "more than one" means for its own
  * words; this module only makes sure they all count the same things.
@@ -22,6 +24,7 @@ import type { BusinessDb } from '../db/pool.js';
 import type { InstructionConfirmation } from '../governance/instruction-confirmations.js';
 import type { InstructionRecord } from '../governance/instructions.js';
 import type { DocumentCard } from '../production/card.js';
+import { openContactCards, type OpenContactCard } from '../whatsapp/contact-card.js';
 import { openConfirmations } from './command-confirm.js';
 import { openDocumentCards } from './whatsapp-document-card.js';
 import { openMailCards, type OpenMailCard } from './whatsapp-mail-card.js';
@@ -32,6 +35,8 @@ export interface OpenOnWhatsApp {
   mailCards: OpenMailCard[];
   questions: InstructionRecord[];
   documentCards: DocumentCard[];
+  /** WhatsApp contact (client/supplier) reply cards presented before the message. */
+  contactCards: OpenContactCard[];
 }
 
 export async function openOnWhatsApp(db: BusinessDb, input: {
@@ -58,5 +63,10 @@ export async function openOnWhatsApp(db: BusinessDb, input: {
   });
   const questions = await answerableWhatsAppQuestions(db, { ...windowOverride });
   const documentCards = await openDocumentCards(db, { inboundAt: input.inboundAt, ...windowOverride });
-  return { confirmations, mailCards, questions, documentCards };
+  const contactCards = await openContactCards(db, {
+    excludeMessageId: input.excludeMessageId,
+    inboundAt: input.inboundAt,
+    ...windowOverride,
+  });
+  return { confirmations, mailCards, questions, documentCards, contactCards };
 }

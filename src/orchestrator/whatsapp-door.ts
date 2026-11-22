@@ -602,13 +602,13 @@ async function handleConfirmationMessage(input: {
     await settleMessage(ctx.db, storedId, state, jobId !== null ? { jobId } : {});
   };
 
-  const { mailCards: cards, questions, documentCards } = open;
+  const { mailCards: cards, questions, documentCards, contactCards } = open;
   const only = confirmations.length === 1 ? confirmations[0] : undefined;
   const reading = readings[0];
   if (
     only === undefined ||
     reading === undefined ||
-    cards.length + questions.length + documentCards.length > 0
+    cards.length + questions.length + documentCards.length + contactCards.length > 0
   ) {
     await reply(SEVERAL_OPEN_REFUSAL, 'failed', null);
     return 'refused';
@@ -809,7 +809,8 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
           msg,
           storedId: stored.id,
           cards: open.documentCards,
-          othersOpen: open.mailCards.length + open.questions.length + open.confirmations.length,
+          othersOpen:
+            open.mailCards.length + open.questions.length + open.confirmations.length + open.contactCards.length,
           messenger: ctx.messenger,
           production: ctx.production,
           ...windowOverride,
@@ -827,21 +828,22 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // note, a caption, a new instruction — falls through to the ordinary door
     // below, and the card stays open.
     if (msg.mediaKind === null && msg.body !== null && isMailCardAction(msg.body)) {
-      const cards = (
-        await openOnWhatsApp(ctx.db, {
-          excludeMessageId: stored.id,
-          inboundAt: msg.providerTimestamp,
-          ...(ctx.questionWindowMinutes !== undefined
-            ? { windowMinutes: ctx.questionWindowMinutes }
-            : {}),
-        })
-      ).mailCards;
+      const openNow = await openOnWhatsApp(ctx.db, {
+        excludeMessageId: stored.id,
+        inboundAt: msg.providerTimestamp,
+        ...(ctx.questionWindowMinutes !== undefined
+          ? { windowMinutes: ctx.questionWindowMinutes }
+          : {}),
+      });
+      const cards = openNow.mailCards;
       if (cards.length > 0) {
         const handled = await handleMailCardMessage(ctx.db, {
           msg,
           storedId: stored.id,
           cards,
           messenger: ctx.messenger,
+          // A contact card open at the same time: "שלח" cannot say which.
+          othersOpen: openNow.contactCards.length,
         });
         if (handled === 'decided' || handled === 'replaced') return 'mailCard';
         if (handled !== 'passthrough') return handled;
