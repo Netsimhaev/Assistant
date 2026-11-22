@@ -582,7 +582,10 @@ describe('an owner-approved WhatsApp reply to a contact card', () => {
     await expectDeniedAtStage8(decision, s.jobId);
   });
 
-  it('whatsapp.initiate (no conversationId) is never covered', async () => {
+  it('whatsapp.initiate (no conversationId) is never covered — refused at stage 8', async () => {
+    // Under dial off the ramp for the class is draft_only, and the exemption
+    // is the only thing that could lift it; without it the call dies at
+    // stage 8 (draft_only, no intent_to_act row), before any approval claim.
     const s = await waSetup(true);
     const { conversationId: _c, ...initiate } = WA;
     const approvalId = await approvedCard(s, { toolName: 'wa.send_message', input: initiate });
@@ -591,7 +594,68 @@ describe('an owner-approved WhatsApp reply to a contact card', () => {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
-    expect(decision.outcome).not.toBe('allow');
+    await expectDeniedAtStage8(decision, s.jobId);
+    expect(await consumedAt(approvalId)).toBeNull();
+  });
+
+  it('a payload naming a different live conversation of the same business is refused at stage 8', async () => {
+    const s = await waSetup(true);
+    await testDb().query(
+      `INSERT INTO contact_conversations
+         (business_id, conversation_id, contact_key, contact_kind, state, last_inbound_at)
+       VALUES ($1, 'conv-2', '972509999999', 'client', 'open', now())`,
+      [BUSINESS],
+    );
+    const other = { ...WA, conversationId: 'conv-2' };
+    const approvalId = await approvedCard(s, { toolName: 'wa.send_message', input: other });
+
+    const decision = await evaluateFor('wa.send_message', other, {
+      ...s.ctx, approval: { approvalId, stepId: STEP_ID },
+    });
+
+    await expectDeniedAtStage8(decision, s.jobId);
+    expect(await consumedAt(approvalId)).toBeNull();
+  });
+
+  it('a conversation no longer in the carded state does not cover the reply', async () => {
+    const s = await waSetup(true);
+    await testDb().query(
+      `UPDATE contact_conversations SET state = 'answered' WHERE business_id = $1 AND conversation_id = 'conv-1'`,
+      [BUSINESS],
+    );
+    const approvalId = await approvedCard(s, { toolName: 'wa.send_message', input: WA });
+
+    const decision = await evaluateFor('wa.send_message', WA, {
+      ...s.ctx, approval: { approvalId, stepId: STEP_ID },
+    });
+
+    await expectDeniedAtStage8(decision, s.jobId);
+    expect(await consumedAt(approvalId)).toBeNull();
+  });
+
+  it('a mail-linked job (no conversation link) cannot send an approved WhatsApp reply', async () => {
+    const s = await setup(); // mailbox reply job
+    const rampLevel = await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'whatsapp.reply'));
+    const approvalId = await approvedCard(s, { toolName: 'wa.send_message', input: WA });
+
+    const decision = await evaluateFor('wa.send_message', WA, {
+      ...s.ctx, agent: 'comms.whatsapp', rampLevel, approval: { approvalId, stepId: STEP_ID },
+    });
+
+    await expectDeniedAtStage8(decision, s.jobId);
+    expect(await consumedAt(approvalId)).toBeNull();
+  });
+
+  it('a conversation-linked job (no mail link) cannot send an approved mail reply', async () => {
+    const s = await waSetup(true);
+    const rampLevel = await withBusiness(BUSINESS, (db) => loadRampLevel(db, 'email.reply'));
+    const approvalId = await approvedCard(s, { toolName: 'mail.send', input: REPLY });
+
+    const decision = await evaluateFor('mail.send', REPLY, {
+      ...s.ctx, agent: 'comms.email', rampLevel, approval: { approvalId, stepId: STEP_ID },
+    });
+
+    await expectDeniedAtStage8(decision, s.jobId);
     expect(await consumedAt(approvalId)).toBeNull();
   });
 

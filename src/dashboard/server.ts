@@ -109,6 +109,7 @@ import type { OAuthRouteOptions } from './oauth-routes.js';
 import { MAILBOX_SYSTEM, type MailProvider } from '../mail/mailbox.js';
 import type { MailboxClient } from '../mail/providers/types.js';
 import { isMailReplyJob } from '../mail/inbox-store.js';
+import { contactReplyEditAllowed } from '../whatsapp/contact-reply-edit.js';
 import { mailReplyEditRefusal, mailboxReplyRecipient } from '../mail/reply-card.js';
 import {
   handleMailboxRevertPost,
@@ -3110,6 +3111,27 @@ async function handleDecision(
         ...(mailReply ? { mailReply: true } : {}),
         ...providerOption,
         error: editRefusal,
+      }),
+    );
+  }
+
+  // A WhatsApp contact reply goes to the contact and thread the card showed:
+  // only the body may be edited. Keyed on the tool, a positive marker, and
+  // checked before the decision is recorded, so the approval stays pending.
+  if (
+    edit.editedInput !== undefined &&
+    approval.proposedTool === 'wa.send_message' &&
+    !contactReplyEditAllowed(approval.proposedInput, edit.editedInput)
+  ) {
+    return sendHtml(
+      res,
+      400,
+      renderApprovalCard({
+        approval,
+        csrf: issueCsrfToken(session.sessionId),
+        editValue: JSON.stringify(edit.editedInput, null, 2),
+        ...(note !== undefined ? { noteValue: note } : {}),
+        error: 'במענה לאיש קשר אפשר לערוך רק את תוכן ההודעה — הנמען והשיחה נשארים כפי שהוצגו.',
       }),
     );
   }

@@ -19,6 +19,7 @@
  * carrying any other name is refused (`attachment_name_mismatch`) — so the
  * name in the confirmation echo is exactly the name that is sent.
  */
+import { stripBidiControls } from '../util/bidi.js';
 import { createHash } from 'node:crypto';
 import { open } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
@@ -303,7 +304,7 @@ export async function resolveStoredDocument(
       he: read.code === 'attachment_hash_mismatch' ? 'הקובץ המצורף השתנה מאז שנקלט — ההודעה לא נשלחה' : 'הקובץ המצורף לא נמצא — ההודעה לא נשלחה',
     };
   }
-  const name = doc.originalName.replace(/[\/:*?"<>| -]/g, '').trim();
+  const name = stripBidiControls(doc.originalName).replace(/[\/:*?"<>| -]/g, '').trim();
   return {
     ok: true,
     file: { documentId: doc.documentId, filename: name === '' ? 'document' : name.slice(0, 120), mediaType: doc.mediaType, bytes: read.bytes },

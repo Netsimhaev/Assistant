@@ -12,7 +12,7 @@ import { insertOrGetDocument, markExtracted } from '../documents/store.js';
 import { Plan } from '../domain/plan.js';
 import type { ConnectionBinding } from '../domain/connection.js';
 import { resolveStoredDocument } from '../production/attachments.js';
-import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
+import { resetDatabase, TEST_BUSINESS, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { browserAdapter } from './adapters/browser.js';
 import { AdapterRegistry } from './adapters/registry.js';
@@ -60,6 +60,13 @@ describe('resolveStoredDocument', () => {
     const r = await withBusiness(TEST_BUSINESS, (db) => resolveStoredDocument(db, 'DOC-1', config.documentRoot));
     expect(r).toMatchObject({ ok: true, file: { documentId: 'DOC-1', mediaType: 'application/pdf', filename: 'הצעה.pdf' } });
     if (r.ok) expect(r.file.bytes.equals(bytes)).toBe(true);
+  });
+
+  it('strips bidi controls from the filename', async () => {
+    await seedDoc(TEST_BUSINESS, 'DOC-BIDI', Buffer.from('pdf bytes'));
+    await testDb().query("UPDATE documents SET original_name = $1 WHERE document_id = 'DOC-BIDI'", ['invoice‮fdp.exe‏']);
+    const r = await withBusiness(TEST_BUSINESS, (db) => resolveStoredDocument(db, 'DOC-BIDI', config.documentRoot));
+    expect(r.ok && r.file.filename).toBe('invoicefdp.exe');
   });
 
   it('refuses when the file on disk no longer matches the recorded hash', async () => {

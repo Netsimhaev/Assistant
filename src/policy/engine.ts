@@ -344,7 +344,7 @@ export async function evaluateToolCall(
   // See `approvedReplyCovers` for the conditions and for what it does not
   // bypass. `facts.inputHash` is the same hash stage 10 hands
   // `consumeApproval`, so the exemption and the claim agree on the bytes.
-  const approvedReply = await approvedReplyCovers(facts, facts.toolName, facts.inputHash, ctx);
+  const approvedReply = await approvedReplyCovers(facts, facts.toolName, facts.inputHash, toolInput, ctx);
   // A reply to an incoming mail the assistant has LEARNED to send (owner
   // ruling H10): judged without the provenance ceiling — and only that one;
   // the ramp stays, and is `auto_notify` whenever this holds. See

@@ -2674,6 +2674,49 @@ describe('HTML escaping', () => {
 });
 
 describe('editing before approval', () => {
+  async function waCardApproval() {
+    const baseUrl = await startServer();
+    const job = await jobAwaitingApproval(BUSINESS);
+    const original = { to: '+972501234567', body: 'שלום', conversationId: 'conv-1' };
+    const approvalId = await withBusiness(BUSINESS, (bdb) => enqueueApproval(bdb, {
+      jobId: job.jobId,
+      facts: factsFixture(original, { toolName: 'wa.send_message', actionClass: 'whatsapp.reply' }),
+      risk: riskFixture(),
+      proposedInput: original,
+      summary: 'מענה לאיש קשר',
+    }));
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    return { baseUrl, approvalId, cookie, original };
+  }
+
+  it('refuses an edit of a WhatsApp contact reply that changes the recipient or thread', async () => {
+    const { baseUrl, approvalId, cookie, original } = await waCardApproval();
+    const csrf = extractCsrf(await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text());
+    for (const edited of [{ ...original, to: '+972509999999' }, { ...original, conversationId: 'conv-2' }]) {
+      const res = await fetch(`${baseUrl}/a/${approvalId}/approve`, {
+        method: 'POST', headers: { cookie },
+        body: new URLSearchParams({ csrf, input: JSON.stringify(edited) }), redirect: 'manual',
+      });
+      expect(res.status).toBe(400);
+    }
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
+    expect(approval?.state).toBe('pending');
+  });
+
+  it('accepts a body-only edit of a WhatsApp contact reply', async () => {
+    const { baseUrl, approvalId, cookie, original } = await waCardApproval();
+    const csrf = extractCsrf(await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text());
+    const edited = { ...original, body: 'נוסח ערוך' };
+    const res = await fetch(`${baseUrl}/a/${approvalId}/approve`, {
+      method: 'POST', headers: { cookie },
+      body: new URLSearchParams({ csrf, input: JSON.stringify(edited) }), redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
+    expect(approval?.state).toBe('approved_with_edit');
+    expect(approval?.editedInput).toEqual(edited);
+  });
+
   it('stores the edited payload and yields approved_with_edit when something actually changed', async () => {
     const baseUrl = await startServer();
     const job = await jobAwaitingApproval(BUSINESS);
