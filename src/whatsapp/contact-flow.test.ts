@@ -297,7 +297,12 @@ describe('the contact flow through the door', () => {
   it('a source past its deadline, a failed researcher and a failed drafter still raise a card with the reasons', async () => {
     const w = await world();
     await addContact();
-    const hanging: Tier2Source = () => new Promise(() => undefined);
+    // Answers only well after its deadline. It must settle eventually: it now
+    // holds a pooled connection of its own until it does (fix round 1).
+    const hanging: Tier2Source = (_db, _ids, signal) =>
+      new Promise((resolve) => {
+        signal.addEventListener('abort', () => setTimeout(() => resolve({ items: [], ownershipViolation: false }), 100));
+      });
     await door(
       w,
       deps(w, {
@@ -420,3 +425,142 @@ async function insertDocument(id: string): Promise<void> {
     [id, BUSINESS, 'c'.repeat(64), `${BUSINESS}/${id}/original.pdf`],
   );
 }
+
+describe('fix round 1', () => {
+  it('a source that ignores its signal and writes after its deadline runs on its own connection and cannot touch the card', async () => {
+    const w = await world();
+    await addContact();
+    let doorPid = -1;
+    let sourcePid = -2;
+    let lateWrite: () => void = () => undefined;
+    const lateDone = new Promise<void>((resolve) => {
+      lateWrite = resolve;
+    });
+    const late: Tier2Source = async (own) => {
+      const { rows } = await own.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+      sourcePid = rows[0]!.pid;
+      await new Promise((r) => setTimeout(r, 150));
+      // Long past the 20 ms deadline, ignoring the aborted signal.
+      await own.query(
+        `INSERT INTO whatsapp_messages (id, business_id, direction, body, provider_timestamp, state)
+         VALUES ('WA-LATE', $1, 'outbound', 'late', now(), 'handled')`,
+        [own.businessId],
+      );
+      lateWrite();
+      return { items: [], ownershipViolation: false };
+    };
+    w.gateway.enqueue(msg(CONTACT, 'שאלה'));
+    const result = await withBusiness(BUSINESS, async (db) => {
+      const { rows } = await db.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+      doorPid = rows[0]!.pid;
+      return runWhatsAppDoor(db, {
+        gateway: w.gateway,
+        messenger: w.messenger,
+        charter: w.charter,
+        contactFlow: deps(w, { sources: [late], tier2TimeoutMs: 20 }),
+      });
+    });
+    expect(sourcePid).not.toBe(doorPid);
+    expect(result.contactHandled).toBe(1);
+    expect(result.contactFailed).toBe(0);
+    const [card] = await approvals();
+    expect(card?.state).toBe('pending');
+    expect(card?.detail).toContain(REASON_SOURCE_FAILED);
+    const [conv] = await conversations();
+    expect(conv).toMatchObject({ state: 'carded', card_job_id: card!.job_id });
+
+    await lateDone;
+    // The late row committed on its own connection, apart from the card.
+    const { rows } = await testDb().query(`SELECT 1 FROM whatsapp_messages WHERE id = 'WA-LATE'`);
+    expect(rows).toHaveLength(1);
+    expect((await approvals())[0]?.state).toBe('pending');
+  });
+
+  it('the researcher gets a connection of its own', async () => {
+    const w = await world();
+    await addContact();
+    let doorPid = -1;
+    let researchPid = -2;
+    w.gateway.enqueue(msg(CONTACT, 'שאלה'));
+    await withBusiness(BUSINESS, async (db) => {
+      doorPid = (await db.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]!.pid;
+      return runWhatsAppDoor(db, {
+        gateway: w.gateway,
+        messenger: w.messenger,
+        charter: w.charter,
+        contactFlow: {
+          ...deps(w),
+          researcher: async (req) => {
+            researchPid = (await req.db.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]!.pid;
+            return { status: 'none' };
+          },
+        },
+      });
+    });
+    expect(researchPid).not.toBe(doorPid);
+  });
+
+  it('the drafter receives a signal that aborts at its deadline', async () => {
+    const w = await world();
+    let seen: AbortSignal | undefined;
+    const flow = deps(w, {
+      draftTimeoutMs: 20,
+      draft: (req) => {
+        seen = req.signal;
+        return new Promise(() => undefined);
+      },
+    });
+    await door(w, flow, [msg(UNKNOWN, 'שאלה')]);
+    expect(seen?.aborted).toBe(true);
+    expect((await approvals())[0]?.detail).toContain(REASON_DRAFT_FAILED);
+  });
+
+  it('busy: a throwing owner note does not mark the messages failed', async () => {
+    const w = await world();
+    await addContact();
+    await door(w, deps(w), [msg(CONTACT, 'ראשונה')]);
+    const [first] = await approvals();
+    await withBusiness(BUSINESS, (db) => decide(db, first!.approval_id, 'approved', { by: 'whatsapp:test', channel: 'whatsapp' }));
+    const throwing: BossMessenger = {
+      ...w.messenger,
+      send: async () => {
+        throw new Error('note failed');
+      },
+    };
+    const result = await door(w, deps(w, { messenger: throwing }), [msg(CONTACT, 'שנייה', 5_000)]);
+    expect(result.contactHandled).toBe(1);
+    expect(result.contactFailed).toBe(0);
+    expect((await inbound())[1]).toMatchObject({ state: 'handled', job_id: first!.job_id });
+  });
+
+  it('a sender lookup that fails still records the message, recorded only — never handed to the flow', async () => {
+    const w = await world();
+    w.gateway.enqueue(msg(UNKNOWN, 'שלום'));
+    const result = await withBusiness(BUSINESS, (db) => {
+      const flaky = Object.create(db) as typeof db;
+      flaky.query = ((sql: string, params?: unknown[]) => {
+        if (/FROM business_colleagues/.test(sql)) throw new Error('db blip');
+        return db.query(sql, params as never);
+      }) as typeof db.query;
+      return runWhatsAppDoor(flaky, { gateway: w.gateway, messenger: w.messenger, charter: w.charter, contactFlow: deps(w) });
+    });
+    expect(result.recordedOnly).toBe(1);
+    expect(result.contactHandled).toBe(0);
+    expect(w.gateway.sent).toEqual([]);
+    expect(await inbound()).toEqual([{ sender_kind: 'unknown', state: 'handled', job_id: null }]);
+  });
+
+  it('a failed sender lookup does not stop the owner: his message is still an instruction path', async () => {
+    const w = await world();
+    w.gateway.enqueue(msg(PRINCIPAL, 'שלום'));
+    await withBusiness(BUSINESS, (db) => {
+      const flaky = Object.create(db) as typeof db;
+      flaky.query = ((sql: string, params?: unknown[]) => {
+        if (/FROM business_colleagues/.test(sql)) throw new Error('db blip');
+        return db.query(sql, params as never);
+      }) as typeof db.query;
+      return runWhatsAppDoor(flaky, { gateway: w.gateway, messenger: w.messenger, charter: w.charter });
+    });
+    expect((await inbound())[0]?.sender_kind).toBe('principal');
+  });
+});

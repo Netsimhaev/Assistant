@@ -42,7 +42,7 @@
  * download seam for them (`NormalizedInboundMessage` has `downloadAudio`
  * only), so the card says a file arrived unread.
  */
-import type { BusinessDb } from '../db/pool.js';
+import { withBusiness, type BusinessDb } from '../db/pool.js';
 import type { BusinessCharter } from '../domain/charter.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { appendAudit } from '../audit/log.js';
@@ -249,10 +249,16 @@ async function draftFor(db: BusinessDb, deps: ContactFlowDeps, group: Group): Pr
   if (group.sender.kind === 'contact') {
     const c = group.sender.contact;
     const ids: SenderIds = { key: group.sender.key, email: c.email, subjectKey: c.subjectKey, externalIds: c.externalIds };
-    // Sequential: every source reads on this one connection.
+    // Sequential, and each on a connection of its OWN: a source past its
+    // deadline is abandoned, not stopped (the signal is advisory), and a call
+    // still running on the flow's connection could land its writes inside the
+    // card's takeover transaction — or interleave BEGIN/COMMIT with it. On
+    // its own connection an abandoned call can only touch that connection.
     for (const source of deps.sources) {
       try {
-        const res = await withDeadline(deps.tier2TimeoutMs ?? TIER2_TIMEOUT_MS, (signal) => source(db, ids, signal));
+        const res = await withDeadline(deps.tier2TimeoutMs ?? TIER2_TIMEOUT_MS, (signal) =>
+          withBusiness(db.businessId, (own) => source(own, ids, signal)),
+        );
         if (res.ownershipViolation) {
           return { body: '', attachDocumentId: null, sourcesHe: [], notes: [REASON_OWNERSHIP] };
         }
@@ -264,9 +270,20 @@ async function draftFor(db: BusinessDb, deps: ContactFlowDeps, group: Group): Pr
 
     const question = group.items.map((i) => i.text).filter((t) => t.trim() !== '').join('\n');
     try {
-      const index = await loadResearchIndex(db);
+      // Own connection, for the reason the sources above have one: the gate
+      // hook writes its decisions on the researcher's `db`.
       const research = await withDeadline(deps.researchTimeoutMs ?? RESEARCH_TIMEOUT_MS, (signal) =>
-        deps.researcher({ bundle: deps.bundle, question, businessId: db.businessId, signal, db, jobId: null, index }),
+        withBusiness(db.businessId, async (own) =>
+          deps.researcher({
+            bundle: deps.bundle,
+            question,
+            businessId: own.businessId,
+            signal,
+            db: own,
+            jobId: null,
+            index: await loadResearchIndex(own),
+          }),
+        ),
       );
       if (research.status === 'found') tier3 = research.findings.map((f) => ({ text: f.text }));
       else if (research.status === 'failed') notes.push(REASON_RESEARCH_FAILED);
@@ -282,8 +299,9 @@ async function draftFor(db: BusinessDb, deps: ContactFlowDeps, group: Group): Pr
     const conversation = (await recentMessages(db, group.sender.key, 10)).map((m) => ({ direction: m.direction, body: m.body }));
     const description = await descriptionFragment(db);
     const profile = await profileFragment(db);
-    const out = await withDeadline(deps.draftTimeoutMs ?? DRAFT_TIMEOUT_MS, async () =>
+    const out = await withDeadline(deps.draftTimeoutMs ?? DRAFT_TIMEOUT_MS, async (signal) =>
       deps.drafter({
+        signal,
         bundle: deps.bundle,
         businessName: deps.businessName,
         contactKind: group.conversation.contactKind,
@@ -329,10 +347,16 @@ async function settleAll(db: BusinessDb, group: Group, state: 'handled' | 'faile
 /** R11a: keep the message on the conversation, settle with the current card, tell the owner once. */
 async function handleBusy(db: BusinessDb, deps: ContactFlowDeps, group: Group): Promise<void> {
   const current = await loadConversation(db, group.conversation.conversationId);
+  // Settled first: the messages are on the conversation either way, and a
+  // note that fails must not mark them failed.
+  await settleAll(db, group, 'handled', current?.cardJobId ?? null);
   const last = group.items[group.items.length - 1];
   const text = toOneLine(stripBidiControls(last?.text ?? '')).slice(0, NOTE_TEXT_MAX);
-  await deps.messenger.send({ text: busyNote(labelOf(group), text), jobId: null });
-  await settleAll(db, group, 'handled', current?.cardJobId ?? null);
+  try {
+    await deps.messenger.send({ text: busyNote(labelOf(group), text), jobId: null });
+  } catch {
+    // `BossMessenger.send` does not throw by contract; nothing to undo if it did.
+  }
 }
 
 async function processGroup(db: BusinessDb, deps: ContactFlowDeps, group: Group): Promise<'carded' | 'capped' | 'busy'> {

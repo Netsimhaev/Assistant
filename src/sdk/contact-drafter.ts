@@ -30,6 +30,8 @@ export interface ContactDraftRequest {
   tier3: { text: string }[];
   businessDescription?: string;
   businessProfile?: ProfileForPrompt;
+  /** Aborted when the caller's deadline passes, so a hung billed call stops instead of running on. */
+  signal?: AbortSignal;
 }
 export type ContactDrafter = (req: ContactDraftRequest) => Promise<ContactDraftOutcome>;
 
@@ -146,8 +148,14 @@ function refuseUnderTest(): void {
 export const runContactDrafter: ContactDrafter = async (req) => {
   refuseUnderTest();
   const { prompt, options } = buildContactDraftCall(req);
+  // The caller's deadline reaches the SDK: the same linking the researcher does.
+  const abortController = new AbortController();
+  if (req.signal !== undefined) {
+    if (req.signal.aborted) abortController.abort();
+    else req.signal.addEventListener('abort', () => abortController.abort(), { once: true });
+  }
   let raw = '';
-  for await (const message of query({ prompt, options })) {
+  for await (const message of query({ prompt, options: { ...options, abortController } })) {
     if (message.type === 'result' && message.subtype === 'success') raw = message.result;
   }
   return interpretContactDraft(raw, req);

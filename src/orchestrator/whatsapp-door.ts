@@ -138,7 +138,7 @@
 import type { InstructionRecord } from '../governance/instructions.js';
 import { loadActiveCharter } from '../charter/store.js';
 import type { BusinessCharter } from '../domain/charter.js';
-import { authorityNumberKey } from '../governance/principal-number.js';
+import { authorityNumberKey, isPrincipalSender } from '../governance/principal-number.js';
 import { stripBidiControls } from '../util/bidi.js';
 import type { InstructionTextOrigin } from '../governance/typed-recipients.js';
 import type { NormalizedInboundMessage, WhatsAppGateway } from '../whatsapp/gateway.js';
@@ -193,7 +193,7 @@ import {
 } from './whatsapp-routing.js';
 import type { BusinessDb } from '../db/pool.js';
 import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
-import { resolveSender } from '../whatsapp/contact-identity.js';
+import { resolveSender, type ResolvedSender } from '../whatsapp/contact-identity.js';
 import { handleContactCardMessage, isContactCardAction } from '../whatsapp/contact-card.js';
 import {
   handleContactMessages,
@@ -721,8 +721,20 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
   try {
     // Who wrote, deterministically (ruling R11d): the principal, a colleague,
     // a managed contact, or unknown — never the old catch-all 'other'.
-    const sender = await resolveSender(ctx.db, ctx.charter, msg.senderNumber);
-    const senderKind: SenderKind = sender.kind;
+    //
+    // The lookup reads the colleague and contact lists, and a failure there
+    // must never lose the message: it falls back to the charter alone (the
+    // principal check needs no query) and the message is recorded. A
+    // non-owner whose lookup failed is `null` here and is recorded only —
+    // never handed to the contact flow, since a colleague could not be told
+    // apart from a stranger.
+    let sender: ResolvedSender | null;
+    try {
+      sender = await resolveSender(ctx.db, ctx.charter, msg.senderNumber);
+    } catch {
+      sender = isPrincipalSender(ctx.charter, msg.senderNumber) ? { kind: 'principal' } : null;
+    }
+    const senderKind: SenderKind = sender?.kind ?? 'unknown';
 
     stored = await recordInbound(
       ctx.db,
@@ -754,7 +766,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       ctx.reportMalformedSender();
     }
 
-    if (sender.kind !== 'principal') {
+    if (sender === null || sender.kind !== 'principal') {
       // Never the owner's authority: `established` stays `false`, so even a
       // crash below sends this sender nothing from the owner's messenger.
       //
@@ -766,7 +778,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       //
       // Without it, Decision 4 as before: recorded for the conversation
       // screen and closed out, no claim, no reply, ever.
-      if (ctx.contactFlow !== undefined) {
+      if (ctx.contactFlow !== undefined && sender !== null) {
         ctx.pendingContacts.push({ msg, storedId: stored.id, sender });
         return 'contactQueued';
       }
