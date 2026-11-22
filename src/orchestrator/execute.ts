@@ -2,7 +2,8 @@ import type { AgentId } from '../domain/audit.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { isMoneyBearing } from '../domain/action.js';
 import type { AutonomyLevel } from '../domain/trust.js';
-import { ingestsExternalContent } from '../policy/classify.js';
+import { ingestsExternalContent, refineActionClass } from '../policy/classify.js';
+import { readSendAt } from '../util/send-at.js';
 import { classifyCall, resolveExternalCall } from '../policy/external-class.js';
 import { recordExternalRead, type ExternalFieldValue } from '../external/store.js';
 import { z } from 'zod';
@@ -16,6 +17,30 @@ import { markContentIngested, transition } from './jobs.js';
 import { StepChannelError } from './step-error.js';
 import type { Job } from './jobs.js';
 import { transaction, type BusinessDb } from '../db/pool.js';
+
+/** The `job_steps.reason` a scheduled WhatsApp send parks its job with. */
+export const SCHEDULED_SEND_REASON = 'scheduled send';
+
+/** The refusal code for a proactive WhatsApp outside a confirmed boss command. */
+export const WA_INITIATE_NOT_COMMAND = 'wa_initiate_not_confirmed_command';
+
+/**
+ * A positive fact read from the database, never from the caller: the job is a
+ * `boss` job born at the instruction door (`boss_instructions`) whose
+ * confirmation the owner answered "כן" to. The exemption
+ * (`confirmedCommandCovers`) then applies its own window and byte checks.
+ */
+async function isConfirmedBossCommand(db: BusinessDb, jobId: string): Promise<boolean> {
+  const { rows } = await db.query(
+    `SELECT 1 FROM jobs j
+      WHERE j.business_id = $1 AND j.job_id = $2 AND j.provenance = 'boss'
+        AND EXISTS (SELECT 1 FROM boss_instructions b WHERE b.business_id = $1 AND b.job_id = $2)
+        AND EXISTS (SELECT 1 FROM instruction_confirmations c
+                     WHERE c.business_id = $1 AND c.job_id = $2 AND c.state = 'confirmed')`,
+    [db.businessId, jobId],
+  );
+  return rows.length > 0;
+}
 
 /**
  * How long a step sleeps before a retryable channel failure is tried again.
@@ -259,6 +284,40 @@ export async function executeStep(db: BusinessDb, request: StepRequest): Promise
       approval.editedInput !== null
     ) {
       effectiveInput = approval.editedInput as Record<string, unknown>;
+    }
+  }
+
+  // An owner-ordered WhatsApp to a contact (task 13) is the only proactive
+  // WhatsApp send allowed, and only as a confirmed boss command. `whatsapp.
+  // initiate` (no real `conversationId`) on any other job is refused here,
+  // before the gate: under `ask` the gate would otherwise queue an ordinary
+  // approval for it, and that approval would send.
+  if (toolName === 'wa.send_message' && refineActionClass('whatsapp.reply', effectiveInput) === 'whatsapp.initiate') {
+    if (!(await isConfirmedBossCommand(db, job.jobId))) {
+      const reason = 'הודעת וואטסאפ יזומה נשלחת רק לפי הוראה שלך שאישרת.';
+      await transition(db, job.jobId, {
+        to: 'failed',
+        actor: 'orchestrator',
+        reason: `${WA_INITIATE_NOT_COMMAND} — ${reason}`,
+      });
+      return { status: 'refused', code: WA_INITIATE_NOT_COMMAND, reason };
+    }
+  }
+
+  // A scheduled WhatsApp (task 13): the step sleeps until its own `sendAt`,
+  // before the gate is consulted — nothing is judged, claimed or sent early.
+  // The scheduler returns the job to `execute` at that time; a step whose
+  // `sendAt` has come runs now.
+  if (toolName === 'wa.send_message') {
+    const sendAt = readSendAt(effectiveInput);
+    if (sendAt !== null && sendAt.getTime() > now.getTime()) {
+      await transition(db, job.jobId, {
+        to: 'followup',
+        actor: 'orchestrator',
+        reason: SCHEDULED_SEND_REASON,
+        wakeAt: sendAt,
+      });
+      return { status: 'deferred', code: 'scheduled_send', wakeAt: sendAt.toISOString() };
     }
   }
 

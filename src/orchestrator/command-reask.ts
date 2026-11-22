@@ -32,7 +32,9 @@
  *       that leaves it;
  *   (c) `followup`, the confirmation decided 24 hours ago or more (the
  *       exemption's own window, `confirmed-command.ts`), and a step still to
- *       run. Nothing was claimed-and-lost here, so the question is plain;
+ *       run. Nothing was claimed-and-lost here, so the question is plain.
+ *       Except a job parked on a scheduled WhatsApp whose `sendAt` is still
+ *       in the future (`scheduledSendJobs`, task 13): it is waiting, not stuck;
  *   (d) `failed`, and the move to `failed` happened at or after
  *       `decided_at + 24 hours` — the failure itself came after the "כן"
  *       expired. The expiry case once the job woke first: `tick` wakes it,
@@ -99,6 +101,9 @@ import { WHATSAPP_MESSAGE_MAX_CHARS, WHATSAPP_QUESTION_TOO_LONG } from './comman
 import { PhaseMovedError, createJob, linkWhatsAppMessage, transition } from './jobs.js';
 import { bindPlanToJob, completedSteps, loadStoredPlan, planHashOf } from './plan-store.js';
 import { withSessionLock } from './session-lock.js';
+import { readSendAt } from '../util/send-at.js';
+import { listManagedContacts } from '../business/settings-contacts.js';
+import { waRecipientNote, waRecipientSource } from './whatsapp-recipient.js';
 
 /**
  * The reason an old job is moved to `failed` with when it is re-asked. The
@@ -224,15 +229,53 @@ const CANDIDATES_SQL = `
      AND (
            (phase = 'failed' AND claim_uncertain)
         OR has_unknown
-        OR (phase = 'followup' AND decided_at <= now() - interval '24 hours')
+        OR (phase = 'followup' AND decided_at <= now() - interval '24 hours'
+            AND NOT (job_id = ANY($4::text[])))
         OR (phase = 'failed' AND failed_at >= decided_at + interval '24 hours')
      )
    ORDER BY job_id
    LIMIT $3`;
 
 async function readCandidates(db: BusinessDb, jobId: string | null, limit: number): Promise<CandidateRow[]> {
-  const { rows } = await db.query<CandidateRow>(CANDIDATES_SQL, [db.businessId, jobId, limit]);
+  const scheduled = await scheduledSendJobs(db, jobId);
+  const { rows } = await db.query<CandidateRow>(CANDIDATES_SQL, [db.businessId, jobId, limit, scheduled]);
   return rows;
+}
+
+/**
+ * Arm (c)'s one exception (task 13): a `followup` job parked on a scheduled
+ * WhatsApp whose step still to run has a `sendAt` in the future is waiting,
+ * not stuck — the exemption still carries it until `sendAt + 24h`. Parsed in
+ * JS (`readSendAt`, the same strict reader the exemption uses) rather than
+ * cast in SQL, so one malformed stored value cannot fail the whole candidate
+ * read. An unparsable `sendAt` is not "future": that job stays re-askable.
+ */
+async function scheduledSendJobs(db: BusinessDb, jobId: string | null): Promise<string[]> {
+  const { rows } = await db.query<{ job_id: string; input: unknown }>(
+    `SELECT j.job_id, s -> 'input' AS input
+       FROM jobs j
+       JOIN job_plans p ON p.business_id = j.business_id AND p.job_id = j.job_id,
+            jsonb_array_elements(p.plan -> 'steps') s
+      WHERE j.business_id = $1
+        AND ($2::text IS NULL OR j.job_id = $2)
+        AND j.phase = 'followup'
+        AND s ->> 'toolName' = 'wa.send_message'
+        AND NOT EXISTS (
+          SELECT 1 FROM job_step_results r
+           WHERE r.business_id = p.business_id AND r.job_id = p.job_id
+             AND r.plan_hash = p.plan_hash AND r.step_id = s ->> 'id'
+             AND r.status = 'completed'
+        )`,
+    [db.businessId, jobId],
+  );
+  const now = Date.now();
+  const out = new Set<string>();
+  for (const row of rows) {
+    if (row.input === null || typeof row.input !== 'object' || Array.isArray(row.input)) continue;
+    const at = readSendAt(row.input as Record<string, unknown>);
+    if (at !== null && at.getTime() > now) out.add(row.job_id);
+  }
+  return [...out];
 }
 
 /**
@@ -332,11 +375,26 @@ async function reaskOne(
     textOrigin: instruction.textOrigin,
     knownCounterparties: active.bundle.knownCounterparties,
   });
+  const hasWhatsApp = residual.steps.some((step) => step.toolName === 'wa.send_message');
+  const recipientCtx = hasWhatsApp
+    ? { contacts: await listManagedContacts(db), instructionText: instruction.text, textOrigin: instruction.textOrigin }
+    : null;
   const rendered = renderConfirmationQuestion([option], {
     currency: active.bundle.ceilings.currency,
     systems: active.bundle.externalSystems,
     redactPatterns: active.bundle.redactPatterns,
     extraEchoes: [ledgerEcho],
+    ...(recipientCtx === null
+      ? {}
+      : {
+          whatsapp: {
+            timeZone: active.charter.identity.timezone,
+            recipientNote: (to: string) => {
+              const source = waRecipientSource(to, recipientCtx);
+              return source === null ? null : waRecipientNote(source);
+            },
+          },
+        }),
     reask: candidate.uncertain,
     alreadyDone: chosen.plan.steps.length - residual.steps.length,
   });

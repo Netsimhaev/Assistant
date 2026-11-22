@@ -31,6 +31,8 @@ import { createJob, linkWhatsAppMessage, loadJob, transition } from './jobs.js';
 import { bindPlanToJob, loadStoredPlan, planHashOf, recordStepCompletion } from './plan-store.js';
 import { runDueJobs } from './run-due.js';
 import { runPlanForJob } from './run-plan.js';
+import { executeStep } from './execute.js';
+import { localParts, localToInstant } from '../util/local-time.js';
 import type { Runtime } from './runtime.js';
 import { schedulerPass } from './scheduler.js';
 
@@ -809,5 +811,101 @@ describe('reaskFailedCommands', () => {
     ]);
     expect(await reasksOf(jobId)).toEqual([]);
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('followup');
+  });
+
+  describe('a scheduled WhatsApp (task 13)', () => {
+    function waPlan(sendAt: string): Plan {
+      return Plan.parse({
+        goal: 'תזכורת בוואטסאפ',
+        steps: [{
+          id: 's1',
+          agent: 'comms.whatsapp',
+          intent: 'remind',
+          toolName: 'wa.send_message',
+          input: { to: '+972541234567', body: 'תזכורת לפגישה', sendAt },
+          expectedActionClass: 'whatsapp.initiate',
+        }],
+      });
+    }
+
+    function nextLocalNoon(): Date {
+      const now = new Date();
+      const today = localToInstant(localParts(now, 'Asia/Jerusalem').date, '12:00', 'Asia/Jerusalem');
+      return today.getTime() > now.getTime() ? today : new Date(today.getTime() + 24 * 3_600_000);
+    }
+
+    async function parkOn(jobId: string, sendAt: string): Promise<void> {
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, {
+        to: 'followup',
+        actor: 'orchestrator',
+        reason: 'scheduled send',
+        wakeAt: new Date(sendAt),
+      }));
+    }
+
+    it('arm (c) skips a followup job whose sendAt is still in the future', async () => {
+      const sendAt = new Date(Date.now() + 2 * 24 * 3_600_000).toISOString();
+      const { jobId } = await seedCommand({ plan: waPlan(sendAt) });
+      await parkOn(jobId, sendAt);
+      await backdateDecision(jobId);
+
+      const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
+      expect(result).toMatchObject({ reasked: [], errored: [] });
+      expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('followup');
+    });
+
+    it('the same job once its sendAt has passed is re-asked by arm (c)', async () => {
+      const sendAt = new Date(Date.now() - 3_600_000).toISOString();
+      const { jobId } = await seedCommand({ plan: waPlan(sendAt) });
+      await parkOn(jobId, new Date(Date.now() + 3_600_000).toISOString());
+      await backdateDecision(jobId);
+
+      const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
+      expect(result.errored).toEqual([]);
+      expect(result.reasked).toEqual([{ oldJobId: jobId, newJobId: expect.any(String), uncertain: false }]);
+    });
+
+    it('confirmed, charter re-signed before sendAt: not covered at sendAt, and re-asked', async () => {
+      const sendAt = new Date(Date.now() - 60_000).toISOString();
+      const { jobId } = await seedCommand({ plan: waPlan(sendAt) });
+      await testDb().query(
+        `UPDATE instruction_confirmations SET decided_at = now() - interval '72 hours' WHERE job_id = $1`,
+        [jobId],
+      );
+      charterCounter += 1;
+      const resigned = await withBusiness(BUSINESS, (bdb) => installCharter(
+        bdb,
+        buildCharter({ version: `2026-08-15.reask-${charterCounter}`, connections: [MAIL_CONNECTION] }),
+      ));
+      const job = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
+      if (job === null) throw new Error('no job');
+      let performed = 0;
+      const outcome = await withBusiness(BUSINESS, (db) => executeStep(db, {
+        job,
+        stepId: 's1',
+        agent: 'comms.whatsapp',
+        bundle: resigned,
+        toolName: 'wa.send_message',
+        toolInput: waPlan(sendAt).steps[0]?.input ?? {},
+        perform: async () => {
+          performed += 1;
+          return { output: null, externalId: 'WA-1', performed: true };
+        },
+        counterpartyTags: [],
+        rampLevel: 'draft_only',
+        planHash: planHashOf(waPlan(sendAt)),
+        // The gate's quiet-hours clock at the next local noon, so the run is
+        // judged on the window, not on whatever hour the suite runs at. The
+        // exemption's window reads the database clock.
+        now: nextLocalNoon(),
+      }));
+      // Not covered: the normal path ran and stopped at stage 8 on the dial.
+      expect(outcome).toMatchObject({ status: 'refused', code: 'draft_only:persist_as_draft' });
+      expect(performed).toBe(0);
+
+      const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
+      expect(result.errored).toEqual([]);
+      expect(result.reasked).toEqual([{ oldJobId: jobId, newJobId: expect.any(String), uncertain: false }]);
+    });
   });
 });

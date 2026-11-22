@@ -281,14 +281,17 @@ describe('runInstruction', () => {
           agent: 'comms.whatsapp',
           intent: 'לשלוח הודעה',
           toolName: 'wa.send_message',
-          input: { toNumber: '0521234567', body: 'מצורף' },
+          // Task 13: an owner-ordered WhatsApp names its recipient in `to`, in
+          // full international form — the only shape the door and the adapter
+          // accept (a national form is refused before the owner is asked).
+          input: { to: '+972521234567', body: 'מצורף' },
           dependsOn: [],
           expectedActionClass: 'whatsapp.initiate',
         },
       ],
     };
 
-    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לה וואטסאפ למספר 0521234567' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan: waPlan }) }));
+    const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשלחי לה וואטסאפ למספר +972521234567' }, { textOrigin: 'typed', channel: 'dashboard', planner: async () => ({ status: 'planned', plan: waPlan }) }));
 
     expect(result.status).toBe('needs_confirmation');
 
@@ -303,7 +306,9 @@ describe('runInstruction', () => {
       [result.jobId],
     );
     expect(rows[0]?.action_class).toBe('whatsapp.initiate');
-    expect(rows[0]?.recipients).toEqual(['0521234567']);
+    // `readEmails` contributes the raw `to`, `readPhones(input, 'wa.send_message')`
+    // the digits form the gate compares — the latter is the one that matters.
+    expect(rows[0]?.recipients).toContain('972521234567');
   });
 
   it('refuses an over-long instruction before creating anything', async () => {
