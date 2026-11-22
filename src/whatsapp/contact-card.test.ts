@@ -1,12 +1,15 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, withBusiness, type BusinessDb } from '../db/pool.js';
 import { getApproval } from '../governance/approvals.js';
+import { decide } from '../governance/approvals.js';
 import { loadJob } from '../orchestrator/jobs.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { installMailboxCharter } from '../test/mailbox.js';
 import {
+  CONTACT_CARD_EDIT_REFUSAL,
   CONTACT_CARD_GONE,
+  ContactCardBusyError,
   CONTACT_CARD_INSTRUCTION,
   EXTERNAL_FILE_WARNING,
   handleContactCardMessage,
@@ -16,7 +19,7 @@ import {
   REPLACED_JOB_REASON,
   type OpenContactCard,
 } from './contact-card.js';
-import { loadConversation, openOrAppend, type ContactConversation } from './contact-conversations.js';
+import { closeConversation, loadConversation, openOrAppend, type ContactConversation } from './contact-conversations.js';
 import { createFakeGateway, type FakeGateway } from './fake-gateway.js';
 import type { NormalizedInboundMessage } from './gateway.js';
 import { createBossMessenger, type BossMessenger } from './messenger.js';
@@ -191,6 +194,50 @@ describe('raiseContactCard', () => {
     const conv = await withBusiness(BUSINESS, (db) => loadConversation(db, h.conversation.conversationId));
     expect(conv?.cardJobId).toBe(second.jobId);
     expect(conv?.state).toBe('carded');
+  });
+
+  it('a new draft while the previous card is approved but unsent does not cancel it, fail its job or re-point the conversation', async () => {
+    const h = await harness();
+    const first = await raise(h, 'ראשונה');
+    await present(h, first.approvalId);
+    await withBusiness(BUSINESS, (db) => decide(db, first.approvalId, 'approved', { by: 'whatsapp:test', channel: 'whatsapp' }));
+    const jobsBefore = await testDb().query('SELECT 1 FROM jobs WHERE business_id = $1', [BUSINESS]);
+
+    await expect(raise(h, 'שנייה')).rejects.toBeInstanceOf(ContactCardBusyError);
+
+    expect((await approvalsFor(first.jobId))[0]?.state).toBe('approved');
+    expect((await withBusiness(BUSINESS, (db) => loadJob(db, first.jobId)))?.phase).not.toBe('failed');
+    const conv = await withBusiness(BUSINESS, (db) => loadConversation(db, h.conversation.conversationId));
+    expect(conv?.cardJobId).toBe(first.jobId);
+    const jobsAfter = await testDb().query('SELECT 1 FROM jobs WHERE business_id = $1', [BUSINESS]);
+    expect(jobsAfter.rows).toHaveLength(jobsBefore.rows.length);
+  });
+
+  it('a new draft while the previous card is pending replaces it', async () => {
+    const h = await harness();
+    const first = await raise(h, 'ראשונה');
+    const second = await raise(h, 'שנייה');
+    expect((await approvalsFor(first.jobId))[0]?.state).toBe('cancelled');
+    const conv = await withBusiness(BUSINESS, (db) => loadConversation(db, h.conversation.conversationId));
+    expect(conv?.cardJobId).toBe(second.jobId);
+  });
+
+  it('a new draft while the previous job is already past await_approval is refused', async () => {
+    const h = await harness();
+    const first = await raise(h, 'ראשונה');
+    await testDb().query(`UPDATE jobs SET phase = 'execute' WHERE business_id = $1 AND job_id = $2`, [BUSINESS, first.jobId]);
+    await expect(raise(h, 'שנייה')).rejects.toBeInstanceOf(ContactCardBusyError);
+    expect((await approvalsFor(first.jobId))[0]?.state).toBe('pending');
+  });
+
+  it('a closed conversation leaves no live card: the new approval is cancelled and its job failed', async () => {
+    const h = await harness();
+    await withBusiness(BUSINESS, (db) => closeConversation(db, h.conversation.conversationId, 'closed'));
+    await expect(raise(h, 'טיוטה')).rejects.toThrow(/no longer open/);
+    const { rows } = await testDb().query<{ state: string }>(`SELECT state FROM approval_requests WHERE business_id = $1`, [BUSINESS]);
+    expect(rows.map((r) => r.state)).toEqual(['cancelled']);
+    const jobs = await testDb().query<{ phase: string }>(`SELECT phase FROM jobs WHERE business_id = $1`, [BUSINESS]);
+    expect(jobs.rows.map((r) => r.phase)).toEqual(['failed']);
   });
 
   it('refuses, leaving no job and no card, when the attached document cannot be loaded', async () => {
@@ -382,6 +429,43 @@ describe('answering on WhatsApp', () => {
     const { jobId, approvalId } = await raise(h);
     await present(h, approvalId);
     expect(await answer(h, 'נוסח:')).toBe('refused');
+    expect((await approvalsFor(jobId))[0]?.state).toBe('pending');
+  });
+});
+
+describe('timing', () => {
+  it('a message dated before or at the presentation neither opens nor decides the card', async () => {
+    const h = await harness();
+    const { jobId, approvalId } = await raise(h);
+    await present(h, approvalId);
+    const { rows } = await testDb().query<{ created_at: Date }>(
+      `SELECT created_at FROM whatsapp_messages WHERE business_id = $1 AND direction = 'outbound' AND job_id = $2`,
+      [BUSINESS, jobId],
+    );
+    const presented = rows[0]!.created_at;
+    for (const ts of [new Date(presented.getTime() - 5_000), presented]) {
+      const { storedId } = await ownerMsg('שלח');
+      expect(await cardsFor(storedId, ts.toISOString())).toHaveLength(0);
+    }
+    const { msg, storedId } = await ownerMsg('שלח');
+    const early = { ...msg, providerTimestamp: new Date(presented.getTime() - 5_000).toISOString() };
+    const cards = await cardsFor(storedId, early.providerTimestamp);
+    expect(await withBusiness(BUSINESS, (db) =>
+      handleContactCardMessage(db, { msg: early, storedId, cards, messenger: h.messenger, othersOpen: 0 }),
+    )).toBe('passthrough');
+    expect((await approvalsFor(jobId))[0]?.state).toBe('pending');
+  });
+
+  it('a staged edit that changes more than the body gets its own refusal', async () => {
+    const h = await harness();
+    const { jobId, approvalId } = await raise(h);
+    await present(h, approvalId);
+    await testDb().query(
+      `UPDATE approval_requests SET edited_input = jsonb_set(proposed_input, '{to}', '"+972509999999"') WHERE approval_id = $1`,
+      [approvalId],
+    );
+    expect(await answer(h, 'שלח')).toBe('refused');
+    expect(h.gateway.sent.at(-1)?.body).toBe(CONTACT_CARD_EDIT_REFUSAL);
     expect((await approvalsFor(jobId))[0]?.state).toBe('pending');
   });
 });

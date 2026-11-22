@@ -66,6 +66,7 @@ import {
 
 export const CONTACT_CARD_INSTRUCTION = 'לאשר: "שלח". לתקן: "נוסח: <הטקסט>".';
 export const CONTACT_CARD_TTL_MINUTES = 4320;
+export const CONTACT_CARD_EDIT_REFUSAL = 'בכרטיס הזה אפשר לשנות רק את נוסח ההודעה.';
 export const CONTACT_CARD_GONE = 'הטיוטה הזו כבר הוכרעה או שפג תוקפה — לא שיניתי דבר.';
 export const EXTERNAL_FILE_WARNING = '⚠️ הקובץ התקבל מגורם חיצוני';
 export const REPLACED_JOB_REASON = 'replaced by newer draft';
@@ -140,27 +141,54 @@ async function lastInboundText(db: BusinessDb, key: string): Promise<string> {
   return '';
 }
 
-/** Cancel the conversation's previous pending card and close its job. */
-async function withdrawPreviousCard(db: BusinessDb, conversationId: string): Promise<void> {
-  const fresh = await loadConversation(db, conversationId);
-  if (fresh === null || fresh.cardJobId === null) return;
-  const { rows } = await db.query<{ approval_id: string }>(
-    `SELECT approval_id FROM approval_requests
-      WHERE business_id = $1 AND job_id = $2 AND state = 'pending' AND proposed_tool = 'wa.send_message'`,
-    [db.businessId, fresh.cardJobId],
-  );
-  for (const row of rows) await cancelPendingApproval(db, row.approval_id);
-  try {
-    await transition(db, fresh.cardJobId, {
-      to: 'failed',
-      actor: 'orchestrator',
-      reason: REPLACED_JOB_REASON,
-      expectFrom: 'await_approval',
-    });
-  } catch (error) {
-    // Already moved on (decided, expired): nothing left to close.
-    if (!(error instanceof PhaseMovedError)) throw error;
+/**
+ * Thrown when a new draft cannot replace the conversation's current card
+ * because that card's send is already decided or under way (an unspent
+ * approved approval, or a job past `await_approval`). Re-pointing
+ * `card_job_id` then would make `approvedReplyCovers` refuse the approved send,
+ * and cancelling would destroy it. Nothing is created or changed; the caller
+ * may retry once the send completes.
+ */
+export class ContactCardBusyError extends Error {
+  constructor(conversationId: string) {
+    super(`contact card: conversation ${conversationId} has a card that is approved or being sent`);
+    this.name = 'ContactCardBusyError';
   }
+}
+
+interface PreviousCard {
+  jobId: string;
+  /** The pending approval to cancel when the new card takes over, or null (job already failed/closed). */
+  pendingApprovalId: string | null;
+}
+
+/**
+ * Read-only: what the conversation's current card is, and whether it may be
+ * replaced. Throws `ContactCardBusyError` when it may not.
+ */
+async function inspectPreviousCard(db: BusinessDb, conversationId: string): Promise<PreviousCard | null> {
+  const conv = await loadConversation(db, conversationId);
+  if (conv === null || conv.cardJobId === null) return null;
+  const { rows: jobs } = await db.query<{ phase: string }>(
+    'SELECT phase FROM jobs WHERE business_id = $1 AND job_id = $2',
+    [db.businessId, conv.cardJobId],
+  );
+  const phase = jobs[0]?.phase;
+  if (phase === undefined || phase === 'failed' || phase === 'closed') return { jobId: conv.cardJobId, pendingApprovalId: null };
+  if (phase !== 'await_approval') throw new ContactCardBusyError(conversationId);
+  const { rows } = await db.query<{ approval_id: string; state: string; consumed_at: Date | null; expires_at: Date }>(
+    `SELECT approval_id, state, consumed_at, expires_at FROM approval_requests
+      WHERE business_id = $1 AND job_id = $2 AND proposed_tool = 'wa.send_message'`,
+    [db.businessId, conv.cardJobId],
+  );
+  let pending: string | null = null;
+  for (const r of rows) {
+    if ((r.state === 'approved' || r.state === 'approved_with_edit') && r.consumed_at === null && r.expires_at.getTime() > Date.now()) {
+      throw new ContactCardBusyError(conversationId);
+    }
+    if (r.state === 'pending') pending = r.approval_id;
+  }
+  return { jobId: conv.cardJobId, pendingApprovalId: pending };
 }
 
 export async function raiseContactCard(
@@ -191,7 +219,9 @@ export async function raiseContactCard(
     ...(attachment !== null ? attachmentLines(attachment) : []),
   ];
 
-  await withdrawPreviousCard(db, conversation.conversationId);
+  // Refuses (typed error, nothing created) when the current card is approved
+  // or being sent; the old card is withdrawn only once the new one is ready.
+  const previous = await inspectPreviousCard(db, conversation.conversationId);
 
   const plan = Plan.parse({
     goal: `תשובה ל-${label === '' ? number : label} בוואטסאפ`,
@@ -252,7 +282,32 @@ export async function raiseContactCard(
       actor: 'orchestrator',
       reason: `contact card: ${approvalId}`,
     });
-    await setCard(db, conversation.conversationId, job.jobId, null);
+    // One transaction: cancel the old pending card and re-point the
+    // conversation together, or neither. A lost race (the old card was
+    // decided since the inspection) or a closed conversation rolls back.
+    await transaction(db, async (tx) => {
+      if (previous !== null && previous.pendingApprovalId !== null) {
+        if (!(await cancelPendingApproval(tx, previous.pendingApprovalId))) {
+          throw new ContactCardBusyError(conversation.conversationId);
+        }
+      }
+      if (!(await setCard(tx, conversation.conversationId, job.jobId, null))) {
+        throw new Error('contact card: the conversation is no longer open');
+      }
+    });
+    if (previous !== null && previous.pendingApprovalId !== null) {
+      try {
+        await transition(db, previous.jobId, {
+          to: 'failed',
+          actor: 'orchestrator',
+          reason: REPLACED_JOB_REASON,
+          expectFrom: 'await_approval',
+        });
+      } catch (error) {
+        // Already moved on; the old approval is cancelled either way.
+        if (!(error instanceof PhaseMovedError)) throw error;
+      }
+    }
     return { jobId: job.jobId, approvalId };
   } catch (error) {
     if (approvalId !== null) {
@@ -466,7 +521,7 @@ interface StepContext {
 async function approveCard(db: BusinessDb, card: ApprovalRequest, ctx: StepContext): Promise<ContactCardOutcome> {
   const staged = card.editedInput ?? undefined;
   if (staged !== undefined && !contactReplyEditAllowed(card.proposedInput, staged)) {
-    return ctx.refuse(CONTACT_CARD_GONE);
+    return ctx.refuse(CONTACT_CARD_EDIT_REFUSAL);
   }
   let decided: ApprovalRequest;
   try {
@@ -510,7 +565,7 @@ async function replaceBody(
   const jobId = card.jobId;
   const proposed = card.proposedInput as Record<string, unknown>;
   const edited: Record<string, unknown> = { ...proposed, body: stripBidiControls(newBody) };
-  if (!contactReplyEditAllowed(proposed, edited)) return ctx.refuse(CONTACT_CARD_GONE);
+  if (!contactReplyEditAllowed(proposed, edited)) return ctx.refuse(CONTACT_CARD_EDIT_REFUSAL);
 
   const freshId = await transaction(db, async (tx) => {
     if (!(await cancelPendingApproval(tx, card.approvalId))) return null;

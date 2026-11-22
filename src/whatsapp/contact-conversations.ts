@@ -93,12 +93,14 @@ export async function setCard(
   conversationId: string,
   jobId: string,
   presentedAt: Date | null,
-): Promise<void> {
-  await db.query(
+): Promise<boolean> {
+  const res = await db.query(
     `UPDATE contact_conversations SET state = 'carded', card_job_id = $2, card_presented_at = $3
       WHERE business_id = $4 AND conversation_id = $1 AND state IN ('open', 'carded')`,
     [conversationId, jobId, presentedAt, db.businessId],
   );
+  // False when the conversation is closed/expired (or gone): nothing was set.
+  return (res.rowCount ?? 0) === 1;
 }
 
 export async function markHoldingSent(db: BusinessDb, conversationId: string, at: Date): Promise<void> {
