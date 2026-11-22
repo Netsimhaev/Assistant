@@ -9,7 +9,7 @@ import { config } from '../config.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { renderDescriptionSection } from '../business/description-prompt.js';
 import { renderProfileSection, type ProfileForPrompt } from '../business/profile-prompt.js';
-import { stripBidiControls } from '../util/bidi.js';
+import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import { buildFence, stripFenceMarkers } from '../util/fence.js';
 import { extractJsonObjects } from '../util/json-extract.js';
 import type { SourceItem } from '../whatsapp/sources/types.js';
@@ -45,13 +45,24 @@ function fenced(label: string, text: string, nonce: string): string {
   return `${f.open}\n${safe}\n${f.close}`;
 }
 
+/** A tier-2 label becomes part of a fence line, so it must be one short plain line. */
+function safeLabel(label: string, nonce: string): string {
+  let l = toOneLine(stripBidiControls(label));
+  for (const base of [L_CLIENT, L_ASSISTANT, L_INTERNAL, l]) {
+    const f = buildFence(base, nonce);
+    l = stripFenceMarkers(l, f);
+  }
+  l = l.split(nonce).join('').slice(0, 80).trim();
+  return l === '' ? 'מקור' : l;
+}
+
 export function renderContactDraftPrompt(req: ContactDraftRequest, nonce: string): string {
   const parts: string[] = [`# סוג איש הקשר: ${KIND_HE[req.contactKind]}`, '# השיחה (מהישן לחדש)'];
   for (const m of req.conversation) {
     parts.push(fenced(m.direction === 'inbound' ? L_CLIENT : L_ASSISTANT, m.body, nonce));
   }
   parts.push('# מקורות מידע על איש הקשר');
-  for (const s of req.tier2) parts.push(fenced(s.label, s.text, nonce));
+  for (const s of req.tier2) parts.push(fenced(safeLabel(s.label, nonce), s.text, nonce));
   parts.push('# מידע פנימי מהמסמכים');
   for (const t of req.tier3) parts.push(fenced(L_INTERNAL, t.text, nonce));
   return parts.join('\n\n');
@@ -110,7 +121,8 @@ export function buildContactDraftCall(
 
 /** Pure: parse model text. `usedTier3` and the attachment check are decided here, not by the model. */
 export function interpretContactDraft(raw: string, req: ContactDraftRequest): ContactDraftOutcome {
-  for (const obj of extractJsonObjects(raw)) {
+  // The last matching object is the answer; earlier ones may be quoted source text.
+  for (const obj of [...extractJsonObjects(raw)].reverse()) {
     if (typeof obj !== 'object' || obj === null) continue;
     const { body, attachDocumentId } = obj as { body?: unknown; attachDocumentId?: unknown };
     if (typeof body !== 'string') continue;
