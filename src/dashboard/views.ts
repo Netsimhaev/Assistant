@@ -922,6 +922,11 @@ ${
 }
 ${
   options.charterStatus === 'ok'
+    ? '<p><a href="/connections/whatsapp-contacts">וואטסאפ ללקוחות ולספקים — חתימה וביטול</a></p>'
+    : ''
+}
+${
+  options.charterStatus === 'ok'
     ? '<p><a href="/connections/external">מערכות חיצוניות (מערכת לקוחות, הנהלת חשבונות ועוד) — חתימה, שינוי והסרה</a> · <a href="/systems">מה הגיע מהן</a></p>'
     : ''
 }

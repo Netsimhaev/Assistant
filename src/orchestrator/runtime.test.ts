@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
+import { buildWhatsAppContactsAmendment } from '../charter/amend-whatsapp-contacts.js';
+import { signCharter } from '../charter/sign.js';
 import { closePool, withBusiness } from '../db/pool.js';
 import { closePlatformPool } from '../db/platform-pool.js';
 import type { CharterConnection } from '../domain/connection.js';
@@ -1105,5 +1107,58 @@ describe('businessRuntime — external systems (Stage D)', () => {
     const runtime = await build();
     expect(runtime.registry.get('ext:crm')).toBeNull();
     expect(runtime.warnings.some((w) => w.includes('external-system adapters'))).toBe(true);
+  });
+});
+
+describe('whatsapp-contacts adapter registration', () => {
+  async function declare(): Promise<void> {
+    const base = buildCharter();
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, base));
+    await withBusiness(BUSINESS, (bdb) =>
+      installCharter(bdb, signCharter(buildWhatsAppContactsAmendment(base, new Date()), { signedByPersonId: 'owner', method: 'dashboard_click' })),
+    );
+  }
+  async function bind(status: 'live' | 'disconnected'): Promise<void> {
+    await withBusiness(BUSINESS, (db) =>
+      upsertBinding(
+        db,
+        { system: 'whatsapp-contacts', status, endpoint: null, credentialRef: null, provider: null, lastOkAt: null, lastError: null },
+        { by: 'test' },
+      ),
+    );
+  }
+  async function withGateway(): Promise<Parameters<typeof build>[0]> {
+    await storeSecret(GREEN_API_INSTANCE_ID_REF, 'inst');
+    await storeSecret(GREEN_API_TOKEN_REF, 'tok');
+    return { settings: { ...SETTINGS, whatsappEnabled: true }, overrides: { whatsappGateway: () => createFakeGateway() } };
+  }
+
+  it('registers when declared, live and a gateway exists', async () => {
+    await declare();
+    await bind('live');
+    const runtime = await build(await withGateway());
+    expect(runtime.registry.resolve('whatsapp-contacts', 'api', 'wa.send_message')).not.toBeNull();
+  });
+
+  it('does not register without a declared connection', async () => {
+    await bind('live');
+    const runtime = await build(await withGateway());
+    expect(runtime.registry.get('whatsapp-contacts')).toBeNull();
+  });
+
+  it('does not register, and warns, when the binding is not live', async () => {
+    await declare();
+    await bind('disconnected');
+    const runtime = await build(await withGateway());
+    expect(runtime.registry.get('whatsapp-contacts')).toBeNull();
+    expect(runtime.warnings.join(' ')).toMatch(/whatsapp-contacts adapter.*not live/);
+  });
+
+  it('does not register, and warns, when there is no gateway', async () => {
+    await declare();
+    await bind('live');
+    const runtime = await build();
+    expect(runtime.registry.get('whatsapp-contacts')).toBeNull();
+    expect(runtime.warnings.join(' ')).toMatch(/whatsapp-contacts adapter.*no WhatsApp gateway/);
   });
 });

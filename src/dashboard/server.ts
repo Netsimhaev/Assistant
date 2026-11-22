@@ -123,6 +123,11 @@ import {
   handleCalendarStatus,
 } from './calendar-connect.js';
 import {
+  handleWhatsAppContactsRevertPost,
+  handleWhatsAppContactsSignPost,
+  handleWhatsAppContactsStatus,
+} from './whatsapp-contacts-connect.js';
+import {
   handleExternalRemovePost,
   handleExternalSignGet,
   handleExternalSignPost,
@@ -3542,6 +3547,16 @@ async function route(
   }
   if (method === 'POST' && pathname === '/connections/calendar/revert') {
     return handleCalendarRevertPost(res, db, session, await readFormBody(req));
+  }
+  // WhatsApp to clients and suppliers (phase 1): sign + live binding in one transaction.
+  if (method === 'GET' && pathname === '/connections/whatsapp-contacts') {
+    return handleWhatsAppContactsStatus(res, db, issueCsrfToken(session.sessionId));
+  }
+  if (method === 'POST' && pathname === '/connections/whatsapp-contacts/sign') {
+    return handleWhatsAppContactsSignPost(res, db, session, await readFormBody(req));
+  }
+  if (method === 'POST' && pathname === '/connections/whatsapp-contacts/revert') {
+    return handleWhatsAppContactsRevertPost(res, db, session, await readFormBody(req));
   }
   // External systems: the owner signs what the technician drafted (Stage D).
   if (method === 'GET' && pathname === '/systems') return handleSystems(res, db);
