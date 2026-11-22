@@ -48,7 +48,8 @@ import { WHATSAPP_CONTACTS_SYSTEM } from '../charter/amend-whatsapp-contacts.js'
 import { runContactResearcher, type ContactResearcher } from '../sdk/contact-researcher.js';
 import { runContactDrafter, type ContactDrafter } from '../sdk/contact-drafter.js';
 import type { ContactFlowDeps } from '../whatsapp/contact-flow.js';
-import { HOLDING_NAME_FALLBACK } from '../whatsapp/holding-reply.js';
+import { HOLDING_NAME_FALLBACK, sendDueHoldingReplies } from '../whatsapp/holding-reply.js';
+import { contactHousekeeping } from '../whatsapp/contact-housekeeping.js';
 import type { Tier2Source } from '../whatsapp/sources/types.js';
 import { uploadedInvoicesOfSender } from '../whatsapp/sources/uploaded-invoices.js';
 import { createSentInvoicesSource } from '../whatsapp/sources/sent-invoices.js';
@@ -1045,6 +1046,8 @@ export async function schedulerPass(
   let whatsappReport: ReportResult | null = null;
   let whatsappError: string | null = null;
   let whatsappMessenger: BossMessenger | null = null;
+  // True when this pass built the contact flow (the same switch the door uses).
+  let contactFlowWired = false;
   if (runtime.whatsapp !== undefined) {
     try {
       const active = await stage((bdb) => loadActiveCharter(bdb));
@@ -1130,6 +1133,21 @@ export async function schedulerPass(
         calendar: { runtime },
         ...(contactFlow !== undefined ? { contactFlow } : {}),
       }));
+      // Deferred holding replies that came due (after the door, which may have
+      // just deferred one). Its own catch: a failure here must not hide the pass.
+      if (contactFlow !== undefined) {
+        contactFlowWired = true;
+        const holdingFlow = contactFlow;
+        try {
+          await stage((db) => sendDueHoldingReplies(db, {
+            gateway: holdingFlow.gateway,
+            bundle: holdingFlow.bundle,
+            now: holdingFlow.now(),
+          }));
+        } catch (err) {
+          console.error('scheduler: due holding replies failed', err instanceof Error ? err.message : err);
+        }
+      }
     } catch (err) {
       whatsappError = err instanceof Error ? err.message : String(err);
       whatsappMessenger = null;
@@ -1329,6 +1347,21 @@ export async function schedulerPass(
     deliveriesReraisedError = err instanceof Error ? err.message : String(err);
   }
   const verified = await stage((db) => closeVerifiedJobs(db, options));
+
+  // Contact-card housekeeping (reminder, expiry, answered, decision log):
+  // after the closes, so a card job closed this pass settles its conversation
+  // now. Only when the contact flow is wired; its own catch.
+  if (contactFlowWired && whatsappMessenger !== null) {
+    const housekeepingMessenger = whatsappMessenger;
+    try {
+      await stage((db) => contactHousekeeping(db, {
+        messenger: housekeepingMessenger,
+        now: options.now ?? new Date(),
+      }));
+    } catch (err) {
+      console.error('scheduler: contact housekeeping failed', err instanceof Error ? err.message : err);
+    }
+  }
 
   // The meetings sweep, after the closes and before the ledger pass — see
   // `SchedulerPassResult.meetings`. Guarded: a sweep that threw must not hide
