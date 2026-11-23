@@ -104,6 +104,9 @@ import { WHATSAPP_MESSAGE_MAX_CHARS, WHATSAPP_QUESTION_TOO_LONG } from './comman
 import { PhaseMovedError, createJob, linkWhatsAppMessage, transition } from './jobs.js';
 import { bindPlanToJob, completedSteps, loadStoredPlan, planHashOf } from './plan-store.js';
 import { withSessionLock } from './session-lock.js';
+import { appendAudit } from '../audit/log.js';
+import { canonicalHash } from '../util/canonical.js';
+import { toOneLine } from '../util/bidi.js';
 import { hasSendAt, readSendAt } from '../util/send-at.js';
 import { listManagedContacts } from '../business/settings-contacts.js';
 import { waRecipientNote, waRecipientSource, waStepProblem } from './whatsapp-recipient.js';
@@ -131,6 +134,13 @@ export interface ReaskResult {
    * instead, and the row stays undelivered — answerable there only.
    */
   tooLong: number;
+  /**
+   * Old jobs whose residual plan the door's own check now refuses (a
+   * recipient no longer saved, a send time that cannot be read): failed with
+   * `RESIDUAL_REFUSED_MARKER`, the owner told once on the job's channel
+   * (`told`), and never picked again.
+   */
+  refused: Array<{ oldJobId: string; told: 'sent' | 'not_connected' | 'failed' | 'dashboard' }>;
   /** Old jobs another pass was re-asking at the same moment. */
   lockedOut: string[];
   errored: Array<{ jobId: string; error: string }>;
@@ -211,6 +221,13 @@ const CANDIDATES_SQL = `
          SELECT 1 FROM document_deliveries dd
           WHERE dd.business_id = j.business_id AND dd.job_id = j.job_id
        )
+       -- Nor a job whose residual was refused once (refuseResidual): it was
+       -- failed and the owner told; asking again every pass would starve the rest.
+       AND NOT EXISTS (
+         SELECT 1 FROM audit_log a
+          WHERE a.business_id = j.business_id AND a.job_id = j.job_id
+            AND a.kind = 'decision' AND a.reason LIKE 'command_reask_refused%'
+       )
        -- Nor is a job that queued a production: its card is the outcome.
        AND NOT EXISTS (
          SELECT 1 FROM document_productions dp
@@ -290,7 +307,9 @@ export async function reaskFailedCommands(
   o: { messenger?: BossMessenger; limit?: number } = {},
 ): Promise<ReaskResult> {
   const businessId = db.businessId;
-  const result: ReaskResult = { reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] };
+  const result: ReaskResult = {
+    reasked: [], refused: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [],
+  };
 
   const candidates = await readCandidates(db, null, o.limit ?? 20);
   for (const candidate of candidates) {
@@ -306,6 +325,10 @@ export async function reaskFailedCommands(
 
         const outcome = await reaskOne(jobDb, fresh, o.messenger);
         if (outcome === null) return;
+        if ('refused' in outcome) {
+          result.refused.push(outcome.refused);
+          return;
+        }
         result.reasked.push(outcome.reasked);
         if (outcome.delivery === 'sent') result.sent += 1;
         if (outcome.delivery === 'not_connected') result.notConnected += 1;
@@ -320,10 +343,12 @@ export async function reaskFailedCommands(
   return result;
 }
 
-interface ReaskOneOutcome {
-  reasked: ReaskResult['reasked'][number];
-  delivery: 'sent' | 'not_connected' | 'failed' | 'too_long' | 'dashboard';
-}
+type ReaskOneOutcome =
+  | {
+      reasked: ReaskResult['reasked'][number];
+      delivery: 'sent' | 'not_connected' | 'failed' | 'too_long' | 'dashboard';
+    }
+  | { refused: ReaskResult['refused'][number] };
 
 async function reaskOne(
   db: BusinessDb,
@@ -352,9 +377,10 @@ async function reaskOne(
   }
   const done = await completedSteps(db, oldJobId, chosen.planHash);
   const rawResidual = residualPlan(chosen.plan, new Set(done.keys()));
-  // A scheduled WhatsApp whose time has passed (or cannot be read) is never
-  // shown as a past time and sent at once on the new "כן": its `sendAt` is
-  // dropped from the step, and the question says so in words (task 13).
+  // A scheduled WhatsApp whose time has passed is never shown as a past time
+  // and sent at once on the new "כן" without saying so: its `sendAt` is
+  // dropped from the step, and the question says so in words (task 13). An
+  // unreadable `sendAt` is kept, and refused below.
   const scheduled = rawResidual === null ? null : withoutLapsedSendAt(rawResidual);
   const residual = scheduled === null ? null : scheduled.plan;
   if (residual === null) {
@@ -376,9 +402,7 @@ async function reaskOne(
   // since, or a time now out of range, is refused rather than re-asked.
   for (const step of residual.steps) {
     const problem = await waStepProblem(db, step, { text: instruction.text, textOrigin: instruction.textOrigin });
-    if (problem !== null) {
-      throw new Error(`command re-ask: job ${oldJobId}'s residual plan is refused (${problem.audit}): ${problem.reason}`);
-    }
+    if (problem !== null) return refuseResidual(db, candidate, problem, messenger);
   }
 
   const active = await loadActiveCharter(db);
@@ -514,20 +538,86 @@ async function reaskOne(
   return { reasked, delivery: 'sent' };
 }
 
+/**
+ * Starts the `audit_log` reason of a refused residual; the candidate read
+ * (`CANDIDATES_SQL`, the literal `command_reask_refused%`) skips any job
+ * carrying it.
+ */
+export const RESIDUAL_REFUSED_MARKER = 'command_reask_refused';
+
+/**
+ * The residual plan of an old command is refused by the door's own check: the
+ * old job is failed (a `followup` one, conditionally — moved on means not
+ * ours), an audit row carrying `RESIDUAL_REFUSED_MARKER` keeps it out of
+ * every later pass, and the owner is told once, on the job's channel. The
+ * move and the marker are one transaction; the message follows the commit,
+ * so a failed send is reported (`told`) and never repeated.
+ */
+async function refuseResidual(
+  db: BusinessDb,
+  candidate: CandidateRow,
+  problem: { reason: string; audit: string },
+  messenger: BossMessenger | undefined,
+): Promise<ReaskOneOutcome | null> {
+  const oldJobId = candidate.job_id;
+  try {
+    await transaction(db, async (tx) => {
+      if (JobPhase.parse(candidate.phase) === 'followup') {
+        await transition(tx, oldJobId, {
+          to: 'failed',
+          actor: 'orchestrator',
+          reason: `${RESIDUAL_REFUSED_MARKER} — ${problem.reason}`,
+          expectFrom: 'followup',
+        });
+      }
+      await appendAudit(tx, {
+        actor: 'orchestrator',
+        kind: 'decision',
+        charterVersion: 'n/a',
+        provenance: 'boss',
+        jobId: oldJobId,
+        inputHash: canonicalHash({ jobId: oldJobId, refused: true }),
+        artifacts: [],
+        costMinor: null,
+        tokens: null,
+        // The audit text names the step and the check, never a number or a name.
+        reason: `${RESIDUAL_REFUSED_MARKER}: ${problem.audit}`,
+      });
+    });
+  } catch (err) {
+    if (err instanceof PhaseMovedError) return null;
+    throw err;
+  }
+
+  const refused = (told: ReaskResult['refused'][number]['told']): ReaskOneOutcome => ({ refused: { oldJobId, told } });
+  if (candidate.channel !== 'whatsapp') return refused('dashboard');
+  if (messenger === undefined) return refused('not_connected');
+  const title = candidate.title === null ? '' : toOneLine(candidate.title);
+  const text = `לא שאלתי שוב על „${title === '' ? 'ההוראה' : title}": ${problem.reason} צריך הוראה חדשה.`;
+  try {
+    const sent = await messenger.send({ text, jobId: oldJobId });
+    return refused(sent.ok ? 'sent' : 'failed');
+  } catch {
+    return refused('failed');
+  }
+}
+
 /** Shown above the step echo when a lapsed `sendAt` was dropped from the re-asked step. */
 export const LAPSED_SEND_AT_NOTE = 'מועד השליחה המקורי בוואטסאפ כבר עבר — אם תאשרי, ההודעה תישלח מיד.';
 
 /**
  * `plan` with every `wa.send_message` step's `sendAt` removed when it has
- * passed or does not parse, and whether anything was removed. A future
- * `sendAt` is kept as it is.
+ * passed, and whether anything was removed. A future `sendAt` is kept as it
+ * is, and so is one that does not parse — the residual check refuses that.
  */
 export function withoutLapsedSendAt(plan: Plan, now: Date = new Date()): { plan: Plan; dropped: boolean } {
   let dropped = false;
   const steps = plan.steps.map((step) => {
     if (step.toolName !== 'wa.send_message' || !hasSendAt(step.input)) return step;
     const at = readSendAt(step.input);
-    if (at !== null && at.getTime() > now.getTime()) return step;
+    // Unreadable is not "passed": it is kept, and `waStepProblem` refuses it
+    // (fail closed, as `executeStep` does) — never re-asked as "send now".
+    if (at === null || at.getTime() > now.getTime()) return step;
     dropped = true;
     const { sendAt: _lapsed, ...rest } = step.input;
     return { ...step, input: rest };
