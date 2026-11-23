@@ -382,6 +382,9 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
   // runPlan's external-system rejections (Stage D, run-plan.ts).
   'run_due:external_definition_changed': 'הגדרת המערכת החיצונית השתנתה אחרי שאישרת — צריך לבקש שוב',
   'run_due:external_operation_unknown': 'הפעולה שהתבקשה במערכת החיצונית אינה מופיעה בהגדרה שנחתמה',
+  // A WhatsApp attachment without a conversation (run-plan.ts, both layers).
+  'run_due:wa_attachment_without_conversation': 'אפשר לצרף קובץ להודעת וואטסאפ רק כתשובה לפנייה של איש קשר',
+  wa_attachment_without_conversation: 'אפשר לצרף קובץ להודעת וואטסאפ רק כתשובה לפנייה של איש קשר',
 };
 
 /**

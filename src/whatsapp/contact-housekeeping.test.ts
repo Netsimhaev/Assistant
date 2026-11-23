@@ -5,7 +5,13 @@ import { resetDatabase, testDb } from '../test/db.js';
 import { installMailboxCharter } from '../test/mailbox.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { presentContactCard, raiseContactCard } from './contact-card.js';
-import { contactHousekeeping, sourceTiersFromDetail, CARD_REMINDER_LEAD } from './contact-housekeeping.js';
+import {
+  contactHousekeeping,
+  sourceTiersFromDetail,
+  CARD_REMINDER_LEAD,
+  FAILED_SEND_MAY_HAVE_SENT,
+  FAILED_SEND_NOT_SENT,
+} from './contact-housekeeping.js';
 import { loadConversation, openOrAppend, type ContactConversation } from './contact-conversations.js';
 import { createFakeGateway, type FakeGateway } from './fake-gateway.js';
 import { tick } from '../orchestrator/scheduler.js';
@@ -231,6 +237,89 @@ describe('contact housekeeping', () => {
     );
     expect((await run(h)).answered).toBe(1);
     expect(await state(h)).toBe('answered');
+  });
+});
+
+describe('an approved card reply that then failed to send (I2)', () => {
+  /** Approve, consume, and fail the card job the way executeStep does, with `code` as the failure. */
+  async function approveAndFail(approvalId: string, jobId: string, code: string): Promise<void> {
+    await withBusiness(BUSINESS, (db) => decide(db, approvalId, 'approved', { by: 'whatsapp:test', channel: 'whatsapp' }));
+    await testDb().query(
+      `UPDATE approval_requests SET consumed_at = now(), consumed_by_step = 'reply' WHERE business_id = $1 AND approval_id = $2`,
+      [BUSINESS, approvalId],
+    );
+    await testDb().query(
+      `INSERT INTO job_steps (business_id, job_id, from_phase, to_phase, actor, reason)
+       VALUES ($1, $2, 'execute', 'failed', 'orchestrator', $3)`,
+      [BUSINESS, jobId, `${code} — the far end refused`],
+    );
+    await setPhase(jobId, 'failed');
+  }
+  const notes = (h: Harness): string[] => h.gateway.sent.map((m) => m.body).filter((b) => b.includes('התשובה שאישרת'));
+
+  it('tells the owner once, across two passes, that the reply did not go out, and closes the conversation', async () => {
+    const h = await harness();
+    const card = await raise(h);
+    await approveAndFail(card.approvalId, card.jobId, 'whatsapp_rejected');
+    const first = await run(h);
+    expect(first.failedNoticed).toBe(1);
+    expect(await state(h)).toBe('closed');
+    const second = await run(h);
+    expect(second.failedNoticed).toBe(0);
+    const sent = notes(h);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain(`+${KEY}`);
+    expect(sent[0]).toContain(FAILED_SEND_NOT_SENT);
+    expect(sent[0]).not.toContain('ייתכן שההודעה כבר יצאה');
+    // The decision is still logged as an approval.
+    const { rows } = await testDb().query('SELECT verdict FROM contact_reply_decisions WHERE business_id = $1', [BUSINESS]);
+    expect(rows).toHaveLength(1);
+  });
+
+  it('says the message may already have gone out when a step row is unknown', async () => {
+    const h = await harness();
+    const card = await raise(h);
+    await approveAndFail(card.approvalId, card.jobId, 'channel_unavailable');
+    await testDb().query(
+      `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, status, performed)
+       VALUES ($1, $2, 'h', 'reply', 'unknown', NULL)`,
+      [BUSINESS, card.jobId],
+    );
+    await run(h);
+    const sent = notes(h);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain(FAILED_SEND_MAY_HAVE_SENT);
+  });
+
+  it('says it may have gone out when the failure code is delivery_unknown', async () => {
+    const h = await harness();
+    const card = await raise(h);
+    await approveAndFail(card.approvalId, card.jobId, 'delivery_unknown');
+    await run(h);
+    expect(notes(h)[0]).toContain(FAILED_SEND_MAY_HAVE_SENT);
+  });
+
+  it('leaves a conversation carded on a newer card untouched, and sends nothing', async () => {
+    const h = await harness();
+    const first = await raise(h, 'ראשונה');
+    await approveAndFail(first.approvalId, first.jobId, 'whatsapp_rejected');
+    // A newer card replaced the failed one before housekeeping ran.
+    const second = await raise(h, 'שנייה');
+    expect((await run(h)).failedNoticed).toBe(0);
+    expect(await state(h)).toBe('carded');
+    const conv = await withBusiness(BUSINESS, (db) => loadConversation(db, h.conversation.conversationId));
+    expect(conv?.cardJobId).toBe(second.jobId);
+    expect(notes(h)).toHaveLength(0);
+  });
+
+  it('positive control: the same approved card whose job is still executing gets no note and stays carded', async () => {
+    const h = await harness();
+    const card = await raise(h);
+    await withBusiness(BUSINESS, (db) => decide(db, card.approvalId, 'approved', { by: 'whatsapp:test', channel: 'whatsapp' }));
+    await setPhase(card.jobId, 'execute');
+    expect((await run(h)).failedNoticed).toBe(0);
+    expect(await state(h)).toBe('carded');
+    expect(notes(h)).toHaveLength(0);
   });
 });
 

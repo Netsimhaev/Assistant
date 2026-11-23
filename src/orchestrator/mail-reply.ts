@@ -33,6 +33,7 @@
  * afterwards and `settleMail` COALESCEs `error`, so the reason survives. A
  * failed DRAFT records nothing: it returns `null` and the poller decides.
  */
+import { MAY_HAVE_SENT_CODES } from '../domain/may-have-sent.js';
 import type { BusinessDb } from '../db/pool.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { MailTriage } from '../domain/mail-triage.js';
@@ -339,12 +340,9 @@ async function raiseReplyCard(
 // Re-asking after an approved send that did not complete (ruling R8)
 // ---------------------------------------------------------------------------
 
-/**
- * Failure codes after which the provider may have accepted the mail.
- * `delivery_unknown` is the send adapter's status-0 answer; `adapter_timeout`
- * is the orchestrator's own deadline. Neither carries "nothing was created".
- */
-const MAY_HAVE_SENT_CODES: readonly string[] = ['delivery_unknown', 'adapter_timeout'];
+// Failure codes after which the provider may have accepted the mail:
+// `MAY_HAVE_SENT_CODES` (`src/domain/may-have-sent.ts`), shared with the
+// WhatsApp contact-card failure note.
 
 interface FailedReplyRow {
   mail_id: string;

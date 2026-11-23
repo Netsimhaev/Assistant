@@ -10,11 +10,19 @@
  *     function has no text parameter, so nothing a contact wrote can reach the
  *     wire;
  *   - the recipient is the conversation's own `contact_key`, read from the row;
+ *   - only while the conversation is `open` or `carded`, first attempt and
+ *     deferred alike;
  *   - once per conversation (claimed in the row before sending), at most 3 per
- *     number per business day, only when the contact wrote within the last 60
- *     minutes (a deferred reply stays valid while the question is open);
- *   - never inside quiet hours (deferred to their end) and stopped by the
- *     `outbound` kill switch;
+ *     number per business day, and a FIRST attempt only when the contact wrote
+ *     within the last 60 minutes (a deferred reply stays valid while the
+ *     question is open). Freshness is checked BEFORE the kill switch, so a
+ *     stale first attempt is dropped (`stale`), never deferred into a send
+ *     after release;
+ *   - never inside quiet hours (deferred to their end), and stopped by the
+ *     kill switch whenever it stops `comms.whatsapp`'s outbound actions —
+ *     scope `all`, `front_office` or `outbound`. Stopped is `halted`: the reply
+ *     is deferred (`holding_due_at` = now + `HOLDING_RETRY_MS`), not dropped,
+ *     and a later pass sends it only if the rules above still hold;
  *   - an audit row that carries a hash and a constant reason, never the number.
  */
 import type { BusinessDb } from '../db/pool.js';
@@ -98,19 +106,22 @@ export async function sendHoldingReply(
     return 'stale';
   }
 
+  // Only while the question is open — first attempt and deferred alike.
+  if (conv.state !== 'open' && conv.state !== 'carded') return 'stale';
+  // A deferred reply (holding_due_at set) is still wanted while the question
+  // is open; a first attempt must be fresh — and is judged so BEFORE the kill
+  // switch, so a stale first attempt is dropped, never deferred.
+  if (conv.holdingDueAt === null && now.getTime() - conv.lastInboundAt.getTime() > HOLDING_FRESHNESS_MS) {
+    return 'stale';
+  }
+
   const kill = await checkKillSwitch(db, 'comms.whatsapp', true);
   if (kill.blocked) {
     // Deferred, not dropped: it goes out after release only if the usual
-    // staleness and give-up rules still hold on a later pass.
+    // state and give-up rules still hold on a later pass.
     await deferHolding(db, conversationId, new Date(now.getTime() + HOLDING_RETRY_MS));
     return 'halted';
   }
-
-  // A deferred reply (holding_due_at set) is still wanted while the question is open;
-  // a first attempt must be fresh.
-  if (conv.holdingDueAt !== null) {
-    if (conv.state !== 'open' && conv.state !== 'carded') return 'stale';
-  } else if (now.getTime() - conv.lastInboundAt.getTime() > HOLDING_FRESHNESS_MS) return 'stale';
   if ((await holdingsToday(db, conv.contactKey, bundle, now)) >= HOLDING_MAX_PER_DAY) return 'capped';
 
   if (inQuietHours(bundle.quietHours, now)) {

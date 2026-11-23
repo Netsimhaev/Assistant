@@ -5,6 +5,7 @@ import type { BusinessDb } from '../db/pool.js';
 import type { PlanStep } from '../domain/plan.js';
 import { listManagedContacts } from '../business/settings-contacts.js';
 import { MAX_SEND_AHEAD_MS, hasSendAt, readSendAt } from '../util/send-at.js';
+import { WA_ATTACHMENT_WITHOUT_CONVERSATION_HE, waAttachmentWithoutConversation } from '../domain/wa-attachment.js';
 
 /**
  * Who an owner-ordered WhatsApp message may go to (task 13, H2): a contact the
@@ -73,7 +74,11 @@ export const SEND_AT_NOT_WHATSAPP = 'מועד שליחה אפשר לקבוע ר�
  *  - a `wa.send_message` must go to a saved contact or a number typed in a
  *    typed instruction (`waRecipientSource`);
  *  - its `sendAt`, when present, must parse, be in the future, and be at most
- *    30 days ahead.
+ *    30 days ahead;
+ *  - it may not carry `attachDocumentId` without a `conversationId`: an
+ *    owner-ordered message never attaches a stored file, because the id could
+ *    name any document of the business, a stranger's included, and the "yes"
+ *    skips gate stages 5–9 (`waAttachmentWithoutConversation`).
  */
 export async function waStepProblem(
   db: BusinessDb,
@@ -85,6 +90,12 @@ export async function waStepProblem(
     return hasSendAt(step.input)
       ? { reason: SEND_AT_NOT_WHATSAPP, audit: `step ${step.id} ${step.toolName} carries sendAt` }
       : null;
+  }
+  if (waAttachmentWithoutConversation(step.toolName, step.input)) {
+    return {
+      reason: WA_ATTACHMENT_WITHOUT_CONVERSATION_HE,
+      audit: `step ${step.id} wa.send_message carries attachDocumentId without a conversationId`,
+    };
   }
   const contacts = await listManagedContacts(db);
   const source = waRecipientSource(Object.hasOwn(step.input, 'to') ? step.input['to'] : undefined, {

@@ -83,7 +83,7 @@ describe('resolveStoredDocument', () => {
 });
 
 describe('wa.send_message attachDocumentId in runPlan', () => {
-  async function run(documentId: string) {
+  async function run(documentId: string, opts: { conversation?: boolean } = {}) {
     const plain = buildCharter({ autonomyBase: { 'whatsapp.initiate': 'auto' } });
     const { signature: _sig, ...unsignedBase } = plain;
     const base = BusinessCharter.parse(
@@ -129,7 +129,10 @@ describe('wa.send_message attachDocumentId in runPlan', () => {
           agent: 'comms.whatsapp',
           intent: 'send',
           toolName: 'wa.send_message',
-          input: { to: '+972501234567', body: 'מצורף', conversationId: 'CONV-1', attachDocumentId: documentId },
+          input:
+            opts.conversation === false
+              ? { to: '+972501234567', body: 'מצורף', attachDocumentId: documentId }
+              : { to: '+972501234567', body: 'מצורף', conversationId: 'CONV-1', attachDocumentId: documentId },
         },
       ],
     });
@@ -159,5 +162,31 @@ describe('wa.send_message attachDocumentId in runPlan', () => {
     const changed = await run('DOC-9');
     expect(changed.result).toMatchObject({ status: 'halted', reason: 'attachment_hash_mismatch' });
     expect(changed.calls).toHaveLength(0);
+  });
+
+  it('hands a card reply (conversationId present) the re-read, hashed bytes of the named document', async () => {
+    const bytes = Buffer.from('the real invoice bytes');
+    await seedDoc(TEST_BUSINESS, 'DOC-OK', bytes);
+    const { result, calls } = await run('DOC-OK');
+    expect(result.status).toBe('done');
+    expect(calls).toHaveLength(1);
+    const att = calls[0]!.attachments;
+    expect(att).toHaveLength(1);
+    expect(Buffer.from(att[0]!.bytes).equals(bytes)).toBe(true);
+    expect(sha(Buffer.from(att[0]!.bytes))).toBe(sha(bytes));
+  });
+
+  it('rejects the whole plan when a WhatsApp step names a file but no conversation — no adapter call', async () => {
+    const bytes = Buffer.from('a stranger mailed this');
+    await seedDoc(TEST_BUSINESS, 'DOC-STRANGER', bytes);
+    const { result, calls } = await run('DOC-STRANGER', { conversation: false });
+    expect(result).toMatchObject({ status: 'rejected', code: 'wa_attachment_without_conversation' });
+    expect(calls).toHaveLength(0);
+    // Positive control: the identical document, with a conversation, does go out.
+    await resetDatabase();
+    await seedDoc(TEST_BUSINESS, 'DOC-STRANGER', bytes);
+    const control = await run('DOC-STRANGER');
+    expect(control.result.status).toBe('done');
+    expect(control.calls).toHaveLength(1);
   });
 });

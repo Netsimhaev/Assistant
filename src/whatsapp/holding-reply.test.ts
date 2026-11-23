@@ -273,4 +273,31 @@ describe('holding reply', () => {
     await withBusiness(TEST_BUSINESS, (db) => sendDueHoldingReplies(db, { gateway: gw, bundle: quiet, now: morning }));
     expect(gw.sent).toHaveLength(0);
   });
+
+  it('a stale first attempt under a tripped kill switch is dropped as stale, not deferred (I3)', async () => {
+    const gw = createFakeGateway();
+    const id = await conv(ago(61));
+    await withBusiness(TEST_BUSINESS, (db) => trip(db, 'all', 'test', 'stop'));
+    expect(await run(gw, id)).toBe('stale');
+    const c = await withBusiness(TEST_BUSINESS, (db) => loadConversation(db, id));
+    expect(c?.holdingDueAt).toBeNull();
+    // Positive control: the same switch, a fresh first attempt — halted and deferred.
+    const fresh = await conv(ago(5), '972501110002');
+    expect(await run(gw, fresh)).toBe('halted');
+    const f = await withBusiness(TEST_BUSINESS, (db) => loadConversation(db, fresh));
+    expect(f?.holdingDueAt).not.toBeNull();
+    expect(gw.sent).toHaveLength(0);
+  });
+
+  it('a first attempt on a conversation that is no longer open is not sent (I3)', async () => {
+    const gw = createFakeGateway();
+    const id = await conv(ago(5));
+    await testDb().query(`UPDATE contact_conversations SET state = 'answered' WHERE conversation_id = $1`, [id]);
+    expect(await run(gw, id)).toBe('stale');
+    expect(gw.sent).toHaveLength(0);
+    // Positive control: the same fresh first attempt on an open conversation is sent.
+    const other = await conv(ago(5), '972501110003');
+    expect(await run(gw, other)).toBe('sent');
+    expect(gw.sent).toHaveLength(1);
+  });
 });

@@ -14,17 +14,41 @@
  * performed step; `closed`/`expired` only when the card's latest approval is
  * denied/cancelled/expired and nothing live remains on the job.
  *
+ * **An approved card whose send then failed is never silent** (I2). The owner
+ * was told "אישרתי. התשובה יוצאת ל-…"; when the card job ends `failed` with
+ * its latest approval approved (consumed or not — a gate or kill-switch
+ * denial fails the job before consumption) and no performed step, the
+ * conversation is closed and the owner gets ONE WhatsApp note that the reply
+ * did not go out — "ייתכן שההודעה כבר יצאה" when any step row is `unknown` or
+ * a failure code is in `MAY_HAVE_SENT_CODES`. A failed job never runs again
+ * (card jobs are not re-asked), so `failed` is terminal here. The conditional
+ * close (`state = 'carded' AND card_job_id = $job`) IS the claim: only the
+ * pass whose UPDATE flipped the row sends the note, so two passes never send
+ * it twice. Claim before send means a crash between the two loses the note —
+ * at most once, never twice, as every claim-then-send here.
+ *
  * Job phase changes are `resume.ts`'s business; nothing here transitions a job.
  */
 import { ulid } from 'ulid';
 import type { BusinessDb } from '../db/pool.js';
 import { agreementVerdict } from '../governance/agreement-verdict.js';
+import { MAY_HAVE_SENT_CODES } from '../domain/may-have-sent.js';
+import { toOneLine } from '../util/bidi.js';
 import { presentContactCard } from './contact-card.js';
 import { INTERNAL_DOCS_SOURCE } from './contact-flow.js';
 import type { BossMessenger } from './messenger.js';
 
 export const CARD_REMINDER_AFTER_MS = 5 * 60 * 60 * 1000;
 export const CARD_REMINDER_LEAD = 'תזכורת: עדיין ממתין לאישורך';
+export const FAILED_SEND_NOTE_PREFIX = 'התשובה שאישרת בוואטסאפ ל-';
+export const FAILED_SEND_NOT_SENT = 'לא יצאה. אפשר לשלוח אותה שוב בעצמך, או לחכות לפנייה הבאה שלו.';
+export const FAILED_SEND_MAY_HAVE_SENT = 'לא הושלמה — ייתכן שההודעה כבר יצאה. כדאי לבדוק בטלפון לפני ששולחים שוב.';
+
+/** The one note an owner gets when an approved contact-card reply failed. */
+export function failedSendNote(contactKey: string, mayHaveSent: boolean): string {
+  return `${FAILED_SEND_NOTE_PREFIX}+${toOneLine(contactKey)} ${mayHaveSent ? FAILED_SEND_MAY_HAVE_SENT : FAILED_SEND_NOT_SENT}`;
+}
+
 const NOTHING_FOUND = 'לא נמצא מידע רלוונטי';
 const FOUND_PREFIX = 'מה נמצא: ';
 
@@ -38,6 +62,8 @@ export interface HousekeepingResult {
   expired: number;
   answered: number;
   decisionsRecorded: number;
+  /** Approved card replies that failed to send: conversation closed, owner noted. */
+  failedNoticed: number;
 }
 
 interface CardRow {
@@ -112,9 +138,20 @@ async function recordDecisions(db: BusinessDb): Promise<number> {
 }
 
 /** Carded conversations, each with the state of its card job's latest approval. */
-async function settleCarded(db: BusinessDb): Promise<{ expired: number; answered: number }> {
-  const { rows } = await db.query<CardRow & { phase: string | null; performed: boolean; latest: string | null; live: boolean }>(
-    `SELECT c.conversation_id, c.card_job_id, j.phase,
+async function settleCarded(
+  db: BusinessDb,
+  deps: HousekeepingDeps,
+): Promise<{ expired: number; answered: number; failedNoticed: number }> {
+  const { rows } = await db.query<
+    CardRow & { contact_key: string; phase: string | null; performed: boolean; latest: string | null; live: boolean; may_have_sent: boolean }
+  >(
+    `SELECT c.conversation_id, c.card_job_id, c.contact_key, j.phase,
+            (EXISTS (SELECT 1 FROM job_steps f
+                      WHERE f.business_id = c.business_id AND f.job_id = c.card_job_id
+                        AND split_part(f.reason, ' ', 1) = ANY($2::text[]))
+             OR EXISTS (SELECT 1 FROM job_step_results u
+                         WHERE u.business_id = c.business_id AND u.job_id = c.card_job_id
+                           AND u.status = 'unknown')) AS may_have_sent,
             EXISTS (SELECT 1 FROM job_step_results s
                      WHERE s.business_id = c.business_id AND s.job_id = c.card_job_id
                        AND s.status = 'completed' AND s.performed IS TRUE) AS performed,
@@ -128,14 +165,20 @@ async function settleCarded(db: BusinessDb): Promise<{ expired: number; answered
        FROM contact_conversations c
        LEFT JOIN jobs j ON j.business_id = c.business_id AND j.job_id = c.card_job_id
       WHERE c.business_id = $1 AND c.state = 'carded' AND c.card_job_id IS NOT NULL`,
-    [db.businessId],
+    [db.businessId, MAY_HAVE_SENT_CODES],
   );
   let expired = 0;
   let answered = 0;
+  let failedNoticed = 0;
   for (const r of rows) {
     let to: 'answered' | 'closed' | 'expired' | null = null;
+    let failedSend = false;
     if (r.phase === 'closed' && r.performed) to = 'answered';
-    else if (!r.live) {
+    else if (r.phase === 'failed' && !r.performed && (r.latest === 'approved' || r.latest === 'approved_with_edit')) {
+      // I2: approved, then the send failed. Terminal; the owner must hear.
+      to = 'closed';
+      failedSend = true;
+    } else if (!r.live) {
       // Nothing live remains on the card job. `followup` is where the real
       // expiry path (scheduler `expireApprovals`) leaves a job whose approval
       // lapsed. Jobs mid-send (execute/verify/remember) are never matched here
@@ -156,12 +199,18 @@ async function settleCarded(db: BusinessDb): Promise<{ expired: number; answered
         WHERE business_id = $1 AND conversation_id = $2 AND state = 'carded' AND card_job_id = $4`,
       [db.businessId, r.conversation_id, to, r.card_job_id],
     );
-    if ((res.rowCount ?? 0) === 1) {
-      if (to === 'answered') answered += 1;
-      else expired += 1;
-    }
+    if ((res.rowCount ?? 0) !== 1) continue;
+    if (failedSend) {
+      // The close above is the claim; only this pass sends the note.
+      const sent = await deps.messenger.send({ text: failedSendNote(r.contact_key, r.may_have_sent), jobId: null });
+      if (!sent.ok) {
+        console.error('contact housekeeping: failed-send note not delivered', sent.error ?? '');
+      }
+      failedNoticed += 1;
+    } else if (to === 'answered') answered += 1;
+    else expired += 1;
   }
-  return { expired, answered };
+  return { expired, answered, failedNoticed };
 }
 
 async function remindOwner(db: BusinessDb, deps: HousekeepingDeps): Promise<number> {
@@ -204,16 +253,17 @@ async function remindOwner(db: BusinessDb, deps: HousekeepingDeps): Promise<numb
 
 /** One scheduler step; each part runs in its own catch so one failure leaves the rest running. */
 export async function contactHousekeeping(db: BusinessDb, deps: HousekeepingDeps): Promise<HousekeepingResult> {
-  const result: HousekeepingResult = { reminded: 0, expired: 0, answered: 0, decisionsRecorded: 0 };
+  const result: HousekeepingResult = { reminded: 0, expired: 0, answered: 0, decisionsRecorded: 0, failedNoticed: 0 };
   try {
     result.decisionsRecorded = await recordDecisions(db);
   } catch (error) {
     console.error('contact housekeeping: decision log failed', error instanceof Error ? error.message : error);
   }
   try {
-    const settled = await settleCarded(db);
+    const settled = await settleCarded(db, deps);
     result.expired = settled.expired;
     result.answered = settled.answered;
+    result.failedNoticed = settled.failedNoticed;
   } catch (error) {
     console.error('contact housekeeping: settle failed', error instanceof Error ? error.message : error);
   }

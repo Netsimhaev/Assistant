@@ -19,6 +19,7 @@ import { localParts } from '../util/local-time.js';
 import { createJob } from './jobs.js';
 import { runInstruction } from './instruct.js';
 import { WA_RECIPIENT_REFUSAL } from './whatsapp-recipient.js';
+import { WA_ATTACHMENT_WITHOUT_CONVERSATION_HE } from '../domain/wa-attachment.js';
 
 const BUSINESS = 'test-business';
 const TZ = 'Asia/Jerusalem';
@@ -133,6 +134,19 @@ describe('who an owner-ordered WhatsApp may go to', () => {
     // yields for `to`; `readEmails` alone only ever contributes the raw
     // `+…` string.
     expect(rows.flatMap((r) => r.recipients)).toContain('972541234567');
+  });
+});
+
+describe('an owner-ordered WhatsApp never attaches a stored file (I1)', () => {
+  it('refuses attachDocumentId without a conversationId, before any question; the same plan without it is offered', async () => {
+    const text = `תשלחי בוואטסאפ ל-${DANA} את הקובץ`;
+    const refused = await instruct(text, waPlan({ to: DANA, body: 'מצורף', attachDocumentId: 'DOC-STRANGER' }));
+    expect(refused).toEqual({ status: 'refused', reason: WA_ATTACHMENT_WITHOUT_CONVERSATION_HE });
+    const { rows } = await testDb().query('SELECT 1 FROM instruction_confirmations');
+    expect(rows).toHaveLength(0);
+    // Positive control: identical recipient and body, no file — asked.
+    const offered = await instruct(text, waPlan({ to: DANA, body: 'מצורף' }));
+    expect(offered.status).toBe('needs_confirmation');
   });
 });
 

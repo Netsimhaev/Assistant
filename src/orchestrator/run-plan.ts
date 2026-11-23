@@ -34,6 +34,11 @@ import { runLocalTool, type LocalToolContext } from './local-tools.js';
 import { ATTACHMENT_TOOL, ATTACHMENTS_KEY, AttachmentRefs } from '../domain/attachment-ref.js';
 import { deliveryVersionOf, resolveAttachments, resolveStoredDocument, type ResolvedAttachment } from '../production/attachments.js';
 import type { Job } from './jobs.js';
+import {
+  WA_ATTACHMENT_WITHOUT_CONVERSATION_CODE,
+  WA_ATTACHMENT_WITHOUT_CONVERSATION_HE,
+  waAttachmentWithoutConversation,
+} from '../domain/wa-attachment.js';
 import type { BusinessDb } from '../db/pool.js';
 
 /**
@@ -326,6 +331,19 @@ export async function runPlan(db: BusinessDb, request: RunPlanRequest): Promise<
           reason: `step ${step.id}: ${resolved.reason}`,
         };
       }
+    }
+
+    // Defence in depth behind the instruction door's `waStepProblem`: a
+    // WhatsApp step that names a stored file but no conversation is refused
+    // for the whole plan, before anything is bound or sent, whatever path
+    // bound it. `stepAttachments` refuses the same shape again on the
+    // effective payload.
+    if (waAttachmentWithoutConversation(step.toolName, step.input)) {
+      return {
+        status: 'rejected',
+        code: WA_ATTACHMENT_WITHOUT_CONVERSATION_CODE,
+        reason: `step ${step.id}: ${WA_ATTACHMENT_WITHOUT_CONVERSATION_HE}`,
+      };
     }
 
     const mismatch = classMismatch(step, bundle.externalSystems);
@@ -867,6 +885,9 @@ async function stepAttachments(
   // WhatsApp to a client or supplier: `attachDocumentId` names ONE stored
   // document of this business; its bytes are re-read and re-hashed here.
   if (toolName === 'wa.send_message' && Object.hasOwn(effectiveInput, 'attachDocumentId')) {
+    if (waAttachmentWithoutConversation(toolName, effectiveInput)) {
+      throw new StepChannelError(WA_ATTACHMENT_WITHOUT_CONVERSATION_CODE, WA_ATTACHMENT_WITHOUT_CONVERSATION_HE, false);
+    }
     const id = effectiveInput['attachDocumentId'];
     if (typeof id !== 'string' || id === '') throw new StepChannelError('attachment_invalid', ATTACHMENT_INVALID_HE, false);
     const resolved = await resolveStoredDocument(db, id, documentRoot);
