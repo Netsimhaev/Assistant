@@ -10,6 +10,7 @@ import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import type { BusinessCharter } from '../domain/charter.js';
 import type { PolicyBundle } from '../domain/policy.js';
+import { trip } from '../governance/killswitch.js';
 import { decide } from '../governance/approvals.js';
 import { addColleague } from '../business/colleagues.js';
 import { addManagedContact } from '../business/settings-contacts.js';
@@ -32,6 +33,7 @@ import {
   REASON_OWNERSHIP,
   REASON_RESEARCH_FAILED,
   REASON_SOURCE_FAILED,
+  REASON_SOURCES_STOPPED,
   type ContactFlowDeps,
 } from './contact-flow.js';
 
@@ -281,6 +283,17 @@ describe('the contact flow through the door', () => {
       [BUSINESS],
     );
     expect(rows).toEqual([{ reason: 'contact_draft:2', input_hash: canonicalHash({ key: CONTACT.slice(1) }) }]);
+  });
+
+  it('a tripped kill switch skips the tier-2 sources; the card says so', async () => {
+    const w = await world();
+    await addContact();
+    await withBusiness(BUSINESS, (db) => trip(db, 'operations', 'test', 'stop'));
+    await door(w, deps(w), [msg(CONTACT, 'יש לך את החשבונית?')]);
+    expect(w.sourceCalls).toBe(0);
+    const [card] = await approvals();
+    expect(card?.state).toBe('pending');
+    expect(card?.detail).toContain(REASON_SOURCES_STOPPED);
   });
 
   it('a source that returns someone else\'s data: card with the reason, no draft', async () => {

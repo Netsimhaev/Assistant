@@ -46,6 +46,7 @@ import { withBusiness, type BusinessDb } from '../db/pool.js';
 import type { BusinessCharter } from '../domain/charter.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { appendAudit } from '../audit/log.js';
+import { checkKillSwitch } from '../governance/killswitch.js';
 import { descriptionFragment } from '../business/description-store.js';
 import { profileFragment } from '../business/profile.js';
 import type { NotifyTarget } from '../orchestrator/proposal-approval.js';
@@ -82,6 +83,7 @@ export const REASON_CAPPED = 'הגיעה התקרה היומית — לא נוס
 export const REASON_CONTACT = 'תשובה ללקוח או לספק בוואטסאפ יוצאת רק באישורך';
 export const REASON_UNKNOWN = 'השולח אינו מוכר — ההצעה נוסחה מתוך השיחה בלבד';
 export const REASON_OWNERSHIP = 'מקור מידע החזיר נתונים שאינם של איש הקשר — לא נוסחה הצעה';
+export const REASON_SOURCES_STOPPED = 'המקורות לא נבדקו כי העוזרת עצורה (מתג העצירה פעיל)';
 export const REASON_SOURCE_FAILED = 'מקור מידע לא ענה בזמן או נכשל — הוא לא נכלל';
 export const REASON_RESEARCH_FAILED = 'החיפוש במסמכים הפנימיים נכשל — הוא לא נכלל';
 export const REASON_DRAFT_FAILED = 'ניסוח ההצעה נכשל — לא נוסחה הצעה';
@@ -254,7 +256,13 @@ async function draftFor(db: BusinessDb, deps: ContactFlowDeps, group: Group): Pr
     // still running on the flow's connection could land its writes inside the
     // card's takeover transaction — or interleave BEGIN/COMMIT with it. On
     // its own connection an abandoned call can only touch that connection.
-    for (const source of deps.sources) {
+    // The accounting read and the sent-mail search run outside the gate, so
+    // they honour the business kill switch the way the daily external scan
+    // does: the same agent and the same outbound reading (scope all,
+    // outbound or operations stops them).
+    const stopped = (await checkKillSwitch(db, 'ops.systems', true)).blocked;
+    if (stopped) notes.push(REASON_SOURCES_STOPPED);
+    for (const source of stopped ? [] : deps.sources) {
       try {
         const res = await withDeadline(deps.tier2TimeoutMs ?? TIER2_TIMEOUT_MS, (signal) =>
           withBusiness(db.businessId, (own) => source(own, ids, signal)),

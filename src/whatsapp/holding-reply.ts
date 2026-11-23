@@ -99,7 +99,12 @@ export async function sendHoldingReply(
   }
 
   const kill = await checkKillSwitch(db, 'comms.whatsapp', true);
-  if (kill.blocked) return 'halted';
+  if (kill.blocked) {
+    // Deferred, not dropped: it goes out after release only if the usual
+    // staleness and give-up rules still hold on a later pass.
+    await deferHolding(db, conversationId, new Date(now.getTime() + HOLDING_RETRY_MS));
+    return 'halted';
+  }
 
   // A deferred reply (holding_due_at set) is still wanted while the question is open;
   // a first attempt must be fresh.

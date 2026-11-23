@@ -2,7 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, withBusiness } from '../db/pool.js';
 import { compileCharter } from '../charter/compile.js';
 import { appendAudit, queryAudit } from '../audit/log.js';
-import { trip } from '../governance/killswitch.js';
+import { release, trip } from '../governance/killswitch.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { canonicalHash } from '../util/canonical.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -77,6 +77,22 @@ describe('holding reply', () => {
     await withBusiness(TEST_BUSINESS, (db) => trip(db, 'outbound', 'test', 'stop'));
     expect(await run(gw, id)).toBe('halted');
     expect(gw.sent).toHaveLength(0);
+  });
+
+  it('halted is a deferral: after release a later pass still sends it', async () => {
+    const gw = createFakeGateway();
+    const id = await conv(ago(5));
+    await withBusiness(TEST_BUSINESS, (db) => trip(db, 'all', 'test', 'stop'));
+    expect(await run(gw, id)).toBe('halted');
+    const c = await withBusiness(TEST_BUSINESS, (db) => loadConversation(db, id));
+    expect(c?.holdingDueAt).not.toBeNull();
+    await withBusiness(TEST_BUSINESS, (db) => release(db, 'all', 'test', 'ok'));
+    const later = new Date(Date.now() + 6 * 60_000);
+    const out = await withBusiness(TEST_BUSINESS, (db) =>
+      sendDueHoldingReplies(db, { gateway: gw, bundle: open, now: later }),
+    );
+    expect(out.sent).toBe(1);
+    expect(gw.sent).toHaveLength(1);
   });
 
   it('capped: three holdings to the number today', async () => {
