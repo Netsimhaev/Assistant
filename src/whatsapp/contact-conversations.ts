@@ -150,6 +150,21 @@ export async function loadConversation(db: BusinessDb, conversationId: string): 
   return rows[0] ? toContactConversation(rows[0]) : null;
 }
 
+/**
+ * True only when `conversationId` (own string, non-empty) names a
+ * conversation of this business that is still `carded` and whose current
+ * card is `jobId`. The positive binding a WhatsApp attachment needs.
+ */
+export async function jobIsCardOfConversation(db: BusinessDb, jobId: string, conversationId: unknown): Promise<boolean> {
+  if (typeof conversationId !== 'string' || conversationId === '') return false;
+  const { rows } = await db.query(
+    `SELECT 1 FROM contact_conversations
+      WHERE business_id = $3 AND conversation_id = $1 AND card_job_id = $2 AND state = 'carded'`,
+    [conversationId, jobId, db.businessId],
+  );
+  return rows.length > 0;
+}
+
 export async function conversationByCardJob(db: BusinessDb, jobId: string): Promise<ContactConversation | null> {
   const { rows } = await db.query<ContactConversationRow>(
     `SELECT * FROM contact_conversations WHERE business_id = $2 AND card_job_id = $1

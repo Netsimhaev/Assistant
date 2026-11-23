@@ -28,5 +28,12 @@ export function waAttachmentWithoutConversation(toolName: string, input: Record<
 }
 
 export const WA_ATTACHMENT_WITHOUT_CONVERSATION_CODE = 'wa_attachment_without_conversation';
+/**
+ * A file named on a step whose job is not the current card of the named
+ * conversation (or the conversation is no longer `carded`). Refused in
+ * `runPlan` before a byte is read: a real conversation id on an
+ * owner-ordered job refines to `whatsapp.reply`, but it is not a card.
+ */
+export const WA_ATTACHMENT_NOT_CARD_CODE = 'wa_attachment_not_card';
 export const WA_ATTACHMENT_WITHOUT_CONVERSATION_HE =
   'אפשר לצרף קובץ להודעת וואטסאפ רק כתשובה לפנייה של איש קשר — לא בהודעה שנשלחת ביוזמתך.';

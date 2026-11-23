@@ -34,7 +34,7 @@ afterAll(async () => {
   await closePool();
 });
 
-function waPlan(input: Record<string, unknown>): Plan {
+function waPlan(input: Record<string, unknown>, expectedActionClass: 'whatsapp.initiate' | 'whatsapp.reply' = 'whatsapp.initiate'): Plan {
   return Plan.parse({
     goal: 'הודעת וואטסאפ',
     steps: [{
@@ -43,7 +43,7 @@ function waPlan(input: Record<string, unknown>): Plan {
       intent: 'send',
       toolName: 'wa.send_message',
       input,
-      expectedActionClass: 'whatsapp.initiate',
+      expectedActionClass,
     }],
   });
 }
@@ -147,6 +147,17 @@ describe('an owner-ordered WhatsApp never attaches a stored file (I1)', () => {
     // Positive control: identical recipient and body, no file — asked.
     const offered = await instruct(text, waPlan({ to: DANA, body: 'מצורף' }));
     expect(offered.status).toBe('needs_confirmation');
+  });
+
+  it('refuses attachDocumentId even with a real-looking conversationId — an owner order is never a card', async () => {
+    const text = `תשלחי בוואטסאפ ל-${DANA} את הקובץ`;
+    const refused = await instruct(
+      text,
+      waPlan({ to: DANA, body: 'מצורף', conversationId: 'CONV-REAL', attachDocumentId: 'DOC-STRANGER' }, 'whatsapp.reply'),
+    );
+    expect(refused).toEqual({ status: 'refused', reason: WA_ATTACHMENT_WITHOUT_CONVERSATION_HE });
+    const { rows } = await testDb().query('SELECT 1 FROM instruction_confirmations');
+    expect(rows).toHaveLength(0);
   });
 });
 

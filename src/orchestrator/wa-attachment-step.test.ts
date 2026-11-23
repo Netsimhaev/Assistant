@@ -83,7 +83,10 @@ describe('resolveStoredDocument', () => {
 });
 
 describe('wa.send_message attachDocumentId in runPlan', () => {
-  async function run(documentId: string, opts: { conversation?: boolean } = {}) {
+  async function run(
+    documentId: string,
+    opts: { conversation?: boolean; card?: 'self' | 'other_job' | 'closed' | 'none' } = {},
+  ) {
     const plain = buildCharter({ autonomyBase: { 'whatsapp.initiate': 'auto' } });
     const { signature: _sig, ...unsignedBase } = plain;
     const base = BusinessCharter.parse(
@@ -105,6 +108,15 @@ describe('wa.send_message attachDocumentId in runPlan', () => {
     const job = await withBusiness(TEST_BUSINESS, (db) => createJob(db, { charterVersion: bundle.charterVersion, provenance: 'boss' }));
     for (const to of ['understand', 'plan', 'execute'] as const) {
       await withBusiness(TEST_BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
+    }
+    const card = opts.card ?? 'self';
+    if (card !== 'none') {
+      await testDb().query(
+        `INSERT INTO contact_conversations
+           (business_id, conversation_id, contact_key, contact_kind, state, last_inbound_at, card_job_id)
+         VALUES ($1, 'CONV-1', '972501234567', 'client', $2, now(), $3)`,
+        [TEST_BUSINESS, card === 'closed' ? 'closed' : 'carded', card === 'other_job' ? 'JOB-SOMEONE-ELSE' : job.jobId],
+      );
     }
     const loaded = await withBusiness(TEST_BUSINESS, (db) => loadJob(db, job.jobId));
     if (loaded === null) throw new Error('job vanished');
@@ -174,6 +186,23 @@ describe('wa.send_message attachDocumentId in runPlan', () => {
     expect(att).toHaveLength(1);
     expect(Buffer.from(att[0]!.bytes).equals(bytes)).toBe(true);
     expect(sha(Buffer.from(att[0]!.bytes))).toBe(sha(bytes));
+  });
+
+  it('halts before reading the file when the conversation exists but this job is not its card, or it is no longer carded', async () => {
+    const bytes = Buffer.from('a stranger mailed this');
+    for (const card of ['none', 'other_job', 'closed'] as const) {
+      await resetDatabase();
+      await seedDoc(TEST_BUSINESS, 'DOC-CARD', bytes);
+      const { result, calls } = await run('DOC-CARD', { card });
+      expect(result, card).toMatchObject({ status: 'halted', reason: 'wa_attachment_not_card' });
+      expect(calls, card).toHaveLength(0);
+    }
+    // Positive control: the same step on the conversation's own card goes out.
+    await resetDatabase();
+    await seedDoc(TEST_BUSINESS, 'DOC-CARD', bytes);
+    const control = await run('DOC-CARD', { card: 'self' });
+    expect(control.result.status).toBe('done');
+    expect(control.calls).toHaveLength(1);
   });
 
   it('rejects the whole plan when a WhatsApp step names a file but no conversation — no adapter call', async () => {

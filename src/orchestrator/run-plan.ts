@@ -37,8 +37,10 @@ import type { Job } from './jobs.js';
 import {
   WA_ATTACHMENT_WITHOUT_CONVERSATION_CODE,
   WA_ATTACHMENT_WITHOUT_CONVERSATION_HE,
+  WA_ATTACHMENT_NOT_CARD_CODE,
   waAttachmentWithoutConversation,
 } from '../domain/wa-attachment.js';
+import { jobIsCardOfConversation } from '../whatsapp/contact-conversations.js';
 import type { BusinessDb } from '../db/pool.js';
 
 /**
@@ -887,6 +889,14 @@ async function stepAttachments(
   if (toolName === 'wa.send_message' && Object.hasOwn(effectiveInput, 'attachDocumentId')) {
     if (waAttachmentWithoutConversation(toolName, effectiveInput)) {
       throw new StepChannelError(WA_ATTACHMENT_WITHOUT_CONVERSATION_CODE, WA_ATTACHMENT_WITHOUT_CONVERSATION_HE, false);
+    }
+    // A conversation id alone proves nothing: a model-written step on an
+    // owner-ordered job can name a real, open conversation and so refine to
+    // `whatsapp.reply`. The file goes out only when THIS job is the current
+    // card of THAT conversation, still `carded` — the one path whose
+    // attachment the drafter was handed from this run's tier-2 results.
+    if (!(await jobIsCardOfConversation(db, job.jobId, effectiveInput['conversationId']))) {
+      throw new StepChannelError(WA_ATTACHMENT_NOT_CARD_CODE, WA_ATTACHMENT_WITHOUT_CONVERSATION_HE, false);
     }
     const id = effectiveInput['attachDocumentId'];
     if (typeof id !== 'string' || id === '') throw new StepChannelError('attachment_invalid', ATTACHMENT_INVALID_HE, false);
