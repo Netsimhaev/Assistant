@@ -33,6 +33,11 @@ import { canonicalHash } from '../util/canonical.js';
 import type { ErasureItem, ErasurePlan, ErasureRefusal } from './erasure-plan.js';
 import {
   ACTION_UPDATES_ERASED_PREDICATE,
+  CONTACT_CONVERSATIONS_ERASED_PREDICATE,
+  CONTACT_DOCUMENTS_ERASED_PREDICATE,
+  CONTACT_REPLY_DECISIONS_ERASED_PREDICATE,
+  contactConversationParams,
+  contactPhoneKey,
   INSTRUCTION_CONFIRMATIONS_ERASED_PREDICATE,
   CONFIRMED_STEP_CLAIMS_ERASED_PREDICATE,
   AGENT_ENVELOPES_ERASED_PREDICATE,
@@ -360,6 +365,25 @@ export async function executeErasure(
       'charter_interview_drafts',
       `DELETE FROM charter_interview_drafts WHERE ${CHARTER_INTERVIEW_DRAFTS_ERASED_PREDICATE}`,
       [businessId, draftIds],
+    );
+    // WhatsApp contacts (migration 083): decisions, documents, conversations,
+    // ahead of the `documents` delete and the job scrub below. None of the
+    // three has a foreign key, so no cascade can beat these statements to a
+    // row. Same predicates, same parameters, as `countItems`.
+    await del(
+      'contact_reply_decisions',
+      `DELETE FROM contact_reply_decisions WHERE ${CONTACT_REPLY_DECISIONS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    );
+    await del(
+      'contact_documents',
+      `DELETE FROM contact_documents WHERE ${CONTACT_DOCUMENTS_ERASED_PREDICATE}`,
+      [businessId, documentIds, contactPhoneKey(plan.anchor)],
+    );
+    await del(
+      'contact_conversations',
+      `DELETE FROM contact_conversations WHERE ${CONTACT_CONVERSATIONS_ERASED_PREDICATE}`,
+      contactConversationParams(businessId, jobIds, plan.anchor),
     );
     await del(
       'proposals',

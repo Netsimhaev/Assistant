@@ -156,14 +156,22 @@ describe('what an erasure leaves behind', () => {
    * hold no person and are not wired. The records at the provider are never
    * deleted, and the preview is asserted to name the system.
    *
-   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen, then twenty, then twenty-one, then twenty-two, then twenty-three, then twenty-five" count is spec §5.1's own
+   * **A twenty-sixth, also outside spec §5.1: WhatsApp conversations with
+   * contacts (migration 083)** — `contact_conversations.contact_subject_key`
+   * (and `contact_key`, digits only, reached by a phone anchor — see the
+   * phone-anchor test below), plus `whatsapp_messages.recipient_number` on
+   * jobless outbound rows. `contact_reply_decisions` and `contact_documents`
+   * hold ids only and are asserted deleted directly;
+   * `contact_whatsapp_settings` holds no person and is not wired.
+   *
+   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen, then twenty, then twenty-one, then twenty-two, then twenty-three, then twenty-five, then twenty-six" count is spec §5.1's own
    * original content-store enumeration, growing as new content-bearing
    * tables were added to it — it is a DIFFERENT number from "how many
-   * tables `countItems`/the executor each name today" (39 since migrations 077–079 added `external_reads`, `external_events` and `external_learning_jobs`; CLAUDE.md states
+   * tables `countItems`/the executor each name today" (42 since migration 083 added `contact_conversations`, `contact_reply_decisions` and `contact_documents`; CLAUDE.md states
    * that figure, because it is the one a reader can grep `erasure-plan.ts`
    * and count directly). The two will not generally match: this file's
    * count tracks a design document's own enumeration of content-bearing
-   * stores, while the 39 also includes tables scrubbed as a consequence of
+   * stores, while the 42 also includes tables scrubbed as a consequence of
    * a kept-vs-erased JOB rather than discovered as a content store in their
    * own right (`jobs`, `job_steps`, `job_step_results`), and counts a table
    * once per table name regardless of how many `action`s `countItems` runs
@@ -722,11 +730,62 @@ describe('what an erasure leaves behind', () => {
     await withBusiness(BUSINESS, (bdb) => transition(bdb, learningJob.jobId, { to: 'understand', actor: 'orchestrator', reason: 't' }));
     await withBusiness(BUSINESS, (bdb) => transition(bdb, learningJob.jobId, { to: 'closed', actor: 'orchestrator', reason: 't' }));
 
+    // --- Migration 083: WhatsApp conversations with contacts. -----------
+    //
+    // `contact_key` is digits only, so the probe (an address) cannot sit
+    // there; it sits in `contact_subject_key`, the memory subject the
+    // conversation was resolved to. A carded conversation on a nameless job
+    // — only the conversation's own discovery can bring that job in — and a
+    // card-less one, matched directly by the contact arm. Its decision row
+    // and a document assignment hold ids only and are asserted gone directly.
+    // Two jobless outbound messages (holding replies / approved sends are
+    // recorded with `job_id` NULL): one naming the probe in both the body and
+    // `recipient_number`, and one naming it ONLY in `recipient_number` — the
+    // sweep can see that row only if the recipient arm works.
+    const cardJob = await withBusiness(BUSINESS, (db) => createJob(db, {
+      charterVersion: bundle.charterVersion,
+      provenance: 'unknown_external',
+      title: 'הודעת וואטסאפ מאיש קשר',
+    }));
+    await db.query(
+      `INSERT INTO contact_conversations
+         (business_id, conversation_id, contact_key, contact_subject_key, contact_kind, state,
+          last_inbound_at, card_job_id)
+       VALUES ($1, 'CC-probe', '972509990001', $2, 'client', 'answered', now(), $3),
+              ($1, 'CC-probe-nocard', '972509990001', $2, 'client', 'closed', now(), NULL)`,
+      [BUSINESS, PROBE, cardJob.jobId],
+    );
+    await db.query(
+      `INSERT INTO contact_reply_decisions
+         (business_id, decision_id, conversation_id, job_id, approval_id, verdict, source_tiers, decided_at)
+       VALUES ($1, 'CRD-probe', 'CC-probe', $2, 'AP-contact-probe', 'right', ARRAY['tier2'], now())`,
+      [BUSINESS, cardJob.jobId],
+    );
+    await db.query(
+      `INSERT INTO contact_documents (business_id, document_id, contact_key, kind, assigned_by)
+       VALUES ($1, $2, '972509990001', 'invoice', 'owner_upload')`,
+      [BUSINESS, documentId],
+    );
+    await db.query(
+      `INSERT INTO whatsapp_messages
+         (id, business_id, direction, body, provider_timestamp, state, job_id, recipient_number)
+       VALUES ('WA-probe-outbound', $1, 'outbound', $2, now(), 'handled', NULL, $3),
+              ('WA-probe-outbound-recipient', $1, 'outbound', 'שלום, קיבלתי את הודעתך', now(), 'handled', NULL, $3)`,
+      [BUSINESS, `תשובה אל ${PROBE}`, PROBE],
+    );
+
     const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PROBE }));
     for (const table of ['external_reads', 'external_events', 'external_learning_jobs']) {
       expect(plan.items.find((item) => item.table === table && item.action === 'delete')?.count, table).toBe(1);
     }
-    expect(plan.jobIds).toEqual(expect.arrayContaining([readJob.jobId, learningJob.jobId]));
+    expect(plan.jobIds).toEqual(expect.arrayContaining([readJob.jobId, learningJob.jobId, cardJob.jobId]));
+    for (const [table, count] of [
+      ['contact_conversations', 2],
+      ['contact_reply_decisions', 1],
+      ['contact_documents', 1],
+    ] as const) {
+      expect(plan.items.find((item) => item.table === table && item.action === 'delete')?.count, table).toBe(count);
+    }
     // The records at the provider outlive the erasure and the preview says so.
     expect(plan.externalSystemsKept).toEqual(['crm']);
     for (const table of ['business_colleagues', 'setup_packages']) {
@@ -785,6 +844,12 @@ describe('what an erasure leaves behind', () => {
       learningJob.jobId,
     ]);
     expect(learningRecord.rows).toHaveLength(0);
+
+    // Migration 083's two id-only tables, asserted gone directly.
+    const decisions = await db.query('SELECT 1 FROM contact_reply_decisions WHERE business_id = $1', [BUSINESS]);
+    expect(decisions.rows).toHaveLength(0);
+    const contactDocuments = await db.query('SELECT 1 FROM contact_documents WHERE business_id = $1', [BUSINESS]);
+    expect(contactDocuments.rows).toHaveLength(0);
 
     const claims = await db.query('SELECT 1 FROM confirmed_step_claims WHERE business_id = $1 AND job_id = $2', [
       BUSINESS,
