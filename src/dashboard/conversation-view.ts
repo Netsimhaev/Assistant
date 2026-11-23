@@ -56,6 +56,13 @@ const STYLE = `
 function senderLabel(m: StoredMessage): string {
   if (m.direction === 'outbound') return 'העוזרת';
   if (m.senderKind === 'principal') return 'אתה (בעל העסק)';
+  // Since the contact flow (ruling R11d) the door writes who the sender is:
+  // a managed contact (client or supplier — the row does not say which), a
+  // colleague, or a number nobody vouched for. 'other' is what rows written
+  // before that still carry.
+  if (m.senderKind === 'contact') return 'לקוח/ספק';
+  if (m.senderKind === 'colleague') return 'איש צוות';
+  if (m.senderKind === 'unknown') return 'שולח לא מוכר';
   if (m.senderKind === 'other') return 'שולח אחר';
   return 'שולח לא מזוהה';
 }

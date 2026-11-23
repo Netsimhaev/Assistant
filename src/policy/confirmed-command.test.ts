@@ -515,3 +515,100 @@ describe('what the command never overrides', () => {
     expect(await claims(s.jobId)).toBe(1);
   });
 });
+
+/**
+ * Task 13 (H15): a scheduled WhatsApp keeps its "yes" until `sendAt + 24h`,
+ * only while the active charter is still the job's. Every negative proves the
+ * normal path ran and stopped at stage 8 (`expectNormalPathDraftOnly`).
+ */
+describe('a scheduled WhatsApp keeps its confirmation until sendAt + 24h', () => {
+  const HOUR = 60 * 60 * 1000;
+
+  function wa(sendAt: Date | string): Record<string, unknown> {
+    return {
+      to: '+972541234567',
+      body: 'תזכורת: הפגישה מחר',
+      sendAt: typeof sendAt === 'string' ? sendAt : sendAt.toISOString(),
+    };
+  }
+
+  async function waSetup(input: Record<string, unknown>, overrides: SetupOptions = {}): Promise<Setup> {
+    const s = await setup({ toolName: 'wa.send_message', stepAgent: 'comms.whatsapp', input, ...overrides });
+    return { ...s, ctx: { ...s.ctx, agent: 'comms.whatsapp' } };
+  }
+
+  async function decidedHoursAgo(jobId: string, hours: number): Promise<void> {
+    await testDb().query(
+      `UPDATE instruction_confirmations SET decided_at = now() - make_interval(hours => $2) WHERE job_id = $1`,
+      [jobId, hours],
+    );
+  }
+
+  it('confirmed tonight, sendAt in 3 days: covered at sendAt', async () => {
+    // At send time: decided 72 h ago, sendAt one minute ago.
+    const input = wa(new Date(Date.now() - 60 * 1000));
+    const s = await waSetup(input);
+    await decidedHoursAgo(s.jobId, 72);
+    await expectExempt(await evaluateFor('wa.send_message', input, s.ctx), s, input);
+  });
+
+  it('same but charter re-signed in between: not covered', async () => {
+    const input = wa(new Date(Date.now() - 60 * 1000));
+    const s = await waSetup(input);
+    await decidedHoursAgo(s.jobId, 72);
+    // Re-signed: the active charter is no longer the one the job ran under.
+    const resigned = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: '2026-08-16.1' })));
+    const decision = await evaluateFor('wa.send_message', input, { ...s.ctx, bundle: resigned });
+    await expectNormalPathDraftOnly(decision, s.jobId);
+  });
+
+  it('no sendAt: 25 h after decision not covered', async () => {
+    const input = { to: '+972541234567', body: 'שלום' };
+    const s = await waSetup(input);
+    await decidedHoursAgo(s.jobId, 25);
+    await expectNormalPathDraftOnly(await evaluateFor('wa.send_message', input, s.ctx), s.jobId);
+  });
+
+  it('more than 24 h after sendAt: not covered', async () => {
+    const input = wa(new Date(Date.now() - 25 * HOUR));
+    const s = await waSetup(input);
+    await decidedHoursAgo(s.jobId, 72);
+    await expectNormalPathDraftOnly(await evaluateFor('wa.send_message', input, s.ctx), s.jobId);
+  });
+
+  it('a "yes" given after sendAt does not extend', async () => {
+    const input = wa(new Date(Date.now() - 30 * HOUR));
+    const s = await waSetup(input);
+    // decided 25 h ago — after the sendAt of 30 h ago.
+    await decidedHoursAgo(s.jobId, 25);
+    await expectNormalPathDraftOnly(await evaluateFor('wa.send_message', input, s.ctx), s.jobId);
+  });
+
+  it('an unparsable sendAt gives no extension', async () => {
+    const input = wa('2026-02-30T09:00:00Z');
+    const s = await waSetup(input);
+    await decidedHoursAgo(s.jobId, 25);
+    await expectNormalPathDraftOnly(await evaluateFor('wa.send_message', input, s.ctx), s.jobId);
+  });
+
+  it('a sendAt more than 30 days after the "yes" gives no extension', async () => {
+    const input = wa(new Date(Date.now() - 60 * 1000));
+    const s = await waSetup(input);
+    await decidedHoursAgo(s.jobId, 31 * 24);
+    await expectNormalPathDraftOnly(await evaluateFor('wa.send_message', input, s.ctx), s.jobId);
+  });
+
+  it('within 24 h of the "yes" the window is the ordinary one, sendAt or not', async () => {
+    const input = wa(new Date(Date.now() + 2 * HOUR));
+    const s = await waSetup(input);
+    await decidedHoursAgo(s.jobId, 1);
+    await expectExempt(await evaluateFor('wa.send_message', input, s.ctx), s, input);
+  });
+
+  it('a sendAt on any other tool gives no extension', async () => {
+    const input = { ...SEND, sendAt: new Date(Date.now() - 60 * 1000).toISOString() };
+    const s = await setup({ input });
+    await decidedHoursAgo(s.jobId, 72);
+    await expectNormalPathDraftOnly(await evaluateFor('mail.send', input, s.ctx), s.jobId);
+  });
+});

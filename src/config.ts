@@ -250,6 +250,9 @@ export const config = {
   // A single recording longer than this is never sent to the provider at all
   // — see transcribe.ts, checked before either daily budget.
   whatsappMaxAudioSeconds: positiveInt('WHATSAPP_MAX_AUDIO_SECONDS', 180),
+  // Model reads of clients' and suppliers' WhatsApp messages, per business per
+  // day. 0 stops them.
+  contactWaReadsPerDay: positiveInt('CONTACT_WA_READS_PER_DAY', 100),
   // Every instruction spends a planner call, same shape as curationRunsPerDay/
   // delegationsPerDay above. Read by the triage task that wires instructions
   // to the planner, not by transcribe.ts. MUST be counted off its own

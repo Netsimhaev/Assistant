@@ -406,3 +406,57 @@ describe('graph attachments (document production §8.2)', () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+describe('graph searchSent', () => {
+  const q = { to: 'dana@x.co.il', sinceDays: 365, limit: 20 };
+
+  it('searches the sent folder with attachments expanded', async () => {
+    const { http, calls } = fake(() => ({
+      status: 200,
+      body: {
+        value: [
+          {
+            id: 'S1',
+            subject: 'חשבונית',
+            toRecipients: [{ emailAddress: { address: 'Dana@X.co.il' } }],
+            ccRecipients: [{ emailAddress: { address: 'b@y.com' } }],
+            sentDateTime: new Date(Date.now() - 86_400_000).toISOString(),
+            attachments: [{ id: 'a1', name: 'inv.pdf', contentType: 'application/pdf' }],
+          },
+        ],
+      },
+    }));
+    const res = await createGraphClient(http).searchSent('tok', q, signal);
+    const raw = calls[0]!.url;
+    expect(raw.startsWith('https://graph.microsoft.com/v1.0/me/mailFolders/sentitems/messages?')).toBe(true);
+    const url = new URL(raw);
+    expect(url.searchParams.has('$filter')).toBe(false);
+    expect(url.searchParams.get('$search')).toBe('"to:dana@x.co.il"');
+    expect(url.searchParams.get('$top')).toBe('20');
+    expect(url.searchParams.get('$expand')).toBe('attachments($select=id,name,contentType)');
+    expect(res).toEqual([
+      {
+        providerMessageId: 'S1',
+        sentAt: expect.any(String),
+        subject: 'חשבונית',
+        recipients: ['dana@x.co.il', 'b@y.com'],
+        attachments: [{ attachmentId: 'a1', filename: 'inv.pdf', mediaType: 'application/pdf' }],
+      },
+    ]);
+  });
+
+  it('drops messages older than sinceDays', async () => {
+    const { http } = fake(() => ({
+      status: 200,
+      body: { value: [{ id: 'old', subject: 'x', sentDateTime: '2020-01-01T00:00:00Z', attachments: [] }] },
+    }));
+    expect(await createGraphClient(http).searchSent('tok', q, signal)).toEqual([]);
+  });
+
+  it('refuses a malformed to without HTTP', async () => {
+    const { http, calls } = fake(() => ({ status: 200, body: {} }));
+    const res = await createGraphClient(http).searchSent('tok', { ...q, to: 'x"y@z.co' }, signal);
+    expect(res).toMatchObject({ failure: 'rejected' });
+    expect(calls).toHaveLength(0);
+  });
+});

@@ -147,11 +147,15 @@ function twoStepPlan(body = 'שלום'): Plan {
  * resumption — what re-runs, what is skipped, what the idempotency key
  * protects — and a step that never sends observes none of it.
  *
+ * `knownCounterpartyPhone` does the same for the WhatsApp step's `+972500000000`:
+ * since `readPhones` reads `to` for `wa.*` tools (ruling R7) that number is a
+ * recipient the gate sees, and an unknown one is a first contact.
+ *
  * Deliberately NOT extended to `example.com`: the plans that send to
  * `new@example.com` are the ones whose second step is *supposed* to queue.
  */
 async function install(connections: CharterConnection[]): Promise<PolicyBundle> {
-  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections, knownCounterpartyEmailDomain: 'b.com' })));
+  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections, knownCounterpartyEmailDomain: 'b.com', knownCounterpartyPhone: '+972500000000' })));
 }
 
 async function jobInExecute(bundle: PolicyBundle): Promise<Job> {

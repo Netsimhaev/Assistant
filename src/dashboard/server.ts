@@ -109,6 +109,7 @@ import type { OAuthRouteOptions } from './oauth-routes.js';
 import { MAILBOX_SYSTEM, type MailProvider } from '../mail/mailbox.js';
 import type { MailboxClient } from '../mail/providers/types.js';
 import { isMailReplyJob } from '../mail/inbox-store.js';
+import { contactReplyEditAllowed } from '../whatsapp/contact-reply-edit.js';
 import { mailReplyEditRefusal, mailboxReplyRecipient } from '../mail/reply-card.js';
 import {
   handleMailboxRevertPost,
@@ -122,6 +123,11 @@ import {
   handleCalendarSignPost,
   handleCalendarStatus,
 } from './calendar-connect.js';
+import {
+  handleWhatsAppContactsRevertPost,
+  handleWhatsAppContactsSignPost,
+  handleWhatsAppContactsStatus,
+} from './whatsapp-contacts-connect.js';
 import {
   handleExternalRemovePost,
   handleExternalSignGet,
@@ -148,7 +154,19 @@ import {
   handleLedgerSettingsPost,
 } from './ledger-routes.js';
 import { DESCRIPTION_SETTINGS_PATH, handleDescriptionGet, handleDescriptionPost } from './description-routes.js';
-import { PEOPLE_ACTION_PATH, PEOPLE_SETTINGS_PATH, handlePeopleAction, handlePeopleGet } from './people-routes.js';
+import {
+  PEOPLE_ACTION_PATH,
+  PEOPLE_INVOICE_PATH,
+  PEOPLE_SETTINGS_PATH,
+  handlePeopleAction,
+  handlePeopleGet,
+  handlePeopleInvoicePost,
+} from './people-routes.js';
+import {
+  CONTACT_WHATSAPP_SETTINGS_PATH,
+  handleContactWhatsappGet,
+  handleContactWhatsappPost,
+} from './contact-whatsapp-settings.js';
 import {
   PROFILE_LOGO_PATH,
   PROFILE_SETTINGS_PATH,
@@ -3097,6 +3115,27 @@ async function handleDecision(
     );
   }
 
+  // A WhatsApp contact reply goes to the contact and thread the card showed:
+  // only the body may be edited. Keyed on the tool, a positive marker, and
+  // checked before the decision is recorded, so the approval stays pending.
+  if (
+    edit.editedInput !== undefined &&
+    approval.proposedTool === 'wa.send_message' &&
+    !contactReplyEditAllowed(approval.proposedInput, edit.editedInput)
+  ) {
+    return sendHtml(
+      res,
+      400,
+      renderApprovalCard({
+        approval,
+        csrf: issueCsrfToken(session.sessionId),
+        editValue: JSON.stringify(edit.editedInput, null, 2),
+        ...(note !== undefined ? { noteValue: note } : {}),
+        error: 'במענה לאיש קשר אפשר לערוך רק את תוכן ההודעה — הנמען והשיחה נשארים כפי שהוצגו.',
+      }),
+    );
+  }
+
   // `applyDecision` only knows 'approved' | 'denied' — a signature is an
   // extra act performed before this, not a third outcome it records itself.
   await applyDecision(db, approvalId, outcome === 'denied' ? 'denied' : 'approved', {
@@ -3531,6 +3570,16 @@ async function route(
   if (method === 'POST' && pathname === '/connections/calendar/revert') {
     return handleCalendarRevertPost(res, db, session, await readFormBody(req));
   }
+  // WhatsApp to clients and suppliers (phase 1): sign + live binding in one transaction.
+  if (method === 'GET' && pathname === '/connections/whatsapp-contacts') {
+    return handleWhatsAppContactsStatus(res, db, issueCsrfToken(session.sessionId));
+  }
+  if (method === 'POST' && pathname === '/connections/whatsapp-contacts/sign') {
+    return handleWhatsAppContactsSignPost(res, db, session, await readFormBody(req));
+  }
+  if (method === 'POST' && pathname === '/connections/whatsapp-contacts/revert') {
+    return handleWhatsAppContactsRevertPost(res, db, session, await readFormBody(req));
+  }
   // External systems: the owner signs what the technician drafted (Stage D).
   if (method === 'GET' && pathname === '/systems') return handleSystems(res, db);
   if (method === 'GET' && pathname === '/connections/external') {
@@ -3597,6 +3646,13 @@ async function route(
     return handleLogoPost(req, res, db, session, documentRoot ?? config.documentRoot);
   }
   if (method === 'GET' && pathname === PEOPLE_SETTINGS_PATH) return handlePeopleGet(res, db, session);
+  if (method === 'GET' && pathname === CONTACT_WHATSAPP_SETTINGS_PATH) return handleContactWhatsappGet(res, db, session);
+  if (method === 'POST' && pathname === CONTACT_WHATSAPP_SETTINGS_PATH) {
+    return handleContactWhatsappPost(res, db, session, await readFormBody(req));
+  }
+  if (method === 'POST' && pathname === PEOPLE_INVOICE_PATH) {
+    return handlePeopleInvoicePost(req, res, db, session, documentRoot ?? config.documentRoot);
+  }
   const peopleActionMatch = PEOPLE_ACTION_PATH.exec(pathname);
   if (method === 'POST' && peopleActionMatch?.[1] !== undefined && peopleActionMatch[2] !== undefined) {
     const list = peopleActionMatch[1] as 'colleague' | 'contact';

@@ -388,3 +388,60 @@ describe('gmail attachments (document production §8.2)', () => {
     expect(raw).not.toContain('multipart');
   });
 });
+
+describe('gmail searchSent', () => {
+  const q = { to: 'dana@x.co.il', sinceDays: 365, limit: 20 };
+
+  it('lists sent mail with attachments and reads each message', async () => {
+    const { http, calls } = fake((r) => {
+      if (r.url.includes('/messages?')) return { status: 200, body: { messages: [{ id: 'S1' }] } };
+      return {
+        status: 200,
+        body: {
+          id: 'S1',
+          internalDate: String(Date.UTC(2026, 9, 1)),
+          payload: {
+            headers: [
+              { name: 'Subject', value: 'חשבונית' },
+              { name: 'To', value: '"Cohen, Dana" <Dana@X.co.il>' },
+              { name: 'Cc', value: 'b@y.com, "Lee" <c@z.com>' },
+            ],
+            parts: [{ mimeType: 'application/pdf', filename: 'inv.pdf', body: { attachmentId: 'a1' } }],
+          },
+        },
+      };
+    });
+    const res = await createGmailClient(http).searchSent('tok', q, signal);
+    const url = new URL(calls[0]!.url);
+    expect(url.origin + url.pathname).toBe('https://gmail.googleapis.com/gmail/v1/users/me/messages');
+    expect(url.searchParams.get('q')).toBe('in:sent to:dana@x.co.il has:attachment newer_than:365d');
+    expect(url.searchParams.get('maxResults')).toBe('20');
+    expect(calls[1]!.url).toContain('/messages/S1?format=full');
+    expect(res).toEqual([
+      {
+        providerMessageId: 'S1',
+        sentAt: '2026-10-01T00:00:00.000Z',
+        subject: 'חשבונית',
+        recipients: ['dana@x.co.il', 'b@y.com', 'c@z.com'],
+        attachments: [{ attachmentId: 'a1', filename: 'inv.pdf', mediaType: 'application/pdf' }],
+      },
+    ]);
+  });
+
+  it('skips a message whose read fails instead of discarding all results', async () => {
+    const { http } = fake((r) => {
+      if (r.url.includes('/messages?')) return { status: 200, body: { messages: [{ id: 'BAD' }, { id: 'S2' }] } };
+      if (r.url.includes('/messages/BAD')) return { status: 403, body: {} };
+      return { status: 200, body: { id: 'S2', internalDate: '1', payload: { headers: [], parts: [] } } };
+    });
+    const res = await createGmailClient(http).searchSent('tok', q, signal);
+    expect(Array.isArray(res) && res.map((m) => m.providerMessageId)).toEqual(['S2']);
+  });
+
+  it('refuses a malformed to without HTTP', async () => {
+    const { http, calls } = fake(() => ({ status: 200, body: {} }));
+    const res = await createGmailClient(http).searchSent('tok', { ...q, to: 'a@b.co OR in:anywhere' }, signal);
+    expect(res).toMatchObject({ failure: 'rejected' });
+    expect(calls).toHaveLength(0);
+  });
+});

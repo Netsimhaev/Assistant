@@ -1446,13 +1446,33 @@ export const LOCAL_TOOL_REDIRECTS: readonly { toolName: string; payload: string 
 }));
 
 /**
+ * Payload contracts of channel tools — performed by an adapter, not a local
+ * handler — that the planner would otherwise invent from the tool name.
+ *
+ * Kept apart from `LOCAL_TOOL_CONTRACTS` for the same reason as the redirects:
+ * that list's invariant is "declared == implemented locally". `wa.send_message`
+ * (task 13): a message to a saved contact or a number the owner typed; the
+ * door refuses any other recipient and a `sendAt` beyond 30 days.
+ */
+export const CHANNEL_TOOL_CONTRACTS: readonly { toolName: string; payload: string }[] = [
+  {
+    toolName: 'wa.send_message',
+    payload:
+      'הודעת וואטסאפ לאיש קשר ששמרת או למספר שהקלדת בהוראה בלבד. ' +
+      '`{"to": מספר בינלאומי עם + (למשל "+972541234567"), "body": טקסט ההודעה, ' +
+      '"sendAt"?: מועד שליחה עתידי כ-ISO עם אזור זמן (למשל "2026-11-24T09:00:00+02:00"), עד 30 יום קדימה}`. ' +
+      'בלי `conversationId` זו הודעה יזומה (`whatsapp.initiate`); בלי `sendAt` היא נשלחת מיד אחרי האישור.',
+  },
+];
+
+/**
  * The contracts as the text a prompt carries.
  *
  * A stable, sorted rendering: this sits in the cacheable prefix of both
  * prompts, and a byte that moves between calls invalidates the whole prefix.
  */
 export function renderLocalToolContracts(): string {
-  return [...LOCAL_TOOL_CONTRACTS, ...LOCAL_TOOL_REDIRECTS]
+  return [...LOCAL_TOOL_CONTRACTS, ...LOCAL_TOOL_REDIRECTS, ...CHANNEL_TOOL_CONTRACTS]
     .sort((a, b) => a.toolName.localeCompare(b.toolName))
     .map((c) => `- \`${c.toolName}\` — ${c.payload}`)
     .join('\n');

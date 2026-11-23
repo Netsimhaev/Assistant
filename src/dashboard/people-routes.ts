@@ -15,7 +15,13 @@
  * have been typed by a technician, and a bidi control in them changes what the
  * owner reads.
  */
-import type { ServerResponse } from 'node:http';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ingestDocument, MAX_ORIGINAL_BYTES } from '../documents/ingest.js';
+import { authorityNumberKey } from '../governance/principal-number.js';
+import { readBoundedMultipart } from './multipart.js';
 import { addColleague, listColleagues, removeColleague, updateColleague } from '../business/colleagues.js';
 import {
   addManagedContact,
@@ -35,10 +41,19 @@ export const PEOPLE_INTRO =
   'העוזרת מכירה את האנשים כאן ויודעת מה התפקיד שלהם. הוראות היא מקבלת רק ממך. כדי שאיש קשר ייחשב "מוכר" (מענה בלי כרטיס אישור), הוסף אותו ב"ערוך את הכללים".';
 
 export const PERSON_FIELDS_REQUIRED = `שם ותפקיד הם שדות חובה (עד ${PERSON_FIELD_MAX_CHARS} תווים).`;
+export const PERSON_EMAIL_INVALID = 'כתובת המייל אינה תקינה.';
+export const PERSON_EXTERNAL_IDS_INVALID = 'המזהים במערכות חיצוניות אינם תקינים (עד חמישה, בצורה מזהה_מערכת=מזהה).';
 export const PERSON_NOT_FOUND = 'לא מצאתי את האדם הזה — אולי הוא כבר הוסר. רענן את העמוד.';
 
 /** `POST /settings/people/<colleague|contact>/<add|edit|remove>`. */
 export const PEOPLE_ACTION_PATH = /^\/settings\/people\/(colleague|contact)\/(add|edit|remove)$/;
+
+/** `POST /settings/people/contact/invoice` — attach an invoice file to a managed contact. */
+export const PEOPLE_INVOICE_PATH = '/settings/people/contact/invoice';
+
+export const INVOICE_FILE_MISSING = 'לא נבחר קובץ.';
+export const INVOICE_TOO_LARGE = 'הקובץ גדול מדי.';
+export const INVOICE_UPLOAD_MALFORMED = 'לא הצלחתי לקרוא את הטופס.';
 
 export interface PeopleSession {
   sessionId: string;
@@ -58,17 +73,53 @@ function seeOther(res: ServerResponse, location: string): void {
 }
 
 /** The fields of one person, parsed; or the Hebrew reason they are refused. */
-function personFrom(form: URLSearchParams): { ok: true; entry: PersonEntry } | { ok: false; error: string } {
+function personFrom(
+  form: URLSearchParams,
+  withContactFields: boolean,
+): { ok: true; entry: PersonEntry } | { ok: false; error: string } {
+  const kind = withContactFields ? (form.get('kind') ?? '') : '';
+  const email = withContactFields ? (form.get('email') ?? '').trim() : '';
+  const externalIds = withContactFields ? parseExternalIds(form.get('externalIds') ?? '') : {};
   const parsed = PersonEntry.safeParse({
     name: form.get('name') ?? '',
     role: form.get('role') ?? '',
     phone: form.get('phone') ?? '',
+    ...(kind === '' ? {} : { kind }),
+    ...(email === '' ? {} : { email }),
+    ...(Object.keys(externalIds).length === 0 ? {} : { externalIds }),
   });
   if (parsed.success) return { ok: true, entry: parsed.data };
+  if (parsed.error.issues.some((i) => i.path[0] === 'externalIds')) {
+    return { ok: false, error: PERSON_EXTERNAL_IDS_INVALID };
+  }
+  if (parsed.error.issues.some((i) => i.path[0] === 'email')) return { ok: false, error: PERSON_EMAIL_INVALID };
   // The phone's own issue is already Hebrew (`InternationalPhone`); the
   // name/role issues are zod's English defaults, replaced here.
   const phoneIssue = parsed.error.issues.find((i) => i.path[0] === 'phone' && i.code === 'custom');
   return { ok: false, error: phoneIssue?.message ?? PERSON_FIELDS_REQUIRED };
+}
+
+/** One `system=id` per line; whatever `PersonEntry` refuses is reported by `personFrom`. */
+function parseExternalIds(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const line of text.split(/\r?\n/)) {
+    const at = line.indexOf('=');
+    if (at < 0) continue;
+    const key = line.slice(0, at).trim();
+    const value = line.slice(at + 1).trim();
+    if (key !== '' && value !== '') out[key] = value;
+  }
+  return out;
+}
+
+function contactInputs(values: { kind: string | null; email: string | null; externalIds: Record<string, string> }): string {
+  const idLines = Object.entries(values.externalIds)
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
+  const opt = (v: string, label: string) => `<option value="${v}"${values.kind === v || (v === '' && values.kind === null) ? ' selected' : ''}>${label}</option>`;
+  return `<label>סוג <select name="kind">${opt('', '—')}${opt('client', 'לקוח')}${opt('supplier', 'ספק')}</select></label>
+  <label>מייל <input type="email" name="email" value="${esc(values.email ?? '')}" maxlength="254" dir="ltr"></label>
+  <label>מזהים במערכות חיצוניות (שורה לכל מערכת: מזהה_מערכת=מזהה) <textarea name="externalIds" rows="2" dir="ltr">${esc(idLines)}</textarea></label>`;
 }
 
 function personInputs(values: { name: string; role: string; phone: string }): string {
@@ -115,11 +166,17 @@ async function renderPeople(
 <form method="post" action="${PEOPLE_SETTINGS_PATH}/contact/edit">
   ${hidden}<input type="hidden" name="key" value="${esc(c.subjectKey)}">
   ${personInputs(c)}
+  ${contactInputs(c)}
   <button type="submit">שמור</button>
 </form>
 <form method="post" action="${PEOPLE_SETTINGS_PATH}/contact/remove">
   ${hidden}<input type="hidden" name="key" value="${esc(c.subjectKey)}">
   <button type="submit">הסר</button>
+</form>
+<form method="post" action="${PEOPLE_INVOICE_PATH}" enctype="multipart/form-data">
+  ${hidden}<input type="hidden" name="key" value="${esc(c.subjectKey)}">
+  <label>צרף חשבונית <input type="file" name="invoice"></label>
+  <button type="submit">צרף</button>
 </form>
 </div>`,
     )
@@ -152,6 +209,7 @@ ${contactRows === '' ? '<p class="muted">אין אנשי קשר.</p>' : contactR
 <form method="post" action="${PEOPLE_SETTINGS_PATH}/contact/add">
   ${hidden}
   ${personInputs(EMPTY)}
+  ${contactInputs({ kind: null, email: null, externalIds: {} })}
   <button type="submit">הוסף</button>
 </form>
 </div>`,
@@ -184,7 +242,7 @@ export async function handlePeopleAction(
     return seeOther(res, PEOPLE_SETTINGS_PATH);
   }
 
-  const person = personFrom(form);
+  const person = personFrom(form, list === 'contact');
   if (!person.ok) return renderPeople(res, 400, db, session, person.error);
 
   try {
@@ -209,5 +267,57 @@ export async function handlePeopleAction(
     throw err;
   }
   if (!updated) return renderPeople(res, 404, db, session, PERSON_NOT_FOUND);
+  seeOther(res, PEOPLE_SETTINGS_PATH);
+}
+
+/**
+ * `POST /settings/people/contact/invoice` — ingest one file and assign it to
+ * a managed contact as an owner-uploaded invoice. CSRF is checked after the
+ * bounded read (the token is a form field) and before anything is written;
+ * only a key that `listManagedContacts` returns is accepted.
+ */
+export async function handlePeopleInvoicePost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  db: BusinessDb,
+  session: PeopleSession,
+  documentRoot: string | undefined,
+): Promise<void> {
+  const parsed = await readBoundedMultipart(req, MAX_ORIGINAL_BYTES);
+  if (!parsed.ok) {
+    if (parsed.code === 'over_cap') res.setHeader('Connection', 'close');
+    const tooLarge = parsed.code === 'over_cap' || parsed.code === 'file_too_large';
+    return renderPeople(res, tooLarge ? 413 : 400, db, session, tooLarge ? INVOICE_TOO_LARGE : INVOICE_UPLOAD_MALFORMED);
+  }
+  if (!verifyCsrfToken(session.sessionId, parsed.fields.get('csrf'))) return html(res, 403, renderForbidden());
+
+  const key = parsed.fields.get('key') ?? '';
+  const contact = (await listManagedContacts(db)).find((c) => c.subjectKey === key);
+  const contactKey = contact === undefined ? null : authorityNumberKey(contact.phone);
+  if (contact === undefined || contactKey === null) return renderPeople(res, 404, db, session, PERSON_NOT_FOUND);
+  const file = parsed.file;
+  if (file === null || file.bytes.length === 0) return renderPeople(res, 400, db, session, INVOICE_FILE_MISSING);
+
+  const dir = await mkdtemp(join(tmpdir(), 'people-invoice-'));
+  try {
+    const path = join(dir, 'upload');
+    await writeFile(path, file.bytes, { flag: 'wx' });
+    const record = await ingestDocument(
+      db,
+      { path, source: 'instruction', originalName: file.filename },
+      { ...(documentRoot !== undefined ? { documentRoot } : {}) },
+    );
+    if (record.status === 'rejected' || (record.status === 'stored' && record.reason !== null)) {
+      return renderPeople(res, 400, db, session, `הקובץ לא נקלט: ${record.reason ?? 'הקובץ נדחה בקליטה.'}`);
+    }
+    await db.query(
+      `INSERT INTO contact_documents (business_id, document_id, contact_key, kind, assigned_by)
+       VALUES ($1, $2, $3, 'invoice', 'owner_upload')
+       ON CONFLICT DO NOTHING`,
+      [db.businessId, record.documentId, contactKey],
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
   seeOther(res, PEOPLE_SETTINGS_PATH);
 }

@@ -161,7 +161,7 @@ export async function listAutonomousActions(
     const actionClass = refineActionClass(base, step.input);
 
     const [email] = readEmails(step.input);
-    const [phone] = readPhones(step.input);
+    const [phone] = readPhones(step.input, step.toolName);
     const subjectRaw = step.input['subject'];
 
     actions.push({

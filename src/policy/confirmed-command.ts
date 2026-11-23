@@ -1,6 +1,7 @@
 import type { ActionFacts } from '../domain/policy.js';
 import { Plan } from '../domain/plan.js';
 import { canonicalHash } from '../util/canonical.js';
+import { MAX_SEND_AHEAD_MS, readSendAt } from '../util/send-at.js';
 import type { GateContext } from './engine.js';
 
 /**
@@ -33,7 +34,16 @@ import type { GateContext } from './engine.js';
  *     instruction door, not by any other path that happens to stamp `boss`;
  *   - its `instruction_confirmations` row is `confirmed`, and was decided
  *     within the last 24 hours (§10.7) — a "yes" from last week does not
- *     carry a transfer the owner may no longer want;
+ *     carry a transfer the owner may no longer want. One extension, and only
+ *     one (task 13, H15): a matched `wa.send_message` step (that tool only)
+ *     whose OWN input carries a parsable
+ *     ISO `sendAt` (a scheduled WhatsApp) is covered until `sendAt + 24h`,
+ *     when the "yes" was given before `sendAt` and no more than 30 days
+ *     before it, AND the job's `charter_version` still equals the active
+ *     charter's — a charter re-signed in between ends the "yes". The bytes
+ *     check below still applies, and `sendAt` is part of those bytes, so a
+ *     plan whose time changed is never carried by the old "yes". The clock
+ *     is the database's, as it was when the window lived in SQL;
  *   - `chosen_plan_hash` equals the hash of the plan bound to the job
  *     (`job_plans`): the plan about to run is the plan he chose;
  *   - that plan has a step with id `ctx.stepId`, whose `agent` is the agent
@@ -72,8 +82,17 @@ export async function confirmedCommandCovers(
 
   const db = ctx.db;
   const businessId = db.businessId;
-  const { rows } = await db.query<{ plan_hash: string; plan: unknown }>(
-    `SELECT p.plan_hash, p.plan
+  const { rows } = await db.query<{
+    plan_hash: string;
+    plan: unknown;
+    decided_at: Date | null;
+    db_now: Date;
+    job_charter_version: string;
+    active_charter_version: string | null;
+  }>(
+    `SELECT p.plan_hash, p.plan, c.decided_at, now() AS db_now,
+            j.charter_version AS job_charter_version,
+            (SELECT a.charter_version FROM charter_active a WHERE a.business_id = $1) AS active_charter_version
        FROM jobs j
        JOIN boss_instructions b
          ON b.job_id = j.job_id AND b.business_id = $1
@@ -85,7 +104,6 @@ export async function confirmedCommandCovers(
         AND j.business_id = $1
         AND j.provenance = 'boss'
         AND c.state = 'confirmed'
-        AND c.decided_at > now() - interval '24 hours'
         AND c.chosen_plan_hash = p.plan_hash
         AND NOT EXISTS (
           SELECT 1 FROM job_step_results r
@@ -107,5 +125,42 @@ export async function confirmedCommandCovers(
   if (step.toolName !== facts.toolName) return null;
   if (canonicalHash(step.input) !== facts.inputHash) return null;
 
+  if (!withinConfirmationWindow(row, step.toolName, step.input, ctx.bundle.charterVersion)) return null;
+
   return { stepId: step.id, planHash: row.plan_hash };
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The window a "yes" carries, every arm positive and fail-closed: a missing
+ * `decided_at`, an unparsable `sendAt` or an unknown active charter all mean
+ * "not covered".
+ */
+function withinConfirmationWindow(
+  row: { decided_at: Date | null; db_now: Date; job_charter_version: string; active_charter_version: string | null },
+  stepToolName: string,
+  stepInput: Record<string, unknown>,
+  bundleCharterVersion: string,
+): boolean {
+  if (row.decided_at === null) return false;
+  const decided = row.decided_at.getTime();
+  const now = row.db_now.getTime();
+  if (!Number.isFinite(decided) || !Number.isFinite(now)) return false;
+  if (now - decided < DAY_MS) return true;
+
+  // The extension is a scheduled WhatsApp's and nothing else's: a `sendAt`
+  // on any other tool is an ordinary payload field and buys no time.
+  if (stepToolName !== 'wa.send_message') return false;
+  const sendAt = readSendAt(stepInput);
+  if (sendAt === null) return false;
+  const at = sendAt.getTime();
+  if (!(decided < at)) return false;
+  if (at - decided > MAX_SEND_AHEAD_MS) return false;
+  if (!(now < at + DAY_MS)) return false;
+  return (
+    row.active_charter_version !== null &&
+    row.job_charter_version === row.active_charter_version &&
+    row.job_charter_version === bundleCharterVersion
+  );
 }

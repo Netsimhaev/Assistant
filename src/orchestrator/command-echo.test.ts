@@ -424,3 +424,46 @@ describe('attachments in the echo (document production §8.2)', () => {
     expect(echo).toContain('⟦U+202E⟧');
   });
 });
+
+describe('the WhatsApp echo (task 13)', () => {
+  const waStep = (input: Record<string, unknown>): PlanStep => ({ ...step('wa.send_message', input), agent: 'comms.whatsapp' });
+  const ctx = {
+    timeZone: 'Asia/Jerusalem',
+    recipientNote: (to: string) => (to === '+972541234567' ? '(איש קשר ששמרת: דנה\u202E)' : null),
+  };
+
+  it('shows sendAt as בשעה in the charter timezone and the recipient with its source', () => {
+    const echo = renderStepEchoWith(
+      waStep({ to: '+972541234567', body: 'שלום', sendAt: '2026-11-24T07:00:00Z' }),
+      'ILS',
+      [],
+      ctx,
+    );
+    expect(echo).toContain('בשעה: 24/11/2026 09:00');
+    // The note's bidi control is stripped, never passed through.
+    expect(echo).toContain('אל: +972541234567 (איש קשר ששמרת: דנה)');
+    expect(echo).not.toContain('‮');
+  });
+
+  it('without the context, sendAt is shown as stored and the recipient without a note', () => {
+    const echo = renderStepEcho(waStep({ to: '+972541234567', body: 'שלום', sendAt: '2026-11-24T07:00:00Z' }), 'ILS');
+    expect(echo).toContain('בשעה: 2026-11-24T07:00:00Z');
+    expect(echo).toContain('אל: +972541234567\n');
+  });
+
+  it('an unparsable sendAt is shown as stored, never reinterpreted', () => {
+    const echo = renderStepEchoWith(waStep({ to: '+972541234567', body: 'שלום', sendAt: 'מחר' }), 'ILS', [], ctx);
+    expect(echo).toContain('בשעה: מחר');
+  });
+
+  it('a sendAt on any other tool is an ordinary extra field, never "בשעה"', () => {
+    const echo = renderStepEchoWith(
+      step('mail.send', { to: 'dana@example.com', subject: 's', body: 'b', sendAt: '2026-11-24T07:00:00Z' }),
+      'ILS',
+      [],
+      ctx,
+    );
+    expect(echo).not.toContain('בשעה');
+    expect(echo).toContain('שדה נוסף: sendAt = 2026-11-24T07:00:00Z');
+  });
+});

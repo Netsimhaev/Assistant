@@ -589,12 +589,20 @@ export function approvalRequestParams(
  * now. `job_id IS NULL` closes both: there is no job to undermine and
  * nothing live to race.
  *
- * Content columns only: `sender_number`, `body` and `transcript` — never
+ * Content columns only: `sender_number`, `recipient_number`, `body` and `transcript` — never
  * `provider_message_id` (the provider's own id, not a person) and never
  * `direction`/`state`/`job_id` (structure, not content).
  *
+ * **Migration 083 added `recipient_number`** — the contact an outbound
+ * message went to (holding replies, approved and owner-ordered sends are
+ * recorded with `job_id` NULL). It is a content column like `sender_number`:
+ * matched by the contact LIKE pattern, and both numbers also by their digits
+ * against the anchor's phone key (`$6`, `contactPhoneKey`), so a stored
+ * `972541…@c.us` is reached by an anchor typed `+972 54-1…`.
+ *
  * Parameters, in both places: `$1` businessId, `$2` jobIds, `$3` the contact
- * LIKE pattern or NULL, `$4`/`$5` the window bounds or NULL — the same
+ * LIKE pattern or NULL, `$4`/`$5` the window bounds or NULL, `$6` the phone
+ * key or NULL — the same
  * convention `approvalRequestParams` already established, reused via
  * `whatsappMessageParams` below so the preview and the destruction cannot
  * differ in values any more than in text.
@@ -603,15 +611,19 @@ export const WHATSAPP_MESSAGES_ERASED_PREDICATE = `business_id = $1
   AND (job_id = ANY ($2)
     OR (job_id IS NULL
         AND (($3::text IS NOT NULL
-              AND (coalesce(sender_number, '') ILIKE $3 ${LIKE_ESCAPE}
-                OR coalesce(body, '')          ILIKE $3 ${LIKE_ESCAPE}
-                OR coalesce(transcript, '')    ILIKE $3 ${LIKE_ESCAPE}))
+              AND (coalesce(sender_number, '')    ILIKE $3 ${LIKE_ESCAPE}
+                OR coalesce(recipient_number, '') ILIKE $3 ${LIKE_ESCAPE}
+                OR coalesce(body, '')             ILIKE $3 ${LIKE_ESCAPE}
+                OR coalesce(transcript, '')       ILIKE $3 ${LIKE_ESCAPE}))
+          OR ($6::text IS NOT NULL
+              AND (${digitsOf('sender_number')} = $6
+                OR ${digitsOf('recipient_number')} = $6))
           OR ($4::timestamptz IS NOT NULL
               AND created_at >= $4::timestamptz
               AND created_at <  $5::timestamptz))))`;
 
 /**
- * The five parameters `WHATSAPP_MESSAGES_ERASED_PREDICATE` takes, derived
+ * The six parameters `WHATSAPP_MESSAGES_ERASED_PREDICATE` takes, derived
  * from the anchor the plan already carries — the same shape as
  * `approvalRequestParams`, kept as its own function rather than reused
  * because the two tables' predicates are independent text that must not
@@ -629,8 +641,116 @@ export function whatsappMessageParams(
     anchor.kind === 'contact' ? `%${likeLiteral(anchor.identifier)}%` : null,
     anchor.kind === 'window' ? anchor.fromIso : null,
     anchor.kind === 'window' ? anchor.toIso : null,
+    contactPhoneKey(anchor),
   ];
 }
+
+/**
+ * The digits of a number column, the same normalisation `recentMessages`
+ * (`whatsapp/contact-conversations.ts`) compares by — so a stored `+972 54…`,
+ * `972541…@c.us` or `972541…` all reduce to one key. `column` is a
+ * code-written identifier, never user input.
+ */
+function digitsOf(column: string): string {
+  return `regexp_replace(coalesce(${column}, ''), '[^0-9]', '', 'g')`;
+}
+
+/**
+ * A contact anchor's phone key: the identifier with the usual separators
+ * (spaces, `-`, `(`, `)`, `.`, `/`) and a leading `+` removed, when what is
+ * left is 10–15 digits (the same bounds `authorityNumberKey` uses). Any other
+ * anchor — or an identifier that is not a number — has none, and every arm
+ * that reads it is switched off (`$n::text IS NOT NULL`).
+ *
+ * `contact_conversations.contact_key` and `contact_documents.contact_key` are
+ * digits only (`authorityNumberKey`, no `+`), so a typed address or name can
+ * never reach them through a LIKE pattern; this key is how a phone anchor
+ * does, by EQUALITY — never a substring, so `1234` does not sweep every
+ * number that contains it. A national form (`054…`) yields a key that matches
+ * no stored international number: a miss, not a guess at a country code.
+ */
+export function contactPhoneKey(anchor: ErasureAnchor): string | null {
+  if (anchor.kind !== 'contact') return null;
+  const stripped = anchor.identifier.trim().replace(/^\+/, '').replace(/[\s\-()./]/g, '');
+  return /^[0-9]{10,15}$/.test(stripped) ? stripped : null;
+}
+
+/**
+ * The `contact_conversations` rows an erasure destroys (migration 083), as
+ * ONE predicate, shared verbatim by `countItems` and the executor.
+ *
+ * A conversation holds the contact's number (`contact_key`) and, when one was
+ * resolved, the memory subject key of the person (`contact_subject_key`). It
+ * is reached three ways — the same three-arm shape, and the same
+ * `card_job_id IS NULL` gate, as `WHATSAPP_MESSAGES_ERASED_PREDICATE`:
+ *
+ * - **job arm** — `card_job_id = ANY($2)`. Discovery adds the card job of
+ *   every conversation the contact or window anchor matched, so a carded
+ *   conversation goes with its job — and stays with it when the owner KEPT
+ *   that job (a kept job's own conversation is not deleted out from under
+ *   it, nor raced while live; the plan-time refusal and the executor's lock
+ *   both cover `jobList` only).
+ * - **contact arm** (gated on `card_job_id IS NULL`) — `contact_key` EQUALS
+ *   the anchor's phone key (`contactPhoneKey`), or `contact_subject_key`
+ *   matches the contact LIKE pattern.
+ * - **window arm** (same gate) — `opened_at` inside the window.
+ *
+ * The remaining columns are structure and timestamps, not content.
+ *
+ * Parameters, in both places: `$1` businessId, `$2` jobIds, `$3` phone key
+ * or NULL, `$4` contact LIKE pattern or NULL, `$5`/`$6` window bounds or
+ * NULL — built by `contactConversationParams` below.
+ */
+export const CONTACT_CONVERSATIONS_ERASED_PREDICATE = `business_id = $1
+  AND (card_job_id = ANY ($2)
+    OR (card_job_id IS NULL
+        AND (($3::text IS NOT NULL AND contact_key = $3)
+          OR ($4::text IS NOT NULL AND coalesce(contact_subject_key, '') ILIKE $4 ${LIKE_ESCAPE})
+          OR ($5::timestamptz IS NOT NULL
+              AND opened_at >= $5::timestamptz
+              AND opened_at <  $6::timestamptz))))`;
+
+export function contactConversationParams(
+  businessId: string,
+  jobIds: readonly string[],
+  anchor: ErasureAnchor,
+): unknown[] {
+  return [
+    businessId,
+    jobIds,
+    contactPhoneKey(anchor),
+    anchor.kind === 'contact' ? `%${likeLiteral(anchor.identifier)}%` : null,
+    anchor.kind === 'window' ? anchor.fromIso : null,
+    anchor.kind === 'window' ? anchor.toIso : null,
+  ];
+}
+
+/**
+ * `contact_reply_decisions` (migration 083): the owner's verdict on a reply
+ * the assistant proposed to a contact. Ids, a code-derived verdict and
+ * reason (`agreementVerdict`), and source tiers — no free text about a
+ * person — so it is not a discovery source; it goes with its card job.
+ *
+ * Parameters, in both places: `$1` businessId, `$2` jobIds.
+ */
+export const CONTACT_REPLY_DECISIONS_ERASED_PREDICATE = 'business_id = $1 AND job_id = ANY ($2)';
+
+/**
+ * `contact_documents` (migration 083): a document assigned to a contact's
+ * number. A contact anchor's phone key reaches the row directly AND adds its
+ * `document_id` to `documentIds` (discovery), so the document itself, its
+ * artifacts, readings and file go through the existing document path; any
+ * other anchor reaches the row through an erased document.
+ *
+ * Parameters, in both places: `$1` businessId, `$2` documentIds, `$3` phone
+ * key or NULL (`contactPhoneKey`).
+ */
+export const CONTACT_DOCUMENTS_ERASED_PREDICATE = `business_id = $1
+  AND (document_id = ANY ($2) OR ($3::text IS NOT NULL AND contact_key = $3))`;
+
+// `contact_whatsapp_settings` (migration 083) is deliberately NOT wired: it
+// is the owner's accounting-lookup configuration (a system id, an operation
+// and two field names), one row per business, with no person in it.
 
 /**
  * The `proposals` rows an erasure destroys, as ONE predicate.
@@ -1290,6 +1410,7 @@ export async function buildErasurePlan(
   if (anchor.kind === 'contact') {
     const pattern = `%${likeLiteral(anchor.identifier)}%`;
     const exact = anchor.identifier;
+    const phoneKey = contactPhoneKey(anchor);
 
     for (const jobId of await idsFrom(
       db,
@@ -1448,12 +1569,43 @@ export async function buildErasurePlan(
       db,
       `SELECT DISTINCT job_id FROM whatsapp_messages
         WHERE business_id = $1 AND job_id IS NOT NULL
-          AND (coalesce(sender_number, '') ILIKE $2 ${LIKE_ESCAPE}
-            OR coalesce(body, '')         ILIKE $2 ${LIKE_ESCAPE}
-            OR coalesce(transcript, '')   ILIKE $2 ${LIKE_ESCAPE})`,
-      [businessId, pattern],
+          AND (coalesce(sender_number, '')    ILIKE $2 ${LIKE_ESCAPE}
+            OR coalesce(recipient_number, '') ILIKE $2 ${LIKE_ESCAPE}
+            OR coalesce(body, '')             ILIKE $2 ${LIKE_ESCAPE}
+            OR coalesce(transcript, '')       ILIKE $2 ${LIKE_ESCAPE}
+            OR ($3::text IS NOT NULL
+                AND (${digitsOf('sender_number')} = $3 OR ${digitsOf('recipient_number')} = $3)))`,
+      [businessId, pattern, phoneKey],
       'job_id',
     )) jobIds.add(jobId);
+
+    // WhatsApp conversations with contacts (migration 083): the card job of
+    // every conversation the contact names — by its number (EQUALITY with the
+    // phone key) or its memory subject key — joins `jobIds`, and through it
+    // the conversation itself, its card, its plan and its decisions (see
+    // `CONTACT_CONVERSATIONS_ERASED_PREDICATE`). A conversation with no card
+    // job is matched directly by that predicate's contact arm.
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT card_job_id AS job_id FROM contact_conversations
+        WHERE business_id = $1 AND card_job_id IS NOT NULL
+          AND (($2::text IS NOT NULL AND contact_key = $2)
+            OR coalesce(contact_subject_key, '') ILIKE $3 ${LIKE_ESCAPE})`,
+      [businessId, phoneKey, pattern],
+      'job_id',
+    )) jobIds.add(jobId);
+
+    // The documents assigned to the contact's number (invoices uploaded by the
+    // owner, found in sent mail or in accounting) go through the existing
+    // document path — rows, artifacts, readings and file.
+    if (phoneKey !== null) {
+      for (const documentId of await idsFrom(
+        db,
+        `SELECT DISTINCT document_id FROM contact_documents WHERE business_id = $1 AND contact_key = $2`,
+        [businessId, phoneKey],
+        'document_id',
+      )) documentIds.add(documentId);
+    }
 
     for (const jobId of await idsFrom(
       db,
@@ -1672,6 +1824,17 @@ export async function buildErasurePlan(
       [businessId, anchor.fromIso, anchor.toIso],
       'event_id',
     )) externalEventIds.add(eventId);
+
+    // A contact conversation opened in the window brings its card job, the
+    // same way a window erases a meeting's job by the meeting's own instant.
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT card_job_id AS job_id FROM contact_conversations
+        WHERE business_id = $1 AND card_job_id IS NOT NULL
+          AND opened_at >= $2 AND opened_at < $3`,
+      [businessId, anchor.fromIso, anchor.toIso],
+      'job_id',
+    )) jobIds.add(jobId);
 
     // A production's own `created_at` — when the owner asked for it.
     for (const productionId of await idsFrom(
@@ -2292,6 +2455,27 @@ async function countItems(
       'delete',
       `SELECT count(*)::text AS n FROM charter_interview_drafts WHERE ${CHARTER_INTERVIEW_DRAFTS_ERASED_PREDICATE}`,
       [businessId, draftIds],
+    ),
+    // WhatsApp contacts (migration 083), in the executor's order: decisions,
+    // documents, conversations — before the documents and jobs they point at.
+    // No foreign keys, so no cascade can run ahead of them.
+    await one(
+      'contact_reply_decisions',
+      'delete',
+      `SELECT count(*)::text AS n FROM contact_reply_decisions WHERE ${CONTACT_REPLY_DECISIONS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    ),
+    await one(
+      'contact_documents',
+      'delete',
+      `SELECT count(*)::text AS n FROM contact_documents WHERE ${CONTACT_DOCUMENTS_ERASED_PREDICATE}`,
+      [businessId, documentIds, contactPhoneKey(anchor)],
+    ),
+    await one(
+      'contact_conversations',
+      'delete',
+      `SELECT count(*)::text AS n FROM contact_conversations WHERE ${CONTACT_CONVERSATIONS_ERASED_PREDICATE}`,
+      contactConversationParams(businessId, jobIds, anchor),
     ),
     await one(
       'documents',

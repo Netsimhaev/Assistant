@@ -41,6 +41,14 @@ export const PersonEntry = z
     name: z.string().trim().min(1).max(PERSON_FIELD_MAX_CHARS),
     role: z.string().trim().min(1).max(PERSON_FIELD_MAX_CHARS),
     phone: InternationalPhone,
+    /** Contacts only (WhatsApp for clients/suppliers); colleagues ignore both. */
+    kind: z.enum(['client', 'supplier']).optional(),
+    email: z.string().trim().email().max(254).optional(),
+    /** Contacts only: the contact's own id in a signed external system, keyed by system id. */
+    externalIds: z
+      .record(z.string().regex(/^[a-z][a-z0-9_]{1,30}$/), z.string().trim().min(1).max(100))
+      .refine((r) => Object.keys(r).length <= 5)
+      .optional(),
   })
   .strict();
 export type PersonEntry = z.infer<typeof PersonEntry>;

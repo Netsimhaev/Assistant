@@ -185,4 +185,21 @@ describe('claimForReport', () => {
     expect(await withBusiness(BUSINESS, (db) => claimForReport(db, msg.id, 'terminal'))).toBe(false);
     expect(await stateOf(msg.id)).toBe('reported');
   });
+  it('accepts a contact sender kind and stores the recipient of an outbound message', async () => {
+    const m = await withBusiness(BUSINESS, (db) =>
+      recordInbound(db, { ...base, senderKind: 'contact', providerMessageId: 'wamid.c1' }));
+    expect(m?.senderKind).toBe('contact');
+    const out = await withBusiness(BUSINESS, (db) =>
+      recordOutbound(db, { body: 'x', jobId: null, recipientNumber: '+972501234567' }));
+    const { rows } = await testDb().query(
+      'SELECT recipient_number FROM whatsapp_messages WHERE id = $1', [out.id]);
+    expect(rows[0].recipient_number).toBe('+972501234567');
+  });
+
+  it('creates the contact conversation tables', async () => {
+    for (const t of ['contact_conversations', 'contact_reply_decisions', 'contact_documents', 'contact_whatsapp_settings']) {
+      const { rows } = await testDb().query('SELECT to_regclass($1) AS r', [t]);
+      expect(rows[0].r, t).not.toBeNull();
+    }
+  });
 });

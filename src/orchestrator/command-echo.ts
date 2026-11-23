@@ -10,6 +10,8 @@ import type { ExternalSystem } from '../domain/external-system.js';
 import { buildExternalRequestFromPayload } from '../external/request.js';
 import { isExternalTool, resolveExternalCall } from '../policy/external-class.js';
 import { redactPayload } from '../policy/redact.js';
+import { localParts } from '../util/local-time.js';
+import { parseIsoInstant } from '../util/send-at.js';
 
 /**
  * The Hebrew confirmation question (boss command, spec §4.1, §4.2, §10.5, §10.6).
@@ -55,6 +57,8 @@ const KNOWN_FIELDS: readonly { key: string; name: string }[] = [
   { key: 'location', name: 'מיקום' },
   { key: 'description', name: 'פרטים ללקוח' },
   { key: 'attendees', name: 'משתתפים' },
+  // wa.send_message (owner-ordered WhatsApp, task 13): when it will be sent.
+  { key: 'sendAt', name: 'בשעה' },
 ];
 /** Multi-line known fields: every continuation line carries the fixed margin. */
 const BLOCK_KEYS: ReadonlySet<string> = new Set(['body', 'description']);
@@ -124,6 +128,28 @@ function renderValue(value: unknown): string {
     return value.map((element) => renderScalar(element)).join(', ');
   }
   return renderScalar(value);
+}
+
+/**
+ * What the WhatsApp echo needs beyond the step itself (task 13): the charter's
+ * timezone, so `sendAt` reads as the owner's wall clock, and where the
+ * recipient came from — a saved contact or a number typed in the instruction.
+ * The caller resolves the source (it holds the contacts and the instruction);
+ * this module stays pure.
+ */
+export interface WhatsAppEchoContext {
+  timeZone: string;
+  /** The source note for a `wa.send_message` recipient, or null when it has none. */
+  recipientNote: (to: string) => string | null;
+}
+
+/** `sendAt` in the charter timezone, `DD/MM/YYYY HH:MM`; the raw value when it does not parse. */
+function renderSendAt(value: unknown, wa: WhatsAppEchoContext | undefined): string {
+  const at = parseIsoInstant(value);
+  if (at === null || wa === undefined) return renderValue(value);
+  const { date, time } = localParts(at, wa.timeZone);
+  const [y, m, d] = date.split('-');
+  return `${d}/${m}/${y} ${time}`;
 }
 
 function renderKnown(key: string, value: unknown, currency: string): string {
@@ -283,7 +309,12 @@ function externalEcho(step: PlanStep, currency: string, systems: readonly Extern
  * reason: an `ext.*` step is labelled by the class the owner signed and shows
  * the exact request the adapter will build — never the placeholder class.
  */
-export function renderStepEcho(step: PlanStep, currency: string, systems: readonly ExternalSystem[]): string {
+export function renderStepEcho(
+  step: PlanStep,
+  currency: string,
+  systems: readonly ExternalSystem[],
+  wa?: WhatsAppEchoContext,
+): string {
   if (isHidden(step.toolName)) return '';
   if (isExternalTool(step.toolName)) {
     const echo = externalEcho(step, currency, systems);
@@ -297,15 +328,24 @@ export function renderStepEcho(step: PlanStep, currency: string, systems: readon
       : actionClassLabel(refineActionClass(base, step.input));
   const lines: string[] = [label, `כלי: ${inlineValue(step.toolName)}`];
 
+  const whatsapp = step.toolName === 'wa.send_message';
   for (const { key, name } of KNOWN_FIELDS) {
     if (!Object.hasOwn(step.input, key)) continue;
-    lines.push(`${name}: ${renderKnown(key, step.input[key], currency)}`);
+    const value = step.input[key];
+    if (key === 'sendAt') {
+      // "בשעה" is a WhatsApp send time and nothing else: on any other tool
+      // the field is shown raw under "שדה נוסף" below, never as a schedule.
+      if (whatsapp) lines.push(`${name}: ${renderSendAt(value, wa)}`);
+      continue;
+    }
+    const note = whatsapp && key === 'to' && typeof value === 'string' ? (wa?.recipientNote(value) ?? null) : null;
+    lines.push(`${name}: ${renderKnown(key, value, currency)}${note === null ? '' : ` ${labelText(note)}`}`);
   }
   if (Object.hasOwn(step.input, ATTACHMENTS_KEY)) {
     lines.push(...attachmentLines(step.input[ATTACHMENTS_KEY]));
   }
   const extras = Object.keys(step.input)
-    .filter((key) => !KNOWN_KEYS.has(key) && key !== ATTACHMENTS_KEY)
+    .filter((key) => (!KNOWN_KEYS.has(key) || (key === 'sendAt' && !whatsapp)) && key !== ATTACHMENTS_KEY)
     .sort();
   for (const key of extras) {
     lines.push(`שדה נוסף: ${inlineValue(key)} = ${renderValue(step.input[key])}`);
@@ -325,6 +365,7 @@ function optionEchoes(
   currency: string,
   systems: readonly ExternalSystem[],
   redactPatterns: readonly string[],
+  wa: WhatsAppEchoContext | undefined,
 ): string[] | { refused: string } {
   const echoes: string[] = [];
   for (const step of option.plan.steps) {
@@ -332,7 +373,7 @@ function optionEchoes(
     if (problem !== null) return { refused: problem };
     const redaction = externalRedactionProblem(step, redactPatterns);
     if (redaction !== null) return { refused: redaction };
-    const echo = renderStepEcho(step, currency, systems);
+    const echo = renderStepEcho(step, currency, systems, wa);
     if (echo === '') continue;
     if (echo.length > MAX_ECHO_CHARS_PER_STEP) return { refused: TOO_LONG };
     echoes.push(echo);
@@ -349,6 +390,12 @@ export function renderConfirmationQuestion(
     systems: readonly ExternalSystem[];
     /** The active charter's redaction patterns (`bundle.redactPatterns`) — required: an `ext.*` value they hide is refused (T7-b). */
     redactPatterns: readonly string[];
+    /**
+     * The WhatsApp echo context (charter timezone, recipient source). Every
+     * production caller passes it; absent, `sendAt` is shown as stored and
+     * the recipient without a source note.
+     */
+    whatsapp?: WhatsAppEchoContext;
     reask?: boolean;
     /** Steps of the original plan that completed and were dropped from this one; shown when > 0. */
     alreadyDone?: number;
@@ -367,7 +414,7 @@ export function renderConfirmationQuestion(
   const multiple = options.length > 1;
   const rendered: string[] = [];
   for (const [index, option] of options.entries()) {
-    const echoes = optionEchoes(option, opts.currency, opts.systems, opts.redactPatterns);
+    const echoes = optionEchoes(option, opts.currency, opts.systems, opts.redactPatterns, opts.whatsapp);
     if (!Array.isArray(echoes)) return echoes;
     const head = `${multiple ? `${index + 1}. ` : ''}${labelText(option.label)}${sourceMarker(option)}`;
     const extra = opts.extraEchoes?.[index] ?? null;

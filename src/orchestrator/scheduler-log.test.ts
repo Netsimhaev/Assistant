@@ -31,7 +31,7 @@ function cleanResult(): SchedulerPassResult {
     externalLearn: null,
     externalLearnError: null,
     due: { ran: [], lockedOut: [], unbound: [], phaseMoved: [], errored: [] },
-    reasked: { reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] },
+    reasked: { reasked: [], refused: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] },
     reaskError: null,
     verified: {
       closed: [],
@@ -133,7 +133,7 @@ describe('logErrored', () => {
     try {
       const result: SchedulerPassResult = {
         ...cleanResult(),
-        whatsappDoor: { polled: 3, instructed: 1, recordedOnly: 0, refused: 2, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, documentCardReplies: 0, confirmErrored: [], malformedSenderCount: 0 },
+        whatsappDoor: { polled: 3, instructed: 1, recordedOnly: 0, refused: 2, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, documentCardReplies: 0, confirmErrored: [], malformedSenderCount: 0, contactHandled: 0, contactCapped: 0, contactFailed: 0, contactCardReplies: 0 },
         whatsappReport: { reported: 0, deferred: 2, errored: ['job-a', 'job-b'] },
       };
       logErrored(result, null);
@@ -174,7 +174,7 @@ describe('logErrored', () => {
         whatsappDoor: {
           polled: 1, instructed: 0, recordedOnly: 0, refused: 1, closed: 0, mailCardReplies: 0,
           confirmationReplies: 0, ledgerReplies: 0, documentCardReplies: 0, confirmErrored: [{ jobId: 'job-c', error: 'bound to nothing' }],
-          malformedSenderCount: 0,
+          malformedSenderCount: 0, contactHandled: 0, contactCapped: 0, contactFailed: 0, contactCardReplies: 0,
         },
       }, null);
       const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');
@@ -189,7 +189,7 @@ describe('logErrored', () => {
     try {
       logErrored({
         ...cleanResult(),
-        whatsappDoor: { polled: 0, instructed: 0, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, documentCardReplies: 0, confirmErrored: [], malformedSenderCount: 0 },
+        whatsappDoor: { polled: 0, instructed: 0, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, documentCardReplies: 0, confirmErrored: [], malformedSenderCount: 0, contactHandled: 0, contactCapped: 0, contactFailed: 0, contactCardReplies: 0 },
         whatsappError: 'reportCandidates query rejected',
       }, null);
       const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');

@@ -66,7 +66,7 @@ export function buildFacts(
       input['amountMinor'] !== null,
     counterpartyId: readString(input, 'counterpartyId') ?? readString(input, 'entityId'),
     counterpartyEmails: readEmails(input),
-    counterpartyPhones: readPhones(input),
+    counterpartyPhones: readPhones(input, toolName),
     counterpartyTags: ctx.counterpartyTags,
     provenance: ctx.provenance,
     chainDepth: ctx.chainDepth,
@@ -189,8 +189,13 @@ export function readEmails(input: Record<string, unknown>): string[] {
  * (`src/governance/authorization.ts`) needs to see a WhatsApp step's
  * recipient, which arrives here and not through `readEmails`.
  */
-export function readPhones(input: Record<string, unknown>): string[] {
-  return collectStrings(input, ['phone', 'toNumber', 'msisdn'])
+export function readPhones(input: Record<string, unknown>, toolName?: string): string[] {
+  // A WhatsApp tool's recipient arrives in `to` (a number), as a mail tool's does
+  // — and `to` is an e-mail address for every other tool, so it is read as a
+  // phone ONLY for `wa.*`: a positive, tool-scoped rule. Own property only, like
+  // the other phone keys: a phone match makes a recipient "known", which loosens.
+  const keys = toolName !== undefined && toolName.startsWith('wa.') ? ['phone', 'toNumber', 'msisdn', 'to'] : ['phone', 'toNumber', 'msisdn'];
+  return collectStrings(input, keys)
     .flatMap((value) => value.split(/[,;]/))
     .map((value) => value.replace(/\D/g, ''))
     .filter((value) => value.length > 0);

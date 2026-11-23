@@ -160,6 +160,22 @@ describe('renderConversation', () => {
     expect((html.match(/<form/g) ?? []).length).toBe(1);
   });
 
+  it('labels a contact, a colleague and an unknown number in Hebrew (R11d)', () => {
+    const html = renderConversation({
+      messages: [
+        msg({ id: 'WA-c', direction: 'inbound', senderKind: 'contact', body: 'מלקוח' }),
+        msg({ id: 'WA-g', direction: 'inbound', senderKind: 'colleague', body: 'מעמית' }),
+        msg({ id: 'WA-u', direction: 'inbound', senderKind: 'unknown', body: 'מזר' }),
+      ],
+      csrf: 'c',
+    });
+    expect(html).toContain('לקוח/ספק');
+    expect(html).toContain('איש צוות');
+    expect(html).toContain('שולח לא מוכר');
+    expect(html).not.toContain('בעל העסק');
+    expect(html).not.toContain('שולח לא מזוהה');
+  });
+
   it('labels an inbound message with no resolved sender kind as unknown, never as the principal', () => {
     // The existing "everyone" test above short-circuits on `direction`
     // before `senderKind` is even consulted for the outbound case — this

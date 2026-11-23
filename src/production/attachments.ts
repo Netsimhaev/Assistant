@@ -19,10 +19,12 @@
  * carrying any other name is refused (`attachment_name_mismatch`) — so the
  * name in the confirmation echo is exactly the name that is sent.
  */
+import { stripBidiControls } from '../util/bidi.js';
 import { createHash } from 'node:crypto';
 import { open } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { BusinessDb } from '../db/pool.js';
+import { loadDocument } from '../documents/store.js';
 import {
   FORMAT_MEDIA_TYPE,
   sanitizeAttachmentFilename,
@@ -139,7 +141,7 @@ export type ReadVersionBytesResult =
  * the one that was hashed — callers must use it and never re-read.
  */
 export async function readVersionBytes(
-  version: VersionFile,
+  version: Pick<VersionFile, 'storedPath'>,
   expected: { sha256: string; sizeBytes: number },
   documentRoot: string,
 ): Promise<ReadVersionBytesResult> {
@@ -274,4 +276,37 @@ export async function deliveryVersionOf(
   // Two cards naming one job cannot happen (one writer, one job per
   // approval); if it ever did, which version is approved is not knowable.
   return rows.length === 1 ? rows[0]!.version_id : null;
+}
+
+/**
+ * One stored (ingested) document -> the bytes recorded for it, for a WhatsApp
+ * send that names `attachDocumentId`. Found only in THIS business, status
+ * `extracted` or `stored`; the file is re-read from disk and its size and
+ * sha256 compared with the row's — any disagreement refuses (hash mismatch).
+ */
+export async function resolveStoredDocument(
+  db: BusinessDb,
+  documentId: string,
+  documentRoot: string,
+): Promise<{ ok: true; file: ResolvedAttachment & { documentId: string } } | { ok: false; code: AttachmentFailureCode; he: string }> {
+  const doc = await loadDocument(db, documentId);
+  if (doc === null || (doc.status !== 'extracted' && doc.status !== 'stored')) {
+    return { ok: false, code: 'attachment_not_found', he: 'הקובץ המצורף לא נמצא — ההודעה לא נשלחה' };
+  }
+  if (doc.byteSize > MAX_ATTACHMENTS_TOTAL_BYTES) {
+    return { ok: false, code: 'attachment_too_large', he: 'הקובץ המצורף גדול מ-20MB — ההודעה לא נשלחה' };
+  }
+  const read = await readVersionBytes(doc, { sha256: doc.sha256, sizeBytes: doc.byteSize }, documentRoot);
+  if (!read.ok) {
+    return {
+      ok: false,
+      code: read.code,
+      he: read.code === 'attachment_hash_mismatch' ? 'הקובץ המצורף השתנה מאז שנקלט — ההודעה לא נשלחה' : 'הקובץ המצורף לא נמצא — ההודעה לא נשלחה',
+    };
+  }
+  const name = stripBidiControls(doc.originalName).replace(/[\/:*?"<>| -]/g, '').trim();
+  return {
+    ok: true,
+    file: { documentId: doc.documentId, filename: name === '' ? 'document' : name.slice(0, 120), mediaType: doc.mediaType, bytes: read.bytes },
+  };
 }

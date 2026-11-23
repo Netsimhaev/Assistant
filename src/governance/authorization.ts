@@ -285,7 +285,7 @@ export function coveredByAuthorization(
   // and an authorisation that cannot see it could never cover one. The
   // `every` below still applies to the combined list: one authorised address
   // does not vouch for a stranger's number standing beside it.
-  const going = [...readEmails(facts.input), ...readPhones(facts.input)];
+  const going = [...readEmails(facts.input), ...readPhones(facts.input, facts.actionClass.startsWith('whatsapp.') ? 'wa.send_message' : undefined)];
   if (going.length === 0) return false;
 
   // `every`, not `some`: one authorised recipient does not vouch for the

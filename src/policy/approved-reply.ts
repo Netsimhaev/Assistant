@@ -56,15 +56,31 @@ import type { GateContext } from './engine.js';
 /** Appended to the `approval_consumed` audit reason when the exemption carried the call. */
 export const APPROVED_REPLY_EXEMPTION_MARKER = 'approved_reply_exemption';
 
+function readConversationId(input: unknown): string | null {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) return null;
+  if (!Object.hasOwn(input, 'conversationId')) return null;
+  const v = (input as Record<string, unknown>).conversationId;
+  return typeof v === 'string' && v !== '' ? v : null;
+}
+
 export async function approvedReplyCovers(
   facts: ActionFacts,
   toolName: string,
   liveInputHash: string,
+  liveInput: unknown,
   ctx: GateContext,
 ): Promise<boolean> {
   if (ctx.approval === undefined) return false;
   if (typeof ctx.jobId !== 'string') return false;
-  if (facts.actionClass !== 'email.reply') return false;
+  // The job condition depends on the class: a mailbox reply job for mail, a
+  // contact-conversation card job for WhatsApp. `whatsapp.initiate` (no real
+  // `conversationId`) is never covered.
+  const mail = facts.actionClass === 'email.reply';
+  if (!mail && facts.actionClass !== 'whatsapp.reply') return false;
+  // A WhatsApp reply is covered only for the conversation the payload names
+  // (an own-property string), so a card job cannot vouch for another thread.
+  const waConversation = mail ? null : readConversationId(liveInput);
+  if (!mail && waConversation === null) return false;
 
   const db = ctx.db;
   const businessId = db.businessId;
@@ -79,11 +95,18 @@ export async function approvedReplyCovers(
         AND expires_at > now()
         AND proposed_tool = $4
         AND input_hash_at_decision = $5
-        AND EXISTS (
-          SELECT 1 FROM mail_messages m
-           WHERE m.business_id = $2 AND m.reply_job_id = $3
+        AND (
+          ($6::boolean AND EXISTS (
+            SELECT 1 FROM mail_messages m
+             WHERE m.business_id = $2 AND m.reply_job_id = $3
+          ))
+          OR (NOT $6::boolean AND EXISTS (
+            SELECT 1 FROM contact_conversations c
+             WHERE c.business_id = $2 AND c.card_job_id = $3
+               AND c.conversation_id = $7 AND c.state = 'carded'
+          ))
         )`,
-    [ctx.approval.approvalId, businessId, ctx.jobId, toolName, liveInputHash],
+    [ctx.approval.approvalId, businessId, ctx.jobId, toolName, liveInputHash, mail, waConversation],
   );
   return rows[0] !== undefined;
 }

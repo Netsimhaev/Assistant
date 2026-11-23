@@ -922,6 +922,11 @@ ${
 }
 ${
   options.charterStatus === 'ok'
+    ? '<p><a href="/connections/whatsapp-contacts">וואטסאפ ללקוחות ולספקים — חתימה וביטול</a></p>'
+    : ''
+}
+${
+  options.charterStatus === 'ok'
     ? '<p><a href="/connections/external">מערכות חיצוניות (מערכת לקוחות, הנהלת חשבונות ועוד) — חתימה, שינוי והסרה</a> · <a href="/systems">מה הגיע מהן</a></p>'
     : ''
 }
@@ -1675,6 +1680,10 @@ export const TABLE_LABELS: Record<string, string> = {
   external_reads: 'נתונים שנקראו ממערכות חיצוניות',
   external_events: 'אירועים ממערכות חיצוניות',
   external_learning_jobs: 'רישומי למידה ממערכות חיצוניות',
+  // Migration 083: WhatsApp conversations with clients and suppliers.
+  contact_conversations: 'שיחות וואטסאפ עם אנשי קשר',
+  contact_reply_decisions: 'הכרעות על תשובות לאנשי קשר',
+  contact_documents: 'מסמכים ששויכו לאנשי קשר',
 };
 
 /**

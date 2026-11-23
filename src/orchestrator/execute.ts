@@ -2,7 +2,10 @@ import type { AgentId } from '../domain/audit.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { isMoneyBearing } from '../domain/action.js';
 import type { AutonomyLevel } from '../domain/trust.js';
-import { ingestsExternalContent } from '../policy/classify.js';
+import { ingestsExternalContent, refineActionClass } from '../policy/classify.js';
+import { hasSendAt, readSendAt } from '../util/send-at.js';
+import { buildFacts } from '../policy/facts.js';
+import { confirmedCommandCovers } from '../policy/confirmed-command.js';
 import { classifyCall, resolveExternalCall } from '../policy/external-class.js';
 import { recordExternalRead, type ExternalFieldValue } from '../external/store.js';
 import { z } from 'zod';
@@ -11,10 +14,20 @@ import { getApproval } from '../governance/approvals.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
 import { recordSpend } from '../policy/budget.js';
 import { canonicalHash } from '../util/canonical.js';
+import { nextTimeAt } from '../util/local-time.js';
 import { markContentIngested, transition } from './jobs.js';
 import { StepChannelError } from './step-error.js';
 import type { Job } from './jobs.js';
 import { transaction, type BusinessDb } from '../db/pool.js';
+
+/** The `job_steps.reason` a scheduled WhatsApp send parks its job with. */
+export const SCHEDULED_SEND_REASON = 'scheduled send';
+
+/** The refusal code for a proactive WhatsApp outside a confirmed boss command. */
+export const WA_INITIATE_NOT_COMMAND = 'wa_initiate_not_confirmed_command';
+
+/** The refusal code for a scheduled WhatsApp whose `sendAt` does not parse. */
+export const WA_SEND_AT_UNREADABLE = 'wa_send_at_unreadable';
 
 /**
  * How long a step sleeps before a retryable channel failure is tried again.
@@ -258,6 +271,77 @@ export async function executeStep(db: BusinessDb, request: StepRequest): Promise
       approval.editedInput !== null
     ) {
       effectiveInput = approval.editedInput as Record<string, unknown>;
+    }
+  }
+
+  // An owner-ordered WhatsApp to a contact (task 13) is the only proactive
+  // WhatsApp send allowed, and only as a confirmed boss command the
+  // exemption carries right now. `whatsapp.initiate` (no real
+  // `conversationId`) is otherwise refused here, before the gate: under `ask`
+  // the gate would queue an ordinary approval for it, and that approval
+  // would send.
+  if (toolName === 'wa.send_message' && refineActionClass('whatsapp.reply', effectiveInput) === 'whatsapp.initiate') {
+    // Not merely "a confirmed boss job": the exemption itself must carry THIS
+    // step now — same job, plan, step, agent, bytes, window and charter — the
+    // very read the gate makes (`confirmedCommandCovers`). A lapsed window or
+    // a re-signed charter would otherwise pass this guard into the ordinary
+    // gate, where a raised ramp and a standing grant could send it with no card.
+    const covered = await confirmedCommandCovers(
+      buildFacts(toolName, effectiveInput, {
+        provenance: job.provenance,
+        chainDepth: 0,
+        counterpartyTags: request.counterpartyTags,
+      }),
+      {
+        agent: request.agent,
+        bundle,
+        db,
+        jobId: job.jobId,
+        stepId: request.stepId,
+        provenance: job.provenance,
+        chainDepth: 0,
+        counterpartyTags: request.counterpartyTags,
+        ...(request.approvalId !== undefined
+          ? { approval: { approvalId: request.approvalId, stepId: request.stepId } }
+          : {}),
+      },
+    );
+    if (covered === null) {
+      const reason = 'הודעת וואטסאפ יזומה נשלחת רק לפי הוראה שלך שאישרת.';
+      await transition(db, job.jobId, {
+        to: 'failed',
+        actor: 'orchestrator',
+        reason: `${WA_INITIATE_NOT_COMMAND} — ${reason}`,
+      });
+      return { status: 'refused', code: WA_INITIATE_NOT_COMMAND, reason };
+    }
+  }
+
+  // A scheduled WhatsApp (task 13): the step sleeps until its own `sendAt`,
+  // before the gate is consulted — nothing is judged, claimed or sent early.
+  // The scheduler returns the job to `execute` at that time; a step whose
+  // `sendAt` has come runs now.
+  if (toolName === 'wa.send_message' && hasSendAt(effectiveInput)) {
+    const sendAt = readSendAt(effectiveInput);
+    // Fail closed: a `sendAt` that does not parse is not "now" — the owner
+    // asked for a time, and a time we cannot read is never sent early.
+    if (sendAt === null) {
+      const reason = 'מועד השליחה בוואטסאפ אינו תקין — ההודעה לא נשלחה.';
+      await transition(db, job.jobId, {
+        to: 'failed',
+        actor: 'orchestrator',
+        reason: `${WA_SEND_AT_UNREADABLE} — ${reason}`,
+      });
+      return { status: 'refused', code: WA_SEND_AT_UNREADABLE, reason };
+    }
+    if (sendAt.getTime() > now.getTime()) {
+      await transition(db, job.jobId, {
+        to: 'followup',
+        actor: 'orchestrator',
+        reason: SCHEDULED_SEND_REASON,
+        wakeAt: sendAt,
+      });
+      return { status: 'deferred', code: 'scheduled_send', wakeAt: sendAt.toISOString() };
     }
   }
 
@@ -527,50 +611,6 @@ async function recordStepSpend(
       }),
     },
   );
-}
-
-/**
- * The next moment at `hh:mm` in `timezone` that is strictly after `from`.
- *
- * Computed by probing forward in minute-resolution steps rather than by
- * constructing a local date: constructing one requires knowing the zone's UTC
- * offset *at that future instant*, which is exactly what DST makes unsafe to
- * assume. Probing asks Intl, which knows.
- */
-function nextTimeAt(hhmm: string, timezone: string, from: Date): Date {
-  const target = parseHhMm(hhmm);
-  if (target === null) return new Date(from.getTime() + 60 * 60 * 1000);
-
-  // A whole day of minutes is 1440 probes at worst; this runs once per deferred
-  // step, not per request.
-  for (let minutes = 1; minutes <= 60 * 24 + 60; minutes += 1) {
-    const candidate = new Date(from.getTime() + minutes * 60 * 1000);
-    if (localMinutes(candidate, timezone) === target) return candidate;
-  }
-  return new Date(from.getTime() + 60 * 60 * 1000);
-}
-
-function parseHhMm(hhmm: string): number | null {
-  const match = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim());
-  if (!match) return null;
-  return Number(match[1]) * 60 + Number(match[2]);
-}
-
-function localMinutes(at: Date, timezone: string): number {
-  try {
-    const parts = new Intl.DateTimeFormat('en-GB', {
-      timeZone: timezone,
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    }).formatToParts(at);
-    return (
-      Number(parts.find((p) => p.type === 'hour')?.value ?? '0') * 60 +
-      Number(parts.find((p) => p.type === 'minute')?.value ?? '0')
-    );
-  } catch {
-    return at.getUTCHours() * 60 + at.getUTCMinutes();
-  }
 }
 
 /** The adapter's declared-fields output, as `createExternalAdapter` returns it. */

@@ -19,6 +19,8 @@ import {
   labelNotAllowed,
   MailboxCursorError,
   ok2xx,
+  sentQueryProblem,
+  type SentMail,
   type MailboxClient,
   type MailboxFailure,
   type MailboxHttp,
@@ -228,6 +230,54 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
           if (mail !== null) messages.push(mail);
         }
         return { messages, nextCursor: walked.deltaLink };
+      });
+    },
+
+    searchSent(token, query, signal) {
+      return guarded(async () => {
+        const problem = sentQueryProblem(query);
+        if (problem !== null) return problem;
+        // Graph cannot combine $filter with $search on messages: the age bound is applied in code below.
+        const sinceMs = Date.now() - query.sinceDays * 86_400_000;
+        const url =
+          `${BASE}/me/mailFolders/sentitems/messages` +
+          `?$search=${encodeURIComponent(`"to:${query.to}"`)}` +
+          `&$top=${query.limit}` +
+          `&$expand=${encodeURIComponent('attachments($select=id,name,contentType)')}`;
+        const res = await http.request({ method: 'GET', url, accessToken: token, signal });
+        if (!ok2xx(res.status)) return failureFromStatus(res.status, res.body);
+        const value = asRecord(res.body)['value'];
+        const out: SentMail[] = [];
+        for (const m of (Array.isArray(value) ? value : []).slice(0, query.limit)) {
+          const rec = asRecord(m);
+          if (typeof rec['id'] !== 'string') continue;
+          const sent = Date.parse(String(rec['sentDateTime']));
+          if (Number.isFinite(sent) && sent < sinceMs) continue;
+          const recipients = ['toRecipients', 'ccRecipients', 'bccRecipients'].flatMap((k) =>
+            (Array.isArray(rec[k]) ? (rec[k] as unknown[]) : []).flatMap((x) => {
+              const address = asRecord(asRecord(x)['emailAddress'])['address'];
+              return typeof address === 'string' ? [address.trim().toLowerCase()] : [];
+            }),
+          );
+          const attachments: SentMail['attachments'] = [];
+          for (const a of Array.isArray(rec['attachments']) ? rec['attachments'] : []) {
+            const ar = asRecord(a);
+            if (typeof ar['id'] !== 'string') continue;
+            attachments.push({
+              attachmentId: ar['id'],
+              filename: typeof ar['name'] === 'string' ? ar['name'] : 'attachment',
+              mediaType: typeof ar['contentType'] === 'string' ? ar['contentType'] : 'application/octet-stream',
+            });
+          }
+          out.push({
+            providerMessageId: rec['id'],
+            sentAt: new Date(Number.isFinite(sent) ? sent : Date.now()).toISOString(),
+            subject: typeof rec['subject'] === 'string' ? rec['subject'] : '',
+            recipients,
+            attachments,
+          });
+        }
+        return out;
       });
     },
 

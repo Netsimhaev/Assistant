@@ -1,19 +1,35 @@
 import { once } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
-import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { activeCharterVersion, installCharter } from '../charter/store.js';
 import { addColleague, listColleagues } from '../business/colleagues.js';
-import { recallMemories, writeMemory } from '../memory/store.js';
+import { recallMemories, writeManagedContactMemory, writeMemory } from '../memory/store.js';
 import { createJob } from '../orchestrator/jobs.js';
 import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { createServer } from './server.js';
 import { PEOPLE_INTRO } from './people-routes.js';
 import { CONTACT_PHONE_TAKEN } from '../business/settings-contacts.js';
 import { escapeHtml } from './views.js';
+import { documentsAwaitingRead } from '../documents/store.js';
+
+const ingestOverride = vi.hoisted(() => ({ reason: null as string | null }));
+vi.mock('../documents/ingest.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../documents/ingest.js')>();
+  return {
+    ...actual,
+    ingestDocument: (...args: Parameters<typeof actual.ingestDocument>) =>
+      ingestOverride.reason === null
+        ? actual.ingestDocument(...args)
+        : Promise.resolve({ status: 'rejected', reason: ingestOverride.reason, documentId: 'DOC-X' }),
+  };
+});
 
 const BUSINESS = 'people-business';
 const USERNAME = 'owner';
@@ -21,8 +37,10 @@ const PASSWORD = 'correct horse battery staple';
 const PEOPLE = '/settings/people';
 
 let server: Server | null = null;
+let docRoot = '';
 
 beforeEach(async () => {
+  docRoot = await mkdtemp(join(tmpdir(), 'people-docs-'));
   await resetDatabase();
   await createTestOwner(BUSINESS, { username: USERNAME, password: PASSWORD });
   await withBusiness(BUSINESS, (db) => installCharter(db, buildCharter({ version: 'v-people-1' })));
@@ -33,6 +51,7 @@ afterEach(async () => {
     await new Promise<void>((resolve) => server?.close(() => resolve()));
     server = null;
   }
+  await rm(docRoot, { recursive: true, force: true });
 });
 
 afterAll(async () => {
@@ -40,7 +59,7 @@ afterAll(async () => {
 });
 
 async function start(): Promise<{ baseUrl: string; cookie: string }> {
-  server = createServer({ masterKey: TEST_MASTER_KEY, port: 0 });
+  server = createServer({ masterKey: TEST_MASTER_KEY, port: 0, documentRoot: docRoot });
   await once(server, 'listening');
   const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const cookie = await loginWithSecondFactor(baseUrl, BUSINESS, { username: USERNAME, password: PASSWORD });
@@ -86,6 +105,13 @@ async function seedEntity(subjectKey: string, body: Record<string, unknown>, sou
   await withBusiness(BUSINESS, async (db) => {
     const version = await activeCharterVersion(db);
     if (version === null) throw new Error('no charter');
+    // A managed contact is the owner's own write (a boss job, the reserved
+    // writer); anything else is a learned entity, as the assistant writes it.
+    if (sourceRef === 'setup_package' || sourceRef === 'settings_people') {
+      const job = await createJob(db, { charterVersion: version, provenance: 'boss', title: 'seed' });
+      await writeManagedContactMemory(db, { jobId: job.jobId, subjectKey, body, source: sourceRef });
+      return;
+    }
     const job = await createJob(db, { charterVersion: version, provenance: 'unknown_external', title: 'seed' });
     await writeMemory(db, { jobId: job.jobId, kind: 'entity', subjectKey, body, sourceRef });
   });
@@ -247,6 +273,10 @@ describe('/settings/people', () => {
     await seedEntity('+972501110001', { name: 'רונית', role: 'לקוחה', phone: '+972501110001' }, 'setup_package');
     await seedEntity('+972501110002', { name: 'משה', role: 'ספק', phone: '+972501110002' }, 'settings_people');
     const before = await entities();
+    // The seeds above are owner writes (boss jobs); count from here.
+    const bossJobs = async () =>
+      (await testDb().query("SELECT 1 FROM jobs WHERE business_id = $1 AND provenance = 'boss'", [BUSINESS])).rows.length;
+    const bossJobsBefore = await bossJobs();
     const { baseUrl, cookie } = await start();
 
     const add = await post(baseUrl, cookie, `${PEOPLE}/contact/add`, {
@@ -270,10 +300,7 @@ describe('/settings/people', () => {
 
     const after = await entities();
     expect(after).toEqual(before);
-    const { rows: jobs } = await testDb().query("SELECT 1 FROM jobs WHERE business_id = $1 AND provenance = 'boss'", [
-      BUSINESS,
-    ]);
-    expect(jobs).toEqual([]);
+    expect(await bossJobs()).toBe(bossJobsBefore);
   });
 
   it('a contact add on the phone of a learned (not managed) entity still supersedes it', async () => {
@@ -335,5 +362,120 @@ describe('/settings/people', () => {
     expect(contact.status).toBe(403);
     expect(await withBusiness(BUSINESS, (db) => listColleagues(db))).toEqual([]);
     expect(await entities()).toEqual([]);
+  });
+});
+
+describe('/settings/people — contact kind and email', () => {
+  it('saves kind and email, re-renders them, and stores them in the entity body', async () => {
+    const { baseUrl, cookie } = await start();
+    const add = await post(baseUrl, cookie, `${PEOPLE}/contact/add`, {
+      csrf: await csrf(baseUrl, cookie),
+      name: 'דנה',
+      role: 'לקוחה',
+      phone: '+972501110009',
+      kind: 'supplier',
+      email: 'dana@example.com',
+    });
+    expect(add.status).toBe(303);
+    const row = (await entities())[0];
+    expect(row?.body).toMatchObject({ kind: 'supplier', email: 'dana@example.com' });
+    const html = await (await get(baseUrl, cookie, PEOPLE)).text();
+    expect(html).toContain('value="dana@example.com"');
+    expect(html).toMatch(/<option value="supplier" selected>/);
+  });
+
+  it('rejects an invalid email with a Hebrew message and writes nothing', async () => {
+    const { baseUrl, cookie } = await start();
+    const res = await post(baseUrl, cookie, `${PEOPLE}/contact/add`, {
+      csrf: await csrf(baseUrl, cookie),
+      name: 'דנה',
+      role: 'לקוחה',
+      phone: '+972501110009',
+      kind: 'client',
+      email: 'not-an-email',
+    });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('כתובת המייל אינה תקינה');
+    expect(await entities()).toEqual([]);
+  });
+
+  it('a contact without kind or email still saves', async () => {
+    const { baseUrl, cookie } = await start();
+    const res = await post(baseUrl, cookie, `${PEOPLE}/contact/add`, {
+      csrf: await csrf(baseUrl, cookie),
+      name: 'דנה',
+      role: 'לקוחה',
+      phone: '+972501110009',
+      kind: '',
+      email: '',
+    });
+    expect(res.status).toBe(303);
+    expect((await entities())[0]?.body).toEqual({ name: 'דנה', role: 'לקוחה', phone: '+972501110009' });
+  });
+});
+
+describe('attach invoice to a contact', () => {
+  const PHONE = '+972501110009';
+
+  async function addContact(baseUrl: string, cookie: string): Promise<string> {
+    await post(baseUrl, cookie, `${PEOPLE}/contact/add`, {
+      csrf: await csrf(baseUrl, cookie),
+      name: 'דנה',
+      role: 'לקוחה',
+      phone: PHONE,
+      kind: 'client',
+    });
+    return PHONE;
+  }
+
+  async function uploadInvoice(baseUrl: string, cookie: string, fields: Record<string, string>) {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(fields)) form.append(k, v);
+    form.append('invoice', new Blob(['חשבונית 1234 סכום 500']), 'inv.txt');
+    return fetch(`${baseUrl}${PEOPLE}/contact/invoice`, { method: 'POST', headers: { cookie }, body: form, redirect: 'manual' });
+  }
+
+  const rowsOf = async () =>
+    (
+      await testDb().query<{ contact_key: string; assigned_by: string }>(
+        `SELECT contact_key, assigned_by FROM contact_documents WHERE business_id = $1`,
+        [BUSINESS],
+      )
+    ).rows;
+
+  it('an upload assigned in the dashboard appears for that contact', async () => {
+    const { baseUrl, cookie } = await start();
+    const key = await addContact(baseUrl, cookie);
+    const res = await uploadInvoice(baseUrl, cookie, { csrf: await csrf(baseUrl, cookie), key });
+    expect(res.status).toBe(303);
+    expect(await rowsOf()).toEqual([{ contact_key: '972501110009', assigned_by: 'owner_upload' }]);
+    const { rows } = await testDb().query<{ source: string }>(`SELECT source FROM documents WHERE business_id = $1`, [BUSINESS]);
+    expect(rows.map((r) => r.source)).toEqual(['instruction']);
+    expect(await withBusiness(BUSINESS, (db) => documentsAwaitingRead(db, 10))).toEqual([]);
+  });
+
+  it('assigning requires CSRF and a managed contact key', async () => {
+    const { baseUrl, cookie } = await start();
+    const key = await addContact(baseUrl, cookie);
+    const bad = await uploadInvoice(baseUrl, cookie, { csrf: 'deadbeef', key });
+    expect(bad.status).toBe(403);
+    const unknown = await uploadInvoice(baseUrl, cookie, { csrf: await csrf(baseUrl, cookie), key: '+972509999999' });
+    expect(unknown.status).toBe(404);
+    expect(await rowsOf()).toEqual([]);
+  });
+
+  it('renders an ingest rejection reason HTML-escaped', async () => {
+    const { baseUrl, cookie } = await start();
+    const key = await addContact(baseUrl, cookie);
+    ingestOverride.reason = '<script>alert(1)</script>';
+    try {
+      const res = await uploadInvoice(baseUrl, cookie, { csrf: await csrf(baseUrl, cookie), key });
+      expect(res.status).toBe(400);
+      const body = await res.text();
+      expect(body).not.toContain('<script>alert(1)');
+      expect(body).toContain('&lt;script&gt;');
+    } finally {
+      ingestOverride.reason = null;
+    }
   });
 });

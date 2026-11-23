@@ -112,6 +112,9 @@ import {
 import { recallForPlanning } from '../memory/recall-planning.js';
 import { classifyAction } from '../policy/classify.js';
 import { readEmails, readPhones } from '../policy/facts.js';
+import { listManagedContacts } from '../business/settings-contacts.js';
+import { waRecipientNote, waRecipientSource, waStepProblem } from './whatsapp-recipient.js';
+import type { WhatsAppEchoContext } from './command-echo.js';
 import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import { nameCarriesCancelWord } from './command-confirm.js';
 import { descriptionFragment } from '../business/description-store.js';
@@ -826,6 +829,9 @@ async function planAndCheck(
     const ledger = await ledgerStepProblem(door, step);
     if (ledger !== null) return { kind: 'refused', ...ledger };
 
+    const whatsapp = await whatsAppStepProblem(door, step);
+    if (whatsapp !== null) return { kind: 'refused', ...whatsapp };
+
     // Spec §4.2: a plan that produces a document does ONLY that. The
     // production job is parked and closed by the production loop, the card is
     // its report, and delivery is a separate approved job — a second step
@@ -853,6 +859,41 @@ async function planAndCheck(
   }
 
   return { kind: 'plan', plan };
+}
+
+/**
+ * Task 13 (H2, H15): an owner-ordered WhatsApp message goes only to a contact
+ * he saved or a number he TYPED in this instruction (`waRecipientSource`:
+ * exact `authorityNumberKey`, `textOrigin === 'typed'` for the typed arm), a
+ * `sendAt` must be an ISO instant in the future, at most 30 days ahead, and no
+ * other tool may carry a `sendAt` at all (`waStepProblem`).
+ * Refused here, before the owner is asked, so the question never shows a send
+ * that could not be allowed. Null when the step is fine (or not WhatsApp).
+ */
+async function whatsAppStepProblem(
+  door: DoorContext,
+  step: Plan['steps'][number],
+): Promise<{ reason: string; audit: string } | null> {
+  const problem = await waStepProblem(door.db, step, { text: door.instruction.text, textOrigin: door.textOrigin });
+  return problem === null ? null : { reason: problem.reason, audit: `instruction door: ${problem.audit}` };
+}
+
+/**
+ * The WhatsApp echo context for this instruction's confirmation question: the
+ * charter timezone and each recipient's source, resolved by the same rule the
+ * plan check refuses on (`waRecipientSource`).
+ */
+async function whatsAppEchoContext(door: DoorContext, plan: readonly Plan[]): Promise<WhatsAppEchoContext | undefined> {
+  if (!plan.some((p) => p.steps.some((step) => step.toolName === 'wa.send_message'))) return undefined;
+  const contacts = await listManagedContacts(door.db);
+  const ctx = { contacts, instructionText: door.instruction.text, textOrigin: door.textOrigin };
+  return {
+    timeZone: door.timeZone,
+    recipientNote: (to) => {
+      const source = waRecipientSource(to, ctx);
+      return source === null ? null : waRecipientNote(source);
+    },
+  };
 }
 
 /**
@@ -1097,11 +1138,13 @@ async function planPerCandidate(
 
   const ledgerEchoes: (string | null)[] = [];
   for (const option of options) ledgerEchoes.push(await ledgerEchoOf(door, option.plan));
+  const whatsappEcho = await whatsAppEchoContext(door, options.map((o) => o.plan));
   const rendered = renderConfirmationQuestion(options, {
     currency: door.bundle.ceilings.currency,
     systems: door.bundle.externalSystems,
     redactPatterns: door.bundle.redactPatterns,
     extraEchoes: ledgerEchoes,
+    ...(whatsappEcho === undefined ? {} : { whatsapp: whatsappEcho }),
   });
   if ('refused' in rendered) {
     await failJob(door, 'instruction door: confirmation question refused (step too long to show)');
@@ -1174,11 +1217,13 @@ async function finishSingle(
       plan,
       contactSource: single.contactSource,
     };
+    const whatsappEcho = await whatsAppEchoContext(door, [plan]);
     const rendered = renderConfirmationQuestion([option], {
       currency: door.bundle.ceilings.currency,
       systems: door.bundle.externalSystems,
       redactPatterns: door.bundle.redactPatterns,
       extraEchoes: [single.extraEcho ?? (await ledgerEchoOf(door, plan))],
+      ...(whatsappEcho === undefined ? {} : { whatsapp: whatsappEcho }),
     });
     if ('refused' in rendered) {
       await failJob(door, 'instruction door: confirmation question refused (step too long to show)');
@@ -1398,7 +1443,7 @@ async function grantForPlan(
     // Emails and phones both. A WhatsApp step's recipient is a number, and
     // Task 3 widened `coveredByAuthorization` to see them for the same
     // reason — a grant the gate cannot match is a grant that does nothing.
-    const candidates = [...readEmails(step.input), ...readPhones(step.input)];
+    const candidates = [...readEmails(step.input), ...readPhones(step.input, step.toolName)];
 
     const covered = authorisedRecipients({
       instruction,

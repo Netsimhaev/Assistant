@@ -73,7 +73,7 @@ async function recipientOfStep(
 
   const [email] = readEmails(step.input);
   if (email !== undefined) return email;
-  const [phone] = readPhones(step.input);
+  const [phone] = readPhones(step.input, step.toolName);
   return phone ?? null;
 }
 

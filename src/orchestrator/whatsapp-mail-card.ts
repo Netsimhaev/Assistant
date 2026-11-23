@@ -287,9 +287,17 @@ export function isMailCardAction(text: string): boolean {
  */
 export async function handleMailCardMessage(
   db: BusinessDb,
-  input: { msg: NormalizedInboundMessage; storedId: string; cards: readonly OpenMailCard[]; messenger: BossMessenger },
+  input: {
+    msg: NormalizedInboundMessage;
+    storedId: string;
+    cards: readonly OpenMailCard[];
+    messenger: BossMessenger;
+    /** Other open things on WhatsApp (contact cards); any makes "שלח" ambiguous. Default 0. */
+    othersOpen?: number;
+  },
 ): Promise<MailCardOutcome> {
   const { msg, storedId, cards, messenger } = input;
+  const othersOpen = input.othersOpen ?? 0;
   if (msg.mediaKind !== null) return 'passthrough';
   const text = msg.body ?? '';
   if (!isMailCardAction(text)) return 'passthrough';
@@ -306,7 +314,7 @@ export async function handleMailCardMessage(
   const by = `whatsapp:${authorityNumberKey(msg.senderNumber) ?? msg.senderNumber}`;
 
   if (isApproveWord(text)) {
-    const only = cards.length === 1 ? cards[0] : undefined;
+    const only = cards.length === 1 && othersOpen === 0 ? cards[0] : undefined;
     if (only === undefined) return refuse(MULTIPLE_MAIL_CARDS_REFUSAL);
     return approveCard(only.approval, { by, storedId, messenger, db, refuse });
   }
@@ -320,7 +328,7 @@ export async function handleMailCardMessage(
 
   const newBody = replacementBody(text) ?? '';
   if (newBody === '') return refuse(EMPTY_REPLACEMENT);
-  const only = cards.length === 1 ? cards[0] : undefined;
+  const only = cards.length === 1 && othersOpen === 0 ? cards[0] : undefined;
   if (only === undefined) return refuse(MULTIPLE_MAIL_CARDS_REFUSAL);
   return replaceBody(only.approval, newBody, { storedId, messenger, db, refuse });
 }

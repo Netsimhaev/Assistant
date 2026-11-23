@@ -129,7 +129,7 @@ SELECT b.business_id,
        (SELECT count(*) FROM memories m
          WHERE m.business_id = b.business_id
            AND m.kind = 'entity' AND m.retired_at IS NULL
-           AND m.source_ref = ANY($SOURCES::text[])) AS contacts_confirmed,
+           AND m.source_ref = ANY($SOURCES::text[]) AND m.provenance = 'boss') AS contacts_confirmed,
        (SELECT count(*) FROM business_colleagues bc
          WHERE bc.business_id = b.business_id) AS colleagues_confirmed
   FROM businesses b

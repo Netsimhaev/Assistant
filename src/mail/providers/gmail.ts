@@ -29,6 +29,8 @@ import {
   labelNotAllowed,
   MailboxCursorError,
   ok2xx,
+  sentQueryProblem,
+  type SentMail,
   type MailboxClient,
   type OutgoingMessage,
   type MailboxFailure,
@@ -292,6 +294,57 @@ export function createGmailClient(http: MailboxHttp = defaultMailboxHttp()): Mai
           if (mail !== null) messages.push(mail);
         }
         return { messages, nextCursor };
+      });
+    },
+
+    searchSent(token, query, signal) {
+      return guarded(async () => {
+        const problem = sentQueryProblem(query);
+        if (problem !== null) return problem;
+        const list = new URL(`${BASE}/messages`);
+        list.searchParams.set('q', `in:sent to:${query.to} has:attachment newer_than:${query.sinceDays}d`);
+        list.searchParams.set('maxResults', String(query.limit));
+        const found = await http.request({ method: 'GET', url: list.toString(), accessToken: token, signal });
+        if (!ok2xx(found.status)) return failureFromStatus(found.status, found.body);
+        const refs = asRecord(found.body)['messages'];
+        const out: SentMail[] = [];
+        for (const ref of Array.isArray(refs) ? refs.slice(0, query.limit) : []) {
+          const id = asRecord(ref)['id'];
+          if (typeof id !== 'string') continue;
+          const res = await http.request({
+            method: 'GET',
+            url: `${BASE}/messages/${encodeURIComponent(id)}?format=full`,
+            accessToken: token,
+            signal,
+          });
+          if (res.status === 404) continue;
+          // One failing message read must not discard the rest.
+          if (!ok2xx(res.status)) continue;
+          const msg = asRecord(res.body);
+          const payload = asRecord(msg['payload']) as GmailPart;
+          const recipients = ['To', 'Cc', 'Bcc'].flatMap((h) =>
+            parseAddressList(headerOf(payload.headers, h) ?? '').map((a) => a.address.toLowerCase()),
+          );
+          const attachments: SentMail['attachments'] = [];
+          walk(payload, (p) => {
+            if (p.filename !== undefined && p.filename !== '' && p.body?.attachmentId !== undefined) {
+              attachments.push({
+                attachmentId: p.body.attachmentId,
+                filename: p.filename,
+                mediaType: p.mimeType ?? 'application/octet-stream',
+              });
+            }
+          });
+          const internal = Number(msg['internalDate']);
+          out.push({
+            providerMessageId: id,
+            sentAt: new Date(Number.isFinite(internal) && internal > 0 ? internal : Date.now()).toISOString(),
+            subject: decodeHeader(headerOf(payload.headers, 'Subject') ?? ''),
+            recipients,
+            attachments,
+          });
+        }
+        return out;
       });
     },
 

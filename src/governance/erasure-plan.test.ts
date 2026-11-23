@@ -1981,3 +1981,158 @@ describe('external systems', () => {
     expect(plan.externalSystemsKept).toEqual(['blank', 'מערכת הלקוחות (crm)', 'מערכת הלקוחות (crm2)'].sort());
   });
 });
+
+describe('WhatsApp conversations with contacts (migration 083)', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  const PHONE_TYPED = '+972 50-999-0002';
+  const KEY = '972509990002';
+
+  async function aConversation(
+    conversationId: string,
+    contactKey: string,
+    cardJobId: string | null,
+    openedAt = '2026-06-01T10:00:00Z',
+    subjectKey: string | null = null,
+  ): Promise<void> {
+    await testDb().query(
+      `INSERT INTO contact_conversations
+         (business_id, conversation_id, contact_key, contact_subject_key, contact_kind, state,
+          opened_at, last_inbound_at, card_job_id)
+       VALUES ($1, $2, $3, $4, 'client', 'closed', $5, $5, $6)`,
+      [BUSINESS, conversationId, contactKey, subjectKey, openedAt, cardJobId],
+    );
+  }
+
+  it('a phone anchor reaches conversations, decisions, documents and messages by the number, and nothing of another number', async () => {
+    const cardJob = await bareJob('wa-card');
+    const sendJob = await bareJob('wa-send');
+    const otherJob = await bareJob('wa-other');
+    await aConversation('CC-1', KEY, cardJob);
+    await aConversation('CC-2', KEY, null);
+    await aConversation('CC-other', '972509990003', otherJob);
+    // A key that CONTAINS the anchor's key as a substring: equality, never LIKE.
+    await aConversation('CC-longer', `${KEY}9`, null);
+    await testDb().query(
+      `INSERT INTO contact_reply_decisions
+         (business_id, decision_id, conversation_id, job_id, approval_id, verdict, source_tiers, decided_at)
+       VALUES ($1, 'CRD-1', 'CC-1', $2, 'AP-1', 'right', ARRAY['tier2'], now()),
+              ($1, 'CRD-other', 'CC-other', $3, 'AP-other', 'wrong', ARRAY[]::text[], now())`,
+      [BUSINESS, cardJob, otherJob],
+    );
+    const invoice = await aDocument();
+    const otherInvoice = await aDocument();
+    await testDb().query(
+      `INSERT INTO contact_documents (business_id, document_id, contact_key, kind, assigned_by)
+       VALUES ($1, $2, $3, 'invoice', 'owner_upload'), ($1, $4, '972509990003', 'invoice', 'sent_mail')`,
+      [BUSINESS, invoice, KEY, otherInvoice],
+    );
+    await testDb().query(
+      `INSERT INTO whatsapp_messages
+         (id, business_id, provider_message_id, direction, sender_number, sender_kind, body,
+          provider_timestamp, state, job_id, recipient_number)
+       VALUES ('WA-in', $1, 'wamid-in', 'inbound', $2, 'contact', 'מתי החשבונית?', now(), 'handled', NULL, NULL),
+              ('WA-out', $1, NULL, 'outbound', NULL, NULL, 'קיבלתי, בודקת', now(), 'handled', NULL, $3),
+              ('WA-out-job', $1, NULL, 'outbound', NULL, NULL, 'הנה החשבונית', now(), 'handled', $4, $3),
+              ('WA-other', $1, NULL, 'outbound', NULL, NULL, 'שלום', now(), 'handled', NULL, '+972509990003')`,
+      [BUSINESS, `${KEY}@c.us`, `+${KEY}`, sendJob],
+    );
+
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PHONE_TYPED }));
+    expect(plan.jobIds).toEqual(expect.arrayContaining([cardJob, sendJob]));
+    expect(plan.jobIds).not.toContain(otherJob);
+    expect(plan.documentIds).toContain(invoice);
+    expect(plan.documentIds).not.toContain(otherInvoice);
+    const count = (table: string): number | undefined =>
+      plan.items.find((item) => item.table === table && item.action === 'delete')?.count;
+    expect(count('contact_conversations')).toBe(2);
+    expect(count('contact_reply_decisions')).toBe(1);
+    expect(count('contact_documents')).toBe(1);
+    expect(count('whatsapp_messages')).toBe(3);
+
+    const outcome = await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
+    const done = (table: string): number | undefined =>
+      outcome.deleted.find((item) => item.table === table && item.action === 'delete')?.count;
+    // The executor touched exactly what the preview counted.
+    for (const table of ['contact_conversations', 'contact_reply_decisions', 'contact_documents', 'whatsapp_messages']) {
+      expect(done(table), table).toBe(count(table));
+    }
+
+    const left = async (sql: string): Promise<string[]> =>
+      (await testDb().query<{ id: string }>(sql, [BUSINESS])).rows.map((r) => r.id).sort();
+    expect(await left('SELECT conversation_id AS id FROM contact_conversations WHERE business_id = $1'))
+      .toEqual(['CC-longer', 'CC-other']);
+    expect(await left('SELECT decision_id AS id FROM contact_reply_decisions WHERE business_id = $1')).toEqual(['CRD-other']);
+    expect(await left('SELECT document_id AS id FROM contact_documents WHERE business_id = $1')).toEqual([otherInvoice]);
+    expect(await left('SELECT id FROM whatsapp_messages WHERE business_id = $1')).toEqual(['WA-other']);
+    expect(await left('SELECT document_id AS id FROM documents WHERE business_id = $1')).toEqual([otherInvoice]);
+  });
+
+  it('a phone anchor removes the contact_documents link even when the owner kept the document', async () => {
+    const invoice = await aDocument();
+    await testDb().query(
+      `INSERT INTO contact_documents (business_id, document_id, contact_key, kind, assigned_by)
+       VALUES ($1, $2, $3, 'invoice', 'accounting')`,
+      [BUSINESS, invoice, KEY],
+    );
+    await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'document', itemId: invoice, note: 'לשימור' }));
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PHONE_TYPED }));
+    expect(plan.documentIds).not.toContain(invoice);
+    expect(plan.items.find((item) => item.table === 'contact_documents' && item.action === 'delete')?.count).toBe(1);
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
+    const link = await testDb().query('SELECT 1 FROM contact_documents WHERE business_id = $1', [BUSINESS]);
+    expect(link.rows).toHaveLength(0);
+    const kept = await testDb().query('SELECT 1 FROM documents WHERE business_id = $1 AND document_id = $2', [BUSINESS, invoice]);
+    expect(kept.rows).toHaveLength(1);
+  });
+
+  it('a window anchor reaches a conversation by opened_at, with its card job, and not one outside it', async () => {
+    const inside = await bareJob('wa-inside');
+    const outside = await bareJob('wa-outside');
+    await aConversation('CC-in', KEY, inside, '2026-06-01T10:00:00Z');
+    await aConversation('CC-in-nocard', KEY, null, '2026-06-01T11:00:00Z');
+    await aConversation('CC-out', KEY, outside, '2026-06-03T10:00:00Z');
+    // Card jobs are created now, outside the window: only the conversation brings them in.
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, {
+      kind: 'window', fromIso: '2026-06-01T00:00:00.000Z', toIso: '2026-06-02T00:00:00.000Z',
+    }));
+    expect(plan.jobIds).toContain(inside);
+    expect(plan.jobIds).not.toContain(outside);
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
+    const rows = await testDb().query<{ id: string }>(
+      'SELECT conversation_id AS id FROM contact_conversations WHERE business_id = $1', [BUSINESS],
+    );
+    expect(rows.rows.map((r) => r.id)).toEqual(['CC-out']);
+  });
+
+  it('a conversation found by its subject key goes with its card job, and stays when that job is kept', async () => {
+    const kept = await bareJob('wa-kept');
+    const erased = await bareJob('wa-erased');
+    await aConversation('CC-kept', KEY, kept, undefined, RONIT);
+    await aConversation('CC-erased', '972509990004', erased, undefined, RONIT);
+    await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'job', itemId: kept, note: 'לשימור' }));
+
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
+    expect(plan.jobIds).toContain(erased);
+    expect(plan.jobIds).not.toContain(kept);
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
+    const rows = await testDb().query<{ id: string }>(
+      'SELECT conversation_id AS id FROM contact_conversations WHERE business_id = $1', [BUSINESS],
+    );
+    expect(rows.rows.map((r) => r.id)).toEqual(['CC-kept']);
+  });
+
+  it('refuses while a conversation card is waiting on the owner', async () => {
+    const card = await bareJob('wa-live');
+    await testDb().query(`UPDATE jobs SET phase = 'await_approval' WHERE business_id = $1 AND job_id = $2`, [BUSINESS, card]);
+    await aConversation('CC-live', KEY, card);
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: `+${KEY}` }));
+    expect(plan.refusals.map((r) => r.kind)).toContain('live_job');
+  });
+});

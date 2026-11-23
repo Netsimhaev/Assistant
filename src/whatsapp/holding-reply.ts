@@ -1,0 +1,206 @@
+/**
+ * The holding reply: "I received your message, checking and will update."
+ *
+ * THE ONE DOCUMENTED GATE BYPASS of the contact-WhatsApp feature. It goes
+ * straight to the gateway, not through `evaluateToolCall`, because a contact's
+ * first message is `unknown_external` and the gate would refuse every outbound
+ * action there. What stands in for the gate, all positive checks:
+ *   - the text is a constant (`HOLDING_REPLY_TEXT`) around the business's own
+ *     display name, read here and made one bidi-free line — the sending
+ *     function has no text parameter, so nothing a contact wrote can reach the
+ *     wire;
+ *   - the recipient is the conversation's own `contact_key`, read from the row;
+ *   - only while the conversation is `open` or `carded`, first attempt and
+ *     deferred alike;
+ *   - once per conversation (claimed in the row before sending), at most 3 per
+ *     number per business day, and a FIRST attempt only when the contact wrote
+ *     within the last 60 minutes (a deferred reply stays valid while the
+ *     question is open). Freshness is checked BEFORE the kill switch, so a
+ *     stale first attempt is dropped (`stale`), never deferred into a send
+ *     after release;
+ *   - never inside quiet hours (deferred to their end), and stopped by the
+ *     kill switch whenever it stops `comms.whatsapp`'s outbound actions —
+ *     scope `all`, `front_office` or `outbound`. Stopped is `halted`: the reply
+ *     is deferred (`holding_due_at` = now + `HOLDING_RETRY_MS`), not dropped,
+ *     and a later pass sends it only if the rules above still hold;
+ *   - an audit row that carries a hash and a constant reason, never the number.
+ */
+import type { BusinessDb } from '../db/pool.js';
+import type { PolicyBundle } from '../domain/policy.js';
+import { appendAudit } from '../audit/log.js';
+import { checkKillSwitch } from '../governance/killswitch.js';
+import { inQuietHours } from '../policy/redact.js';
+import { stripBidiControls, toOneLine } from '../util/bidi.js';
+import { canonicalHash } from '../util/canonical.js';
+import { localParts, localToInstant, nextQuietEnd } from '../util/local-time.js';
+import { deferHolding, loadConversation, markHoldingSent } from './contact-conversations.js';
+import type { WhatsAppGateway } from './gateway.js';
+import { recordOutbound } from './store.js';
+
+export const HOLDING_REPLY_REASON = 'contact_holding_reply';
+export const HOLDING_MAX_PER_DAY = 3;
+export const HOLDING_FRESHNESS_MS = 60 * 60 * 1000;
+export const HOLDING_RETRY_MS = 5 * 60 * 1000;
+export const HOLDING_GIVE_UP_MS = 24 * 60 * 60 * 1000;
+export const HOLDING_NAME_FALLBACK = 'העסק';
+
+export const HOLDING_REPLY_TEXT = (businessName: string): string =>
+  `שלום, כאן העוזרת הדיגיטלית של ${businessName}. קיבלתי את הודעתך — בודקת ומעדכנת בהקדם.`;
+
+export interface HoldingDeps {
+  gateway: WhatsAppGateway;
+  bundle: PolicyBundle;
+  now: Date;
+}
+
+export type HoldingOutcome = 'sent' | 'deferred' | 'already' | 'stale' | 'capped' | 'halted' | 'failed';
+
+/** The business's display name, read here (never passed in) and made one safe line. */
+async function displayName(db: BusinessDb): Promise<string> {
+  const { rows } = await db.query<{ display_name: string | null }>(
+    'SELECT display_name FROM business_profiles WHERE business_id = $1',
+    [db.businessId],
+  );
+  const name = toOneLine(stripBidiControls(rows[0]?.display_name ?? '')).trim();
+  return name === '' ? HOLDING_NAME_FALLBACK : name;
+}
+
+/** Holdings to this number today (business timezone): the larger of audited sends and claimed rows. */
+async function holdingsToday(db: BusinessDb, key: string, bundle: PolicyBundle, now: Date): Promise<number> {
+  // The charter's timezone (UTC when no quiet window names one).
+  const tz = bundle.quietHours?.timezone ?? 'UTC';
+  const dayStart = localToInstant(localParts(now, tz).date, '00:00', tz);
+  const audited = await db.query<{ n: string }>(
+    `SELECT count(*) AS n FROM audit_log
+      WHERE business_id = $1 AND kind = 'tool_call' AND reason = $2 AND input_hash = $3 AND at >= $4`,
+    [db.businessId, HOLDING_REPLY_REASON, canonicalHash({ key }), dayStart],
+  );
+  const claimed = await db.query<{ n: string }>(
+    `SELECT count(*) AS n FROM contact_conversations
+      WHERE business_id = $1 AND contact_key = $2 AND holding_sent_at >= $3`,
+    [db.businessId, key, dayStart],
+  );
+  return Math.max(Number(audited.rows[0]?.n ?? 0), Number(claimed.rows[0]?.n ?? 0));
+}
+
+export async function sendHoldingReply(
+  db: BusinessDb,
+  deps: HoldingDeps,
+  conversationId: string,
+): Promise<HoldingOutcome> {
+  const { gateway, bundle, now } = deps;
+  const conv = await loadConversation(db, conversationId);
+  if (conv === null) return 'stale';
+  if (conv.holdingSentAt !== null) return 'already';
+
+  // Retries are bounded: a conversation untouched for 24 hours is given up on.
+  const giveUp = async (): Promise<void> => {
+    await db.query(
+      `UPDATE contact_conversations SET holding_due_at = NULL
+        WHERE business_id = $1 AND conversation_id = $2 AND holding_sent_at IS NULL`,
+      [db.businessId, conversationId],
+    );
+  };
+  if (now.getTime() - conv.lastInboundAt.getTime() > HOLDING_GIVE_UP_MS) {
+    await giveUp();
+    return 'stale';
+  }
+
+  // Only while the question is open — first attempt and deferred alike.
+  if (conv.state !== 'open' && conv.state !== 'carded') return 'stale';
+  // A deferred reply (holding_due_at set) is still wanted while the question
+  // is open; a first attempt must be fresh — and is judged so BEFORE the kill
+  // switch, so a stale first attempt is dropped, never deferred.
+  if (conv.holdingDueAt === null && now.getTime() - conv.lastInboundAt.getTime() > HOLDING_FRESHNESS_MS) {
+    return 'stale';
+  }
+
+  const kill = await checkKillSwitch(db, 'comms.whatsapp', true);
+  if (kill.blocked) {
+    // Deferred, not dropped: it goes out after release only if the usual
+    // state and give-up rules still hold on a later pass.
+    await deferHolding(db, conversationId, new Date(now.getTime() + HOLDING_RETRY_MS));
+    return 'halted';
+  }
+  if ((await holdingsToday(db, conv.contactKey, bundle, now)) >= HOLDING_MAX_PER_DAY) return 'capped';
+
+  if (inQuietHours(bundle.quietHours, now)) {
+    await deferHolding(db, conversationId, nextQuietEnd(bundle, now));
+    return 'deferred';
+  }
+
+  const name = await displayName(db);
+  let claimed = false;
+  try {
+    // Claim before sending: exactly one runner gets the row back, and only it sends.
+    const claim = await db.query(
+      `UPDATE contact_conversations SET holding_sent_at = $3
+        WHERE business_id = $1 AND conversation_id = $2 AND holding_sent_at IS NULL RETURNING 1`,
+      [db.businessId, conversationId, now],
+    );
+    if (claim.rows.length === 0) return 'already';
+    claimed = true;
+
+    // Best effort against a race on the daily cap: recount with our claim included.
+    if ((await holdingsToday(db, conv.contactKey, bundle, now)) > HOLDING_MAX_PER_DAY) {
+      await release(db, conversationId, now);
+      return 'capped';
+    }
+
+    const result = await gateway.sendMessage({
+      contactId: conv.contactKey,
+      body: HOLDING_REPLY_TEXT(name),
+      idempotencyKey: `holding:${conversationId}`,
+    });
+    if (result.state === 'rejected') throw new Error('rejected');
+  } catch {
+    // Anything before the send completed: free our claim and try again later.
+    if (claimed) await release(db, conversationId, now);
+    if (now.getTime() - conv.lastInboundAt.getTime() > HOLDING_GIVE_UP_MS) await giveUp();
+    else await deferHolding(db, conversationId, new Date(now.getTime() + HOLDING_RETRY_MS));
+    return 'failed';
+  }
+
+  await markHoldingSent(db, conversationId, now);
+  await recordOutbound(db, { body: HOLDING_REPLY_TEXT(name), jobId: null, recipientNumber: conv.contactKey });
+  await appendAudit(db, {
+    actor: 'comms.whatsapp',
+    kind: 'tool_call',
+    charterVersion: bundle.charterVersion,
+    provenance: 'unknown_external',
+    inputHash: canonicalHash({ key: conv.contactKey }),
+    reason: HOLDING_REPLY_REASON,
+  });
+  return 'sent';
+}
+
+/** Clear only our own claim. */
+async function release(db: BusinessDb, conversationId: string, claimedAt: Date): Promise<void> {
+  await db.query(
+    `UPDATE contact_conversations SET holding_sent_at = NULL
+      WHERE business_id = $1 AND conversation_id = $2 AND holding_sent_at = $3`,
+    [db.businessId, conversationId, claimedAt],
+  );
+}
+
+/** Scheduler entry: every conversation whose deferred reply is now due and unsent. */
+export async function sendDueHoldingReplies(
+  db: BusinessDb,
+  deps: HoldingDeps,
+): Promise<{ sent: number; failed: number }> {
+  const { rows } = await db.query<{ conversation_id: string }>(
+    `SELECT conversation_id FROM contact_conversations
+      WHERE business_id = $1 AND holding_due_at <= $2 AND holding_sent_at IS NULL
+        AND state IN ('open', 'carded')
+      ORDER BY holding_due_at`,
+    [db.businessId, deps.now],
+  );
+  let sent = 0;
+  let failed = 0;
+  for (const r of rows) {
+    const outcome = await sendHoldingReply(db, deps, r.conversation_id);
+    if (outcome === 'sent') sent += 1;
+    else if (outcome === 'failed') failed += 1;
+  }
+  return { sent, failed };
+}

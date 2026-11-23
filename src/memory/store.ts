@@ -106,6 +106,66 @@ export async function writeMemory(
   db: BusinessDb,
   input: WriteMemoryInput,
 ): Promise<MemoryRecord> {
+  // A reserved `source_ref` is stripped, never stored: on this path it can
+  // only have come from a planner payload or a curator candidate, both of
+  // which read text a stranger may have written (see `RESERVED_SOURCE_REFS`).
+  const sourceRef = isReservedSourceRef(input.sourceRef) ? null : (input.sourceRef ?? null);
+  return insertMemory(db, input, sourceRef);
+}
+
+/**
+ * The `source_ref` values that mark a contact the OWNER saved — at setup
+ * (`setup_package`, `business/confirm-people.ts`) or on "הגדרות ← אנשים"
+ * (`settings_people`, `business/settings-contacts.ts`). Those rows are what
+ * `listManagedContacts` lists, so they make a number a "saved contact": the
+ * WhatsApp sender resolver treats it as known, and an owner-ordered WhatsApp
+ * to it is echoed "(איש קשר ששמרת: …)" — a "כן" on which skips gate stages
+ * 5–9. So the marker is a grant of trust, and it must not be writable by
+ * anyone but the owner's own two screens.
+ *
+ * `writeMemory` strips these values (exact match after trim and lower-case,
+ * so a variant cannot slip through either); the only path that writes them is
+ * `writeManagedContactMemory`, imported by exactly those two modules
+ * (`managed-contact-invariants.test.ts`).
+ */
+export const RESERVED_SOURCE_REFS = ['setup_package', 'settings_people'] as const;
+export type ReservedSourceRef = (typeof RESERVED_SOURCE_REFS)[number];
+
+export function isReservedSourceRef(value: string | null | undefined): boolean {
+  if (typeof value !== 'string') return false;
+  const normalised = value.trim().toLowerCase();
+  return (RESERVED_SOURCE_REFS as readonly string[]).includes(normalised);
+}
+
+/**
+ * The owner's own contact write: an `entity` memory carrying a reserved
+ * `source_ref`. For `business/confirm-people.ts` and
+ * `business/settings-contacts.ts` only — both write under a fresh job whose
+ * provenance is the literal `boss`, and `listManagedContacts` requires that
+ * provenance too. Refuses a job whose stored provenance is not `boss`.
+ */
+export async function writeManagedContactMemory(
+  db: BusinessDb,
+  input: { jobId: string; subjectKey: string; body: Record<string, unknown>; source: ReservedSourceRef },
+): Promise<MemoryRecord> {
+  if (!(RESERVED_SOURCE_REFS as readonly string[]).includes(input.source)) {
+    throw new Error('writeManagedContactMemory: not a managed-contact source');
+  }
+  const record = await insertMemory(
+    db,
+    { jobId: input.jobId, kind: 'entity', subjectKey: input.subjectKey, body: input.body },
+    input.source,
+    'boss',
+  );
+  return record;
+}
+
+async function insertMemory(
+  db: BusinessDb,
+  input: WriteMemoryInput,
+  sourceRef: string | null,
+  requiredProvenance?: 'boss',
+): Promise<MemoryRecord> {
   const businessId = db.businessId;
 
   const job = await db.query<{ provenance: string }>(
@@ -117,6 +177,9 @@ export async function writeMemory(
     throw new MemoryJobUnresolvedError(
       `writeMemory: no job ${input.jobId} for business ${businessId}`,
     );
+  }
+  if (requiredProvenance !== undefined && provenance !== requiredProvenance) {
+    throw new Error(`writeMemory: job ${input.jobId} is not a ${requiredProvenance} job`);
   }
 
   const attribute = input.kind === 'preference' ? (input.attribute ?? null) : null;
@@ -151,7 +214,7 @@ export async function writeMemory(
       JSON.stringify(input.body),
       provenance,
       input.jobId,
-      input.sourceRef ?? null,
+      sourceRef,
     ],
   );
 

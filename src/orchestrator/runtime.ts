@@ -36,6 +36,10 @@ import { oauthCredentials } from './oauth-token.js';
 import type { TokenHttp } from './oauth-token.js';
 import type { CredentialHandle } from './adapters/types.js';
 import type { WhatsAppGateway } from '../whatsapp/gateway.js';
+import { createWhatsAppContactsAdapter } from './adapters/whatsapp-contacts.js';
+import { WHATSAPP_CONTACTS_SYSTEM } from '../charter/amend-whatsapp-contacts.js';
+import { loadConversation } from '../whatsapp/contact-conversations.js';
+import { recordOutbound } from '../whatsapp/store.js';
 import { canonicalHash } from '../util/canonical.js';
 import { PRODUCTION_TOOLS_MISSING_REASON } from '../production/render-error.js';
 import { withBusiness } from '../db/pool.js';
@@ -851,6 +855,36 @@ export async function businessRuntime(server: ServerRuntime, db: BusinessDb): Pr
         ...(overrides.calendarClient !== undefined ? { client: overrides.calendarClient(provider) } : {}),
       }),
     );
+  }
+
+  // WhatsApp to clients and suppliers (phase 1): registered only when the
+  // signed charter declares the connection AND a live binding exists AND this
+  // business has a gateway. Each missing half is reported, not silent.
+  const waContactsConnection = connectionBySystem.get(WHATSAPP_CONTACTS_SYSTEM);
+  if (waContactsConnection !== undefined) {
+    const waBinding = bindings.find((b) => b.system === WHATSAPP_CONTACTS_SYSTEM);
+    if (waBinding === undefined || waBinding.status !== 'live') {
+      warnings.push(`no whatsapp-contacts adapter: the charter declares "${WHATSAPP_CONTACTS_SYSTEM}" but its binding is not live`);
+    } else if (whatsapp === undefined) {
+      warnings.push(`no whatsapp-contacts adapter: the charter declares "${WHATSAPP_CONTACTS_SYSTEM}" but this business has no WhatsApp gateway`);
+    } else if (!waContactsConnection.serves.includes('wa.send_message') || waContactsConnection.channel !== 'api') {
+      warnings.push(`no whatsapp-contacts adapter: the charter connection does not serve wa.send_message on the api channel`);
+    } else if (systemAdapters.some((a) => a.system === WHATSAPP_CONTACTS_SYSTEM)) {
+      warnings.push(`no whatsapp-contacts adapter: an adapter is already registered under this system name`);
+    } else {
+      systemAdapters.push(
+        createWhatsAppContactsAdapter({
+          gateway: whatsapp.gateway,
+          // Each opens its own connection for THIS business: the adapter runs
+          // during a later step, long after this runtime's `db` was released.
+          conversationNumber: async (bid, conversationId) =>
+            withBusiness(bid, async (bdb) => (await loadConversation(bdb, conversationId))?.contactKey ?? null),
+          recordOutbound: async (bid, input) => {
+            await withBusiness(bid, (bdb) => recordOutbound(bdb, input));
+          },
+        }),
+      );
+    }
   }
 
   // External systems (Stage D): one adapter per system signed in the ACTIVE

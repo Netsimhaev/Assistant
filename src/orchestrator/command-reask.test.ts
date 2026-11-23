@@ -25,12 +25,17 @@ import type { AdapterResult, ExternalAdapter } from './adapters/types.js';
 import { upsertBinding } from './bindings.js';
 import { envCredentials } from './credentials.js';
 import { REASK_PREFIX, alreadyDoneLine } from './command-echo.js';
-import { REASK_REASON, reaskFailedCommands, residualPlan } from './command-reask.js';
+import { LAPSED_SEND_AT_NOTE, REASK_REASON, reaskFailedCommands, residualPlan, withoutLapsedSendAt } from './command-reask.js';
+import { addManagedContact } from '../business/settings-contacts.js';
+import { PersonEntry } from '../business/setup-package.js';
+import { WA_RECIPIENT_REFUSAL, WA_SEND_AT_INVALID } from './whatsapp-recipient.js';
 import { WHATSAPP_MESSAGE_MAX_CHARS, WHATSAPP_QUESTION_TOO_LONG } from './command-confirm.js';
 import { createJob, linkWhatsAppMessage, loadJob, transition } from './jobs.js';
-import { bindPlanToJob, loadStoredPlan, planHashOf, recordStepCompletion } from './plan-store.js';
+import { bindPlanToJob, loadPlanBody, loadStoredPlan, planHashOf, recordStepCompletion } from './plan-store.js';
 import { runDueJobs } from './run-due.js';
 import { runPlanForJob } from './run-plan.js';
+import { WA_INITIATE_NOT_COMMAND, executeStep } from './execute.js';
+import { localParts, localToInstant } from '../util/local-time.js';
 import type { Runtime } from './runtime.js';
 import { schedulerPass } from './scheduler.js';
 
@@ -324,7 +329,7 @@ describe('reaskFailedCommands', () => {
 
     // A second pass asks nothing more.
     const again = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger }));
-    expect(again).toEqual({ reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] });
+    expect(again).toEqual({ reasked: [], refused: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] });
     expect(await jobCount()).toBe(2);
     expect(messenger.sent).toHaveLength(1);
     expect(await reasksOf(jobId)).toHaveLength(1);
@@ -539,7 +544,7 @@ describe('reaskFailedCommands', () => {
 
     const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger: fakeMessenger() }));
     // Not found at all — not found and then failed on the missing row.
-    expect(result).toEqual({ reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] });
+    expect(result).toEqual({ reasked: [], refused: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] });
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('followup');
   });
 
@@ -548,7 +553,7 @@ describe('reaskFailedCommands', () => {
     await timeOut(jobId, bundle, OTHER);
 
     const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger: fakeMessenger() }));
-    expect(result).toEqual({ reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] });
+    expect(result).toEqual({ reasked: [], refused: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] });
     expect((await withBusiness(OTHER, (db) => loadJob(db, jobId)))?.phase).toBe('followup');
     expect(await reasksOf(jobId)).toEqual([]);
 
@@ -809,5 +814,174 @@ describe('reaskFailedCommands', () => {
     ]);
     expect(await reasksOf(jobId)).toEqual([]);
     expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('followup');
+  });
+
+  describe('a scheduled WhatsApp (task 13)', () => {
+    function waPlan(sendAt: string): Plan {
+      return Plan.parse({
+        goal: 'תזכורת בוואטסאפ',
+        steps: [{
+          id: 's1',
+          agent: 'comms.whatsapp',
+          intent: 'remind',
+          toolName: 'wa.send_message',
+          input: { to: '+972541234567', body: 'תזכורת לפגישה', sendAt },
+          expectedActionClass: 'whatsapp.initiate',
+        }],
+      });
+    }
+
+    function nextLocalNoon(): Date {
+      const now = new Date();
+      const today = localToInstant(localParts(now, 'Asia/Jerusalem').date, '12:00', 'Asia/Jerusalem');
+      return today.getTime() > now.getTime() ? today : new Date(today.getTime() + 24 * 3_600_000);
+    }
+
+    async function saveDana(): Promise<void> {
+      await withBusiness(BUSINESS, (db) => addManagedContact(db, PersonEntry.parse({
+        name: 'דנה', role: 'לקוחה', phone: '+972541234567', kind: 'client',
+      })));
+    }
+
+    async function parkOn(jobId: string, sendAt: string): Promise<void> {
+      await withBusiness(BUSINESS, (db) => transition(db, jobId, {
+        to: 'followup',
+        actor: 'orchestrator',
+        reason: 'scheduled send',
+        wakeAt: new Date(sendAt),
+      }));
+    }
+
+    it('arm (c) skips a followup job whose sendAt is still in the future', async () => {
+      const sendAt = new Date(Date.now() + 2 * 24 * 3_600_000).toISOString();
+      const { jobId } = await seedCommand({ plan: waPlan(sendAt) });
+      await parkOn(jobId, sendAt);
+      await backdateDecision(jobId);
+
+      const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
+      expect(result).toMatchObject({ reasked: [], errored: [] });
+      expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('followup');
+    });
+
+    it('the same job once its sendAt has passed is re-asked by arm (c)', async () => {
+      const sendAt = new Date(Date.now() - 3_600_000).toISOString();
+      const { jobId } = await seedCommand({ plan: waPlan(sendAt) });
+      await saveDana();
+      await parkOn(jobId, new Date(Date.now() + 3_600_000).toISOString());
+      await backdateDecision(jobId);
+
+      const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
+      expect(result.errored).toEqual([]);
+      expect(result.reasked).toEqual([{ oldJobId: jobId, newJobId: expect.any(String), uncertain: false }]);
+      // The lapsed time is dropped and said in words — never shown as a past
+      // time and sent at once.
+      const newJobId = result.reasked[0]?.newJobId ?? '';
+      const confirmation = await withBusiness(BUSINESS, (bdb) => loadConfirmation(bdb, newJobId));
+      expect(confirmation?.presentedText).toContain(LAPSED_SEND_AT_NOTE);
+      expect(confirmation?.presentedText).not.toContain('בשעה');
+      const stored = await withBusiness(BUSINESS, (db) => loadPlanBody(db, newJobId));
+      expect(Object.hasOwn(stored?.plan.steps[0]?.input ?? {}, 'sendAt')).toBe(false);
+    });
+
+    it('a refused residual: old job failed, owner told once, never picked again, others still asked', async () => {
+      const sendAt = new Date(Date.now() - 3_600_000).toISOString();
+      // Dana is not a saved contact, and the instruction never typed her number.
+      const { jobId } = await seedCommand({ plan: waPlan(sendAt) });
+      await parkOn(jobId, new Date(Date.now() + 3_600_000).toISOString());
+      await backdateDecision(jobId);
+      // An ordinary re-askable command beside it (arm c).
+      const { jobId: otherId } = await seedCommand();
+      await withBusiness(BUSINESS, (db) => transition(db, otherId, {
+        to: 'followup', actor: 'orchestrator', reason: 'quiet_hours', wakeAt: new Date(Date.now() + 3_600_000),
+      }));
+      await backdateDecision(otherId);
+
+      const messenger = fakeMessenger();
+      const first = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger }));
+      expect(first.errored).toEqual([]);
+      expect(first.refused).toEqual([{ oldJobId: jobId, told: 'sent' }]);
+      expect(first.reasked.map((r) => r.oldJobId)).toEqual([otherId]);
+      expect(await reasksOf(jobId)).toEqual([]);
+      expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
+      const toOwner = messenger.sent.filter((m) => m.jobId === jobId).map((m) => m.text);
+      expect(toOwner).toEqual([`לא שאלתי שוב על „הצעה לזר": ${WA_RECIPIENT_REFUSAL} צריך הוראה חדשה.`]);
+
+      // Next pass: the refused job is not picked, and the owner is not told again.
+      const second = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger }));
+      expect(second).toMatchObject({ refused: [], reasked: [], errored: [] });
+      expect(messenger.sent.filter((m) => m.jobId === jobId)).toHaveLength(1);
+    });
+
+    it('an unparsable sendAt is refused like a lapsed recipient, never re-asked as "send now"', async () => {
+      const { jobId } = await seedCommand({ plan: waPlan('2026-02-30T09:00:00Z') });
+      await saveDana();
+      await parkOn(jobId, new Date(Date.now() + 3_600_000).toISOString());
+      await backdateDecision(jobId);
+
+      const messenger = fakeMessenger();
+      const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db, { messenger }));
+      expect(result).toMatchObject({ reasked: [], errored: [], refused: [{ oldJobId: jobId, told: 'sent' }] });
+      expect(messenger.sent.map((m) => m.text)).toEqual([
+        `לא שאלתי שוב על „הצעה לזר": ${WA_SEND_AT_INVALID} צריך הוראה חדשה.`,
+      ]);
+      expect(messenger.sent.some((m) => m.text.includes(LAPSED_SEND_AT_NOTE))).toBe(false);
+      expect((await withBusiness(BUSINESS, (db) => loadJob(db, jobId)))?.phase).toBe('failed');
+    });
+
+    it('withoutLapsedSendAt drops only a parsable past sendAt', () => {
+      const past = withoutLapsedSendAt(waPlan(new Date(Date.now() - 60_000).toISOString()));
+      expect(past.dropped).toBe(true);
+      const unreadable = withoutLapsedSendAt(waPlan('מחר בבוקר'));
+      expect(unreadable.dropped).toBe(false);
+      expect(unreadable.plan.steps[0]?.input['sendAt']).toBe('מחר בבוקר');
+      const future = withoutLapsedSendAt(waPlan(new Date(Date.now() + 3_600_000).toISOString()));
+      expect(future.dropped).toBe(false);
+    });
+
+    it('confirmed, charter re-signed before sendAt: not covered at sendAt, and re-asked', async () => {
+      const sendAt = new Date(Date.now() - 60_000).toISOString();
+      const { jobId } = await seedCommand({ plan: waPlan(sendAt) });
+      await saveDana();
+      await testDb().query(
+        `UPDATE instruction_confirmations SET decided_at = now() - interval '72 hours' WHERE job_id = $1`,
+        [jobId],
+      );
+      charterCounter += 1;
+      const resigned = await withBusiness(BUSINESS, (bdb) => installCharter(
+        bdb,
+        buildCharter({ version: `2026-08-15.reask-${charterCounter}`, connections: [MAIL_CONNECTION] }),
+      ));
+      const job = await withBusiness(BUSINESS, (db) => loadJob(db, jobId));
+      if (job === null) throw new Error('no job');
+      let performed = 0;
+      const outcome = await withBusiness(BUSINESS, (db) => executeStep(db, {
+        job,
+        stepId: 's1',
+        agent: 'comms.whatsapp',
+        bundle: resigned,
+        toolName: 'wa.send_message',
+        toolInput: waPlan(sendAt).steps[0]?.input ?? {},
+        perform: async () => {
+          performed += 1;
+          return { output: null, externalId: 'WA-1', performed: true };
+        },
+        counterpartyTags: [],
+        rampLevel: 'draft_only',
+        planHash: planHashOf(waPlan(sendAt)),
+        // The gate's quiet-hours clock at the next local noon, so the run is
+        // judged on the window, not on whatever hour the suite runs at. The
+        // exemption's window reads the database clock.
+        now: nextLocalNoon(),
+      }));
+      // Not covered: the exemption does not carry it, so the WhatsApp guard
+      // refuses it before the gate (fix round 1, item 3) — it never reaches
+      // the ordinary path at all.
+      expect(outcome).toMatchObject({ status: 'refused', code: WA_INITIATE_NOT_COMMAND });
+      expect(performed).toBe(0);
+
+      const result = await withBusiness(BUSINESS, (db) => reaskFailedCommands(db));
+      expect(result.errored).toEqual([]);
+      expect(result.reasked).toEqual([{ oldJobId: jobId, newJobId: expect.any(String), uncertain: false }]);
+    });
   });
 });
