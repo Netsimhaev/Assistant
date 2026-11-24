@@ -83,7 +83,7 @@ const ids = (externalIds?: Record<string, string>) => ({
 
 function run(http: ExternalHttp, externalIds?: Record<string, string>) {
   const source = createAccountingInvoicesSource({ http, credentials: storedCredentials(TEST_MASTER_KEY) });
-  return withBusiness(BUSINESS, (db) => source(db, ids(externalIds), new AbortController().signal));
+  return withBusiness(BUSINESS, (db) => source(db, ids(externalIds), new AbortController().signal, { window: null, timeZone: 'Asia/Jerusalem' }));
 }
 
 beforeEach(async () => {
@@ -185,7 +185,7 @@ describe('createAccountingInvoicesSource', () => {
     const source = createAccountingInvoicesSource({ http, credentials: storedCredentials(TEST_MASTER_KEY) });
     const ctrl = new AbortController();
     ctrl.abort();
-    const out = await withBusiness(BUSINESS, (db) => source(db, ids({ crm: 'C-7' }), ctrl.signal));
+    const out = await withBusiness(BUSINESS, (db) => source(db, ids({ crm: 'C-7' }), ctrl.signal, { window: null, timeZone: 'Asia/Jerusalem' }));
     expect(out).toEqual({ items: [], ownershipViolation: false });
     expect(http.requests).toHaveLength(0);
   });

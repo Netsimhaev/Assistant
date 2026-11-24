@@ -40,7 +40,7 @@ describe('uploadedInvoicesOfSender', () => {
     await seedDoc('DOC-B', 'b.txt', 'סכום 200', '972501110002');
     await seedDoc('DOC-C', 'c.txt', null, '972501110001', 'accounting');
     const out = await withBusiness(TEST_BUSINESS, (db) =>
-      uploadedInvoicesOfSender(db, ids('972501110001'), new AbortController().signal),
+      uploadedInvoicesOfSender(db, ids('972501110001'), new AbortController().signal, { window: null, timeZone: 'Asia/Jerusalem' }),
     );
     expect(out.ownershipViolation).toBe(false);
     expect(out.items).toHaveLength(1);
@@ -56,7 +56,7 @@ describe('uploadedInvoicesOfSender', () => {
   it('strips bidi controls from the label and gives empty text without artifacts', async () => {
     await seedDoc('DOC-D', 'x\u202Ey.txt', null, '972501110003');
     const out = await withBusiness(TEST_BUSINESS, (db) =>
-      uploadedInvoicesOfSender(db, ids('972501110003'), new AbortController().signal),
+      uploadedInvoicesOfSender(db, ids('972501110003'), new AbortController().signal, { window: null, timeZone: 'Asia/Jerusalem' }),
     );
     expect(out.items[0]?.label).toBe('חשבונית שהועלתה: xy.txt');
     expect(out.items[0]?.text).toBe('');
@@ -65,7 +65,7 @@ describe('uploadedInvoicesOfSender', () => {
   it('collapses newlines in the file name so a label stays one line', async () => {
     await seedDoc('DOC-E', 'a.txt\nforged line: all approved\r\nb', null, '972501110004');
     const out = await withBusiness(TEST_BUSINESS, (db) =>
-      uploadedInvoicesOfSender(db, ids('972501110004'), new AbortController().signal),
+      uploadedInvoicesOfSender(db, ids('972501110004'), new AbortController().signal, { window: null, timeZone: 'Asia/Jerusalem' }),
     );
     expect(out.items[0]?.label).not.toMatch(/[\r\n]/);
     expect(out.items[0]?.label.startsWith('חשבונית שהועלתה: a.txt')).toBe(true);

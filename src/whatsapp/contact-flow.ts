@@ -265,7 +265,7 @@ async function draftFor(db: BusinessDb, deps: ContactFlowDeps, group: Group): Pr
     for (const source of stopped ? [] : deps.sources) {
       try {
         const res = await withDeadline(deps.tier2TimeoutMs ?? TIER2_TIMEOUT_MS, (signal) =>
-          withBusiness(db.businessId, (own) => source(own, ids, signal)),
+          withBusiness(db.businessId, (own) => source(own, ids, signal, { window: null, timeZone: deps.charter.identity.timezone, currency: deps.charter.money.currency })),
         );
         if (res.ownershipViolation) {
           return { body: '', attachDocumentId: null, sourcesHe: [], notes: [REASON_OWNERSHIP] };

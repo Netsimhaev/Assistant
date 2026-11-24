@@ -4,6 +4,7 @@
  * sender's identity only — never by anything the message says.
  */
 import type { BusinessDb } from '../../db/pool.js';
+import type { Tier2SourceName } from '../contact-topics.js';
 
 export interface SenderIds {
   /** `authorityNumberKey` digits (no '+'). */
@@ -16,7 +17,7 @@ export interface SenderIds {
 }
 
 export interface SourceItem {
-  source: 'uploaded_invoices' | 'sent_invoices' | 'accounting_invoices';
+  source: Tier2SourceName;
   label: string;
   text: string;
   documentId: string | null;
@@ -27,6 +28,18 @@ export interface Tier2Result {
   items: SourceItem[];
   /** True when the source found data that does not belong to this sender. */
   ownershipViolation: boolean;
+  /** The source ran and could not answer (provider failure, truncation): a failed source, not a violation. */
+  failed?: boolean;
 }
 
-export type Tier2Source = (db: BusinessDb, ids: SenderIds, signal: AbortSignal) => Promise<Tier2Result>;
+/** What the question is about, decided by the classifier and the charter - never by a source. */
+export interface SourceContext {
+  /** The time window the message asks about; null when it names none. */
+  window: { from: Date; to: Date } | null;
+  /** The charter's time zone. */
+  timeZone: string;
+  /** Charter currency for amounts; without it a source leaves amounts out. */
+  currency?: string;
+}
+
+export type Tier2Source = (db: BusinessDb, ids: SenderIds, signal: AbortSignal, ctx: SourceContext) => Promise<Tier2Result>;

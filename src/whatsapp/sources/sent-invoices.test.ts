@@ -72,7 +72,7 @@ async function run(email: string | null, withMailbox = true) {
   const fake = fakeClient();
   const documentRoot = await mkdtemp(join(tmpdir(), 'sent-inv-test-'));
   const source = createSentInvoicesSource({ credentials, documentRoot, clientFor: () => fake.client });
-  const out = await withBusiness(TEST_BUSINESS, (db) => source(db, ids(email), new AbortController().signal));
+  const out = await withBusiness(TEST_BUSINESS, (db) => source(db, ids(email), new AbortController().signal, { window: null, timeZone: 'Asia/Jerusalem' }));
   return { out, fake };
 }
 
