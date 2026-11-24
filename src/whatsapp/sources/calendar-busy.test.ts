@@ -99,11 +99,80 @@ describe('calendar busy source', () => {
     expect(f.calls.n).toBe(0);
   });
 
-  it('does not run on a window longer than two weeks', async () => {
+  it('does not run on a three-week window', async () => {
     await connect();
     const f = fake([]);
     const out = await run(f.client, { from: FROM, to: new Date(FROM.getTime() + 21 * 86400_000) });
     expect(out.failed).toBe(true);
     expect(f.calls.n).toBe(0);
+  });
+});
+
+describe('calendar busy source - guards and title ownership', () => {
+  const DAY = 86400_000;
+  const linkRow = (over: Record<string, string | null>) => {
+    const row: Record<string, string | null> = {
+      meeting_id: 'M1', business_id: TEST_BUSINESS, job_id: 'j', step_id: 's', calendar_id: 'a', event_id: 'e1',
+      operation: 'create', client_name: 'x', client_phone: null, client_email: null, ...over,
+    };
+    const keys = Object.keys(row);
+    return testDb().query(
+      `INSERT INTO meetings (${keys.join(',')}) VALUES (${keys.map((_, i) => `$${i + 1}`).join(',')})`,
+      keys.map((k) => row[k]),
+    );
+  };
+  const titled = () => fake([event('e1', 'כותרת סודית')]);
+
+  it('rejects an 8-day window without a client call', async () => {
+    await connect();
+    const f = fake([]);
+    const out = await run(f.client, { from: FROM, to: new Date(FROM.getTime() + 8 * DAY) });
+    expect(out.failed).toBe(true);
+    expect(f.calls.n).toBe(0);
+  });
+
+  it('runs on exactly 7 days', async () => {
+    await connect();
+    const f = fake([]);
+    const out = await run(f.client, { from: FROM, to: new Date(FROM.getTime() + 7 * DAY) });
+    expect(out.failed).toBeUndefined();
+    expect(f.calls.n).toBe(1);
+  });
+
+  it('rejects to <= from and NaN dates without a client call', async () => {
+    await connect();
+    const f = fake([]);
+    expect((await run(f.client, { from: TO, to: FROM })).failed).toBe(true);
+    expect((await run(f.client, { from: FROM, to: FROM })).failed).toBe(true);
+    expect((await run(f.client, { from: new Date(NaN), to: TO })).failed).toBe(true);
+    expect((await run(f.client, { from: FROM, to: new Date(NaN) })).failed).toBe(true);
+    expect(f.calls.n).toBe(0);
+  });
+
+  it('hides the title when the event is linked to a different sender', async () => {
+    await connect();
+    await linkRow({ client_phone: '+972 50-999-0009', client_email: 'other@x.example' });
+    const out = await run(titled().client, { from: FROM, to: TO });
+    expect(out.items[0]?.text).toContain('תפוס');
+    expect(out.items[0]?.text).not.toContain('סודית');
+  });
+
+  it('shows the title when linked by email', async () => {
+    await connect();
+    await linkRow({ client_email: 'Dana@Client.example' });
+    const out = await withBusiness(TEST_BUSINESS, (db) =>
+      createCalendarBusySource({ runtime, client: titled().client })(
+        db, { ...ids, email: 'dana@client.example' }, new AbortController().signal, ctx({ from: FROM, to: TO }),
+      ),
+    );
+    expect(out.items[0]?.text).toContain('— כותרת סודית');
+  });
+
+  it('hides the title when the matching meetings row belongs to another business', async () => {
+    await connect();
+    await linkRow({ business_id: 'other-biz', client_phone: '+972 50-111-0001' });
+    const out = await run(titled().client, { from: FROM, to: TO });
+    expect(out.items[0]?.text).toContain('תפוס');
+    expect(out.items[0]?.text).not.toContain('סודית');
   });
 });

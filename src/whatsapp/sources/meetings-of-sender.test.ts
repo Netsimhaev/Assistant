@@ -46,6 +46,13 @@ describe('meetingsOfSender', () => {
     expect((await run('dana@client.example')).items).toHaveLength(1);
   });
 
+  it('returns a proposed meeting', async () => {
+    await seed({ state: 'proposed', response: 'needs_action' });
+    const out = await run();
+    expect(out.items).toHaveLength(1);
+    expect(out.items[0]?.text).toContain('ממתין לתשובה');
+  });
+
   it('skips a meeting from 2 days ago, abandoned ones and other people', async () => {
     await seed({ start_at: new Date(Date.now() - 2 * 86400_000).toISOString() });
     await seed({ state: 'abandoned' });

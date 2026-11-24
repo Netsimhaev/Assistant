@@ -14,9 +14,7 @@ import { stripBidiControls, toOneLine } from '../../util/bidi.js';
 import { localParts } from '../../util/local-time.js';
 import type { Tier2Source } from './types.js';
 
-const MAX_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
-const EMPTY = { items: [], ownershipViolation: false } as const;
-const FAILED = { items: [], ownershipViolation: false, failed: true } as const;
+const MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function createCalendarBusySource(deps: {
   runtime: Pick<Runtime, 'credentials'>;
@@ -24,18 +22,18 @@ export function createCalendarBusySource(deps: {
 }): Tier2Source {
   return async (db, ids, signal, ctx) => {
     const w = ctx.window;
-    if (w === null) return { ...EMPTY, items: [] };
+    if (w === null) return { items: [], ownershipViolation: false };
     const from = w.from.getTime();
     const to = w.to.getTime();
     if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from || to - from > MAX_WINDOW_MS) {
-      return { ...FAILED, items: [] };
+      return { items: [], ownershipViolation: false, failed: true };
     }
 
     const access = await resolveCalendarAccess(db, {
       runtime: deps.runtime,
       ...(deps.client !== undefined ? { client: deps.client } : {}),
     });
-    if ('unavailable' in access) return { ...FAILED, items: [] };
+    if ('unavailable' in access) return { items: [], ownershipViolation: false, failed: true };
     const settings = await loadMeetingSettings(db);
     const snap = await loadCalendarRange(db, {
       access,
@@ -45,7 +43,7 @@ export function createCalendarBusySource(deps: {
       toIso: w.to.toISOString(),
       signal,
     });
-    if (isCalendarFailure(snap) || snap.truncated) return { ...FAILED, items: [] };
+    if (isCalendarFailure(snap) || snap.truncated) return { items: [], ownershipViolation: false, failed: true };
 
     const busy = busyIntervals(snap, 0).some((i) => i.start < to && i.end > from);
     const f = localParts(w.from, ctx.timeZone);

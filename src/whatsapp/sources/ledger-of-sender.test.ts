@@ -55,6 +55,16 @@ describe('ledgerOfSender', () => {
     expect((await run('dana@client.example')).items).toEqual([]);
   });
 
+  it('returns a stuck row labelled as stuck', async () => {
+    await seed('L1', { status: 'stuck' });
+    expect((await run('dana@client.example')).items[0]?.text).toContain('תקוע');
+  });
+
+  it('returns at most 10 rows', async () => {
+    for (let i = 0; i < 12; i += 1) await seed(`L${i}`);
+    expect((await run('dana@client.example')).items).toHaveLength(10);
+  });
+
   it('is empty when the sender has no email', async () => {
     await seed('L1');
     expect((await run(null)).items).toEqual([]);
