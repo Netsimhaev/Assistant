@@ -111,7 +111,6 @@ export async function loadTopic(db: BusinessDb, topicId: string): Promise<Contac
 
 export async function createTopic(db: BusinessDb, input: TopicInput): Promise<ContactTopic> {
   validate({ name: input.name, appliesTo: input.appliesTo, sources: input.sources });
-  if (input.name.trim() === '') throw new Error('חובה לתת שם לנושא.');
   const topicId = ulid();
   await db.query(
     `INSERT INTO contact_topics (business_id, topic_id, name, description, applies_to, sources, auto_reply, created_by)
@@ -119,6 +118,7 @@ export async function createTopic(db: BusinessDb, input: TopicInput): Promise<Co
     [db.businessId, topicId, input.name.trim(), input.description, input.appliesTo, input.sources, input.autoReply, input.by],
   );
   await audit(db, 'created', topicId, input.by);
+  if (input.autoReply) await audit(db, 'auto_on', topicId, input.by);
   const topic = await loadTopic(db, topicId);
   if (topic === null) throw new Error('topic insert returned no row');
   return topic;
