@@ -20,6 +20,8 @@ import {
   whatsAppContactsSubprocessorAdded,
 } from '../charter/amend-whatsapp-contacts.js';
 import {
+  AutoReplyNotSignedError,
+  AutoReplyPreconditionError,
   AUTO_REPLY_AUTHORISATION_TEXT,
   autoReplyBlockedByNever,
   autoReplySigned,
@@ -41,6 +43,9 @@ export type WhatsAppContactsSession = MailboxSession;
 /** What signing authorises, verbatim — phase 1 only. */
 export const WHATSAPP_CONTACTS_AUTHORISATION_TEXT =
   'העוזרת תוכל לשלוח הודעות וואטסאפ ללקוחות ולספקים רק אחרי שאישרת כל הודעה, או בהוראה ישירה שלך.';
+
+export const CONNECTION_AUTO_REPLY_NOTE =
+  'שימי לב: בכללים שלך כבר נקבע שהעוזרת עונה לבד בוואטסאפ. אחרי החתימה, ואם המענה האוטומטי מופעל בהגדרות, היא תענה לבד ללקוחות ולספקים שהכנסת — רק בנושאים שאישרת.';
 
 const CHARTER_UNREADABLE = 'לא ניתן לקרוא את התקנון הפעיל של העסק — יש לפנות למי שמחזיק את ההתקנה. לא בוצעה כל פעולה.';
 const CHARTER_MISSING = 'לא הותקן עדיין תקנון פעיל לעסק הזה.';
@@ -129,7 +134,12 @@ ${subprocessor}
 </ul>
 <p>שאר התקנון נשאר בדיוק כפי שנחתם.</p>
 </div>
-<form method="post" action="/connections/whatsapp-contacts/sign">
+${
+  ['auto_notify', 'auto'].includes(charter.autonomy.base['whatsapp.reply'] ?? '')
+    ? `<div class="card"><p><b>${esc(CONNECTION_AUTO_REPLY_NOTE)}</b></p></div>
+`
+    : ''
+}<form method="post" action="/connections/whatsapp-contacts/sign">
   <input type="hidden" name="csrf" value="${esc(csrf)}">
   <input type="hidden" name="base" value="${esc(charter.charterVersion)}">
   <button type="submit">חתימה על התוספת לתקנון</button>
@@ -290,6 +300,9 @@ async function autoReplyPost(
     });
   } catch (error) {
     if (error instanceof Refusal) return sendHtml(res, error.status, error.html);
+    if (error instanceof AutoReplyPreconditionError || error instanceof AutoReplyNotSignedError) {
+      return sendHtml(res, 409, errorPage('התקנון השתנה', STALE_MESSAGE));
+    }
     throw error;
   }
   seeOther(res, '/connections/whatsapp-contacts');

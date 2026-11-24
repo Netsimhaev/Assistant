@@ -21,7 +21,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { issueCsrfToken } from './csrf.js';
-import { WHATSAPP_CONTACTS_AUTHORISATION_TEXT } from './whatsapp-contacts-connect.js';
+import { CONNECTION_AUTO_REPLY_NOTE, WHATSAPP_CONTACTS_AUTHORISATION_TEXT } from './whatsapp-contacts-connect.js';
 import { createServer } from './server.js';
 
 const BUSINESS = 'test-business';
@@ -78,6 +78,15 @@ describe('whatsapp-contacts connection', () => {
     const html = await (await fetch(`${b}/connections/whatsapp-contacts`, { headers: { cookie } })).text();
     expect(html).toContain(WHATSAPP_CONTACTS_AUTHORISATION_TEXT);
     expect(html).toContain('action="/connections/whatsapp-contacts/sign"');
+  });
+
+  it('the sign page has no auto-reply note when the base is approve_required', async () => {
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'v-noauto', autonomyBase: { 'whatsapp.reply': 'approve_required' } })));
+    const b = await startServer();
+    const cookie = await login(b);
+    const html = await (await fetch(`${b}/connections/whatsapp-contacts`, { headers: { cookie } })).text();
+    expect(html).toContain('action="/connections/whatsapp-contacts/sign"');
+    expect(html).not.toContain(CONNECTION_AUTO_REPLY_NOTE);
   });
 
   it('signs: the charter gains the connection, a live binding is written, an audit row exists', async () => {
@@ -177,6 +186,15 @@ describe('whatsapp-contacts connection', () => {
       const { b, cookie } = await prepare();
       expect((await post(b, cookie, SIGN, { csrf: 'nope', base: await activeVersion() })).status).toBe(403);
       expect(await base()).toBe('approve_required');
+    });
+
+    it('the connection sign page shows the auto-reply note only when the base is already automatic', async () => {
+      const { b, cookie } = await prepare();
+      await post(b, cookie, SIGN, { csrf: csrfFor(cookie), base: await activeVersion() });
+      await post(b, cookie, '/connections/whatsapp-contacts/revert', { csrf: csrfFor(cookie), base: await activeVersion() });
+      const page = await (await fetch(`${b}/connections/whatsapp-contacts`, { headers: { cookie } })).text();
+      expect(page).toContain('action="/connections/whatsapp-contacts/sign"');
+      expect(page).toContain(CONNECTION_AUTO_REPLY_NOTE);
     });
 
     it('reverts to approve_required', async () => {
