@@ -12,6 +12,18 @@ describe('parseClassification', () => {
   it('courtesy with a 41-char text is unclassified', () => {
     expect(parseClassification({ ...base, kind: 'courtesy' }, ctx(['א'.repeat(41)])).kind).toBe('unclassified');
   });
+  it('courtesy with no texts is unclassified', () => {
+    expect(parseClassification({ ...base, kind: 'courtesy' }, ctx([])).kind).toBe('unclassified');
+  });
+  it('courtesy needs every text to be short', () => {
+    expect(parseClassification({ ...base, kind: 'courtesy' }, ctx(['תודה', 'א'.repeat(41)])).kind).toBe('unclassified');
+  });
+  it('keeps a window of exactly 7 days, drops one ending at now', () => {
+    const seven = { from: '2026-11-25T08:00:00Z', to: '2026-12-02T08:00:00Z' };
+    expect(parseClassification({ ...base, window: seven }, ctx()).window).not.toBeNull();
+    const atNow = { from: '2026-11-24T09:00:00Z', to: '2026-11-24T10:00:00Z' };
+    expect(parseClassification({ ...base, window: atNow }, ctx()).window).toBeNull();
+  });
   it('unknown topic id becomes null', () => {
     const r = parseClassification({ ...base, topicId: 'X' }, ctx());
     expect(r.kind).toBe('question');

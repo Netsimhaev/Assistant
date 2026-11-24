@@ -6,10 +6,9 @@
 import { z } from 'zod';
 import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import { parseIsoInstant } from '../util/send-at.js';
-import type { MessageKind } from './card-context.js';
+import { SUMMARY_MAX_CHARS, type MessageKind } from './card-context.js';
 
 export const COURTESY_MAX_CHARS = 40;
-export const SUMMARY_MAX_CHARS = 200;
 export const WINDOW_MAX_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface Classification {
@@ -54,7 +53,7 @@ export function parseClassification(raw: unknown, ctx: ClassificationContext): C
   const parsed = RawClassification.safeParse(raw);
   if (!parsed.success) return { ...UNCLASSIFIED };
   const p = parsed.data;
-  if (p.kind === 'courtesy' && !ctx.texts.every((t) => t.length <= COURTESY_MAX_CHARS)) {
+  if (p.kind === 'courtesy' && !(ctx.texts.length > 0 && ctx.texts.every((t) => t.length <= COURTESY_MAX_CHARS))) {
     return { ...UNCLASSIFIED };
   }
   return {

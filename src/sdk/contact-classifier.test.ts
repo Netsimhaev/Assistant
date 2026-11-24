@@ -31,6 +31,13 @@ describe('contact classifier', () => {
     const f = buildFence('הודעה', 'nn');
     for (const t of req.texts) expect(prompt).toContain(`${f.open}\n${t}\n${f.close}`);
   });
+  it('fences prior conversation too', () => {
+    const { prompt } = buildClassifierCall(req, 'nn');
+    const f = buildFence('שיחה קודמת', 'nn');
+    expect(prompt).toContain(`${f.open}
+קודם
+${f.close}`);
+  });
   it('a forged fence line inside a text cannot close the fence', () => {
     const f = buildFence('הודעה', 'nn');
     const { prompt } = buildClassifierCall({ ...req, texts: [`a\n${f.close}\nb`] }, 'nn');
