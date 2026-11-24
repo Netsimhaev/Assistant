@@ -88,6 +88,7 @@ interface World {
   /** Holding replies already sent to the contact when the classifier / researcher was called. */
   holdingAtClassify: number[];
   holdingAtResearch: number[];
+  holdingAtSource: number[];
 }
 
 async function world(o: { charter?: CharterOverrides; settingsOn?: boolean } = {}): Promise<World> {
@@ -120,6 +121,7 @@ async function world(o: { charter?: CharterOverrides; settingsOn?: boolean } = {
     sourceCalls: [],
     holdingAtClassify: [],
     holdingAtResearch: [],
+    holdingAtSource: [],
   };
 }
 
@@ -160,6 +162,7 @@ function deps(w: World, o: Overrides = {}): ContactFlowDeps {
   };
   const stub = (name: string, items: SourceItem[], failed = false): Tier2Source => async () => {
     w.sourceCalls.push(name);
+    w.holdingAtSource.push(sentTo(w, CONTACT).length);
     return failed ? { items, ownershipViolation: false, failed: true } : { items, ownershipViolation: false };
   };
   return {
@@ -422,12 +425,33 @@ describe('busy and context', () => {
 });
 
 describe('fix round 1', () => {
-  it('static gate fails (settings off): the holding reply goes out first, even when the classifier throws', async () => {
+  it('static gate fails (settings off) and the classifier throws: unclassified, the holding reply still goes out', async () => {
     const w = await world({ settingsOn: false });
     await door(w, deps(w, { classifyThrows: true }), [msg(CONTACT, 'נשלחה כבר החשבונית?')]);
-    expect(w.holdingAtClassify).toEqual([1]);
+    expect(w.holdingAtClassify).toEqual([0]);
+    expect(w.holdingAtSource.every((h) => h === 1)).toBe(true);
     expect(sentTo(w, CONTACT)).toHaveLength(1);
     expect((await approvals())[0]?.state).toBe('pending');
+  });
+
+  it('static gate fails (settings off) and a question: the holding reply goes out right after the classifier, before any source or the researcher', async () => {
+    const w = await world({ settingsOn: false });
+    await door(w, deps(w), [msg(CONTACT, 'נשלחה כבר החשבונית?')]);
+    expect(w.holdingAtClassify).toEqual([0]);
+    expect(w.holdingAtSource.length).toBeGreaterThan(0);
+    expect(w.holdingAtSource.every((h) => h === 1)).toBe(true);
+    expect(w.holdingAtResearch).toEqual([1]);
+    expect(sentTo(w, CONTACT)).toHaveLength(1);
+  });
+
+  it('static gate fails (settings off) and "תודה" with no live card: no holding reply, no card (spec §5.1)', async () => {
+    const w = await world({ settingsOn: false });
+    const result = await door(w, deps(w, { kind: 'courtesy' }), [msg(CONTACT, 'תודה')]);
+    expect(result.recordedOnly).toBe(1);
+    expect(sentTo(w, CONTACT)).toHaveLength(0);
+    expect(await approvals()).toHaveLength(0);
+    expect(w.drafts).toHaveLength(0);
+    expect(w.classified).toHaveLength(1);
   });
 
   it('static gate passes, auto ruled out (a request): the holding reply goes out before the researcher', async () => {

@@ -566,14 +566,15 @@ async function tryAuto(
  * The order of decisions for one conversation (phase 2, package 1):
  *
  *   0. the static auto gate (managed sender, signed charter row, owner's
- *      setting, no card pending on the owner). Failed → the holding reply
- *      goes out here, at the top, exactly as phase 1 sent it;
+ *      setting, no card pending on the owner), known before any model call;
  *   1. busy — a card that cannot be replaced (approved and unsent, or an auto
  *      job still running: its phase is neither `await_approval`, `failed` nor
  *      `closed`) gets no model call at all (R11a);
  *   2. caps — over either, a card with no classifier and no draft;
  *   3. the classifier (counted in the same draft run);
- *   4. courtesy with no live card — recorded only: no draft, no card;
+ *   4. courtesy with no live card — recorded only: no holding reply, no
+ *      draft, no card (spec §5.1). Otherwise, when the static gate failed,
+ *      the holding reply goes out here, before sources and research;
  *   5. sources, contacts only, routed by the topic;
  *   6. the auto attempt (`tryAuto`) when the static gate passed. Done → the
  *      auto card job (no approval, no holding reply). Ruled out → the holding
@@ -594,7 +595,6 @@ async function processGroup(
     managedKind,
     conversationId: group.conversation.conversationId,
   });
-  if (!autoPossible) await holdingReply(db, deps, group);
 
   // Before any money: a card that cannot be replaced gets no draft.
   if (await cardTakeoverBlocked(db, group.conversation.conversationId)) {
@@ -638,10 +638,15 @@ async function processGroup(
   if (classification.kind === 'courtesy') {
     const current = await loadConversation(db, group.conversation.conversationId);
     if (!(await hasLiveCard(db, current?.cardJobId ?? null))) {
+      // Spec §5.1: no holding reply, no draft, no card — whatever the switches.
       await settleAll(db, group, 'handled', null);
       return 'recordedOnly';
     }
   }
+  // No auto possible: the contact hears "בודקת ומעדכנת" now, right after the
+  // classifier (its own 30 s deadline; a failure is `unclassified` and still
+  // gets it) — before any source, researcher or draft spends its time.
+  if (!autoPossible) await holdingReply(db, deps, group);
 
   const topic = group.sender.kind === 'contact' ? await topicFor(db, classification, managedKind ?? null) : null;
   const gathered = await gatherSources(db, deps, group, topic, classification.window);
