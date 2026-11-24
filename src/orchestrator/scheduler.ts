@@ -50,6 +50,7 @@ import { runContactDrafter, type ContactDrafter } from '../sdk/contact-drafter.j
 import type { ContactFlowDeps } from '../whatsapp/contact-flow.js';
 import { HOLDING_NAME_FALLBACK, sendDueHoldingReplies } from '../whatsapp/holding-reply.js';
 import { contactHousekeeping } from '../whatsapp/contact-housekeeping.js';
+import { reraiseFailedAutoReplies } from '../whatsapp/contact-auto-reraise.js';
 import { namedSource, type Tier2Source } from '../whatsapp/sources/types.js';
 import { runContactClassifier, type ContactClassifier } from '../sdk/contact-classifier.js';
 import { createCalendarBusySource } from '../whatsapp/sources/calendar-busy.js';
@@ -1057,6 +1058,7 @@ export async function schedulerPass(
   let whatsappMessenger: BossMessenger | null = null;
   // True when this pass built the contact flow (the same switch the door uses).
   let contactFlowWired = false;
+  let contactReraiseDeps: Parameters<typeof reraiseFailedAutoReplies>[1] | null = null;
   if (runtime.whatsapp !== undefined) {
     try {
       const active = await stage((bdb) => loadActiveCharter(bdb));
@@ -1155,6 +1157,13 @@ export async function schedulerPass(
       // just deferred one). Its own catch: a failure here must not hide the pass.
       if (contactFlow !== undefined) {
         contactFlowWired = true;
+        contactReraiseDeps = {
+          bundle: contactFlow.bundle,
+          gateway: contactFlow.gateway,
+          messenger: contactFlow.messenger,
+          ...(contactFlow.notify !== undefined ? { notify: contactFlow.notify } : {}),
+          now: contactFlow.now(),
+        };
         const holdingFlow = contactFlow;
         try {
           await stage((db) => sendDueHoldingReplies(db, {
@@ -1371,6 +1380,16 @@ export async function schedulerPass(
   // now. Only when the contact flow is wired; its own catch.
   if (contactFlowWired && whatsappMessenger !== null) {
     const housekeepingMessenger = whatsappMessenger;
+    // A failed auto reply becomes a card first, so housekeeping (which leaves
+    // failed auto jobs alone) sees the conversation on its new card.
+    if (contactReraiseDeps !== null) {
+      const reraiseDeps = contactReraiseDeps;
+      try {
+        await stage((db) => reraiseFailedAutoReplies(db, reraiseDeps));
+      } catch (err) {
+        console.error('scheduler: failed auto replies re-raise failed', err instanceof Error ? err.message : err);
+      }
+    }
     try {
       await stage((db) => contactHousekeeping(db, {
         messenger: housekeepingMessenger,

@@ -105,11 +105,17 @@ async function recordDecisions(db: BusinessDb): Promise<number> {
     decided_at: Date;
     conversation_id: string;
     contact_kind: string;
+    topic_id: string | null;
+    summary: string | null;
+    source_names: string[] | null;
+    internal_document_ids: string[] | null;
   }>(
     `SELECT a.approval_id, a.job_id, a.state, a.proposed_input, a.edited_input, a.detail, a.decided_at,
-            c.conversation_id, c.contact_kind
+            c.conversation_id, c.contact_kind,
+            x.topic_id, x.summary, x.source_names, x.internal_document_ids
        FROM approval_requests a
        JOIN contact_conversations c ON c.business_id = a.business_id AND c.card_job_id = a.job_id
+       LEFT JOIN contact_card_context x ON x.business_id = a.business_id AND x.job_id = a.job_id
       WHERE a.business_id = $1 AND a.proposed_tool = 'wa.send_message'
         AND a.state IN ('approved', 'approved_with_edit', 'denied') AND a.decided_at IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM contact_reply_decisions d
@@ -126,11 +132,13 @@ async function recordDecisions(db: BusinessDb): Promise<number> {
     });
     const res = await db.query(
       `INSERT INTO contact_reply_decisions
-         (business_id, decision_id, conversation_id, job_id, approval_id, verdict, wrong_reason, source_tiers, decided_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         (business_id, decision_id, conversation_id, job_id, approval_id, verdict, wrong_reason, source_tiers, decided_at,
+          topic_id, summary, source_names, internal_document_ids)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        ON CONFLICT (business_id, approval_id) DO NOTHING`,
       [db.businessId, ulid(), r.conversation_id, r.job_id, r.approval_id, verdict, reason,
-        sourceTiersFromDetail(r.detail, r.contact_kind), r.decided_at],
+        sourceTiersFromDetail(r.detail, r.contact_kind), r.decided_at,
+        r.topic_id, r.summary, r.source_names, r.internal_document_ids],
     );
     recorded += res.rowCount ?? 0;
   }
@@ -143,7 +151,10 @@ async function settleCarded(
   deps: HousekeepingDeps,
 ): Promise<{ expired: number; answered: number; failedNoticed: number }> {
   const { rows } = await db.query<
-    CardRow & { contact_key: string; phase: string | null; performed: boolean; latest: string | null; live: boolean; may_have_sent: boolean }
+    CardRow & {
+      contact_key: string; phase: string | null; performed: boolean; latest: string | null; live: boolean;
+      may_have_sent: boolean; auto: boolean;
+    }
   >(
     `SELECT c.conversation_id, c.card_job_id, c.contact_key, j.phase,
             (EXISTS (SELECT 1 FROM job_steps f
@@ -152,6 +163,8 @@ async function settleCarded(
              OR EXISTS (SELECT 1 FROM job_step_results u
                          WHERE u.business_id = c.business_id AND u.job_id = c.card_job_id
                            AND u.status = 'unknown')) AS may_have_sent,
+            COALESCE((SELECT x.auto FROM contact_card_context x
+                       WHERE x.business_id = c.business_id AND x.job_id = c.card_job_id), false) AS auto,
             EXISTS (SELECT 1 FROM job_step_results s
                      WHERE s.business_id = c.business_id AND s.job_id = c.card_job_id
                        AND s.status = 'completed' AND s.performed IS TRUE) AS performed,
@@ -173,6 +186,10 @@ async function settleCarded(
   for (const r of rows) {
     let to: 'answered' | 'closed' | 'expired' | null = null;
     let failedSend = false;
+    // A failed AUTO job has no approval and was never shown to the owner: the
+    // re-raise (`contact-auto-reraise.ts`) turns it into a card and owns the
+    // conversation. Closing it here would swallow the reply (spec §6).
+    if (r.auto && r.phase === 'failed' && !r.performed) continue;
     if (r.phase === 'closed' && r.performed) to = 'answered';
     else if (r.phase === 'failed' && !r.performed && (r.latest === 'approved' || r.latest === 'approved_with_edit')) {
       // I2: approved, then the send failed. Terminal; the owner must hear.

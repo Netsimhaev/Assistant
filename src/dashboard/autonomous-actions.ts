@@ -229,3 +229,6 @@ export async function markUpdatesSeen(
     [db.businessId, pairs.map((p) => p[0]), pairs.map((p) => p[1])],
   );
 }
+
+/** Shown after a mark turned a topic's automatic replies off; the topic name follows. */
+export const AUTO_REPLY_TOPIC_TURNED_OFF = 'המענה האוטומטי לנושא כבוי מעכשיו — הנושא יחזור לכרטיסים לאישורך:';

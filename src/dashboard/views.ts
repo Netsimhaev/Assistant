@@ -23,7 +23,7 @@ import type { IntentName } from '../domain/reading.js';
 import { actionClassLabel } from '../domain/labels.js';
 import type { MemoryRecord } from '../memory/store.js';
 import { AutonomyMode } from '../governance/autonomy-mode.js';
-import { stepKey, type AutonomousAction } from './autonomous-actions.js';
+import { AUTO_REPLY_TOPIC_TURNED_OFF, stepKey, type AutonomousAction } from './autonomous-actions.js';
 import type { ActionUpdateSettings } from '../governance/action-update-settings.js';
 import { renderLearning, type LearningSnapshot } from './learning-view.js';
 import { CONNECTION_GROUP_ORDER, GROUP_LABELS, groupForServes } from './connection-groups.js';
@@ -609,8 +609,13 @@ export function renderAutonomousActions(
   csrf: string,
   error?: string,
   newSteps: ReadonlySet<string> = new Set(),
+  topicTurnedOff?: string,
 ): string {
-  const errorBlock = error === undefined ? '' : `<p class="error">${esc(error)}</p>`;
+  const errorBlock =
+    (error === undefined ? '' : `<p class="error">${esc(error)}</p>`) +
+    (topicTurnedOff === undefined
+      ? ''
+      : `<p class="notice">${esc(AUTO_REPLY_TOPIC_TURNED_OFF)} ${escLabel(topicTurnedOff)}</p>`);
 
   const rows = actions
     .map((action) => {
