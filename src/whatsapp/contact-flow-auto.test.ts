@@ -35,6 +35,15 @@ import { CONTACT_AUTO_REASON } from './contact-card.js';
 import type { ContactFlowDeps } from './contact-flow.js';
 import type { BusinessCharter } from '../domain/charter.js';
 import type { PolicyBundle } from '../domain/policy.js';
+import { Plan } from '../domain/plan.js';
+import type { ConnectionBinding } from '../domain/connection.js';
+import { loadJob } from '../orchestrator/jobs.js';
+import { runPlan } from '../orchestrator/run-plan.js';
+import { AdapterRegistry } from '../orchestrator/adapters/registry.js';
+import { browserAdapter } from '../orchestrator/adapters/browser.js';
+import type { AdapterCall, ExternalAdapter } from '../orchestrator/adapters/types.js';
+import { envCredentials } from '../orchestrator/credentials.js';
+import { CONTACT_REPLY_EXEMPTION_MARKER } from '../policy/contact-reply.js';
 
 const BUSINESS = 'test-business';
 const PRINCIPAL = '+972500000000';
@@ -76,6 +85,9 @@ interface World {
   classified: ClassifierRequest[];
   researched: number;
   sourceCalls: string[];
+  /** Holding replies already sent to the contact when the classifier / researcher was called. */
+  holdingAtClassify: number[];
+  holdingAtResearch: number[];
 }
 
 async function world(o: { charter?: CharterOverrides; settingsOn?: boolean } = {}): Promise<World> {
@@ -106,6 +118,8 @@ async function world(o: { charter?: CharterOverrides; settingsOn?: boolean } = {
     classified: [],
     researched: 0,
     sourceCalls: [],
+    holdingAtClassify: [],
+    holdingAtResearch: [],
   };
 }
 
@@ -114,12 +128,17 @@ interface Overrides {
   topic?: 'same' | null;
   draft?: (req: ContactDraftRequest) => ContactDraftOutcome;
   research?: () => ResearchOutcome;
+  classifyThrows?: boolean;
+  items?: SourceItem[];
+  ledgerFailed?: boolean;
   extra?: Partial<ContactFlowDeps>;
 }
 
 function deps(w: World, o: Overrides = {}): ContactFlowDeps {
   const classifier: ContactClassifier = async (req) => {
     w.classified.push(req);
+    w.holdingAtClassify.push(sentTo(w, CONTACT).length);
+    if (o.classifyThrows === true) throw new Error('classifier down');
     return {
       status: 'classified',
       raw: {
@@ -136,11 +155,12 @@ function deps(w: World, o: Overrides = {}): ContactFlowDeps {
   };
   const researcher: ContactResearcher = async () => {
     w.researched += 1;
+    w.holdingAtResearch.push(sentTo(w, CONTACT).length);
     return o.research !== undefined ? o.research() : { status: 'none' };
   };
-  const stub = (name: string, items: SourceItem[]): Tier2Source => async () => {
+  const stub = (name: string, items: SourceItem[], failed = false): Tier2Source => async () => {
     w.sourceCalls.push(name);
-    return { items, ownershipViolation: false };
+    return failed ? { items, ownershipViolation: false, failed: true } : { items, ownershipViolation: false };
   };
   return {
     gateway: w.gateway,
@@ -153,7 +173,7 @@ function deps(w: World, o: Overrides = {}): ContactFlowDeps {
     classifier,
     sources: [
       namedSource('uploaded_invoices', stub('uploaded_invoices', [])),
-      namedSource('ledger_of_sender', stub('ledger_of_sender', [LEDGER_ITEM])),
+      namedSource('ledger_of_sender', stub('ledger_of_sender', o.items ?? [LEDGER_ITEM], o.ledgerFailed === true)),
       namedSource('meetings_of_sender', stub('meetings_of_sender', [])),
     ],
     calendarSource: stub('calendar_busy', []),
@@ -398,5 +418,119 @@ describe('busy and context', () => {
     expect(w.classified).toHaveLength(1);
     expect(w.drafts).toHaveLength(1);
     expect(w.drafts[0]?.instruction).toBeUndefined();
+  });
+});
+
+describe('fix round 1', () => {
+  it('static gate fails (settings off): the holding reply goes out first, even when the classifier throws', async () => {
+    const w = await world({ settingsOn: false });
+    await door(w, deps(w, { classifyThrows: true }), [msg(CONTACT, 'נשלחה כבר החשבונית?')]);
+    expect(w.holdingAtClassify).toEqual([1]);
+    expect(sentTo(w, CONTACT)).toHaveLength(1);
+    expect((await approvals())[0]?.state).toBe('pending');
+  });
+
+  it('static gate passes, auto ruled out (a request): the holding reply goes out before the researcher', async () => {
+    const w = await world();
+    await door(w, deps(w, { kind: 'request' }), [msg(CONTACT, 'אפשר לשלוח שוב?')]);
+    expect(w.holdingAtClassify).toEqual([0]);
+    expect(w.holdingAtResearch).toEqual([1]);
+    expect(sentTo(w, CONTACT)).toHaveLength(1);
+  });
+
+  it('a card pending on the owner is never retired by an auto reply: a qualifying question takes the card path', async () => {
+    const w = await world();
+    await door(w, deps(w, { kind: 'request' }), [msg(CONTACT, 'אפשר לשלוח שוב?')]);
+    const [first] = await approvals();
+    expect(first?.state).toBe('pending');
+
+    await door(w, deps(w), [msg(CONTACT, 'נשלחה כבר החשבונית?', 2_000)]);
+
+    const { rows: clearances } = await testDb().query(
+      'SELECT 1 FROM contact_auto_clearances WHERE business_id = $1', [BUSINESS]);
+    expect(clearances).toHaveLength(0);
+    expect((await jobs()).some((j) => j.phase === 'execute')).toBe(false);
+    const all = await approvals();
+    expect(all).toHaveLength(2);
+    expect(all[0]?.state).toBe('cancelled');
+    expect(all[1]?.state).toBe('pending');
+    // No auto attempt: one draft per message, both on the card path.
+    expect(w.drafts.map((d) => d.instruction)).toEqual([undefined, undefined]);
+    // Both messages are on the conversation the new card is drafted from.
+    const asked = w.drafts[1]!.conversation.filter((m) => m.direction === 'inbound').map((m) => m.body);
+    expect(asked).toEqual(['אפשר לשלוח שוב?', 'נשלחה כבר החשבונית?']);
+  });
+
+  it('a failed source skips the auto attempt: no billed auto draft, the sources reason, card', async () => {
+    const w = await world();
+    await door(w, deps(w, { ledgerFailed: true }), [msg(CONTACT, 'נשלחה כבר החשבונית?')]);
+    expect(w.drafts).toHaveLength(1);
+    expect(w.drafts[0]?.instruction).toBeUndefined();
+    const [card] = await approvals();
+    expect(card?.detail).toContain(EXIT_REASONS.sources);
+    expect(w.researched).toBe(1);
+  });
+
+  it('an auto draft attaching a tier-2 document that cannot be loaded falls back to the card path', async () => {
+    const w = await world();
+    const ghost: SourceItem = { ...LEDGER_ITEM, documentId: 'DOC-GHOST0000000001' };
+    const flow = deps(w, {
+      items: [ghost],
+      draft: (req) => ({
+        status: 'drafted', body: GROUNDED, usedTier3: false,
+        attachDocumentId: req.instruction === 'report_state' ? 'DOC-GHOST0000000001' : null,
+      }),
+    });
+    await door(w, flow, [msg(CONTACT, 'נשלחה כבר החשבונית?')]);
+    const [card] = await approvals();
+    expect(card?.state).toBe('pending');
+    expect(card?.detail).toContain(EXIT_REASONS.attachment);
+    expect((await jobs()).some((j) => j.phase === 'execute')).toBe(false);
+  });
+
+  it('end to end: the auto job the flow raised runs through the gate on the exemption and sends the exact body', async () => {
+    const w = await world();
+    await door(w, deps(w), [msg(CONTACT, 'נשלחה כבר החשבונית?')]);
+    const [row] = await jobs();
+    expect(row?.phase).toBe('execute');
+    const job = await withBusiness(BUSINESS, (db) => loadJob(db, row!.job_id));
+    if (job === null) throw new Error('job vanished');
+    const { rows } = await testDb().query<{ plan: unknown }>(
+      'SELECT plan FROM job_plans WHERE business_id = $1 AND job_id = $2', [BUSINESS, job.jobId]);
+    const plan = Plan.parse(rows[0]?.plan);
+
+    const calls: AdapterCall[] = [];
+    const adapter: ExternalAdapter = {
+      system: WHATSAPP_CONTACTS_SYSTEM,
+      channel: 'api',
+      serves: ['wa.send_message'],
+      async execute(call) {
+        calls.push(call);
+        return { ok: true, output: null, externalId: 'M-1' };
+      },
+    };
+    const binding: ConnectionBinding = {
+      system: WHATSAPP_CONTACTS_SYSTEM, status: 'live', endpoint: null, credentialRef: null, provider: null, lastOkAt: null, lastError: null,
+    };
+    const result = await withBusiness(BUSINESS, (db) =>
+      runPlan(db, {
+        job,
+        bundle: w.bundle,
+        plan,
+        registry: new AdapterRegistry([adapter], [browserAdapter]),
+        bindings: [binding],
+        credentials: envCredentials({}, 'X_'),
+        counterpartyTags: [],
+        // The dial's default: without the exemption stage 8 would refuse.
+        rampLevel: 'draft_only',
+        now: new Date(),
+      }),
+    );
+    expect(result.status).toBe('done');
+    expect(calls).toHaveLength(1);
+    expect((calls[0]!.input as Record<string, unknown>)['body']).toBe(GROUNDED);
+    const { rows: intents } = await testDb().query<{ reason: string }>(
+      `SELECT reason FROM audit_log WHERE business_id = $1 AND kind = 'intent_to_act' ORDER BY seq`, [BUSINESS]);
+    expect(intents.at(-1)?.reason.endsWith(CONTACT_REPLY_EXEMPTION_MARKER)).toBe(true);
   });
 });

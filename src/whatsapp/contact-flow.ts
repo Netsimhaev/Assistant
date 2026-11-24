@@ -57,10 +57,20 @@ import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import { canonicalHash } from '../util/canonical.js';
 import type { CardContext } from './card-context.js';
-import { CLASSIFY_TIMEOUT_MS, autoGate, classifyConversation, hasLiveCard, loadOtherPeople, namedRuns, sourceRuns, topicFor } from './contact-auto.js';
+import {
+  CLASSIFY_TIMEOUT_MS,
+  classifyConversation,
+  hasLiveCard,
+  loadOtherPeople,
+  namedRuns,
+  perMessageGateReason,
+  sourceRuns,
+  staticAutoGate,
+  topicFor,
+} from './contact-auto.js';
 import type { Classification } from './contact-classification.js';
 import type { ContactTopic } from './contact-topics.js';
-import { exitChecks } from './exit-checks.js';
+import { EXIT_REASONS, exitChecks } from './exit-checks.js';
 import { publicSourceItems } from './sources/public-source.js';
 import {
   ContactCardBusyError,
@@ -449,10 +459,10 @@ interface CardInput {
 
 /** The card path's tail: holding reply, the card, its presentation, the messages settled. */
 async function raiseCard(db: BusinessDb, deps: ContactFlowDeps, group: Group, card: CardInput): Promise<'raised' | 'busy'> {
-  // Once per conversation; `sendHoldingReply` itself enforces the per-number
-  // daily limit, freshness, quiet hours and the kill switch. Card path only:
-  // an auto reply goes out without "בודקת ומעדכנת" (spec §5.6).
-  await sendHoldingReply(db, { gateway: deps.gateway, bundle: deps.bundle, now: deps.now() }, group.conversation.conversationId);
+  // Backstop: the holding reply is normally sent earlier (top of the group
+  // or the moment auto is ruled out); once per conversation, so this is a
+  // no-op then. Card path only: an auto reply never gets one (spec §5.6).
+  await holdingReply(db, deps, group);
   let raised: { jobId: string; approvalId: string };
   try {
     raised = await raiseContactCard(
@@ -479,29 +489,113 @@ async function raiseCard(db: BusinessDb, deps: ContactFlowDeps, group: Group, ca
   return 'raised';
 }
 
+/** Once per conversation; `sendHoldingReply` enforces the daily limit, freshness, quiet hours and the kill switch. */
+async function holdingReply(db: BusinessDb, deps: ContactFlowDeps, group: Group): Promise<void> {
+  await sendHoldingReply(db, { gateway: deps.gateway, bundle: deps.bundle, now: deps.now() }, group.conversation.conversationId);
+}
+
+type AutoAttempt = { done: 'carded' | 'busy' } | { done: null; reason: string | null };
+
+/**
+ * The auto attempt, for a sender that passed the static gate. In order, and
+ * every step positive: the per-message gate (topic, question); every source
+ * answered (a failed source means no billed drafter call at all); the drafter
+ * WITHOUT the researcher (`tier3: []`, report-state instruction); the six exit
+ * checks on the drafter's UNFILTERED choice (an attachment outside tier 1/2
+ * fails, it is not silently dropped into a pass); an attachment that cannot
+ * be loaded. Only then the auto card job. Anything else returns the reason
+ * the card will carry, and the caller takes the card path.
+ */
+async function tryAuto(
+  db: BusinessDb,
+  deps: ContactFlowDeps,
+  group: Group,
+  classification: Classification,
+  topic: ContactTopic | null,
+  gathered: Gathered,
+  reasons: readonly string[],
+  contextBase: Omit<CardContext, 'jobId' | 'auto' | 'internalDocumentIds'>,
+): Promise<AutoAttempt> {
+  if (group.sender.kind !== 'contact') return { done: null, reason: null };
+  const contact = group.sender.contact;
+  const managedKind = contact.kind;
+  if (managedKind === null) return { done: null, reason: null };
+  const gateReason = perMessageGateReason(managedKind, topic, classification);
+  if (gateReason !== null || topic === null) return { done: null, reason: gateReason ?? EXIT_REASONS.topic };
+  if (gathered.failed || gathered.ownershipViolation) return { done: null, reason: EXIT_REASONS.sources };
+
+  const attempt = await runDraft(db, deps, group, gathered.tier12, [], 'report_state');
+  if (attempt.status !== 'drafted') return { done: null, reason: null };
+  const check = exitChecks({
+    draft: attempt.body,
+    attachDocumentId: attempt.attachDocumentId,
+    classification,
+    topic,
+    sender: { kind: managedKind, managed: true, colleague: false, name: contact.name },
+    tier12: gathered.tier12,
+    tier3Used: false,
+    sourceFailed: gathered.failed,
+    ownershipViolation: gathered.ownershipViolation,
+    otherPeople: await loadOtherPeople(db, { key: group.sender.key, subjectKey: contact.subjectKey, email: contact.email }),
+  });
+  if (!check.ok) return { done: null, reason: check.reason };
+  if (attempt.attachDocumentId !== null && (await loadAttachmentInfo(db, attempt.attachDocumentId)) === null) {
+    return { done: null, reason: EXIT_REASONS.attachment };
+  }
+  try {
+    const raised = await raiseContactCard(db, {
+      conversation: group.conversation,
+      draft: { body: attempt.body, attachDocumentId: attempt.attachDocumentId },
+      reasonHe: reasons.join('; '),
+      sourcesHe: sourcesHeOf(gathered.tier12, false),
+      bundle: deps.bundle,
+      contactLabel: contact.name,
+      mode: 'auto',
+      context: { ...contextBase, internalDocumentIds: [] },
+    });
+    await settleAll(db, group, 'handled', raised.jobId);
+    return { done: 'carded' };
+  } catch (error) {
+    if (!(error instanceof ContactCardBusyError)) throw error;
+    await handleBusy(db, deps, group);
+    return { done: 'busy' };
+  }
+}
+
 /**
  * The order of decisions for one conversation (phase 2, package 1):
  *
+ *   0. the static auto gate (managed sender, signed charter row, owner's
+ *      setting, no card pending on the owner). Failed → the holding reply
+ *      goes out here, at the top, exactly as phase 1 sent it;
  *   1. busy — a card that cannot be replaced (approved and unsent, or an auto
  *      job still running: its phase is neither `await_approval`, `failed` nor
  *      `closed`) gets no model call at all (R11a);
  *   2. caps — over either, a card with no classifier and no draft;
  *   3. the classifier (counted in the same draft run);
- *   4. courtesy with no live card — recorded only: no holding reply, no draft;
+ *   4. courtesy with no live card — recorded only: no draft, no card;
  *   5. sources, contacts only, routed by the topic;
- *   6. an auto attempt only when every switch holds: the drafter WITHOUT the
- *      researcher, then the six exit checks. Pass → the auto card job (no
- *      approval, no holding reply). Fail, or not eligible → the card path:
- *      holding reply, researcher, and a fresh draft with tier 3.
+ *   6. the auto attempt (`tryAuto`) when the static gate passed. Done → the
+ *      auto card job (no approval, no holding reply). Ruled out → the holding
+ *      reply NOW, then the card path: researcher, and a fresh draft with tier 3.
  *
- * The auto outcome is reported as `carded`: it IS a card job, one the owner
- * is not asked about.
+ * `raiseCard` also calls the holding reply, as a once-per-conversation
+ * backstop. The auto outcome is reported as `carded`: it IS a card job, one
+ * the owner is not asked about.
  */
 async function processGroup(
   db: BusinessDb,
   deps: ContactFlowDeps,
   group: Group,
 ): Promise<'carded' | 'capped' | 'busy' | 'recordedOnly'> {
+  const managedKind = group.sender.kind === 'contact' ? group.sender.contact.kind : undefined;
+  const autoPossible = await staticAutoGate(db, {
+    charter: deps.charter,
+    managedKind,
+    conversationId: group.conversation.conversationId,
+  });
+  if (!autoPossible) await holdingReply(db, deps, group);
+
   // Before any money: a card that cannot be replaced gets no draft.
   if (await cardTakeoverBlocked(db, group.conversation.conversationId)) {
     await handleBusy(db, deps, group);
@@ -549,7 +643,6 @@ async function processGroup(
     }
   }
 
-  const managedKind = group.sender.kind === 'contact' ? group.sender.contact.kind : undefined;
   const topic = group.sender.kind === 'contact' ? await topicFor(db, classification, managedKind ?? null) : null;
   const gathered = await gatherSources(db, deps, group, topic, classification.window);
   const contextBase = {
@@ -571,49 +664,13 @@ async function processGroup(
   }
 
   const reasons = [base, ...group.notes, ...gathered.notes];
-  const gate = await autoGate(db, { charter: deps.charter, managedKind, topic, classification });
-  if (!gate.eligible && gate.reason !== null) reasons.push(gate.reason);
-
-  if (gate.eligible && group.sender.kind === 'contact' && topic !== null) {
-    const contact = group.sender.contact;
-    const attempt = await runDraft(db, deps, group, gathered.tier12, [], 'report_state');
-    if (attempt.status === 'drafted') {
-      const check = exitChecks({
-        draft: attempt.body,
-        // The drafter's own choice, unfiltered: an attachment outside tier 1/2
-        // must fail the check, not be silently dropped into a pass.
-        attachDocumentId: attempt.attachDocumentId,
-        classification,
-        topic,
-        sender: { kind: contact.kind, managed: true, colleague: false, name: contact.name },
-        tier12: gathered.tier12,
-        tier3Used: false,
-        sourceFailed: gathered.failed,
-        ownershipViolation: false,
-        otherPeople: await loadOtherPeople(db, { key: group.sender.key, subjectKey: contact.subjectKey, email: contact.email }),
-      });
-      if (check.ok) {
-        try {
-          const raised = await raiseContactCard(db, {
-            conversation: group.conversation,
-            draft: { body: attempt.body, attachDocumentId: attempt.attachDocumentId },
-            reasonHe: reasons.join('; '),
-            sourcesHe: sourcesHeOf(gathered.tier12, false),
-            bundle: deps.bundle,
-            contactLabel: contact.name,
-            mode: 'auto',
-            context: { ...contextBase, internalDocumentIds: [] },
-          });
-          await settleAll(db, group, 'handled', raised.jobId);
-          return 'carded';
-        } catch (error) {
-          if (!(error instanceof ContactCardBusyError)) throw error;
-          await handleBusy(db, deps, group);
-          return 'busy';
-        }
-      }
-      reasons.push(check.reason);
-    }
+  if (autoPossible) {
+    const auto = await tryAuto(db, deps, group, classification, topic, gathered, reasons, contextBase);
+    if (auto.done !== null) return auto.done;
+    if (auto.reason !== null) reasons.push(auto.reason);
+    // Auto ruled out: the contact hears "בודקת ומעדכנת" now, before the
+    // researcher and the second draft spend their time.
+    await holdingReply(db, deps, group);
   }
 
   // The card path: tier 3 joins, and the draft is written again (without the

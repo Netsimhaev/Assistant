@@ -298,6 +298,17 @@ async function raiseAuto(db: BusinessDb, a: {
 }): Promise<void> {
   const step = a.plan.steps[0];
   if (step === undefined) throw new Error('contact card: auto plan has no step');
+  // The clearance is for a reply and nothing else: the bound bytes must read
+  // as `whatsapp.reply` (a real conversationId) before anything is cleared.
+  const facts = buildFacts(step.toolName, step.input, {
+    provenance: 'unknown_external',
+    chainDepth: 1,
+    counterpartyTags: [],
+    provenanceChainDerived: false,
+  });
+  if (facts.actionClass !== 'whatsapp.reply') {
+    throw new Error(`contact card: auto payload classified as ${String(facts.actionClass)}, not whatsapp.reply`);
+  }
   await takeOverConversation(db, a.conversation.conversationId, a.jobId, a.previous);
   await writeClearance(db, {
     jobId: a.jobId,

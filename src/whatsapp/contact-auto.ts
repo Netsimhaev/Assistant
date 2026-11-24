@@ -95,34 +95,61 @@ export function namedRuns(name: Tier2SourceName, topic: ContactTopic | null): bo
   return topic === null || topic.sources.includes(name);
 }
 
-export type AutoGate = { eligible: true } | { eligible: false; reason: string | null };
-
 /**
- * Whether an auto attempt may be made. Without both switches (the signed
- * charter row and the owner's setting) or for anyone but a managed client or
- * supplier, there is no attempt and no extra reason — the card's base reason
- * already says why. With both on, a missing topic or a message that is not a
- * question names the exit reason the owner will read.
+ * The STATIC half of auto-eligibility — what does not depend on what the
+ * message says, so it is known before the classifier runs (and before the
+ * holding reply is decided): a managed client or supplier (a colleague never
+ * resolves to `contact`), the signed charter row, the owner's setting, and a
+ * conversation with NO card waiting on the owner. A pending card carries an
+ * earlier message the owner has not answered yet; an auto reply would retire
+ * it silently, so that conversation takes the card path, which carries the
+ * history (fix round 1, I2).
  */
-export async function autoGate(
+export async function staticAutoGate(
   db: BusinessDb,
   input: {
     charter: BusinessCharter;
     managedKind: 'client' | 'supplier' | null | undefined;
-    topic: ContactTopic | null;
-    classification: Classification;
+    conversationId: string;
   },
-): Promise<AutoGate> {
-  if (input.managedKind === undefined || input.managedKind === null) return { eligible: false, reason: null };
-  if (!autoReplySigned(input.charter)) return { eligible: false, reason: null };
+): Promise<boolean> {
+  if (input.managedKind === undefined || input.managedKind === null) return false;
+  if (!autoReplySigned(input.charter)) return false;
   const settings = await loadContactWaSettings(db);
-  if (settings.autoReplyEnabled !== true) return { eligible: false, reason: null };
-  const t = input.topic;
-  if (t === null || t.retiredAt !== null || !t.autoReply || !topicApplies(t, input.managedKind)) {
-    return { eligible: false, reason: EXIT_REASONS.topic };
+  if (settings.autoReplyEnabled !== true) return false;
+  return !(await hasPendingCard(db, input.conversationId));
+}
+
+/** The conversation's current card job is parked on the owner with a live pending approval. */
+export async function hasPendingCard(db: BusinessDb, conversationId: string): Promise<boolean> {
+  const { rows } = await db.query<{ pending: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM contact_conversations c
+         JOIN jobs j ON j.business_id = c.business_id AND j.job_id = c.card_job_id AND j.phase = 'await_approval'
+         JOIN approval_requests a ON a.business_id = c.business_id AND a.job_id = c.card_job_id
+        WHERE c.business_id = $1 AND c.conversation_id = $2
+          AND a.state = 'pending' AND a.expires_at > now()
+     ) AS pending`,
+    [db.businessId, conversationId],
+  );
+  return rows[0]?.pending === true;
+}
+
+/**
+ * The PER-MESSAGE half, after the classifier: an approved, live, auto-reply
+ * topic that applies to the contact, and a question. `null` when it holds;
+ * otherwise the exit reason the owner reads on the card.
+ */
+export function perMessageGateReason(
+  managedKind: 'client' | 'supplier',
+  topic: ContactTopic | null,
+  classification: Classification,
+): string | null {
+  if (topic === null || topic.retiredAt !== null || !topic.autoReply || !topicApplies(topic, managedKind)) {
+    return EXIT_REASONS.topic;
   }
-  if (input.classification.kind !== 'question') return { eligible: false, reason: EXIT_REASONS.notQuestion };
-  return { eligible: true };
+  if (classification.kind !== 'question') return EXIT_REASONS.notQuestion;
+  return null;
 }
 
 function readString(body: Record<string, unknown>, key: string): string | null {
