@@ -70,7 +70,18 @@ const SENSITIVITY_SCORE = {
 export async function assessRisk(
   facts: ActionFacts,
   bundle: PolicyBundle,
-  options: { norms?: NormsLookup; charterFit?: RiskDimensions['charterFit'] } = {},
+  options: {
+    norms?: NormsLookup;
+    charterFit?: RiskDimensions['charterFit'];
+    /**
+     * Phones (digits only, the form `readPhones` yields) to treat exactly like
+     * one in the charter's `knownCounterparties.phones`. Set only by the gate,
+     * and only to the one managed contact's number when `contactReplyCovers`
+     * holds (`policy/contact-reply.ts`) — the owner vouched for that number on
+     * the people screen, which is the same vouching a charter entry is.
+     */
+    extraKnownPhones?: readonly string[];
+  } = {},
 ): Promise<RiskAssessment> {
   if (facts.actionClass === null) {
     throw new Error('assessRisk called on a read-only action; the gate should have short-circuited');
@@ -87,7 +98,7 @@ export async function assessRisk(
       class: BASELINE_REVERSIBILITY[facts.actionClass],
       score: REVERSIBILITY_SCORE[BASELINE_REVERSIBILITY[facts.actionClass]],
     },
-    externalVisibility: scoreVisibility(facts, bundle.knownCounterparties),
+    externalVisibility: scoreVisibility(facts, bundle.knownCounterparties, options.extraKnownPhones ?? []),
     dataSensitivity: scoreSensitivity(facts),
     novelty: {
       metric: novelty.metric,
@@ -164,6 +175,7 @@ function scoreMoney(
 function scoreVisibility(
   facts: ActionFacts,
   known: PolicyBundle['knownCounterparties'],
+  extraKnownPhones: readonly string[],
 ): RiskDimensions['externalVisibility'] {
   if (!facts.leavesInstance) return { audience: 'internal', score: 0 };
 
@@ -204,7 +216,7 @@ function scoreVisibility(
       // is not.
       return [known.emailDomains.includes(domain)];
     }),
-    ...facts.counterpartyPhones.map((phone) => known.phones.includes(phone)),
+    ...facts.counterpartyPhones.map((phone) => known.phones.includes(phone) || extraKnownPhones.includes(phone)),
   ];
 
   const identityResolved =

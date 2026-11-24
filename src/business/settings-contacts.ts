@@ -28,9 +28,9 @@
  */
 import { transaction, type BusinessDb } from '../db/pool.js';
 import { activeCharterVersion } from '../charter/store.js';
+import { MANAGED_CONTACT_SOURCES } from '../memory/managed-contacts.js';
 import { retireMemories, writeManagedContactMemory, type ReservedSourceRef } from '../memory/store.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
-import { SETUP_PACKAGE_SOURCE_REF } from './confirm-people.js';
 import type { PersonEntry } from './setup-package.js';
 
 export const SETTINGS_PEOPLE_SOURCE_REF = 'settings_people' satisfies ReservedSourceRef;
@@ -46,63 +46,12 @@ export class ContactPhoneTakenError extends Error {
   }
 }
 
-/** The source refs this screen lists and may change. Closed. */
-export const MANAGED_CONTACT_SOURCES = [SETUP_PACKAGE_SOURCE_REF, SETTINGS_PEOPLE_SOURCE_REF] as const;
-
-export interface ManagedContact {
-  subjectKey: string;
-  name: string;
-  role: string;
-  phone: string;
-  kind: 'client' | 'supplier' | null;
-  email: string | null;
-  externalIds: Record<string, string>;
-}
-
-interface ContactRow {
-  subject_key: string;
-  body: Record<string, unknown>;
-}
-
-function readString(body: Record<string, unknown>, field: string): string {
-  const value = body[field];
-  return typeof value === 'string' ? value : '';
-}
-
-function readExternalIds(body: Record<string, unknown>): Record<string, string> {
-  const value = body['externalIds'];
-  const out: Record<string, string> = {};
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return out;
-  for (const [k, v] of Object.entries(value)) if (typeof v === 'string' && v !== '') out[k] = v;
-  return out;
-}
-
-function readKind(body: Record<string, unknown>): 'client' | 'supplier' | null {
-  const value = body['kind'];
-  return value === 'client' || value === 'supplier' ? value : null;
-}
-
-export async function listManagedContacts(db: BusinessDb): Promise<ManagedContact[]> {
-  const { rows } = await db.query<ContactRow>(
-    `SELECT subject_key, body FROM memories
-      WHERE business_id = $1 AND kind = 'entity' AND retired_at IS NULL
-        AND source_ref = ANY($2::text[])
-        -- Belt and braces beside the write-side guard (writeMemory strips the
-        -- reserved refs): only the owner's own writes are boss jobs.
-        AND provenance = 'boss'
-      ORDER BY created_at, memory_id`,
-    [db.businessId, [...MANAGED_CONTACT_SOURCES]],
-  );
-  return rows.map((row) => ({
-    subjectKey: row.subject_key,
-    name: readString(row.body, 'name'),
-    role: readString(row.body, 'role'),
-    phone: readString(row.body, 'phone'),
-    kind: readKind(row.body),
-    email: readString(row.body, 'email') || null,
-    externalIds: readExternalIds(row.body),
-  }));
-}
+/**
+ * The source refs this screen lists and may change, and the listing itself.
+ * Defined in `memory/managed-contacts.ts` so the policy gate can read them
+ * without reaching `src/business/`; re-exported here for this screen's callers.
+ */
+export { MANAGED_CONTACT_SOURCES, listManagedContacts, type ManagedContact } from '../memory/managed-contacts.js';
 
 async function isManaged(db: BusinessDb, subjectKey: string): Promise<boolean> {
   const { rows } = await db.query(
