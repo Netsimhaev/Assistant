@@ -124,6 +124,8 @@ import {
   handleCalendarStatus,
 } from './calendar-connect.js';
 import {
+  handleAutoReplyRevertPost,
+  handleAutoReplySignPost,
   handleWhatsAppContactsRevertPost,
   handleWhatsAppContactsSignPost,
   handleWhatsAppContactsStatus,
@@ -3576,6 +3578,12 @@ async function route(
   }
   if (method === 'POST' && pathname === '/connections/whatsapp-contacts/sign') {
     return handleWhatsAppContactsSignPost(res, db, session, await readFormBody(req));
+  }
+  if (method === 'POST' && pathname === '/connections/whatsapp-contacts/auto-reply/sign') {
+    return handleAutoReplySignPost(res, db, session, await readFormBody(req));
+  }
+  if (method === 'POST' && pathname === '/connections/whatsapp-contacts/auto-reply/revert') {
+    return handleAutoReplyRevertPost(res, db, session, await readFormBody(req));
   }
   if (method === 'POST' && pathname === '/connections/whatsapp-contacts/revert') {
     return handleWhatsAppContactsRevertPost(res, db, session, await readFormBody(req));

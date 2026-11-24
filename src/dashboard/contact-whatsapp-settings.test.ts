@@ -11,7 +11,11 @@ import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { createTestOwner, loginWithSecondFactor, TEST_MASTER_KEY } from '../test/owner.js';
 import { createServer } from './server.js';
-import { CONTACT_WHATSAPP_SETTINGS_PATH } from './contact-whatsapp-settings.js';
+import {
+  AUTO_REPLY_MISSING_SIGNATURE,
+  AUTO_REPLY_MISSING_TOGGLE,
+  CONTACT_WHATSAPP_SETTINGS_PATH,
+} from './contact-whatsapp-settings.js';
 
 const BUSINESS = 'wa-settings-business';
 const USERNAME = 'owner';
@@ -78,6 +82,46 @@ describe('POST /settings/whatsapp-contacts', () => {
     const rm = await post({ csrf, action: 'remove_source', system: 'crm', operation: 'get_customer' });
     expect(rm.status).toBe(200);
     expect((await withBusiness(BUSINESS, (db) => loadContactWaSettings(db))).externalSources).toEqual([]);
+  });
+
+  it('removes a source even when another remaining entry went stale', async () => {
+    const { baseUrl, cookie, sessionId } = await start();
+    await testDb().query(
+      `INSERT INTO contact_whatsapp_settings (business_id, external_sources) VALUES ($1, $2::jsonb)
+       ON CONFLICT (business_id) DO UPDATE SET external_sources = EXCLUDED.external_sources`,
+      [
+        BUSINESS,
+        JSON.stringify([
+          { systemId: 'crm', operation: 'gone_operation', param: 'customer_id', field: 'data.name' },
+          { systemId: 'crm', operation: 'get_customer', param: 'customer_id', field: 'data.name' },
+        ]),
+      ],
+    );
+    const res = await fetch(`${baseUrl}${CONTACT_WHATSAPP_SETTINGS_PATH}`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf: issueCsrfToken(sessionId), action: 'remove_source', system: 'crm', operation: 'get_customer' }),
+    });
+    expect(res.status).toBe(200);
+    expect((await withBusiness(BUSINESS, (db) => loadContactWaSettings(db))).externalSources.map((s) => s.operation)).toEqual(['gone_operation']);
+  });
+
+  it('toggles auto-reply behind CSRF and says which switch is missing', async () => {
+    const { baseUrl, cookie, sessionId } = await start();
+    const post = (fields: Record<string, string>) =>
+      fetch(`${baseUrl}${CONTACT_WHATSAPP_SETTINGS_PATH}`, { method: 'POST', headers: { cookie }, body: new URLSearchParams(fields) });
+    const before = await (await fetch(`${baseUrl}${CONTACT_WHATSAPP_SETTINGS_PATH}`, { headers: { cookie } })).text();
+    expect(before).toContain(AUTO_REPLY_MISSING_SIGNATURE);
+    expect(before).toContain(AUTO_REPLY_MISSING_TOGGLE);
+    expect((await post({ csrf: 'bad', action: 'auto_reply', enabled: '1' })).status).toBe(403);
+    expect((await withBusiness(BUSINESS, (db) => loadContactWaSettings(db))).autoReplyEnabled).toBe(false);
+    expect((await post({ csrf: issueCsrfToken(sessionId), action: 'auto_reply', enabled: '1' })).status).toBe(200);
+    expect((await withBusiness(BUSINESS, (db) => loadContactWaSettings(db))).autoReplyEnabled).toBe(true);
+    const on = await (await fetch(`${baseUrl}${CONTACT_WHATSAPP_SETTINGS_PATH}`, { headers: { cookie } })).text();
+    expect(on).not.toContain(AUTO_REPLY_MISSING_TOGGLE);
+    expect(on).toContain(AUTO_REPLY_MISSING_SIGNATURE);
+    await post({ csrf: issueCsrfToken(sessionId), action: 'auto_reply' });
+    expect((await withBusiness(BUSINESS, (db) => loadContactWaSettings(db))).autoReplyEnabled).toBe(false);
   });
 
   it('refuses a source whose operation is not a signed read, saving nothing', async () => {

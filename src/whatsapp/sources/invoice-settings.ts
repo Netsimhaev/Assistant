@@ -188,3 +188,20 @@ export async function saveExternalSources(
   );
   return { ok: true };
 }
+
+/**
+ * Removes one source without re-validating the rest: fewer sources only narrows
+ * what is read, so a stale sibling (an operation a later charter dropped) must
+ * not block removing another entry.
+ */
+export async function removeExternalSource(db: BusinessDb, systemId: string, operation: string): Promise<void> {
+  const rest = (await loadContactWaSettings(db)).externalSources.filter(
+    (x) => !(x.systemId === systemId && x.operation === operation),
+  );
+  await db.query(
+    `INSERT INTO contact_whatsapp_settings (business_id, external_sources, updated_at)
+     VALUES ($1, $2::jsonb, now())
+     ON CONFLICT (business_id) DO UPDATE SET external_sources = EXCLUDED.external_sources, updated_at = now()`,
+    [db.businessId, JSON.stringify(rest)],
+  );
+}
