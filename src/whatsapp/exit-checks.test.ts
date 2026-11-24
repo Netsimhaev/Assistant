@@ -111,4 +111,53 @@ describe('exitChecks', () => {
   it('first failure wins', () => {
     expect(reason(base({ draft: 'ב-13/11', tier3Used: true, topic: null }))).toBe(EXIT_REASONS.ungrounded);
   });
+
+  describe('fix round 1', () => {
+    const src = (text: string): ExitCheckInput['tier12'] =>
+      [{ source: 'sent_invoices', label: 'x', text, documentId: null, at: null }] as ExitCheckInput['tier12'];
+    const cases: Array<[string, string, string]> = [
+      ['dash date', 'שולם ב-12-11', 'שולם ב-13-11'],
+      ['range', 'הסכום 450-600 ש״ח', 'הסכום 450-700 ש״ח'],
+      ['phone-like', 'התקשרי 050-1111111', 'התקשרי 050-2222222'],
+      ['slash amount', 'עלות 450/חודש', 'עלות 460/חודש'],
+      ['slash thousands', 'סך 5,000/10,000', 'סך 5,000/11,000'],
+      ['url', 'https://pay.x.co/inv/98765', 'https://pay.x.co/inv/98766'],
+      ['time seconds', 'בשעה 12:30:45', 'בשעה 12:30:46'],
+      ['suffix', 'דגם 100-A', 'דגם 101-A'],
+    ];
+    for (const [name, good, bad] of cases) {
+      it(`digit runs: ${name}`, () => {
+        expect(reason(base({ draft: good, tier12: src(good) }))).toBe('ok');
+        expect(reason(base({ draft: bad, tier12: src(good) }))).toBe(EXIT_REASONS.ungrounded);
+      });
+    }
+    it('thousands commas are stripped before comparing', () => {
+      expect(reason(base({ draft: 'סך 5,000', tier12: src('סך 5000') }))).toBe('ok');
+    });
+    it('non-ASCII digits fail, even folded or split by zero-width', () => {
+      const t12 = src('סך 100');
+      expect(reason(base({ draft: '٣٠٠ ש״ח', tier12: t12 }))).toBe(EXIT_REASONS.ungrounded);
+      expect(reason(base({ draft: '５００ ש״ח', tier12: t12 }))).toBe(EXIT_REASONS.ungrounded);
+      expect(reason(base({ draft: '5\u200b000 ש״ח', tier12: t12 }))).toBe(EXIT_REASONS.ungrounded);
+      expect(reason(base({ draft: '٣٠٠ ש״ח', tier12: [] }))).toBe(EXIT_REASONS.ungrounded);
+      expect(reason(base({ draft: 'סך 100', tier12: t12 }))).toBe('ok');
+    });
+    it('phone next to another number is still caught', () => {
+      const o = { names: [], emails: [], phoneKeys: ['972541234567'] };
+      const t12 = src('3 054-1234567');
+      expect(reason(base({ draft: 'חשבונית 3 054-1234567', tier12: t12, otherPeople: o }))).toBe(EXIT_REASONS.otherPerson);
+      expect(reason(base({ draft: 'חשבונית 3 054-1234567', tier12: t12, otherPeople: { ...o, phoneKeys: ['972549999999'] } }))).toBe('ok');
+    });
+    it('a source decimal does not ground a draft date through the date layer', () => {
+      expect(reason(base({ draft: 'ב-3/11', tier12: src('3.11') }))).toBe(EXIT_REASONS.ungrounded);
+      expect(reason(base({ draft: 'ב-3/11', tier12: src('3/11') }))).toBe('ok');
+      expect(reason(base({ draft: 'ב-3/11', tier12: src('3.11.2026') }))).toBe('ok');
+    });
+    it('collapses whitespace before name matching', () => {
+      const o = { names: ['דנה לוי'], emails: [], phoneKeys: [] };
+      const s = { ...base().sender, name: 'אחר' };
+      expect(reason(base({ draft: 'שאלי את דנה  לוי', sender: s, otherPeople: o }))).toBe(EXIT_REASONS.otherPerson);
+      expect(reason(base({ draft: 'שאלי את דנה', sender: s, otherPeople: o }))).toBe('ok');
+    });
+  });
 });

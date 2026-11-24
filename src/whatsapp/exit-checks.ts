@@ -6,7 +6,6 @@
  * and a value that cannot be read is never the permissive one.
  */
 import { ungroundedNumbers } from '../governance/numeric-grounding.js';
-import { stripBidiControls } from '../util/bidi.js';
 import type { Classification } from './contact-classification.js';
 import { topicApplies, type ContactTopic } from './contact-topics.js';
 import type { SourceItem } from './sources/types.js';
@@ -38,18 +37,17 @@ export type ExitCheckResult = { ok: true } | { ok: false; reason: string };
 
 const fail = (reason: string): ExitCheckResult => ({ ok: false, reason });
 
+/** Drops invisible format characters (zero-width, bidi), then NFKC, then collapses whitespace. */
+function normalise(text: string): string {
+  return text.replace(/\p{Cf}/gu, '').normalize('NFKC').replace(/\s+/g, ' ');
+}
+
 /** Digits only; a local leading 0 becomes 972. Empty when there are no digits. */
 function phoneDigits(raw: string): string {
   const d = raw.replace(/\D/g, '');
   if (d.startsWith('00')) return d.slice(2);
   if (d.startsWith('0')) return `972${d.slice(1)}`;
   return d;
-}
-
-function draftPhoneKeys(draft: string): Set<string> {
-  const keys = new Set<string>();
-  for (const m of draft.matchAll(/\+?\d[\d\s().-]{5,}\d/g)) keys.add(phoneDigits(m[0]));
-  return keys;
 }
 
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -60,21 +58,27 @@ function mentionsName(draftLower: string, nameLower: string): boolean {
   return re.test(draftLower);
 }
 
-// ungroundedNumbers() deliberately skips anything next to '/' or ':' (dates
-// and times), so those are grounded here: every date or time in the draft
-// must appear, normalised, in a source.
+/** Every maximal ASCII digit run, thousands commas removed, leading zeros dropped. */
+function digitRuns(text: string): string[] {
+  let t = text;
+  for (;;) {
+    const next = t.replace(/(\d),(?=\d{3}(?!\d))/g, '$1');
+    if (next === t) break;
+    t = next;
+  }
+  return (t.match(/\d+/g) ?? []).map((r) => r.replace(/^0+(?=\d)/, ''));
+}
+
+// Dates and times must also match as a unit. '.' is read as '/' only for a
+// full d/m/yyyy: a source decimal ("3.11") never grounds a draft "3/11".
 const DATE_OR_TIME = /(?<![\d/.:])\d{1,2}(?:[/.]\d{1,2}(?:[/.]\d{2,4})?|:\d{2})(?![\d/:])/g;
 
 function dateTokens(text: string): string[] {
   const out: string[] = [];
   for (const m of text.matchAll(DATE_OR_TIME)) {
-    out.push(
-      m[0]
-        .replace(/\./g, '/')
-        .split(/([/:])/)
-        .map((p) => (/^\d+$/.test(p) ? String(Number(p)) : p))
-        .join(''),
-    );
+    let tok = m[0];
+    if (/^\d+\.\d+\.\d+$/.test(tok)) tok = tok.replace(/\./g, '/');
+    out.push(tok.split(/([/:.])/).map((p) => (/^\d+$/.test(p) ? String(Number(p)) : p)).join(''));
   }
   return out;
 }
@@ -91,25 +95,29 @@ function datesGrounded(draft: string, sources: readonly string[]): boolean {
   return dateTokens(draft).every((t) => known.has(t));
 }
 
+function numbersGrounded(draft: string, sources: readonly string[]): boolean {
+  if (sources.length === 0) return !/\p{Nd}/u.test(draft);
+  if (/\p{Nd}/u.test(draft.replace(/[0-9]/g, ''))) return false; // non-ASCII digit survived NFKC
+  const known = new Set(sources.flatMap(digitRuns));
+  if (!digitRuns(draft).every((r) => known.has(r))) return false;
+  if (ungroundedNumbers(draft, sources).length > 0) return false;
+  return datesGrounded(draft, sources);
+}
+
 export function exitChecks(i: ExitCheckInput): ExitCheckResult {
   if (i.sourceFailed || i.ownershipViolation) return fail(EXIT_REASONS.sources);
 
-  // 1. Numbers must come from the sources. ungroundedNumbers() grounds
-  // everything on an empty source list, so that case is handled here.
-  if (i.tier12.length === 0) {
-    if (/\d/.test(i.draft)) return fail(EXIT_REASONS.ungrounded);
-  } else {
-    const texts = i.tier12.map((t) => t.text);
-    if (ungroundedNumbers(i.draft, texts).length > 0 || !datesGrounded(i.draft, texts)) {
-      return fail(EXIT_REASONS.ungrounded);
-    }
-  }
+  const draft = normalise(i.draft);
+
+  // 1. Every digit run in the draft must appear in a source (the shared
+  // ungroundedNumbers() skips dates, ranges, urls and grounds an empty list).
+  if (!numbersGrounded(draft, i.tier12.map((t) => normalise(t.text)))) return fail(EXIT_REASONS.ungrounded);
 
   // 2. No other person.
-  const draftLower = stripBidiControls(i.draft).toLowerCase();
-  const senderName = stripBidiControls(i.sender.name).toLowerCase().trim();
+  const draftLower = draft.toLowerCase();
+  const senderName = normalise(i.sender.name).toLowerCase().trim();
   for (const raw of i.otherPeople.names) {
-    const name = stripBidiControls(raw).toLowerCase().trim();
+    const name = normalise(raw).toLowerCase().trim();
     if (name.length < 2 || name === senderName) continue;
     if (mentionsName(draftLower, name)) return fail(EXIT_REASONS.otherPerson);
   }
@@ -117,10 +125,13 @@ export function exitChecks(i: ExitCheckInput): ExitCheckResult {
     const email = raw.toLowerCase().trim();
     if (email !== '' && draftLower.includes(email)) return fail(EXIT_REASONS.otherPerson);
   }
-  const found = draftPhoneKeys(i.draft);
+  // Digits of the whole draft run together, so a phone cannot hide next to
+  // another number; the key is matched by its last 9 digits (local 0 or 972).
+  const draftDigits = draft.replace(/\D/g, '');
   for (const raw of i.otherPeople.phoneKeys) {
     const key = phoneDigits(raw);
-    if (key !== '' && found.has(key)) return fail(EXIT_REASONS.otherPerson);
+    if (key === '') continue;
+    if (draftDigits.includes(key.length > 9 ? key.slice(-9) : key)) return fail(EXIT_REASONS.otherPerson);
   }
 
   // 3. An attachment must be one of the documents the sources returned.
