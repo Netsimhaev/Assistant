@@ -112,7 +112,10 @@ function deps(w: World, overrides: Partial<ContactFlowDeps> & {
     businessName: 'נגריית הדקל',
     researcher,
     drafter,
+    // Phase 2: an unclassified answer keeps every phase-1 path (no topic, no auto).
+    classifier: async () => ({ status: 'failed', reason: 'stub' }),
     sources: [source],
+    calendarSource: async () => ({ items: [], ownershipViolation: false }),
     now: () => new Date(),
     ...rest,
   };

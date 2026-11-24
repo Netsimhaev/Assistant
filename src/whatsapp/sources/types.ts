@@ -43,3 +43,20 @@ export interface SourceContext {
 }
 
 export type Tier2Source = (db: BusinessDb, ids: SenderIds, signal: AbortSignal, ctx: SourceContext) => Promise<Tier2Result>;
+
+/** A source that says which tier-2 kind it is, so a topic can route to it. */
+export type NamedTier2Source = Tier2Source & { readonly sourceName: Tier2SourceName };
+
+/** A fresh function carrying the name — the shared module export is never mutated. */
+export function namedSource(name: Tier2SourceName, run: Tier2Source): NamedTier2Source {
+  const f: Tier2Source = (db, ids, signal, ctx) => run(db, ids, signal, ctx);
+  Object.defineProperty(f, 'sourceName', { value: name, enumerable: true });
+  return f as NamedTier2Source;
+}
+
+/** The source's own declared name; `null` for a source that declared none. */
+export function sourceNameOf(source: Tier2Source): Tier2SourceName | null {
+  if (!Object.hasOwn(source, 'sourceName')) return null;
+  const name = (source as Partial<NamedTier2Source>).sourceName;
+  return typeof name === 'string' ? name : null;
+}

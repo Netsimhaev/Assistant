@@ -50,7 +50,12 @@ import { runContactDrafter, type ContactDrafter } from '../sdk/contact-drafter.j
 import type { ContactFlowDeps } from '../whatsapp/contact-flow.js';
 import { HOLDING_NAME_FALLBACK, sendDueHoldingReplies } from '../whatsapp/holding-reply.js';
 import { contactHousekeeping } from '../whatsapp/contact-housekeeping.js';
-import type { Tier2Source } from '../whatsapp/sources/types.js';
+import { namedSource, type Tier2Source } from '../whatsapp/sources/types.js';
+import { runContactClassifier, type ContactClassifier } from '../sdk/contact-classifier.js';
+import { createCalendarBusySource } from '../whatsapp/sources/calendar-busy.js';
+import { ledgerOfSender } from '../whatsapp/sources/ledger-of-sender.js';
+import { meetingsOfSender } from '../whatsapp/sources/meetings-of-sender.js';
+import { createExternalOfSenderSource } from '../whatsapp/sources/external-of-sender.js';
 import { uploadedInvoicesOfSender } from '../whatsapp/sources/uploaded-invoices.js';
 import { createSentInvoicesSource } from '../whatsapp/sources/sent-invoices.js';
 import { createAccountingInvoicesSource } from '../whatsapp/sources/accounting-invoices.js';
@@ -954,8 +959,12 @@ export async function schedulerPass(
     /** Test seams; production leaves them unset and the contact flow uses the billed researcher/drafter (`refuseUnderTest` guards both). */
     contactResearcher?: ContactResearcher;
     contactDrafter?: ContactDrafter;
+    /** Test seam; production leaves it unset and the contact flow uses the billed classifier (`refuseUnderTest` guards it). */
+    contactClassifier?: ContactClassifier;
     /** Test seam: replaces the contact flow's tier-2 sources. */
     contactSources?: Tier2Source[];
+    /** Test seam: replaces the contact flow's calendar source. */
+    contactCalendarSource?: Tier2Source;
     /** Test seams only; production leaves them unset and the poll uses the real client, triage and drafter. */
     mailClient?: PollMailboxOptions['client'];
     mailTriage?: PollMailboxOptions['triage'];
@@ -1097,14 +1106,23 @@ export async function schedulerPass(
           businessName: profile.businessProfile?.name ?? HOLDING_NAME_FALLBACK,
           researcher: options.contactResearcher ?? runContactResearcher,
           drafter: options.contactDrafter ?? runContactDrafter,
+          classifier: options.contactClassifier ?? runContactClassifier,
+          // Each source declares its tier-2 kind, so a topic can route to it.
           sources: options.contactSources ?? [
-            uploadedInvoicesOfSender,
-            createSentInvoicesSource({
+            namedSource('uploaded_invoices', uploadedInvoicesOfSender),
+            namedSource('sent_invoices', createSentInvoicesSource({
               credentials: runtime.credentials,
               documentRoot: options.documentRoot ?? config.documentRoot,
-            }),
-            createAccountingInvoicesSource({ http, credentials: runtime.credentials }),
+            })),
+            namedSource('accounting_invoices', createAccountingInvoicesSource({ http, credentials: runtime.credentials })),
+            namedSource('ledger_of_sender', ledgerOfSender),
+            namedSource('meetings_of_sender', meetingsOfSender),
+            namedSource('external_of_sender', createExternalOfSenderSource({ http, credentials: runtime.credentials })),
           ],
+          calendarSource: options.contactCalendarSource ?? createCalendarBusySource({
+            runtime,
+            ...(options.calendarClient !== undefined ? { client: options.calendarClient } : {}),
+          }),
           ...(options.whatsappProvider !== undefined ? { transcribe: options.whatsappProvider } : {}),
           ...(runtime.notify !== undefined
             ? { notify: { notifier: runtime.notify.notifier, dashboardBaseUrl: runtime.notify.dashboardBaseUrl } }

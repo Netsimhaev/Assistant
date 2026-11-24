@@ -52,6 +52,9 @@ import { assessRisk } from '../policy/risk.js';
 import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import type { NormalizedInboundMessage } from './gateway.js';
+import { canonicalHash } from '../util/canonical.js';
+import { writeClearance } from './auto-clearance.js';
+import { saveCardContext, type CardContext } from './card-context.js';
 import type { BossMessenger } from './messenger.js';
 import { claimMessage, settleMessage } from './store.js';
 import { contactReplyEditAllowed } from './contact-reply-edit.js';
@@ -72,6 +75,8 @@ export const EXTERNAL_FILE_WARNING = '⚠️ הקובץ התקבל מגורם ח
 export const REPLACED_JOB_REASON = 'replaced by newer draft';
 /** "שלח" on a card raised without a draft (cap, failure): there is nothing to send yet. */
 export const CONTACT_CARD_NO_DRAFT = 'בכרטיס הזה אין עדיין טיוטה לשליחה — כתבי "נוסח: <הטקסט>".';
+/** `job_steps.reason` of an auto job's `plan -> execute`: no approval was raised. */
+export const CONTACT_AUTO_REASON = 'contact reply: auto, no card';
 /** Shown in place of the proposed reply when the card carries no draft. */
 export const CONTACT_CARD_NO_DRAFT_SHOWN = '(לא נוסחה הצעה)';
 
@@ -124,7 +129,24 @@ export interface RaiseContactCardInput {
   sourcesHe: string[];
   bundle: PolicyBundle;
   contactLabel: string;
+  /**
+   * `card` (default): an approval card, as phase 1. `auto`: the caller (the
+   * contact flow) ran the six exit checks on THIS draft and they passed - no
+   * approval, a clearance for the exact bound bytes, straight to `execute`.
+   * The gate (`contactReplyCovers`) re-checks everything at send time.
+   */
+  mode?: 'card' | 'auto';
+  /** What the classifier and the sources said; `auto` is derived from `mode`. Default: unclassified. */
+  context?: Omit<CardContext, 'jobId' | 'auto'>;
 }
+
+const EMPTY_CONTEXT: Omit<CardContext, 'jobId' | 'auto'> = {
+  kind: 'unclassified',
+  topicId: null,
+  summary: '',
+  sourceNames: [],
+  internalDocumentIds: [],
+};
 
 /** The reply payload a card job binds — `wa.send_message`'s input, verbatim. */
 function buildPayload(input: RaiseContactCardInput): Record<string, unknown> {
@@ -212,14 +234,113 @@ export async function cardTakeoverBlocked(db: BusinessDb, conversationId: string
   }
 }
 
+/**
+ * One transaction: cancel the old pending card and re-point the conversation
+ * together, or neither. A lost race (the old card was decided since the
+ * inspection) or a closed conversation rolls back.
+ */
+async function takeOverConversation(
+  db: BusinessDb,
+  conversationId: string,
+  jobId: string,
+  previous: PreviousCard | null,
+): Promise<void> {
+  await transaction(db, async (tx) => {
+    if (previous !== null && previous.pendingApprovalId !== null) {
+      if (!(await cancelPendingApproval(tx, previous.pendingApprovalId))) {
+        throw new ContactCardBusyError(conversationId);
+      }
+    }
+    // Compare-and-swap on the card pointer this raise inspected (R11b): a
+    // concurrent raise that re-pointed the conversation since then wins,
+    // and this one withdraws its own card (the caller's catch) - no live
+    // approval is left that no conversation points at.
+    if (!(await setCard(tx, conversationId, jobId, null, previous?.jobId ?? null))) {
+      const current = await loadConversation(tx, conversationId);
+      if (current !== null && (current.state === 'open' || current.state === 'carded')) {
+        throw new ContactCardBusyError(conversationId);
+      }
+      throw new Error('contact card: the conversation is no longer open');
+    }
+  });
+}
+
+async function failReplaced(db: BusinessDb, previous: PreviousCard | null): Promise<void> {
+  if (previous === null || previous.pendingApprovalId === null) return;
+  try {
+    await transition(db, previous.jobId, {
+      to: 'failed',
+      actor: 'orchestrator',
+      reason: REPLACED_JOB_REASON,
+      expectFrom: 'await_approval',
+    });
+  } catch (error) {
+    // Already moved on; the old approval is cancelled either way.
+    if (!(error instanceof PhaseMovedError)) throw error;
+  }
+}
+
+/**
+ * The auto half: the conversation is taken over (it is `carded` on this job,
+ * which `contactReplyCovers` requires), the clearance is written for the
+ * EXACT input of the bound step - the bytes `executeStep` will hash, under
+ * the step id that will run - and the job moves `plan -> execute`. No
+ * approval, no owner notice, no holding reply. The clearance comes after the
+ * take-over so a lost race never leaves a clearance on a job no conversation
+ * points at.
+ */
+async function raiseAuto(db: BusinessDb, a: {
+  conversation: ContactConversation;
+  jobId: string;
+  plan: Plan;
+  previous: PreviousCard | null;
+  topicId: string;
+}): Promise<void> {
+  const step = a.plan.steps[0];
+  if (step === undefined) throw new Error('contact card: auto plan has no step');
+  await takeOverConversation(db, a.conversation.conversationId, a.jobId, a.previous);
+  await writeClearance(db, {
+    jobId: a.jobId,
+    stepId: step.id,
+    inputHash: canonicalHash(step.input),
+    conversationId: a.conversation.conversationId,
+    topicId: a.topicId,
+  });
+  await transition(db, a.jobId, { to: 'execute', actor: 'orchestrator', reason: CONTACT_AUTO_REASON, expectFrom: 'plan' });
+  await failReplaced(db, a.previous);
+}
+
+export async function raiseContactCard(
+  db: BusinessDb,
+  input: RaiseContactCardInput & { mode?: 'card' },
+  options?: { notify?: NotifyTarget },
+): Promise<{ jobId: string; approvalId: string }>;
+export async function raiseContactCard(
+  db: BusinessDb,
+  input: RaiseContactCardInput & { mode: 'auto' },
+  options?: { notify?: NotifyTarget },
+): Promise<{ jobId: string; approvalId: null }>;
+export async function raiseContactCard(
+  db: BusinessDb,
+  input: RaiseContactCardInput,
+  options?: { notify?: NotifyTarget },
+): Promise<{ jobId: string; approvalId: string | null }>;
 export async function raiseContactCard(
   db: BusinessDb,
   input: RaiseContactCardInput,
   options: { notify?: NotifyTarget } = {},
-): Promise<{ jobId: string; approvalId: string }> {
+): Promise<{ jobId: string; approvalId: string | null }> {
   const { conversation, bundle } = input;
+  const mode = input.mode ?? 'card';
+  const context = input.context ?? EMPTY_CONTEXT;
   const payload = buildPayload(input);
   const body = payload['body'] as string;
+  // An auto reply is cleared for one topic and carries a body; anything else
+  // is refused before anything is created.
+  const autoTopicId = context.topicId;
+  if (mode === 'auto' && (autoTopicId === null || body.trim() === '')) {
+    throw new Error('contact card: an auto reply needs a topic and a body');
+  }
 
   // Before anything is created: an attachment nobody can identify refuses the card.
   let attachment: AttachmentInfo | null = null;
@@ -271,6 +392,11 @@ export async function raiseContactCard(
     }
     const bound = await bindPlanToJob(db, job.jobId, plan);
     if (bound.status === 'conflict') throw new Error(`contact card: plan conflict on fresh job ${job.jobId}`);
+    await saveCardContext(db, { ...context, jobId: job.jobId, auto: mode === 'auto' });
+    if (mode === 'auto' && autoTopicId !== null) {
+      await raiseAuto(db, { conversation, jobId: job.jobId, plan, previous, topicId: autoTopicId });
+      return { jobId: job.jobId, approvalId: null };
+    }
 
     const facts = buildFacts('wa.send_message', payload, {
       provenance: 'unknown_external',
@@ -303,40 +429,8 @@ export async function raiseContactCard(
       actor: 'orchestrator',
       reason: `contact card: ${approvalId}`,
     });
-    // One transaction: cancel the old pending card and re-point the
-    // conversation together, or neither. A lost race (the old card was
-    // decided since the inspection) or a closed conversation rolls back.
-    await transaction(db, async (tx) => {
-      if (previous !== null && previous.pendingApprovalId !== null) {
-        if (!(await cancelPendingApproval(tx, previous.pendingApprovalId))) {
-          throw new ContactCardBusyError(conversation.conversationId);
-        }
-      }
-      // Compare-and-swap on the card pointer this raise inspected (R11b): a
-      // concurrent raise that re-pointed the conversation since then wins,
-      // and this one withdraws its own card (the catch below) — no live
-      // approval is left that no conversation points at.
-      if (!(await setCard(tx, conversation.conversationId, job.jobId, null, previous?.jobId ?? null))) {
-        const current = await loadConversation(tx, conversation.conversationId);
-        if (current !== null && (current.state === 'open' || current.state === 'carded')) {
-          throw new ContactCardBusyError(conversation.conversationId);
-        }
-        throw new Error('contact card: the conversation is no longer open');
-      }
-    });
-    if (previous !== null && previous.pendingApprovalId !== null) {
-      try {
-        await transition(db, previous.jobId, {
-          to: 'failed',
-          actor: 'orchestrator',
-          reason: REPLACED_JOB_REASON,
-          expectFrom: 'await_approval',
-        });
-      } catch (error) {
-        // Already moved on; the old approval is cancelled either way.
-        if (!(error instanceof PhaseMovedError)) throw error;
-      }
-    }
+    await takeOverConversation(db, conversation.conversationId, job.jobId, previous);
+    await failReplaced(db, previous);
     return { jobId: job.jobId, approvalId };
   } catch (error) {
     if (approvalId !== null) {
