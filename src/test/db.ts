@@ -122,6 +122,7 @@ export async function resetDatabase(): Promise<void> {
       contact_topics,
       contact_card_context,
       contact_auto_clearances,
+      contact_suggestions,
       contact_documents,
       contact_whatsapp_settings,
       setup_packages,
