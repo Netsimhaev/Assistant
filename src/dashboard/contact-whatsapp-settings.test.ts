@@ -11,6 +11,8 @@ import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { createTestOwner, loginWithSecondFactor, TEST_MASTER_KEY } from '../test/owner.js';
 import { createServer } from './server.js';
+import { insertSuggestion, shapeHashFor } from '../whatsapp/contact-suggestions.js';
+import { SUGGESTION_APPLIED } from '../whatsapp/suggestion-whatsapp.js';
 import {
   AUTO_REPLY_MISSING_SIGNATURE,
   AUTO_REPLY_MISSING_TOGGLE,
@@ -133,5 +135,72 @@ describe('POST /settings/whatsapp-contacts', () => {
     });
     expect(res.status).toBe(400);
     expect((await withBusiness(BUSINESS, (db) => loadContactWaSettings(db))).externalSources).toEqual([]);
+  });
+});
+
+describe('suggestions section', () => {
+  async function startPlain() {
+    server = createServer({ masterKey: TEST_MASTER_KEY, port: 0 });
+    await once(server, 'listening');
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const cookie = await loginWithSecondFactor(baseUrl, BUSINESS, { username: USERNAME, password: PASSWORD });
+    return { baseUrl, cookie, sessionId: cookie.split('=')[1] ?? '' };
+  }
+  const payload = { name: 'שעות פתיחה', description: 'שאלות על שעות', appliesTo: 'both', sources: [], decisionIds: ['a', 'b', 'c', 'd', 'e'] };
+  async function seed(business: string, hash: string): Promise<string> {
+    const s = await withBusiness(business, (db) => insertSuggestion(db, 'new_topic', payload as never, shapeHashFor({ kind: 'new_topic', name: hash })));
+    return s?.suggestionId ?? '';
+  }
+  const topics = (business: string) =>
+    testDb().query(`SELECT 1 FROM contact_topics WHERE business_id = $1`, [business]).then((r) => r.rows.length);
+
+  it('lists an open suggestion with its text and no raw id', async () => {
+    const id = await seed(BUSINESS, 'h-list');
+    const { baseUrl, cookie } = await startPlain();
+    const text = await (await fetch(`${baseUrl}${CONTACT_WHATSAPP_SETTINGS_PATH}`, { headers: { cookie } })).text();
+    expect(text).toContain('שעות פתיחה');
+    expect(text).toContain('הצעות');
+    expect(text.replace(/name="suggestionId" value="[^"]*"/g, '')).not.toContain(id);
+  });
+
+  it('accept creates the topic, reject leaves none', async () => {
+    const id = await seed(BUSINESS, 'h-acc');
+    const { baseUrl, cookie, sessionId } = await startPlain();
+    const post = (f: Record<string, string>) =>
+      fetch(`${baseUrl}${CONTACT_WHATSAPP_SETTINGS_PATH}`, { method: 'POST', headers: { cookie }, body: new URLSearchParams(f) });
+    expect((await post({ csrf: issueCsrfToken(sessionId), action: 'suggestion', suggestionId: id, decision: 'reject' })).status).toBe(200);
+    expect(await topics(BUSINESS)).toBe(0);
+    const id2 = await seed(BUSINESS, 'h-acc2');
+    const res = await post({ csrf: issueCsrfToken(sessionId), action: 'suggestion', suggestionId: id2, decision: 'accept' });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(SUGGESTION_APPLIED);
+    expect(await topics(BUSINESS)).toBe(1);
+  });
+
+  it('refuses a bad CSRF token and changes nothing', async () => {
+    const id = await seed(BUSINESS, 'h-csrf');
+    const { baseUrl, cookie } = await startPlain();
+    const res = await fetch(`${baseUrl}${CONTACT_WHATSAPP_SETTINGS_PATH}`, {
+      method: 'POST', headers: { cookie },
+      body: new URLSearchParams({ csrf: 'bad', action: 'suggestion', suggestionId: id, decision: 'accept' }),
+    });
+    expect(res.status).toBe(403);
+    expect(await topics(BUSINESS)).toBe(0);
+    const { rows } = await testDb().query(`SELECT state FROM contact_suggestions WHERE suggestion_id = $1`, [id]);
+    expect(rows[0]?.state).toBe('open');
+  });
+
+  it("answers 404 for another business's suggestion and leaves it open", async () => {
+    await createTestOwner('other-wa-business', { username: 'o2', password: PASSWORD });
+    const foreign = await seed('other-wa-business', 'h-foreign');
+    const { baseUrl, cookie, sessionId } = await startPlain();
+    const res = await fetch(`${baseUrl}${CONTACT_WHATSAPP_SETTINGS_PATH}`, {
+      method: 'POST', headers: { cookie },
+      body: new URLSearchParams({ csrf: issueCsrfToken(sessionId), action: 'suggestion', suggestionId: foreign, decision: 'accept' }),
+    });
+    expect(res.status).toBe(404);
+    const { rows } = await testDb().query(`SELECT state FROM contact_suggestions WHERE suggestion_id = $1`, [foreign]);
+    expect(rows[0]?.state).toBe('open');
+    expect(await topics('other-wa-business')).toBe(0);
   });
 });

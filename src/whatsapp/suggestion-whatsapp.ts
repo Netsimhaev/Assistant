@@ -84,7 +84,7 @@ export function isSuggestionAnswer(text: string): 'yes' | 'no' | null {
   return null;
 }
 
-async function labelsFor(db: BusinessDb, s: Suggestion): Promise<SuggestionLabels> {
+export async function labelsFor(db: BusinessDb, s: Suggestion): Promise<SuggestionLabels> {
   if (s.kind === 'auto_reply') {
     const topic = await loadTopic(db, s.payload.topicId);
     return topic !== null ? { topicName: topic.name } : {};
