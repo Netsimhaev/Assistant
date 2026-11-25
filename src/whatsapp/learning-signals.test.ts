@@ -61,10 +61,14 @@ async function decision(d: Dec = {}): Promise<string> {
   return id;
 }
 
-const topic = (autoReply = false): Promise<ContactTopic> =>
-  withBusiness(BUSINESS, (db) =>
+// Topics are back-dated an hour so DB/JS clock skew never puts a decision before updatedAt.
+async function topic(autoReply = false): Promise<ContactTopic> {
+  const t = await withBusiness(BUSINESS, (db) =>
     createTopic(db, { name: 'חשבוניות', description: '', appliesTo: 'both', sources: ['uploaded_invoices'], autoReply, by: 'owner' }),
   );
+  await testDb().query(`UPDATE contact_topics SET updated_at = now() - interval '1 hour' WHERE topic_id = $1`, [t.topicId]);
+  return { ...t, updatedAt: new Date(Date.now() - 3_600_000) };
+}
 
 const candidates = () => withBusiness(BUSINESS, (db) => autoReplyCandidates(db, new Date()));
 
