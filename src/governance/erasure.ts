@@ -370,8 +370,9 @@ export async function executeErasure(
     );
     // WhatsApp contacts (migrations 083, 085): decisions, card context,
     // clearances, documents, conversations, ahead of the `documents` delete
-    // and the job scrub below. None of the five has a foreign key, so no cascade can beat these statements to a
-    // row. Same predicates, same parameters, as `countItems`.
+    // and the job scrub below. None of the five has a foreign key, so no
+    // cascade can beat these statements to a row. Same predicates, same
+    // parameters, as `countItems`.
     await del(
       'contact_reply_decisions',
       `DELETE FROM contact_reply_decisions WHERE ${CONTACT_REPLY_DECISIONS_ERASED_PREDICATE}`,

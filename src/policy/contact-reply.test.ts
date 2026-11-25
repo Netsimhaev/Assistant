@@ -391,6 +391,50 @@ describe('risk and what the exemption does not bypass', () => {
   });
 });
 
+describe('stages 6 and 7 run before the exemption (final review minor 7)', () => {
+  async function denialReasons(): Promise<string[]> {
+    const { rows } = await testDb().query<{ reason: string }>(
+      `SELECT reason FROM audit_log WHERE business_id = $1 AND kind = 'policy_denial' ORDER BY seq`,
+      [BUSINESS],
+    );
+    return rows.map((r) => r.reason);
+  }
+
+  it('a covered send to a number in doNotContact is denied at stage 6', async () => {
+    const s = await setup({ doNotContactPhone: PHONE });
+    const decision = await evaluateFor('wa.send_message', WA, s.ctx);
+    expect(decision.outcome).toBe('deny');
+    if (decision.outcome !== 'deny') throw new Error('unreachable');
+    expect(decision.code).toBe(DENY_CODES.doNotContact);
+    expect((await denialReasons()).some((r) => r.startsWith(`${DENY_CODES.doNotContact}:`))).toBe(true);
+  });
+
+  it('its twin, doNotContact on another number, goes out on the exemption', async () => {
+    const s = await setup({ doNotContactPhone: OTHER_PHONE });
+    const decision = await evaluateFor('wa.send_message', WA, s.ctx);
+    expect(decision.outcome).toBe('allow');
+    expect((await intentRows())[0]?.reason.endsWith(` ${CONTACT_REPLY_EXEMPTION_MARKER}`)).toBe(true);
+  });
+
+  it('a covered send inside quiet hours is deferred at stage 7', async () => {
+    const s = await setup();
+    expect(s.ctx.bundle.quietHours).not.toBeNull();
+    // 22:30 in Jerusalem, inside the charter's 20:00-07:00 window.
+    const decision = await evaluateFor('wa.send_message', WA, { ...s.ctx, now: new Date('2026-08-18T19:30:00.000Z') });
+    expect(decision.outcome).toBe('deny');
+    if (decision.outcome !== 'deny') throw new Error('unreachable');
+    expect(decision.code).toBe(DENY_CODES.quietHours);
+    expect((await denialReasons()).some((r) => r.startsWith(`${DENY_CODES.quietHours}:`))).toBe(true);
+  });
+
+  it('its twin, the same send at noon, goes out on the exemption', async () => {
+    const s = await setup();
+    const decision = await evaluateFor('wa.send_message', WA, s.ctx);
+    expect(decision.outcome).toBe('allow');
+    expect((await intentRows())[0]?.reason.endsWith(` ${CONTACT_REPLY_EXEMPTION_MARKER}`)).toBe(true);
+  });
+});
+
 describe('the class condition, called directly', () => {
   // Through the gate, `wa.send_message` is `whatsapp.reply` exactly when it
   // carries a `conversationId`, so condition 2's class check cannot be isolated
