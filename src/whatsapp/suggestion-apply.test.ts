@@ -4,6 +4,7 @@ import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { createTopic, listTopics, loadTopic, retireTopic, setTopicAutoReply } from './contact-topics.js';
 import { insertSuggestion, loadSuggestion, shapeHashFor } from './contact-suggestions.js';
 import { applySuggestion } from './suggestion-apply.js';
+import { setPublicForSuggested } from './public-documents.js';
 
 beforeEach(async () => {
   await resetDatabase();
@@ -213,5 +214,32 @@ describe('applySuggestion: stale accept', () => {
   it('an unknown suggestion id is stale and writes nothing', async () => {
     expect(await apply('NOPE', 'accept')).toBe('stale');
     expect(await auditReasons()).toEqual([]);
+  });
+});
+
+describe('setPublicForSuggested: conditional at write time', () => {
+  const write = (id: string) => inBiz((db) => setPublicForSuggested(db, id, 'client', 'owner'));
+
+  it('writes an eligible owner document', async () => {
+    await insertDocument('DOC-A');
+    expect(await write('DOC-A')).toBe(true);
+    expect(await publicFor('DOC-A')).toBe('client');
+  });
+
+  it('refuses when public_for was set in the meantime, and leaves it', async () => {
+    await insertDocument('DOC-A');
+    await testDb().query(`UPDATE documents SET public_for = 'supplier' WHERE document_id = 'DOC-A'`);
+    expect(await write('DOC-A')).toBe(false);
+    expect(await publicFor('DOC-A')).toBe('supplier');
+  });
+
+  it('refuses a foreign or unextracted or missing document', async () => {
+    await insertDocument('DOC-M', 'mail');
+    await insertDocument('DOC-S', 'instruction', 'stored');
+    expect(await write('DOC-M')).toBe(false);
+    expect(await write('DOC-S')).toBe(false);
+    expect(await write('DOC-NONE')).toBe(false);
+    expect(await publicFor('DOC-M')).toBeNull();
+    expect(await publicFor('DOC-S')).toBeNull();
   });
 });

@@ -13,7 +13,9 @@ import type { PlanOutcome } from '../sdk/planner.js';
 import type { NormalizedInboundMessage } from '../whatsapp/gateway.js';
 import { createFakeGateway, type FakeGateway } from '../whatsapp/fake-gateway.js';
 import { createBossMessenger, type BossMessenger } from '../whatsapp/messenger.js';
-import { installMailboxCharter } from '../test/mailbox.js';
+import { QUESTION_TRIAGE, installMailboxCharter, storedMail, stubDrafter } from '../test/mailbox.js';
+import { raiseMailReply } from './mail-reply.js';
+import { presentMailCard } from './whatsapp-mail-card.js';
 import { saveInstruction } from '../governance/instructions.js';
 import {
   createConfirmation,
@@ -88,7 +90,8 @@ afterAll(async () => {
   await closePool();
 });
 
-const pass = () => withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, { gateway, messenger, planner }));
+const pass = (p: typeof planner = planner) =>
+  withBusiness(BUSINESS, (db) => runWhatsAppDoor(db, { gateway, messenger, planner: p }));
 const lastSent = () => gateway.sent.at(-1)?.body ?? '';
 
 async function suggestion(name = 'משלוחים', delivered: Date | null = new Date()): Promise<string> {
@@ -152,6 +155,26 @@ async function openContactCard(): Promise<void> {
     presentContactCard(db, approvalId, async (text, jobId) => (await messenger.send({ text, jobId })).ok),
   );
   if (!presented) throw new Error('card not presented');
+}
+
+async function openMailCard(): Promise<string> {
+  const mail = await storedMail(BUSINESS, {
+    providerMessageId: 'PM-1',
+    internetMessageId: '<q-1@client.example>',
+    threadId: 'TH-1',
+  });
+  const raised = await withBusiness(BUSINESS, (db) =>
+    raiseMailReply(db, { mail, triage: QUESTION_TRIAGE, bundle, drafter: stubDrafter() }),
+  );
+  if (raised === null || raised.approvalId === null) throw new Error('expected a card');
+  const approvalId = raised.approvalId;
+  await withBusiness(BUSINESS, (db) =>
+    presentMailCard(db, approvalId, async (text, jobId) => {
+      const sent = await messenger.send({ text, jobId });
+      if (!sent.ok) throw new Error(sent.error ?? 'send failed');
+    }),
+  );
+  return approvalId;
 }
 
 describe('a suggestion answered on WhatsApp', () => {
@@ -269,5 +292,55 @@ describe('a suggestion answered on WhatsApp', () => {
     await pass();
     expect(await stateOf(id)).toBe('accepted');
     expect(await topicCount()).toBe(1);
+  });
+  it('"כן" with a clarifying question open on WhatsApp → SEVERAL_OPEN_REFUSAL, nothing applied', async () => {
+    // A question raised on WhatsApp ("לאיזו רונית?"), answerable in its window.
+    gateway.enqueue(msg('תשלחי לרונית', 500));
+    await pass(async () => ({ status: 'planned', plan: { ...recallPlan(), clarifyingQuestion: 'לאיזו רונית?' } }));
+    const { rows: before } = await testDb().query<{ job_id: string; phase: string }>(
+      `SELECT job_id, phase FROM jobs WHERE business_id = $1`,
+      [BUSINESS],
+    );
+    expect(before.map((r) => r.phase)).toEqual(['understand']);
+    const id = await suggestion();
+
+    gateway.enqueue(msg('כן', 2_000));
+    const result = await pass();
+    expect(lastSent()).toBe(SEVERAL_OPEN_REFUSAL);
+    expect(result.suggestionReplies).toBe(0);
+    expect(result.refused).toBe(1);
+    expect(await stateOf(id)).toBe('open');
+    expect(await topicCount()).toBe(0);
+    const { rows: after } = await testDb().query<{ phase: string }>(
+      `SELECT phase FROM jobs WHERE business_id = $1 AND job_id = $2`,
+      [BUSINESS, before[0]?.job_id],
+    );
+    expect(after[0]?.phase).toBe('understand');
+  });
+
+  it('"כן" with a mail card open → SEVERAL_OPEN_REFUSAL, neither the card nor the suggestion decided', async () => {
+    const approvalId = await openMailCard();
+    const id = await suggestion();
+    gateway.enqueue(msg('כן', 2_000));
+    const result = await pass();
+    expect(lastSent()).toBe(SEVERAL_OPEN_REFUSAL);
+    expect(result.suggestionReplies).toBe(0);
+    expect(await stateOf(id)).toBe('open');
+    expect(await topicCount()).toBe(0);
+    const { rows } = await testDb().query<{ state: string }>(
+      `SELECT state FROM approval_requests WHERE business_id = $1 AND approval_id = $2`,
+      [BUSINESS, approvalId],
+    );
+    expect(rows[0]?.state).toBe('pending');
+  });
+
+  it('"כן" after the suggestion window has passed is passthrough, not applied', async () => {
+    const id = await suggestion('משלוחים', new Date(Date.now() - 31 * 60_000));
+    gateway.enqueue(msg('כן'));
+    const result = await pass();
+    expect(result.suggestionReplies).toBe(0);
+    expect(result.instructed).toBe(1);
+    expect(await stateOf(id)).toBe('open');
+    expect(await topicCount()).toBe(0);
   });
 });

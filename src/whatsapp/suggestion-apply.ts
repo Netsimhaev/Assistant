@@ -23,7 +23,7 @@ import {
   normaliseName,
   type Suggestion,
 } from './contact-suggestions.js';
-import { setPublicFor } from './public-documents.js';
+import { setPublicForSuggested } from './public-documents.js';
 
 export type ApplyOutcome = 'applied' | 'rejected' | 'stale' | 'already';
 
@@ -102,8 +102,9 @@ async function applyEffect(db: BusinessDb, s: Suggestion, by: string): Promise<v
       }
       return;
     case 'public_document':
-      if (!(await setPublicFor(db, s.payload.documentId, s.payload.appliesTo, by))) {
-        throw new Error('public-document suggestion: document vanished under the claim');
+      // Conditional at write time: re-sourced, removed or already public → no row.
+      if (!(await setPublicForSuggested(db, s.payload.documentId, s.payload.appliesTo, by))) {
+        throw new Error('public-document suggestion: document no longer eligible under the claim');
       }
       return;
   }
