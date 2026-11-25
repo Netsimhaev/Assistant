@@ -103,4 +103,24 @@ describe('topics screen', () => {
     const { rows } = await testDb().query(`SELECT auto_reply FROM contact_topics WHERE topic_id = 'T-OTHER'`);
     expect(rows[0]?.auto_reply).toBe(false);
   });
+
+  it('answers 404 and changes nothing when editing or retiring another business topic', async () => {
+    const { csrf, post } = await start();
+    await testDb().query(
+      `INSERT INTO contact_topics (business_id, topic_id, name, description, applies_to, sources, auto_reply, created_by)
+       VALUES ('other-biz', 'T-OTHER', 'זר', '', 'both', '{}', false, 'x')`,
+    );
+    expect((await post({ csrf, action: 'edit', topicId: 'T-OTHER', name: 'פרוץ', appliesTo: 'client' })).status).toBe(404);
+    expect((await post({ csrf, action: 'retire', topicId: 'T-OTHER' })).status).toBe(404);
+    const { rows } = await testDb().query(`SELECT name, retired_at FROM contact_topics WHERE topic_id = 'T-OTHER'`);
+    expect([rows[0]?.name, rows[0]?.retired_at]).toEqual(['זר', null]);
+  });
+
+  it('refuses a toggle with a bad CSRF token', async () => {
+    const { csrf, post } = await start();
+    await post({ csrf, action: 'create', name: 'א', description: '', appliesTo: 'client' });
+    const id = (await topics())[0]?.topicId ?? '';
+    expect((await post({ csrf: 'bad', action: 'toggle', topicId: id, on: '1' })).status).toBe(403);
+    expect((await topics())[0]?.autoReply).toBe(false);
+  });
 });

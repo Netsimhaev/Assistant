@@ -66,14 +66,28 @@ export interface TopicInput {
   by: string;
 }
 
+export const TOPIC_NAME_REQUIRED = 'חובה לתת שם לנושא.';
+export const TOPIC_APPLIES_INVALID = 'הנושא חייב להתאים ללקוחות, לספקים או לשניהם.';
+export const TOPIC_SOURCE_UNKNOWN = 'מקור מידע לא מוכר.';
+export const TOPIC_NOT_FOUND = 'הנושא לא נמצא.';
+
+/** A validation refusal whose Hebrew message is safe to show the owner. */
+export class TopicInputError extends Error {}
+/** The topic is missing, belongs to another business or is retired. */
+export class TopicNotFoundError extends Error {
+  constructor() {
+    super(TOPIC_NOT_FOUND);
+  }
+}
+
 const APPLIES = ['client', 'supplier', 'both'];
 
 function validate(p: { name?: string; appliesTo?: string; sources?: string[] }): void {
-  if (p.name !== undefined && p.name.trim() === '') throw new Error('חובה לתת שם לנושא.');
-  if (p.appliesTo !== undefined && !APPLIES.includes(p.appliesTo)) throw new Error('הנושא חייב להתאים ללקוחות, לספקים או לשניהם.');
+  if (p.name !== undefined && p.name.trim() === '') throw new TopicInputError(TOPIC_NAME_REQUIRED);
+  if (p.appliesTo !== undefined && !APPLIES.includes(p.appliesTo)) throw new TopicInputError(TOPIC_APPLIES_INVALID);
   if (p.sources !== undefined) {
     for (const s of p.sources) {
-      if (!(TIER2_SOURCE_NAMES as readonly string[]).includes(s)) throw new Error('מקור מידע לא מוכר.');
+      if (!(TIER2_SOURCE_NAMES as readonly string[]).includes(s)) throw new TopicInputError(TOPIC_SOURCE_UNKNOWN);
     }
   }
 }
@@ -134,7 +148,7 @@ export interface TopicPatch {
 export async function updateTopic(db: BusinessDb, topicId: string, patch: TopicPatch, by: string): Promise<ContactTopic> {
   validate(patch);
   const current = await loadTopic(db, topicId);
-  if (current === null || current.retiredAt !== null) throw new Error('הנושא לא נמצא.');
+  if (current === null || current.retiredAt !== null) throw new TopicNotFoundError();
   await db.query(
     `UPDATE contact_topics SET name = $3, description = $4, applies_to = $5, sources = $6, updated_at = now()
       WHERE business_id = $1 AND topic_id = $2`,

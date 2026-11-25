@@ -14,6 +14,9 @@ import {
   retireTopic,
   setTopicAutoReply,
   TIER2_SOURCE_NAMES,
+  TOPIC_NOT_FOUND,
+  TopicInputError,
+  TopicNotFoundError,
   updateTopic,
   type ContactTopic,
   type Tier2SourceName,
@@ -182,7 +185,9 @@ export async function handleContactTopicsPost(
       return render(res, 200, db, session, { notice: CONTACT_TOPICS_SAVED });
     }
   } catch (err) {
-    return render(res, 400, db, session, { error: err instanceof Error ? err.message : 'שמירת הנושא נכשלה.' });
+    if (err instanceof TopicNotFoundError) return render(res, 404, db, session, { error: TOPIC_NOT_FOUND });
+    if (err instanceof TopicInputError) return render(res, 400, db, session, { error: err.message });
+    throw err;
   }
   return render(res, 400, db, session, { error: 'פעולה לא מוכרת.' });
 }

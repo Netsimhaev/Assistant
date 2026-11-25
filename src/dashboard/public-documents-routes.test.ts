@@ -98,3 +98,28 @@ describe('public documents screen', () => {
     expect(await publicFor('DOC-X')).toBeNull();
   });
 });
+
+describe('public documents list limit', () => {
+  const seedMany = async (n: number) => {
+    await testDb().query(
+      `INSERT INTO documents (business_id, document_id, sha256, original_name, media_type, byte_size, source, status, stored_path)
+       SELECT $1, 'DOC-' || lpad(g::text, 4, '0'), lpad(g::text, 64, '0'), 'f' || g, 'text/plain', 10, 'instruction', 'extracted', 'x/' || g
+         FROM generate_series(1, $2::int) g`,
+      [BUSINESS, n],
+    );
+  };
+  it('says the list was cut when there are more than 200', async () => {
+    await seedMany(201);
+    const { baseUrl, cookie } = await start();
+    const html = await (await fetch(`${baseUrl}${PUBLIC_DOCUMENTS_PATH}`, { headers: { cookie } })).text();
+    expect(html).toContain('מוצגים 200 המסמכים האחרונים');
+    expect((html.match(/name="documentId"/g) ?? []).length).toBe(200);
+  });
+  it('says nothing at exactly 200', async () => {
+    await seedMany(200);
+    const { baseUrl, cookie } = await start();
+    const html = await (await fetch(`${baseUrl}${PUBLIC_DOCUMENTS_PATH}`, { headers: { cookie } })).text();
+    expect(html).not.toContain('מוצגים 200 המסמכים האחרונים');
+    expect((html.match(/name="documentId"/g) ?? []).length).toBe(200);
+  });
+});
