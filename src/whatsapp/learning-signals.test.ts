@@ -41,6 +41,7 @@ interface Dec {
   kind?: string;
   at?: Date;
   sources?: string[];
+  job?: string;
 }
 async function decision(d: Dec = {}): Promise<string> {
   const business = d.business ?? BUSINESS;
@@ -52,7 +53,7 @@ async function decision(d: Dec = {}): Promise<string> {
         decided_at, topic_id, summary, source_names, internal_document_ids)
      VALUES ($1,$2,$3,$4,$5,$6,$7,'{}',$8,$9,$10,$11,$12)`,
     [
-      business, id, conv, ulid(), ulid(), d.verdict === undefined ? 'right' : d.verdict, d.wrongReason ?? null,
+      business, id, conv, d.job ?? ulid(), ulid(), d.verdict === undefined ? 'right' : d.verdict, d.wrongReason ?? null,
       d.at ?? new Date(), d.topicId ?? null, d.summary === undefined ? 'שאלה' : d.summary,
       d.sources ?? ['יומן'], d.docs === undefined ? null : d.docs,
     ],
@@ -75,6 +76,14 @@ describe('autoReplyCandidates', () => {
     expect(out).toHaveLength(1);
     expect(out[0]).toMatchObject({ right: 5, counted: 5 });
     expect(out[0]?.topic.topicId).toBe(t.topicId);
+  });
+
+  it('counts the earliest decision per job only', async () => {
+    const t = await topic();
+    for (let i = 0; i < 5; i++) await decision({ topicId: t.topicId, job: `J${i}`, at: new Date(Date.now() - 2000) });
+    await decision({ topicId: t.topicId, job: 'J0', verdict: 'wrong', wrongReason: 'edited', at: new Date(Date.now() - 1000) });
+    const out = await candidates();
+    expect(out[0]).toMatchObject({ right: 5, counted: 5 });
   });
 
   it('ignores a topic with only 4 decisions', async () => {
@@ -211,6 +220,21 @@ describe('publicDocumentCandidates', () => {
     expect(await publicCandidates()).toEqual([]);
   });
 
+  it('counts one approval per job, not per decision', async () => {
+    await doc('DOC-A', 'instruction');
+    await decision({ docs: ['DOC-A'], job: 'J1' });
+    await decision({ docs: ['DOC-A'], job: 'J1' });
+    await decision({ docs: ['DOC-A'], job: 'J2' });
+    expect(await publicCandidates()).toEqual([]);
+  });
+
+  it('counts a document listed twice in one decision once', async () => {
+    await doc('DOC-A', 'instruction');
+    await decision({ docs: ['DOC-A', 'DOC-A'] });
+    await decision({ docs: ['DOC-A'] });
+    expect(await publicCandidates()).toEqual([]);
+  });
+
   it('ignores another business', async () => {
     await doc('DOC-A', 'instruction', OTHER);
     for (let i = 0; i < 3; i++) await decision({ docs: ['DOC-A'], business: OTHER });
@@ -238,6 +262,12 @@ describe('unthemedDecisions', () => {
     await decision({ business: OTHER });
     const keep = await decision();
     expect((await run()).map((d) => d.decisionId)).toEqual([keep]);
+  });
+
+  it('returns one row per job (the earliest)', async () => {
+    const first = await decision({ job: 'J1', at: new Date(Date.now() - 2000) });
+    await decision({ job: 'J1', at: new Date(Date.now() - 1000) });
+    expect((await run()).map((d) => d.decisionId)).toEqual([first]);
   });
 
   it('honours the limit', async () => {

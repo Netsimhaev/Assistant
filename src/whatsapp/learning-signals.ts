@@ -32,9 +32,11 @@ export async function autoReplyCandidates(db: BusinessDb, now: Date): Promise<Au
     const { rows } = await db.query<{ right: string; counted: string }>(
       `SELECT count(*) FILTER (WHERE verdict = 'right') AS right,
               count(*) AS counted
-         FROM contact_reply_decisions
-        WHERE business_id = $1 AND topic_id = $2 AND decided_at > $3
-          AND verdict IN ('right', 'wrong')`,
+         FROM (SELECT DISTINCT ON (job_id) verdict
+                 FROM contact_reply_decisions
+                WHERE business_id = $1 AND topic_id = $2 AND decided_at > $3
+                  AND verdict IN ('right', 'wrong')
+                ORDER BY job_id, decided_at, decision_id) per_job`,
       [db.businessId, topic.topicId, windowStart],
     );
     const right = Number(rows[0]?.right ?? 0);
@@ -53,7 +55,7 @@ export interface PublicDocumentCandidate {
 export async function publicDocumentCandidates(db: BusinessDb): Promise<PublicDocumentCandidate[]> {
   const { rows } = await db.query<{ document_id: string; approvals: string; kinds: string[] }>(
     `SELECT u.document_id,
-            count(DISTINCT d.decision_id) AS approvals,
+            count(DISTINCT d.job_id) AS approvals,
             array_agg(DISTINCT c.contact_kind) AS kinds
        FROM contact_reply_decisions d
        CROSS JOIN LATERAL unnest(d.internal_document_ids) AS u(document_id)
@@ -65,7 +67,7 @@ export async function publicDocumentCandidates(db: BusinessDb): Promise<PublicDo
         AND ${APPROVED_SQL}
         AND doc.source = 'instruction' AND doc.status = 'extracted' AND doc.public_for IS NULL
       GROUP BY u.document_id
-     HAVING count(DISTINCT d.decision_id) >= $2
+     HAVING count(DISTINCT d.job_id) >= $2
       ORDER BY u.document_id`,
     [db.businessId, PUBLIC_DOC_MIN_APPROVALS],
   );
@@ -98,14 +100,16 @@ interface UnthemedRow {
 export async function unthemedDecisions(db: BusinessDb, now: Date, limit = 200): Promise<UnthemedDecision[]> {
   const since = new Date(now.getTime() - UNTHEMED_WINDOW_DAYS * DAY_MS);
   const { rows } = await db.query<UnthemedRow>(
-    `SELECT d.decision_id, d.summary, d.source_names, c.contact_kind,
+    `SELECT * FROM (
+       SELECT DISTINCT ON (d.job_id) d.decision_id, d.decided_at, d.summary, d.source_names, c.contact_kind,
             ${APPROVED_SQL} AS approved
        FROM contact_reply_decisions d
        LEFT JOIN contact_conversations c
          ON c.business_id = d.business_id AND c.conversation_id = d.conversation_id
       WHERE d.business_id = $1 AND d.topic_id IS NULL AND d.summary IS NOT NULL
         AND d.decided_at > $2
-      ORDER BY d.decided_at DESC, d.decision_id DESC
+      ORDER BY d.job_id, d.decided_at, d.decision_id) per_job
+      ORDER BY decided_at DESC, decision_id DESC
       LIMIT $3`,
     [db.businessId, since, limit],
   );
