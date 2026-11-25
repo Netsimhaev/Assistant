@@ -8,7 +8,7 @@
 ## פקודות
 
 ```bash
-npm test          # vitest run — 6028 מבחנים ב-391 קבצים (6027 עוברים, 1 מדולג; נמדד 23/11 על בסיס ייעודי; `dashboard/server.test.ts` נכשל בהרצה מלאה אחת רק בגלל התנגשות עם תהליך תלוי ועבר 148/148 לבדו)
+npm test          # vitest run — 6246 מבחנים ב-411 קבצים (6245 עוברים, 1 מדולג; נמדד 25/11 על בסיס ייעודי)
 npm run typecheck # tsc --noEmit
 npm run build     # tsc
 npm run migrate   # מריץ מיגרציות על DATABASE_MIGRATE_URL (בעלי הטבלאות — לעולם לא חשבון זמן הריצה)
