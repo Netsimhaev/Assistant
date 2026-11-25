@@ -4,7 +4,7 @@
  * and the mail-card reader (`whatsapp-door.ts`), so their collision counts
  * cannot drift apart.
  *
- * Five kinds (the fifth, `contactCards`, below), each by its own owner's definition and nothing re-derived here:
+ * Six kinds, each by its own owner's definition and nothing re-derived here:
  *
  *   - `confirmations` — boss-command questions delivered on WhatsApp before
  *     the message (`openConfirmations`);
@@ -15,7 +15,10 @@
  *   - `documentCards` — document cards delivered on WhatsApp before the
  *     message (`openDocumentCards`);
  *   - `contactCards` — WhatsApp contact reply cards presented before the
- *     message (`openContactCards`).
+ *     message (`openContactCards`);
+ *   - `suggestions` — learned suggestions delivered on WhatsApp before the
+ *     message and inside the window (`deliveredOpenSuggestions`). "כן" is a
+ *     confirmation word too, so every other reader must count these.
  *
  * Read-only. Each reader decides what "more than one" means for its own
  * words; this module only makes sure they all count the same things.
@@ -25,6 +28,8 @@ import type { InstructionConfirmation } from '../governance/instruction-confirma
 import type { InstructionRecord } from '../governance/instructions.js';
 import type { DocumentCard } from '../production/card.js';
 import { openContactCards, type OpenContactCard } from '../whatsapp/contact-card.js';
+import { deliveredOpenSuggestions, type Suggestion } from '../whatsapp/contact-suggestions.js';
+import { capFor, loadRuntimeSettings } from '../tenancy/runtime-settings.js';
 import { openConfirmations } from './command-confirm.js';
 import { openDocumentCards } from './whatsapp-document-card.js';
 import { openMailCards, type OpenMailCard } from './whatsapp-mail-card.js';
@@ -37,6 +42,8 @@ export interface OpenOnWhatsApp {
   documentCards: DocumentCard[];
   /** WhatsApp contact (client/supplier) reply cards presented before the message. */
   contactCards: OpenContactCard[];
+  /** Learned suggestions delivered on WhatsApp before the message, inside the window. */
+  suggestions: Suggestion[];
 }
 
 export async function openOnWhatsApp(db: BusinessDb, input: {
@@ -48,7 +55,7 @@ export async function openOnWhatsApp(db: BusinessDb, input: {
 }): Promise<OpenOnWhatsApp> {
   const windowOverride = input.windowMinutes !== undefined ? { windowMinutes: input.windowMinutes } : {};
   const inbound = new Date(input.inboundAt);
-  // Sequential, never `Promise.all`: all four read on the one `BusinessDb`, and
+  // Sequential, never `Promise.all`: all six read on the one `BusinessDb`, and
   // a shared connection must not carry interleaved work (a reader that opens
   // its own transaction would capture the others' statements).
   const confirmations = await openConfirmations(db, {
@@ -68,5 +75,16 @@ export async function openOnWhatsApp(db: BusinessDb, input: {
     inboundAt: input.inboundAt,
     ...windowOverride,
   });
-  return { confirmations, mailCards, questions, documentCards, contactCards };
+  // The window resolves the same way the card readers resolve theirs; a
+  // window of 0 or less fails closed — nothing is open.
+  const suggestionWindow =
+    input.windowMinutes ?? capFor(await loadRuntimeSettings(db), 'whatsappQuestionWindowMinutes');
+  const suggestions =
+    suggestionWindow > 0
+      ? await deliveredOpenSuggestions(db, {
+          inboundAt: Number.isNaN(inbound.getTime()) ? null : inbound,
+          windowMinutes: suggestionWindow,
+        })
+      : [];
+  return { confirmations, mailCards, questions, documentCards, contactCards, suggestions };
 }

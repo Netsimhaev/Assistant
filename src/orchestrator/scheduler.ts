@@ -51,6 +51,7 @@ import type { ContactFlowDeps } from '../whatsapp/contact-flow.js';
 import { HOLDING_NAME_FALLBACK, sendDueHoldingReplies } from '../whatsapp/holding-reply.js';
 import { contactHousekeeping } from '../whatsapp/contact-housekeeping.js';
 import { buildSuggestions } from '../whatsapp/suggestion-pass.js';
+import { deliverNextSuggestion } from '../whatsapp/suggestion-whatsapp.js';
 import { runContactClusterer, type ContactClusterer } from '../sdk/contact-clusterer.js';
 import { reraiseFailedAutoReplies } from '../whatsapp/contact-auto-reraise.js';
 import { namedSource, type Tier2Source } from '../whatsapp/sources/types.js';
@@ -1414,6 +1415,16 @@ export async function schedulerPass(
       } catch (err) {
         console.error('scheduler: contact suggestions failed', err instanceof Error ? err.message : err);
       }
+    }
+    // One suggestion on WhatsApp at a time, after the build (so a suggestion
+    // made this pass can go out now). Its own catch.
+    try {
+      await stage((db) => deliverNextSuggestion(db, {
+        messenger: housekeepingMessenger,
+        now: options.now ?? new Date(),
+      }));
+    } catch (err) {
+      console.error('scheduler: suggestion delivery failed', err instanceof Error ? err.message : err);
     }
   }
 
