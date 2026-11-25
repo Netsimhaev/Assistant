@@ -1,4 +1,8 @@
 import { once } from 'node:events';
+import { createTopic } from '../whatsapp/contact-topics.js';
+import { saveCardContext } from '../whatsapp/card-context.js';
+import { CONTACT_REPLY_EXEMPTION_MARKER } from '../policy/contact-reply.js';
+import { AUTO_REPLY_TOPIC_TURNED_OFF } from './autonomous-actions.js';
 import type { AddressInfo } from 'node:net';
 import type { Server, ServerResponse } from 'node:http';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -32,7 +36,7 @@ import { saveReading } from '../documents/reading-store.js';
 import { saveProposal } from '../orchestrator/proposal-store.js';
 import { loadSignature } from '../governance/signatures.js';
 import { saveNotJudged, saveVerdict, type NotJudgedReason } from '../governance/verdict-store.js';
-import { queryAudit } from '../audit/log.js';
+import { appendAudit, queryAudit } from '../audit/log.js';
 import {
   loadInstructionForJob,
   claimAnswer,
@@ -3242,6 +3246,75 @@ describe('POST /autonomy/actions/:jobId/:stepId/mark', () => {
 
     const { rows } = await testDb().query('SELECT * FROM autonomy_marks WHERE business_id = $1', [BUSINESS]);
     expect(rows).toHaveLength(0);
+  });
+});
+
+describe('POST /autonomy/actions/:jobId/:stepId/mark — an auto WhatsApp reply turns its topic off', () => {
+  async function topicRow(topicId: string): Promise<boolean> {
+    const { rows } = await testDb().query<{ auto_reply: boolean }>(
+      'SELECT auto_reply FROM contact_topics WHERE business_id = $1 AND topic_id = $2', [BUSINESS, topicId]);
+    return rows[0]?.auto_reply ?? false;
+  }
+
+  /** A completed, un-carded step with a topic's card context; `exempt` adds the gate's marker row. */
+  async function seedAutoReply(exempt: boolean): Promise<{ jobId: string; stepId: string; topicId: string }> {
+    const { jobId, stepId } = await seedAutonomousAction(BUSINESS);
+    const topic = await withBusiness(BUSINESS, (bdb) =>
+      createTopic(bdb, { name: 'חשבוניות', description: 'מתי נשלחה', appliesTo: 'client', sources: ['ledger_of_sender'], autoReply: true, by: 'owner' }),
+    );
+    await withBusiness(BUSINESS, (bdb) =>
+      saveCardContext(bdb, { jobId, kind: 'question', topicId: topic.topicId, summary: 's', sourceNames: [], internalDocumentIds: [], auto: exempt }),
+    );
+    await withBusiness(BUSINESS, (bdb) =>
+      appendAudit(bdb, {
+        actor: 'comms.whatsapp', kind: 'intent_to_act', jobId, actionClass: 'whatsapp.reply', charterVersion: 'n/a',
+        provenance: 'unknown_external', inputHash: 'a'.repeat(64),
+        reason: exempt ? `risk explanation ${CONTACT_REPLY_EXEMPTION_MARKER}` : 'risk explanation',
+      }),
+    );
+    return { jobId, stepId, topicId: topic.topicId };
+  }
+
+  async function mark(jobId: string, stepId: string): Promise<Response> {
+    const baseUrl = await startServer();
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const csrf = extractCsrf(await (await fetch(`${baseUrl}/autonomy/actions`, { headers: { cookie } })).text());
+    return fetch(`${baseUrl}/autonomy/actions/${jobId}/${stepId}/mark`, {
+      method: 'POST', headers: { cookie }, body: new URLSearchParams({ csrf, note: 'לא היה צריך לצאת' }), redirect: 'manual',
+    });
+  }
+
+  it('switches the topic off and tells the owner which one', async () => {
+    const { jobId, stepId, topicId } = await seedAutoReply(true);
+    expect(await topicRow(topicId)).toBe(true);
+    const res = await mark(jobId, stepId);
+    expect(res.status).toBe(302);
+    const location = res.headers.get('location') ?? '';
+    expect(location).toBe(`/autonomy/actions?topicOff=${topicId}`);
+    expect(await topicRow(topicId)).toBe(false);
+
+    const baseUrl = await startServer();
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const page = await (await fetch(`${baseUrl}${location}`, { headers: { cookie } })).text();
+    expect(page).toContain(AUTO_REPLY_TOPIC_TURNED_OFF);
+    expect(page).toContain('חשבוניות');
+  });
+
+  it('leaves topics alone when the marked step did not ride the auto-reply exemption', async () => {
+    const { jobId, stepId, topicId } = await seedAutoReply(false);
+    const res = await mark(jobId, stepId);
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/autonomy/actions');
+    expect(await topicRow(topicId)).toBe(true);
+    const { rows } = await testDb().query('SELECT 1 FROM autonomy_marks WHERE business_id = $1', [BUSINESS]);
+    expect(rows).toHaveLength(1);
+  });
+
+  it('names nothing when the topicOff id is not a topic of this business', async () => {
+    const baseUrl = await startServer();
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const page = await (await fetch(`${baseUrl}/autonomy/actions?topicOff=nope`, { headers: { cookie } })).text();
+    expect(page).not.toContain(AUTO_REPLY_TOPIC_TURNED_OFF);
   });
 });
 

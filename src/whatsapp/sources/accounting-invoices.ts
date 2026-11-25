@@ -21,6 +21,7 @@
 import { ulid } from 'ulid';
 import { config } from '../../config.js';
 import { loadActiveCharter } from '../../charter/store.js';
+import type { BusinessDb } from '../../db/pool.js';
 import { loadBindings } from '../../orchestrator/bindings.js';
 import type { CredentialSource } from '../../orchestrator/credentials.js';
 import { stripBidiControls, toOneLine } from '../../util/bidi.js';
@@ -29,11 +30,11 @@ import type { ExternalHttp } from '../../external/http.js';
 import { carriesSecret, headerSafe, secretForms, sendExternal } from '../../external/perform.js';
 import { buildExternalRequest } from '../../external/request.js';
 import { countCallsToday, recordCall } from '../../external/store.js';
-import { loadInvoiceSettings } from './invoice-settings.js';
-import type { SourceItem, Tier2Source } from './types.js';
+import { loadInvoiceSettings, type ExternalSenderSource } from './invoice-settings.js';
+import type { SenderIds, SourceItem, Tier2Result, Tier2Source } from './types.js';
 
 export const ACCOUNTING_INVOICE_LABEL = 'חשבונית ממערכת הנהלת החשבונות';
-const MAX_ROWS = 10;
+export const MAX_OWNED_ROWS = 10;
 const MAX_TEXT_CHARS = 2000;
 /** Where a list response may keep its rows. */
 const LIST_KEYS = ['data', 'items', 'results', 'invoices'] as const;
@@ -65,6 +66,104 @@ function rawId(value: unknown): string | null {
 
 const clean = (v: string): string => toOneLine(stripBidiControls(v));
 
+export interface OwnedRows extends Tier2Result {
+  /** Kept rows: declared field path to its scalar value (secret-bearing values left out). */
+  rows: Record<string, string>[];
+  /** The operation's declared response fields, in declaration order. */
+  fields: { path: string; label: string }[];
+  /** The signed operation's label (empty when nothing ran). */
+  opLabel: string;
+}
+
+/**
+ * The shared read-and-own-check: one signed `read` operation of a signed
+ * system, keyed by the sender's id in that system. Re-checks the active
+ * charter, live binding, credential, daily cap (inside `sendExternal`) and
+ * the guarded client; keeps a row only when its declared id field equals the
+ * sender's id exactly. Any dropped row, nested value or non-list answer is an
+ * ownership violation. Any other failure yields no rows (`failed` when the
+ * provider call itself failed). The kill switch is the caller's (draftFor).
+ */
+export async function readOwnedRows(
+  db: BusinessDb,
+  deps: AccountingInvoicesDeps,
+  ids: SenderIds,
+  signal: AbortSignal,
+  s: ExternalSenderSource,
+): Promise<OwnedRows> {
+  const none: OwnedRows = { items: [], ownershipViolation: false, rows: [], fields: [], opLabel: '' };
+  try {
+    if (signal.aborted) return none;
+    const contactId = ids.externalIds?.[s.systemId];
+    if (contactId === undefined || contactId === '') return none;
+
+    const active = await loadActiveCharter(db);
+    if (active === null) return none;
+    const system = active.bundle.externalSystems.find((x) => x.id === s.systemId);
+    const op = system?.operations.find((o) => o.name === s.operation);
+    // Re-checked at read time: the charter may have changed since the settings were saved.
+    if (system === undefined || op === undefined || op.kind !== 'read') return none;
+    if (!op.params.some((p) => p.name === s.param)) return none;
+    if (!op.fields.some((f) => f.path === s.field)) return none;
+
+    const binding = (await loadBindings(db)).find((b) => b.system === `ext:${system.id}`);
+    if (binding === undefined || binding.status !== 'live' || binding.credentialRef === null) return none;
+    const credential = await deps.credentials.resolve(binding.credentialRef, db.businessId, db);
+    const secret = credential?.value;
+    if (typeof secret !== 'string' || !headerSafe(secret)) return none;
+
+    const now = (deps.now ?? (() => new Date()))();
+    // A fresh id per call: nothing about the contact (no phone digits) goes to the provider.
+    const built = buildExternalRequest(system, op, { params: { [s.param]: contactId } }, `wa-invoices:${ulid()}`);
+    if (!built.ok) return none;
+
+    const timeZone = active.charter.identity.timezone;
+    if (signal.aborted) return none;
+    const sent = await sendExternal(system, built, secret, false, {
+      http: deps.http,
+      callsToday: (systemId) => countCallsToday(db, systemId, timeZone, now),
+      recordCall: (call) => recordCall(db, call),
+      capPerDay: config.externalCallsPerDay,
+    });
+    if (!sent.ok || sent.json === undefined) return { ...none, failed: true };
+
+    const rows = rowsOf(sent.json);
+    if (rows === null) return { ...none, ownershipViolation: true };
+
+    const forms = secretForms(system, secret);
+    const kept: Record<string, string>[] = [];
+    let violation = false;
+    for (const row of rows) {
+      if (rawId(readFieldPath(row, s.field)) !== contactId) {
+        violation = true;
+        continue;
+      }
+      if (kept.length >= MAX_OWNED_ROWS) continue;
+      const values: Record<string, string> = {};
+      for (const f of op.fields) {
+        const raw = readFieldPath(row, f.path);
+        if (raw === undefined || raw === null) continue;
+        if (typeof raw === 'object') {
+          violation = true;
+          continue;
+        }
+        const value = String(raw);
+        if (!carriesSecret(value, forms)) values[f.path] = value;
+      }
+      kept.push(values);
+    }
+    return {
+      items: [],
+      ownershipViolation: violation,
+      rows: kept,
+      fields: op.fields.map((f) => ({ path: f.path, label: f.label })),
+      opLabel: op.label,
+    };
+  } catch {
+    return none;
+  }
+}
+
 export function createAccountingInvoicesSource(deps: AccountingInvoicesDeps): Tier2Source {
   return async (db, ids, signal) => {
     const none = { items: [] as SourceItem[], ownershipViolation: false };
@@ -72,69 +171,19 @@ export function createAccountingInvoicesSource(deps: AccountingInvoicesDeps): Ti
       if (signal.aborted) return none;
       const settings = await loadInvoiceSettings(db);
       if (settings === null) return none;
-      const contactId = ids.externalIds?.[settings.systemId];
-      if (contactId === undefined || contactId === '') return none;
-
-      const active = await loadActiveCharter(db);
-      if (active === null) return none;
-      const system = active.bundle.externalSystems.find((s) => s.id === settings.systemId);
-      const op = system?.operations.find((o) => o.name === settings.operation);
-      // Re-checked at read time: the charter may have changed since the settings were saved.
-      if (system === undefined || op === undefined || op.kind !== 'read') return none;
-      if (!op.params.some((p) => p.name === settings.customerParam)) return none;
-      if (!op.fields.some((f) => f.path === settings.customerField)) return none;
-
-      const binding = (await loadBindings(db)).find((b) => b.system === `ext:${system.id}`);
-      if (binding === undefined || binding.status !== 'live' || binding.credentialRef === null) return none;
-      const credential = await deps.credentials.resolve(binding.credentialRef, db.businessId, db);
-      const secret = credential?.value;
-      if (typeof secret !== 'string' || !headerSafe(secret)) return none;
-
-      const now = (deps.now ?? (() => new Date()))();
-      // A fresh id per call: nothing about the contact (no phone digits) goes to the provider.
-      const built = buildExternalRequest(
-        system,
-        op,
-        { params: { [settings.customerParam]: contactId } },
-        `wa-invoices:${ulid()}`,
-      );
-      if (!built.ok) return none;
-
-      const timeZone = active.charter.identity.timezone;
-      if (signal.aborted) return none;
-      const sent = await sendExternal(system, built, secret, false, {
-        http: deps.http,
-        callsToday: (systemId) => countCallsToday(db, systemId, timeZone, now),
-        recordCall: (call) => recordCall(db, call),
-        capPerDay: config.externalCallsPerDay,
+      const r = await readOwnedRows(db, deps, ids, signal, {
+        systemId: settings.systemId,
+        operation: settings.operation,
+        param: settings.customerParam,
+        field: settings.customerField,
       });
-      if (!sent.ok || sent.json === undefined) return none;
-
-      const rows = rowsOf(sent.json);
-      if (rows === null) return { items: [], ownershipViolation: true };
-
-      const forms = secretForms(system, secret);
-      const numberField = op.fields.find((f) => /invoice|number|מספר/i.test(`${f.path} ${f.label}`));
+      const numberField = r.fields.find((f) => /invoice|number|מספר/i.test(`${f.path} ${f.label}`));
       const items: SourceItem[] = [];
-      let violation = false;
-      for (const row of rows) {
-        if (rawId(readFieldPath(row, settings.customerField)) !== contactId) {
-          violation = true;
-          continue;
-        }
-        if (items.length >= MAX_ROWS) continue;
-        const fields: { label: string; value: string }[] = [];
-        for (const f of op.fields) {
-          const raw = readFieldPath(row, f.path);
-          if (raw === undefined || raw === null) continue;
-          if (typeof raw === 'object') {
-            violation = true;
-            continue;
-          }
-          const value = String(raw);
-          if (!carriesSecret(value, forms)) fields.push({ label: f.label, value });
-        }
-        const number = numberField === undefined ? undefined : fields.find((f) => f.label === numberField.label)?.value;
+      for (const row of r.rows) {
+        const fields = r.fields
+          .filter((f) => row[f.path] !== undefined)
+          .map((f) => ({ label: f.label, value: row[f.path] as string }));
+        const number = numberField === undefined ? undefined : row[numberField.path];
         items.push({
           source: 'accounting_invoices',
           label: number === undefined ? ACCOUNTING_INVOICE_LABEL : `${ACCOUNTING_INVOICE_LABEL}: ${clean(number)}`,
@@ -146,7 +195,7 @@ export function createAccountingInvoicesSource(deps: AccountingInvoicesDeps): Ti
           at: null,
         });
       }
-      return { items, ownershipViolation: violation };
+      return { items, ownershipViolation: r.ownershipViolation };
     } catch {
       return none;
     }

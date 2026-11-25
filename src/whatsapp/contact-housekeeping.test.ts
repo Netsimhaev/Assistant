@@ -15,7 +15,8 @@ import {
 import { loadConversation, openOrAppend, type ContactConversation } from './contact-conversations.js';
 import { createFakeGateway, type FakeGateway } from './fake-gateway.js';
 import { tick } from '../orchestrator/scheduler.js';
-import { loadJob } from '../orchestrator/jobs.js';
+import { loadJob, transition } from '../orchestrator/jobs.js';
+import { createTopic } from './contact-topics.js';
 import { createBossMessenger, type BossMessenger } from './messenger.js';
 
 const BUSINESS = 'test-business';
@@ -329,5 +330,83 @@ describe('sourceTiersFromDetail', () => {
     expect(sourceTiersFromDetail('מה נמצא: מסמכים פנימיים', 'supplier')).toEqual(['tier3']);
     expect(sourceTiersFromDetail('מה נמצא: לא נמצא מידע רלוונטי', 'client')).toEqual([]);
     expect(sourceTiersFromDetail('מה נמצא: הצעת מחיר 1', 'unknown')).toEqual([]);
+  });
+});
+
+describe('auto replies and card context', () => {
+  async function topic(): Promise<string> {
+    const t = await withBusiness(BUSINESS, (db) =>
+      createTopic(db, {
+        name: 'חשבוניות', description: 'מתי נשלחה חשבונית', appliesTo: 'client', sources: ['ledger_of_sender'], autoReply: true, by: 'owner',
+      }),
+    );
+    return t.topicId;
+  }
+
+  it('leaves a failed auto job conversation carded (the re-raise owns it)', async () => {
+    const h = await harness();
+    const topicId = await topic();
+    const auto = await withBusiness(BUSINESS, (db) =>
+      raiseContactCard(db, {
+        conversation: h.conversation,
+        draft: { body: 'החשבונית נשלחה.', attachDocumentId: null },
+        reasonHe: 'x', sourcesHe: [], bundle: h.bundle, contactLabel: 'דנה לוי',
+        mode: 'auto',
+        context: { kind: 'question', topicId, summary: 's', sourceNames: [], internalDocumentIds: [] },
+      }),
+    );
+    await withBusiness(BUSINESS, (db) =>
+      transition(db, auto.jobId, { to: 'failed', actor: 'orchestrator', reason: 'whatsapp_rejected — x', expectFrom: 'execute' }),
+    );
+    const result = await run(h);
+    expect(result.failedNoticed).toBe(0);
+    expect(result.expired).toBe(0);
+    expect(await state(h)).toBe('carded');
+    expect(h.gateway.sent).toHaveLength(0);
+  });
+
+  it('copies topic, summary, source names and internal documents from the card context into the decision', async () => {
+    const h = await harness();
+    const topicId = await topic();
+    const card = await withBusiness(BUSINESS, (db) =>
+      raiseContactCard(db, {
+        conversation: h.conversation,
+        draft: { body: 'שלום', attachDocumentId: null },
+        reasonHe: 'x', sourcesHe: [], bundle: h.bundle, contactLabel: 'דנה לוי',
+        context: { kind: 'question', topicId, summary: 'מתי החשבונית', sourceNames: ['חשבוניות שהעלית', 'יומן'], internalDocumentIds: ['DOC-1'] },
+      }),
+    );
+    await withBusiness(BUSINESS, (db) => decide(db, card.approvalId, 'approved', { by: 'whatsapp:test', channel: 'whatsapp' }));
+    expect((await run(h)).decisionsRecorded).toBe(1);
+    const { rows } = await testDb().query(
+      'SELECT topic_id, summary, source_names, internal_document_ids FROM contact_reply_decisions WHERE business_id = $1',
+      [BUSINESS],
+    );
+    expect(rows[0]).toEqual({
+      topic_id: topicId, summary: 'מתי החשבונית', source_names: ['חשבוניות שהעלית', 'יומן'], internal_document_ids: ['DOC-1'],
+    });
+  });
+
+  it('records a decision with an unclassified card context as empty values, not a failure', async () => {
+    const h = await harness();
+    const card = await raise(h);
+    await withBusiness(BUSINESS, (db) => decide(db, card.approvalId, 'denied', { by: 'whatsapp:test', channel: 'whatsapp' }));
+    expect((await run(h)).decisionsRecorded).toBe(1);
+    const { rows } = await testDb().query(
+      'SELECT topic_id, summary FROM contact_reply_decisions WHERE business_id = $1', [BUSINESS],
+    );
+    expect(rows[0]).toEqual({ topic_id: null, summary: '' });
+  });
+
+  it('records NULL context columns when the job has no card context at all', async () => {
+    const h = await harness();
+    const card = await raise(h);
+    await testDb().query('DELETE FROM contact_card_context WHERE business_id = $1 AND job_id = $2', [BUSINESS, card.jobId]);
+    await withBusiness(BUSINESS, (db) => decide(db, card.approvalId, 'approved', { by: 'whatsapp:test', channel: 'whatsapp' }));
+    expect((await run(h)).decisionsRecorded).toBe(1);
+    const { rows } = await testDb().query(
+      'SELECT topic_id, summary, source_names, internal_document_ids FROM contact_reply_decisions WHERE business_id = $1', [BUSINESS],
+    );
+    expect(rows[0]).toEqual({ topic_id: null, summary: null, source_names: null, internal_document_ids: null });
   });
 });

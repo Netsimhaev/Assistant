@@ -95,6 +95,8 @@ export interface CharterOverrides {
    * post-signature mutation breaks the signature.
    */
   forbidden?: ForbiddenRule[];
+  /** Replaces the default `data.subprocessorsAllowed`. */
+  subprocessorsAllowed?: string[];
   /** Replaces the default `redactBeforeSending` patterns. */
   redactBeforeSending?: string[];
 }
@@ -281,7 +283,7 @@ export function buildCharter(overrides: CharterOverrides = {}): BusinessCharter 
       retentionDays: { customer_pii: 730, financial: 2555 },
       redactBeforeSending: overrides.redactBeforeSending ?? ['\\b\\d{9}\\b'],
       mayShareExternally: { health: 'never', legal: 'never', credentials: 'never' },
-      subprocessorsAllowed: ['anthropic', 'google-workspace'],
+      subprocessorsAllowed: overrides.subprocessorsAllowed ?? ['anthropic', 'google-workspace'],
     },
 
     forbidden: overrides.forbidden ?? [

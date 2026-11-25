@@ -23,7 +23,7 @@ import type { IntentName } from '../domain/reading.js';
 import { actionClassLabel } from '../domain/labels.js';
 import type { MemoryRecord } from '../memory/store.js';
 import { AutonomyMode } from '../governance/autonomy-mode.js';
-import { stepKey, type AutonomousAction } from './autonomous-actions.js';
+import { AUTO_REPLY_TOPIC_TURNED_OFF, stepKey, type AutonomousAction } from './autonomous-actions.js';
 import type { ActionUpdateSettings } from '../governance/action-update-settings.js';
 import { renderLearning, type LearningSnapshot } from './learning-view.js';
 import { CONNECTION_GROUP_ORDER, GROUP_LABELS, groupForServes } from './connection-groups.js';
@@ -609,8 +609,13 @@ export function renderAutonomousActions(
   csrf: string,
   error?: string,
   newSteps: ReadonlySet<string> = new Set(),
+  topicTurnedOff?: string,
 ): string {
-  const errorBlock = error === undefined ? '' : `<p class="error">${esc(error)}</p>`;
+  const errorBlock =
+    (error === undefined ? '' : `<p class="error">${esc(error)}</p>`) +
+    (topicTurnedOff === undefined
+      ? ''
+      : `<p class="notice">${esc(AUTO_REPLY_TOPIC_TURNED_OFF)} ${escLabel(topicTurnedOff)}</p>`);
 
   const rows = actions
     .map((action) => {
@@ -1684,6 +1689,8 @@ export const TABLE_LABELS: Record<string, string> = {
   contact_conversations: 'שיחות וואטסאפ עם אנשי קשר',
   contact_reply_decisions: 'הכרעות על תשובות לאנשי קשר',
   contact_documents: 'מסמכים ששויכו לאנשי קשר',
+  contact_card_context: 'הקשר כרטיסים של הודעות מאנשי קשר',
+  contact_auto_clearances: 'אישורי שליחה של תשובות שיצאו לבד',
 };
 
 /**
@@ -1958,6 +1965,12 @@ function externalSystemsKeptSection(labels: readonly string[]): string {
 export const EXTERNAL_RECORD_MAY_RETURN_NOTE =
   'אם המערכת עדיין מחזיקה את הרשומה ותשנה אותה, היא עלולה להגיע שוב בסריקה או בהתראה';
 
+/** The contact's name sits in a WhatsApp reply topic the owner defined (even a retired one): told, never edited. */
+function topicNoticeSection(mentioned: boolean): string {
+  if (!mentioned) return '';
+  return `<p>השם מופיע בנושא מענה בוואטסאפ שהגדרת. נושאי המענה הם הטקסט שלך ואינם נמחקים — אם צריך, ערוך אותם בעצמך. <a href="/settings/whatsapp-contacts/topics">לנושאי המענה</a></p>`;
+}
+
 /** The contact's name sits in some version of the owner's business description: told, never edited. */
 function descriptionNoticeSection(mentioned: boolean): string {
   if (!mentioned) return '';
@@ -2047,6 +2060,7 @@ export function renderErasure(model: ErasureViewModel): string {
      ${calendarEventsKeptSection(plan.calendarEventsKept, model.timeZone ?? null)}
      ${externalSystemsKeptSection(plan.externalSystemsKept)}
      ${descriptionNoticeSection(plan.descriptionMentionsContact)}
+     ${topicNoticeSection(plan.topicMentionsContact)}
      ${plan.filesNotDeleted.length > 0
        ? `<p class="error">${plan.filesNotDeleted.length} קבצים שנרשמו להפקה נמצאים מחוץ לתיקיית ההפקה שלה, ולכן לא יימחקו:</p><ul>${plan.filesNotDeleted.map((path) => `<li>${escLabel(path)}</li>`).join('')}</ul>`
        : ''}

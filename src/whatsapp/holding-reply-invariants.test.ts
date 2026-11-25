@@ -49,13 +49,15 @@ describe('holding reply — the gate bypass stays narrow', () => {
     expect(SEND_SHAPE.test(MODULE)).toBe(true);
   });
 
-  it('only the door, the scheduler and the contact flow reach the module', () => {
+  it('only the door, the scheduler, the contact flow and the auto re-raise reach the module', () => {
     const files = sources(SRC);
     expect(files.length).toBeGreaterThan(100); // positive control: the scan actually found the source tree
     const allowed = new Set([
       'orchestrator/whatsapp-door.ts',
       'orchestrator/scheduler.ts',
       'whatsapp/contact-flow.ts',
+      // A failed auto reply becomes a card and only then owes the contact the holding reply (spec section 6).
+      'whatsapp/contact-auto-reraise.ts',
       'whatsapp/holding-reply.ts',
     ]);
     const importers = files

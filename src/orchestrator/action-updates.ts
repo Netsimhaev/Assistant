@@ -60,6 +60,11 @@ import { NOTIFY_TIMEOUT_MS, withDeadline } from '../governance/notify.js';
 import { listAutonomousActions, type AutonomousAction } from '../dashboard/autonomous-actions.js';
 import { stripBidiControls } from '../util/bidi.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
+import { Plan } from '../domain/plan.js';
+import { CONTACT_REPLY_EXEMPTION_MARKER } from '../policy/contact-reply.js';
+import { listManagedContacts } from '../memory/managed-contacts.js';
+import { loadCardContext } from '../whatsapp/card-context.js';
+import { loadTopic } from '../whatsapp/contact-topics.js';
 
 export interface ActionUpdatesResult {
   /** Rows this pass inserted — one per newly reported step. */
@@ -91,8 +96,42 @@ function present(value: string | null): string | null {
   return cleaned.length > 0 ? cleaned : null;
 }
 
-/** The owner-facing Hebrew text of one update. `link` null → no link line. */
-export function renderActionUpdate(a: AutonomousAction, link: string | null): string {
+/** How much of an auto reply's body the update quotes. */
+export const CONTACT_REPLY_QUOTE_CHARS = 200;
+
+/**
+ * What an auto reply to a WhatsApp contact said, for its update (phase 2,
+ * package 1): who it went to — the saved contact's name, or the number — the
+ * reply body as the step carried it, and the topic it answered under.
+ */
+export interface ContactReplyDetails {
+  who: string;
+  body: string;
+  topicName: string | null;
+}
+
+/**
+ * The owner-facing Hebrew text of one update. `link` null → no link line.
+ * `contactReply` present → the auto-reply wording ("ענתה לבד ל…"), the first
+ * `CONTACT_REPLY_QUOTE_CHARS` characters of the cleaned body, and the topic.
+ */
+export function renderActionUpdate(
+  a: AutonomousAction,
+  link: string | null,
+  contactReply?: ContactReplyDetails,
+): string {
+  if (contactReply !== undefined) {
+    const chars = [...oneLine(contactReply.body)];
+    const quote =
+      chars.slice(0, CONTACT_REPLY_QUOTE_CHARS).join('') + (chars.length > CONTACT_REPLY_QUOTE_CHARS ? '…' : '');
+    const replyLines = [`ענתה לבד ל${oneLine(contactReply.who)}: ${quote}`];
+    const topic = present(contactReply.topicName);
+    if (topic !== null) replyLines.push(`נושא המענה: ${topic}`);
+    if (link !== null) {
+      replyLines.push('', 'לצפייה בפעולות שביצעה בעצמה ולסימון טעות:', link);
+    }
+    return replyLines.join('\n');
+  }
   const lines = [`העוזרת ביצעה פעולה בעצמה: ${actionClassLabel(a.actionClass)}`];
   const recipient = present(a.recipient);
   const subject = present(a.subject);
@@ -106,7 +145,55 @@ export function renderActionUpdate(a: AutonomousAction, link: string | null): st
   return lines.join('\n');
 }
 
-function emailSubject(a: AutonomousAction): string {
+function digitsOnly(value: string): string {
+  return value.replace(/[^0-9]/g, '');
+}
+
+/**
+ * The details of an auto reply, or `null` for every other step. A step counts
+ * as an auto reply only when the gate itself wrote the marker on that job's
+ * `intent_to_act` row (`CONTACT_REPLY_EXEMPTION_MARKER`) — never from anything
+ * the payload carries. The body is read from the job's bound plan, the name
+ * from the owner's saved contacts (digit equality with the recipient), and the
+ * topic from the card context; a name or topic that cannot be found falls back
+ * to the number / no topic line.
+ */
+async function contactReplyDetails(db: BusinessDb, a: AutonomousAction): Promise<ContactReplyDetails | null> {
+  if (a.toolName !== 'wa.send_message') return null;
+  const marker = await db.query<{ n: string }>(
+    `SELECT count(*)::text AS n FROM audit_log
+      WHERE business_id = $1 AND job_id = $2 AND kind = 'intent_to_act'
+        AND right(reason, length($3)) = $3`,
+    [db.businessId, a.jobId, CONTACT_REPLY_EXEMPTION_MARKER],
+  );
+  if (Number(marker.rows[0]?.n ?? '0') === 0) return null;
+
+  const planRow = await db.query<{ plan: unknown }>(
+    'SELECT plan FROM job_plans WHERE business_id = $1 AND job_id = $2',
+    [db.businessId, a.jobId],
+  );
+  const parsed = Plan.safeParse(planRow.rows[0]?.plan);
+  const step = parsed.success ? parsed.data.steps.find((candidate) => candidate.id === a.stepId) : undefined;
+  const rawBody = step?.input['body'];
+  const body = typeof rawBody === 'string' ? rawBody : '';
+
+  const number = a.recipient ?? '';
+  const key = digitsOnly(number);
+  let who = number;
+  if (key !== '') {
+    const saved = (await listManagedContacts(db)).find(
+      (c) => c.name.trim() !== '' && digitsOnly(c.phone) === key,
+    );
+    if (saved !== undefined) who = saved.name;
+  }
+
+  const context = await loadCardContext(db, a.jobId);
+  const topic = context?.topicId ? await loadTopic(db, context.topicId) : null;
+  return { who, body, topicName: topic?.name ?? null };
+}
+
+function emailSubject(a: AutonomousAction, contactReply: ContactReplyDetails | undefined): string {
+  if (contactReply !== undefined) return `עדכון: ענתה לבד ל${oneLine(contactReply.who)}`;
   const about = present(a.recipient) ?? present(a.jobTitle);
   const label = actionClassLabel(a.actionClass);
   return about === null ? `עדכון: ${label}` : `עדכון: ${label} — ${about}`;
@@ -159,7 +246,8 @@ export async function dispatchActionUpdates(db: BusinessDb, options: {
     .reverse();
 
   for (const a of due) {
-    const body = renderActionUpdate(a, null);
+    const contactReply = (await contactReplyDetails(db, a)) ?? undefined;
+    const body = renderActionUpdate(a, null, contactReply);
     const inserted = await db.query<{ update_id: string }>(
       `INSERT INTO action_updates
          (update_id, business_id, job_id, step_id, action_class, recipient, subject, body)
@@ -181,7 +269,7 @@ export async function dispatchActionUpdates(db: BusinessDb, options: {
     // be byte-identical, the mail server would drop the second as a
     // duplicate while `sendAlert` reported `ok` — the exact silence the
     // bridge alert already paid for (`runtime.ts`), and a broken H3.
-    const text = [renderActionUpdate(a, link), '', `מזהה עדכון: ${updateId}`].join('\n');
+    const text = [renderActionUpdate(a, link, contactReply), '', `מזהה עדכון: ${updateId}`].join('\n');
 
     let emailState: ChannelState | null = null;
     if (settings.toEmail) {
@@ -189,7 +277,7 @@ export async function dispatchActionUpdates(db: BusinessDb, options: {
       emailState =
         sendAlert === undefined
           ? 'skipped_not_connected'
-          : await deliver(() => sendAlert(emailSubject(a), text), timeoutMs);
+          : await deliver(() => sendAlert(emailSubject(a, contactReply), text), timeoutMs);
     }
 
     let whatsappState: ChannelState | null = null;

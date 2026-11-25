@@ -32,6 +32,11 @@ export interface ContactDraftRequest {
   businessProfile?: ProfileForPrompt;
   /** Aborted when the caller's deadline passes, so a hung billed call stops instead of running on. */
   signal?: AbortSignal;
+  /**
+   * Set on the auto-reply attempt: report state only. Guidance to the model,
+   * not the control — the exit checks and the gate are the control.
+   */
+  instruction?: 'report_state';
 }
 export type ContactDrafter = (req: ContactDraftRequest) => Promise<ContactDraftOutcome>;
 
@@ -70,7 +75,9 @@ export function renderContactDraftPrompt(req: ContactDraftRequest, nonce: string
   return parts.join('\n\n');
 }
 
-function buildContract(nonce: string, businessName: string): string {
+export const REPORT_STATE_INSTRUCTION = 'מסרי מצב בלבד; אל תסכימי, אל תתחייבי ואל תבטיחי פעולה';
+
+function buildContract(nonce: string, businessName: string, instruction: ContactDraftRequest['instruction']): string {
   const labels = [L_CLIENT, L_ASSISTANT, L_INTERNAL];
   const fences = labels.map((l) => {
     const f = buildFence(l, nonce);
@@ -82,6 +89,7 @@ function buildContract(nonce: string, businessName: string): string {
     'ענה/י אך ורק על סמך המקורות המצוטטים. לעולם אל תציין/י מחירי עלות, רווח, או כל מידע על אדם אחר או לקוח אחר.',
     'אם המקורות אינם עונים על השאלה, כתוב/י הצעת תשובה קצרה לבעל העסק וציין/י במפורש שהיא דורשת את בדיקתו.',
     'סגנון וואטסאפ: קצר, בלי markdown.',
+    ...(instruction === 'report_state' ? [REPORT_STATE_INSTRUCTION] : []),
     `החזר/י JSON בלבד: {"body":"...","attachDocumentId":"DOC-..." או null}. אורך הגוף עד ${CONTACT_DRAFT_MAX_CHARS} תווים. attachDocumentId רק ממזהי מסמך שהופיעו במקורות.`,
   ].join('\n');
 }
@@ -104,7 +112,7 @@ export function buildContactDraftCall(
     ...descriptionBlock(req.businessDescription),
     ...profileBlock(req.businessProfile),
     '',
-    buildContract(nonce, stripBidiControls(req.businessName)),
+    buildContract(nonce, stripBidiControls(req.businessName), req.instruction),
   ].join('\n');
   return {
     prompt: renderContactDraftPrompt(req, nonce),

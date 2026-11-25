@@ -428,6 +428,14 @@ export interface ErasurePlan {
    * `planFingerprint`.
    */
   descriptionMentionsContact: boolean;
+  /**
+   * True only for a `contact` anchor whose identifier appears in the name or
+   * description of any WhatsApp reply topic (migration 085), retired ones
+   * included. Topics are the owner's own text and are never edited or
+   * deleted by an erasure — the preview only tells him. Included in
+   * `planFingerprint`.
+   */
+  topicMentionsContact: boolean;
   items: ErasureItem[];
   excluded: KeptExclusion[];
   refusals: ErasureRefusal[];
@@ -728,12 +736,41 @@ export function contactConversationParams(
 /**
  * `contact_reply_decisions` (migration 083): the owner's verdict on a reply
  * the assistant proposed to a contact. Ids, a code-derived verdict and
- * reason (`agreementVerdict`), and source tiers — no free text about a
- * person — so it is not a discovery source; it goes with its card job.
+ * reason (`agreementVerdict`) and source tiers — and, since migration 085,
+ * `summary`: the classifier's one-line summary of what the sender asked,
+ * free text that can name a person. The row goes with its card job, and its
+ * `summary` is a discovery source of its own (a contact anchor's LIKE pattern
+ * brings the row's `job_id` into `jobIds`), so a decision whose job nothing
+ * else names is still reached.
  *
  * Parameters, in both places: `$1` businessId, `$2` jobIds.
  */
 export const CONTACT_REPLY_DECISIONS_ERASED_PREDICATE = 'business_id = $1 AND job_id = ANY ($2)';
+
+/**
+ * `contact_card_context` (migration 085): what the classifier and the sources
+ * said about one card job — kind, topic, a one-line `summary` of the sender's
+ * message (free text that can name a person), the source names and internal
+ * document ids. One row per job: deleted with its job, and `summary` is a
+ * discovery source (it brings the job into `jobIds`).
+ *
+ * Parameters, in both places: `$1` businessId, `$2` jobIds.
+ */
+export const CONTACT_CARD_CONTEXT_ERASED_PREDICATE = 'business_id = $1 AND job_id = ANY ($2)';
+
+/**
+ * `contact_auto_clearances` (migration 085): the send-time clearance an auto
+ * reply was given — ids and a payload hash only, no person — so it is not a
+ * discovery source; it goes with its card job.
+ *
+ * Parameters, in both places: `$1` businessId, `$2` jobIds.
+ */
+export const CONTACT_AUTO_CLEARANCES_ERASED_PREDICATE = 'business_id = $1 AND job_id = ANY ($2)';
+
+// `contact_topics` (migration 085) is deliberately NOT deleted: a topic's
+// name and description are the owner's own text, like the business
+// description. When the anchor appears in one, the preview says so
+// (`topicMentionsContact`) and the owner edits it himself.
 
 /**
  * `contact_documents` (migration 083): a document assigned to a contact's
@@ -750,7 +787,10 @@ export const CONTACT_DOCUMENTS_ERASED_PREDICATE = `business_id = $1
 
 // `contact_whatsapp_settings` (migration 083) is deliberately NOT wired: it
 // is the owner's accounting-lookup configuration (a system id, an operation
-// and two field names), one row per business, with no person in it.
+// and two field names), one row per business, with no person in it. Migration
+// 085's two columns change nothing: `auto_reply_enabled` is a flag, and
+// `external_sources` holds system ids, operation names, a parameter name and
+// a field name — configuration, never a person.
 
 /**
  * The `proposals` rows an erasure destroys, as ONE predicate.
@@ -1595,6 +1635,25 @@ export async function buildErasurePlan(
       'job_id',
     )) jobIds.add(jobId);
 
+    // WhatsApp contacts phase 2 (migration 085): the classifier's one-line
+    // summaries — on the card context of a job, and on the owner's decision
+    // row — are free text about what the sender asked. Each brings its job
+    // in, and through it the context, the clearance and the decision.
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT job_id FROM contact_card_context
+        WHERE business_id = $1 AND summary ILIKE $2 ${LIKE_ESCAPE}`,
+      [businessId, pattern],
+      'job_id',
+    )) jobIds.add(jobId);
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT job_id FROM contact_reply_decisions
+        WHERE business_id = $1 AND coalesce(summary, '') ILIKE $2 ${LIKE_ESCAPE}`,
+      [businessId, pattern],
+      'job_id',
+    )) jobIds.add(jobId);
+
     // The documents assigned to the contact's number (invoices uploaded by the
     // owner, found in sent mail or in accounting) go through the existing
     // document path — rows, artifacts, readings and file.
@@ -2359,6 +2418,21 @@ export async function buildErasurePlan(
     descriptionMentionsContact = rows[0]?.hit === true;
   }
 
+  // The owner's WhatsApp reply topics survive erasure by name, like the
+  // description; the owner is told when the contact appears in any of them.
+  let topicMentionsContact = false;
+  if (anchor.kind === 'contact') {
+    const { rows } = await db.query<{ hit: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM contact_topics
+          WHERE business_id = $1
+            AND (name ILIKE $2 ${LIKE_ESCAPE} OR description ILIKE $2 ${LIKE_ESCAPE})
+       ) AS hit`,
+      [businessId, `%${likeLiteral(anchor.identifier)}%`],
+    );
+    topicMentionsContact = rows[0]?.hit === true;
+  }
+
   const digestList = [...digestIds];
   const draftList = [...draftIds];
   const mailList = [...mailIds];
@@ -2390,6 +2464,7 @@ export async function buildErasurePlan(
     externalEventIds: externalEventList,
     externalSystemsKept,
     descriptionMentionsContact,
+    topicMentionsContact,
     items,
     excluded,
     refusals,
@@ -2463,6 +2538,18 @@ async function countItems(
       'contact_reply_decisions',
       'delete',
       `SELECT count(*)::text AS n FROM contact_reply_decisions WHERE ${CONTACT_REPLY_DECISIONS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    ),
+    await one(
+      'contact_card_context',
+      'delete',
+      `SELECT count(*)::text AS n FROM contact_card_context WHERE ${CONTACT_CARD_CONTEXT_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    ),
+    await one(
+      'contact_auto_clearances',
+      'delete',
+      `SELECT count(*)::text AS n FROM contact_auto_clearances WHERE ${CONTACT_AUTO_CLEARANCES_ERASED_PREDICATE}`,
       [businessId, jobIds],
     ),
     await one(

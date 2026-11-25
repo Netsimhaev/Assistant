@@ -29,6 +29,7 @@ import { mayDelegate } from '../governance/delegation.js';
 import { isExternalTool, resolveExternalCall } from './external-class.js';
 import { APPROVED_REPLY_EXEMPTION_MARKER, approvedReplyCovers } from './approved-reply.js';
 import { LEARNED_REPLY_EXEMPTION_MARKER, learnedReplyCovers } from './learned-reply.js';
+import { CONTACT_REPLY_EXEMPTION_MARKER, contactReplyCovers } from './contact-reply.js';
 import { CONFIRMED_COMMAND_EXEMPTION_MARKER, confirmedCommandCovers } from './confirmed-command.js';
 import { claimConfirmedStep } from '../governance/instruction-confirmations.js';
 
@@ -352,8 +353,18 @@ export async function evaluateToolCall(
   // `ctx.approval`, this one requires its absence, and the `!` says so here.
   const learnedReply =
     !approvedReply && (await learnedReplyCovers(facts, isRecord(toolInput) ? toolInput : {}, ctx));
+  // An auto reply to a managed WhatsApp contact, cleared for these exact bytes
+  // by the exit checks and re-checked here at send time (topic, contact,
+  // charter switch, settings switch): judged without the ramp and provenance
+  // ceilings, and its one number counts as known in the risk score. See
+  // `contactReplyCovers`. Never alongside the other two: it requires no
+  // approval and a WhatsApp class, and the `!`s say so here.
+  const contactReply =
+    !approvedReply && !learnedReply
+      ? await contactReplyCovers(facts, isRecord(toolInput) ? toolInput : {}, ctx)
+      : ({ covered: false } as const);
   let effective = effectiveAutonomy(facts, ctx, {
-    skipRampAndProvenance: approvedReply,
+    skipRampAndProvenance: approvedReply || contactReply.covered,
     skipProvenanceOnly: learnedReply,
   });
 
@@ -385,7 +396,10 @@ export async function evaluateToolCall(
   }
 
   // 10. Risk ----------------------------------------------------------------
-  const risk = await assessRisk(facts, ctx.bundle, ctx.norms ? { norms: ctx.norms } : {});
+  const risk = await assessRisk(facts, ctx.bundle, {
+    ...(ctx.norms ? { norms: ctx.norms } : {}),
+    ...(contactReply.covered ? { extraKnownPhones: [contactReply.knownPhone] } : {}),
+  });
 
   // Intent to act is recorded here, before any decision to permit — so an
   // action that crashes between this point and execution leaves a trace.
@@ -394,7 +408,10 @@ export async function evaluateToolCall(
   // reader can find every reply that went out on what she learned alone.
   const intent = await recordIntent(facts, ctx, currentVersion, {
     kind: 'intent_to_act',
-    reason: risk.explanation + (learnedReply ? ` ${LEARNED_REPLY_EXEMPTION_MARKER}` : ''),
+    reason:
+      risk.explanation +
+      (learnedReply ? ` ${LEARNED_REPLY_EXEMPTION_MARKER}` : '') +
+      (contactReply.covered ? ` ${CONTACT_REPLY_EXEMPTION_MARKER}` : ''),
     risk,
   });
 

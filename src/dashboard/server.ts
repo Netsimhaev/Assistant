@@ -110,6 +110,8 @@ import { MAILBOX_SYSTEM, type MailProvider } from '../mail/mailbox.js';
 import type { MailboxClient } from '../mail/providers/types.js';
 import { isMailReplyJob } from '../mail/inbox-store.js';
 import { contactReplyEditAllowed } from '../whatsapp/contact-reply-edit.js';
+import { turnOffTopicOfMarkedAutoReply } from '../whatsapp/contact-auto-reraise.js';
+import { loadTopic } from '../whatsapp/contact-topics.js';
 import { mailReplyEditRefusal, mailboxReplyRecipient } from '../mail/reply-card.js';
 import {
   handleMailboxRevertPost,
@@ -124,6 +126,8 @@ import {
   handleCalendarStatus,
 } from './calendar-connect.js';
 import {
+  handleAutoReplyRevertPost,
+  handleAutoReplySignPost,
   handleWhatsAppContactsRevertPost,
   handleWhatsAppContactsSignPost,
   handleWhatsAppContactsStatus,
@@ -167,6 +171,8 @@ import {
   handleContactWhatsappGet,
   handleContactWhatsappPost,
 } from './contact-whatsapp-settings.js';
+import { CONTACT_TOPICS_PATH, handleContactTopicsGet, handleContactTopicsPost } from './contact-topics-routes.js';
+import { PUBLIC_DOCUMENTS_PATH, handlePublicDocumentsGet, handlePublicDocumentsPost } from './public-documents-routes.js';
 import {
   PROFILE_LOGO_PATH,
   PROFILE_SETTINGS_PATH,
@@ -2280,6 +2286,7 @@ function planFingerprint(plan: ErasurePlan): string {
     // Display-only (the description is never touched), but what the owner was
     // told is part of what he confirms.
     descriptionMentionsContact: plan.descriptionMentionsContact,
+    topicMentionsContact: plan.topicMentionsContact,
     items: plan.items.map((item) => `${item.table}:${item.action}:${item.count}`).sort(),
     excluded: plan.excluded.map((k) => `${k.itemKind}:${k.itemId}`).sort(),
     refusals: plan.refusals.map((r) => `${r.kind}:${r.detail}`).sort(),
@@ -3255,11 +3262,16 @@ async function handleAutonomyUpdatesPost(
  * has not seen are marked "חדש", and exactly those rows are then marked
  * seen — after the page is rendered, so the mark is what he was shown.
  */
-async function handleAutonomousActionsGet(res: ServerResponse, db: BusinessDb, session: Session): Promise<void> {
+async function handleAutonomousActionsGet(res: ServerResponse, db: BusinessDb, session: Session, topicOffId: string | null): Promise<void> {
   const actions = await listAutonomousActions(db);
   const settings = await loadActionUpdateSettings(db);
   const fresh = settings.toScreen ? await unseenUpdateKeys(db, actions) : new Set<string>();
-  const html = renderAutonomousActions(actions, issueCsrfToken(session.sessionId), undefined, fresh);
+  // The topic a mark just turned off, named from the topic row itself (never
+  // from the query string): an id that is not a topic names nothing.
+  const topic = topicOffId === null ? null : await loadTopic(db, topicOffId);
+  const html = renderAutonomousActions(
+    actions, issueCsrfToken(session.sessionId), undefined, fresh, topic === null ? undefined : topic.name,
+  );
   await markUpdatesSeen(db, fresh);
   sendHtml(res, 200, html);
 }
@@ -3308,7 +3320,10 @@ async function handleAutonomousActionMark(
     db,
     { jobId, stepId, actionClass: action.actionClass, note, by: session.username }
   );
-  redirect(res, '/autonomy/actions');
+  // A mistake on a reply she sent by herself takes the trust back where she
+  // earned it: that topic goes back to cards (the owner can turn it on again).
+  const topicOff = await turnOffTopicOfMarkedAutoReply(db, jobId, session.username);
+  redirect(res, topicOff === null ? '/autonomy/actions' : `/autonomy/actions?topicOff=${encodeURIComponent(topicOff)}`);
 }
 
 const CARD_PATH = /^\/a\/([^/]+)$/;
@@ -3577,6 +3592,12 @@ async function route(
   if (method === 'POST' && pathname === '/connections/whatsapp-contacts/sign') {
     return handleWhatsAppContactsSignPost(res, db, session, await readFormBody(req));
   }
+  if (method === 'POST' && pathname === '/connections/whatsapp-contacts/auto-reply/sign') {
+    return handleAutoReplySignPost(res, db, session, await readFormBody(req));
+  }
+  if (method === 'POST' && pathname === '/connections/whatsapp-contacts/auto-reply/revert') {
+    return handleAutoReplyRevertPost(res, db, session, await readFormBody(req));
+  }
   if (method === 'POST' && pathname === '/connections/whatsapp-contacts/revert') {
     return handleWhatsAppContactsRevertPost(res, db, session, await readFormBody(req));
   }
@@ -3626,7 +3647,7 @@ async function route(
   if (method === 'POST' && pathname === '/autonomy/updates')
     return handleAutonomyUpdatesPost(req, res, db, session);
   if (method === 'GET' && pathname === '/autonomy/actions')
-    return handleAutonomousActionsGet(res, db, session);
+    return handleAutonomousActionsGet(res, db, session, new URL(req.url ?? '/', 'http://x').searchParams.get('topicOff'));
 
   // The business description after setup: proposals go to the edit draft.
   if (method === 'GET' && pathname === DESCRIPTION_SETTINGS_PATH) return handleDescriptionGet(res, db, session);
@@ -3649,6 +3670,14 @@ async function route(
   if (method === 'GET' && pathname === CONTACT_WHATSAPP_SETTINGS_PATH) return handleContactWhatsappGet(res, db, session);
   if (method === 'POST' && pathname === CONTACT_WHATSAPP_SETTINGS_PATH) {
     return handleContactWhatsappPost(res, db, session, await readFormBody(req));
+  }
+  if (method === 'GET' && pathname === CONTACT_TOPICS_PATH) return handleContactTopicsGet(res, db, session);
+  if (method === 'POST' && pathname === CONTACT_TOPICS_PATH) {
+    return handleContactTopicsPost(res, db, session, await readFormBody(req));
+  }
+  if (method === 'GET' && pathname === PUBLIC_DOCUMENTS_PATH) return handlePublicDocumentsGet(res, db, session);
+  if (method === 'POST' && pathname === PUBLIC_DOCUMENTS_PATH) {
+    return handlePublicDocumentsPost(res, db, session, await readFormBody(req));
   }
   if (method === 'POST' && pathname === PEOPLE_INVOICE_PATH) {
     return handlePeopleInvoicePost(req, res, db, session, documentRoot ?? config.documentRoot);

@@ -8,7 +8,9 @@ import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { queryAudit } from '../audit/log.js';
-import { WHATSAPP_CONTACTS_SYSTEM } from '../charter/amend-whatsapp-contacts.js';
+import { WHATSAPP_CONTACTS_SYSTEM, whatsAppContactsConnection } from '../charter/amend-whatsapp-contacts.js';
+import { AUTO_REPLY_AUTHORISATION_TEXT, autoReplySigned } from '../charter/amend-whatsapp-auto-reply.js';
+import { INTERVIEW_NEVER_PREFIX } from '../charter/interview/build.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { closePool, withBusiness } from '../db/pool.js';
 import { KEY_BYTES, writeKeyState } from '../governance/master-key.js';
@@ -19,7 +21,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { createTestOwner, TEST_MASTER_KEY, loginWithSecondFactor } from '../test/owner.js';
 import { issueCsrfToken } from './csrf.js';
-import { WHATSAPP_CONTACTS_AUTHORISATION_TEXT } from './whatsapp-contacts-connect.js';
+import { CONNECTION_AUTO_REPLY_NOTE, WHATSAPP_CONTACTS_AUTHORISATION_TEXT } from './whatsapp-contacts-connect.js';
 import { createServer } from './server.js';
 
 const BUSINESS = 'test-business';
@@ -78,6 +80,15 @@ describe('whatsapp-contacts connection', () => {
     expect(html).toContain('action="/connections/whatsapp-contacts/sign"');
   });
 
+  it('the sign page has no auto-reply note when the base is approve_required', async () => {
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'v-noauto', autonomyBase: { 'whatsapp.reply': 'approve_required' } })));
+    const b = await startServer();
+    const cookie = await login(b);
+    const html = await (await fetch(`${b}/connections/whatsapp-contacts`, { headers: { cookie } })).text();
+    expect(html).toContain('action="/connections/whatsapp-contacts/sign"');
+    expect(html).not.toContain(CONNECTION_AUTO_REPLY_NOTE);
+  });
+
   it('signs: the charter gains the connection, a live binding is written, an audit row exists', async () => {
     const b = await startServer();
     const cookie = await login(b);
@@ -119,6 +130,80 @@ describe('whatsapp-contacts connection', () => {
     const b = await startServer();
     const cookie = await login(b);
     expect((await post(b, cookie, '/connections/whatsapp-contacts/sign', { csrf: 'nope', base: await activeVersion() })).status).toBe(403);
+  });
+
+  describe('auto-reply signature', () => {
+    const SIGN = '/connections/whatsapp-contacts/auto-reply/sign';
+    const REVERT = '/connections/whatsapp-contacts/auto-reply/revert';
+    const base = async (): Promise<string> => (await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter.autonomy.base['whatsapp.reply'] ?? '';
+    async function prepare(opts: { never?: boolean } = {}) {
+      await withBusiness(BUSINESS, (bdb) =>
+        installCharter(
+          bdb,
+          buildCharter({
+            version: 'v-auto-1',
+            connections: [whatsAppContactsConnection()],
+            subprocessorsAllowed: ['anthropic', 'google-workspace', 'green-api'],
+            autonomyBase: { 'whatsapp.reply': 'approve_required' },
+            ...(opts.never
+              ? { forbidden: [{ id: `${INTERVIEW_NEVER_PREFIX}whatsapp.reply`, description: 'x', actionClasses: ['whatsapp.reply' as const] }] }
+              : {}),
+          }),
+        ),
+      );
+      const b = await startServer();
+      return { b, cookie: await login(b) };
+    }
+
+    it('signs: base becomes auto_notify and autoReplySigned is true', async () => {
+      const { b, cookie } = await prepare();
+      const res = await post(b, cookie, SIGN, { csrf: csrfFor(cookie), base: await activeVersion() });
+      expect(res.status).toBe(303);
+      const after = (await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)))?.charter;
+      expect(after?.autonomy.base['whatsapp.reply']).toBe('auto_notify');
+      expect(after !== undefined && autoReplySigned(after)).toBe(true);
+      const page = await (await fetch(`${b}/connections/whatsapp-contacts`, { headers: { cookie } })).text();
+      expect(page).toContain(AUTO_REPLY_AUTHORISATION_TEXT);
+      expect(page).toContain('action="/connections/whatsapp-contacts/auto-reply/revert"');
+    });
+
+    it('a stale base is 409 and installs nothing', async () => {
+      const { b, cookie } = await prepare();
+      const res = await post(b, cookie, SIGN, { csrf: csrfFor(cookie), base: 'old' });
+      expect(res.status).toBe(409);
+      expect(await base()).toBe('approve_required');
+    });
+
+    it('a never-rule is 409 with the refusal text and installs nothing', async () => {
+      const { b, cookie } = await prepare({ never: true });
+      const res = await post(b, cookie, SIGN, { csrf: csrfFor(cookie), base: await activeVersion() });
+      expect(res.status).toBe(409);
+      expect(await res.text()).toContain('ערוך את הכללים');
+      expect(await base()).toBe('approve_required');
+    });
+
+    it('refuses a bad CSRF token with 403', async () => {
+      const { b, cookie } = await prepare();
+      expect((await post(b, cookie, SIGN, { csrf: 'nope', base: await activeVersion() })).status).toBe(403);
+      expect(await base()).toBe('approve_required');
+    });
+
+    it('the connection sign page shows the auto-reply note only when the base is already automatic', async () => {
+      const { b, cookie } = await prepare();
+      await post(b, cookie, SIGN, { csrf: csrfFor(cookie), base: await activeVersion() });
+      await post(b, cookie, '/connections/whatsapp-contacts/revert', { csrf: csrfFor(cookie), base: await activeVersion() });
+      const page = await (await fetch(`${b}/connections/whatsapp-contacts`, { headers: { cookie } })).text();
+      expect(page).toContain('action="/connections/whatsapp-contacts/sign"');
+      expect(page).toContain(CONNECTION_AUTO_REPLY_NOTE);
+    });
+
+    it('reverts to approve_required', async () => {
+      const { b, cookie } = await prepare();
+      await post(b, cookie, SIGN, { csrf: csrfFor(cookie), base: await activeVersion() });
+      const res = await post(b, cookie, REVERT, { csrf: csrfFor(cookie), base: await activeVersion() });
+      expect(res.status).toBe(303);
+      expect(await base()).toBe('approve_required');
+    });
   });
 
   it('reverts: the connection is removed and the binding disconnected', async () => {
