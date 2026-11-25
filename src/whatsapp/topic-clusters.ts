@@ -55,13 +55,18 @@ function hasWord(text: string, word: string, prefixes: string): boolean {
   return new RegExp(`(?<![\\p{L}\\p{N}])${pre}${w}(?![\\p{L}\\p{N}])`, 'u').test(text.normalize('NFKC').toLowerCase());
 }
 
-// Particles for H8 exclude "ב": "בעלות" is ownership far more often than
-// "in the cost", and the brief requires it not to be a false hit.
-const H8_PREFIXES = 'ולכמהש';
+/**
+ * H8 is SUBSTRING containment on stems, deliberately strict: it catches plurals
+ * and construct forms ("עלויות", "הנחות", "מחיר הקנייה"). A false positive only
+ * loses one suggestion (the owner can create the topic by hand), so it also
+ * drops "בעלות" (ownership) and "השכרה" (rental) topics — accepted.
+ */
+export const H8_STEMS: readonly string[] = ['עלות', 'עלוי', 'רווח', 'הנחה', 'הנחות', 'מחיר קני', 'מחיר הקני', 'עמל', 'שכר'];
 const NAME_PREFIXES = 'ולכבמהש';
 
 function touchesH8(text: string): boolean {
-  return H8_WORDS.some((w) => hasWord(text, w, H8_PREFIXES));
+  const t = stripBidiControls(text).normalize('NFKC').toLowerCase().replace(/s+/g, ' ');
+  return H8_STEMS.some((stem) => t.includes(stem));
 }
 
 function appliesToOf(kinds: Set<string>): NewTopicPayload['appliesTo'] | null {
@@ -85,7 +90,6 @@ export function parseClusters(raw: unknown, ctx: ClusterContext): NewTopicPayloa
       if (i < 0 || i >= ctx.rows.length || used.has(i)) continue;
       idx.add(i);
     }
-    for (const i of idx) used.add(i);
     if (idx.size < NEW_TOPIC_MIN_DECISIONS) continue;
     const name = toOneLine(stripBidiControls(g.name));
     const description = toOneLine(stripBidiControls(g.description));
@@ -93,10 +97,14 @@ export function parseClusters(raw: unknown, ctx: ClusterContext): NewTopicPayloa
     const text = `${name}\n${description}`;
     if (touchesH8(text)) continue;
     if (ctx.contactNames.some((n) => hasWord(text, n, NAME_PREFIXES))) continue;
-    if (existing.has(normaliseName(name))) continue;
+    const key = normaliseName(name);
+    if (existing.has(key)) continue;
     const members = [...idx].sort((a, b) => a - b).map((i) => ctx.rows[i] as ClusterRow);
     const appliesTo = appliesToOf(new Set(members.map((m) => m.contactKind)));
     if (appliesTo === null) continue;
+    // Only a kept group consumes its indexes and its name.
+    for (const i of idx) used.add(i);
+    existing.add(key);
     const sources = new Set<Tier2SourceName>();
     for (const m of members) {
       if (!m.approved) continue;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { H8_WORDS, NEW_TOPIC_MIN_DECISIONS, parseClusters } from './topic-clusters.js';
+import { H8_STEMS, H8_WORDS, NEW_TOPIC_MIN_DECISIONS, parseClusters } from './topic-clusters.js';
 
 type Row = { decisionId: string; sourceNames: string[]; approved: boolean; contactKind: 'client' | 'supplier' | 'unknown' };
 const rows = (n: number, over: Partial<Row> = {}): Row[] =>
@@ -52,7 +52,32 @@ describe('parseClusters', () => {
     expect(H8_WORDS).toContain('עלות');
     expect(parseClusters(group('עלות משלוח', [0, 1, 2, 3, 4]), ctx(rows(5)))).toEqual([]);
     expect(parseClusters(group('משלוח', [0, 1, 2, 3, 4], 'שאלות על העלות'), ctx(rows(5)))).toEqual([]);
-    expect(parseClusters(group('בעלות משלוח', [0, 1, 2, 3, 4]), ctx(rows(5)))).toHaveLength(1);
+    expect(H8_STEMS).toContain('עלוי');
+    // accepted: substring containment also drops "בעלות" (ownership)
+    expect(parseClusters(group('בעלות משלוח', [0, 1, 2, 3, 4]), ctx(rows(5)))).toEqual([]);
+  });
+  it('drops plural and construct forms of H8 words', () => {
+    for (const n of ['עלויות משלוח', 'הנחות ללקוחות', 'עמלות', 'רווחים', 'מחיר הקנייה']) {
+      expect(parseClusters(group(n, [0, 1, 2, 3, 4]), ctx(rows(5)))).toEqual([]);
+    }
+  });
+  it('a rejected group does not consume its indexes', () => {
+    const raw = {
+      groups: [
+        { name: 'עלויות', description: 'x', indexes: [0, 1, 2, 3, 4] },
+        { name: 'משלוחים', description: 'y', indexes: [0, 1, 2, 3, 4] },
+      ],
+    };
+    expect(parseClusters(raw, ctx(rows(5))).map((o) => o.name)).toEqual(['משלוחים']);
+  });
+  it('two kept groups with the same name give one payload', () => {
+    const raw = {
+      groups: [
+        { name: 'משלוחים', description: 'x', indexes: [0, 1, 2, 3, 4] },
+        { name: ' משלוחים ', description: 'y', indexes: [5, 6, 7, 8, 9] },
+      ],
+    };
+    expect(parseClusters(raw, ctx(rows(10)))).toHaveLength(1);
   });
   it('drops a name containing a managed contact name', () => {
     expect(parseClusters(group('הזמנות של רונית', [0, 1, 2, 3, 4]), ctx(rows(5), { contactNames: ['רונית'] }))).toEqual([]);
