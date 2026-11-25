@@ -171,6 +171,8 @@ import {
   handleContactWhatsappGet,
   handleContactWhatsappPost,
 } from './contact-whatsapp-settings.js';
+import { CONTACT_TOPICS_PATH, handleContactTopicsGet, handleContactTopicsPost } from './contact-topics-routes.js';
+import { PUBLIC_DOCUMENTS_PATH, handlePublicDocumentsGet, handlePublicDocumentsPost } from './public-documents-routes.js';
 import {
   PROFILE_LOGO_PATH,
   PROFILE_SETTINGS_PATH,
@@ -3667,6 +3669,14 @@ async function route(
   if (method === 'GET' && pathname === CONTACT_WHATSAPP_SETTINGS_PATH) return handleContactWhatsappGet(res, db, session);
   if (method === 'POST' && pathname === CONTACT_WHATSAPP_SETTINGS_PATH) {
     return handleContactWhatsappPost(res, db, session, await readFormBody(req));
+  }
+  if (method === 'GET' && pathname === CONTACT_TOPICS_PATH) return handleContactTopicsGet(res, db, session);
+  if (method === 'POST' && pathname === CONTACT_TOPICS_PATH) {
+    return handleContactTopicsPost(res, db, session, await readFormBody(req));
+  }
+  if (method === 'GET' && pathname === PUBLIC_DOCUMENTS_PATH) return handlePublicDocumentsGet(res, db, session);
+  if (method === 'POST' && pathname === PUBLIC_DOCUMENTS_PATH) {
+    return handlePublicDocumentsPost(res, db, session, await readFormBody(req));
   }
   if (method === 'POST' && pathname === PEOPLE_INVOICE_PATH) {
     return handlePeopleInvoicePost(req, res, db, session, documentRoot ?? config.documentRoot);

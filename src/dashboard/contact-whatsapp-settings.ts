@@ -157,7 +157,7 @@ async function render(
     status,
     page(
       'וואטסאפ לאנשי קשר',
-      `<nav><a href="/">לכרטיסי האישור</a> · <a href="/settings/people">אנשים</a></nav>
+      `<nav><a href="/">לכרטיסי האישור</a> · <a href="/settings/people">אנשים</a> · <a href="/settings/whatsapp-contacts/topics">נושאים</a> · <a href="/documents/public">מסמכים ציבוריים</a></nav>
 <h1>וואטסאפ לאנשי קשר</h1>
 <p>${esc(CONTACT_WHATSAPP_INTRO)}</p>
 ${message?.error === undefined ? '' : `<p class="error">${esc(message.error)}</p>`}
