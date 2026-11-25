@@ -64,7 +64,7 @@ function toSuggestion(row: SuggestionRow): Suggestion {
   } as Suggestion;
 }
 
-function normaliseName(name: string): string {
+export function normaliseName(name: string): string {
   return stripBidiControls(name).trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
