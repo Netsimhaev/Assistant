@@ -1537,6 +1537,49 @@ describe('calendar scheduling', () => {
   });
 });
 
+describe('the contact topics notice', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+  });
+
+  const topic = async (topicId: string, name: string, description: string): Promise<void> => {
+    await testDb().query(
+      `INSERT INTO contact_topics (business_id, topic_id, name, description, applies_to, sources, created_by)
+       VALUES ($1, $2, $3, $4, 'both', ARRAY['uploaded_invoices'], 'owner')`,
+      [BUSINESS, topicId, name, description],
+    );
+  };
+  const planFor = (anchor: Parameters<typeof buildErasurePlan>[1]) =>
+    withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, anchor));
+
+  it('flags a contact named in a topic name', async () => {
+    await topic('TP-1', `מחירים ל-${RONIT}`, '');
+    expect((await planFor({ kind: 'contact', identifier: RONIT })).topicMentionsContact).toBe(true);
+  });
+
+  it('flags a contact named only in a topic description', async () => {
+    await topic('TP-1', 'מחירים', `שאלות של ${RONIT} על מחירים`);
+    expect((await planFor({ kind: 'contact', identifier: RONIT })).topicMentionsContact).toBe(true);
+  });
+
+  it('does not flag a contact no topic names', async () => {
+    await topic('TP-1', 'מחירים', 'שאלות על מחירים');
+    expect((await planFor({ kind: 'contact', identifier: RONIT })).topicMentionsContact).toBe(false);
+  });
+
+  it('does not let _ in the identifier act as a wildcard', async () => {
+    await topic('TP-1', 'הלקוח danaQx@a.co', '');
+    expect((await planFor({ kind: 'contact', identifier: 'dana_x@a.co' })).topicMentionsContact).toBe(false);
+    expect((await planFor({ kind: 'contact', identifier: 'danaQx@a.co' })).topicMentionsContact).toBe(true);
+  });
+
+  it('is false for a window anchor', async () => {
+    await topic('TP-1', `מחירים ל-${RONIT}`, '');
+    const plan = await planFor({ kind: 'window', fromIso: '2020-01-01T00:00:00Z', toIso: '2030-01-01T00:00:00Z' });
+    expect(plan.topicMentionsContact).toBe(false);
+  });
+});
+
 describe('the business description notice', () => {
   beforeEach(async () => {
     await resetDatabase();
@@ -1851,7 +1894,7 @@ describe('external systems', () => {
     await signCrm();
     await aRead('R-a', job, 'zeta', { x: 1 });
     await aRead('R-b', job, 'crm', { x: 1 });
-    await anEvent('E-a', 'alpha‮beta', { who: RONIT });
+    await anEvent('E-a', 'alpha\u202ebeta', { who: RONIT });
 
     const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
     expect(plan.externalSystemsKept).toEqual(['alphabeta', 'zeta', 'מערכת הלקוחות'].sort());

@@ -1689,6 +1689,8 @@ export const TABLE_LABELS: Record<string, string> = {
   contact_conversations: 'שיחות וואטסאפ עם אנשי קשר',
   contact_reply_decisions: 'הכרעות על תשובות לאנשי קשר',
   contact_documents: 'מסמכים ששויכו לאנשי קשר',
+  contact_card_context: 'הקשר כרטיסים של הודעות מאנשי קשר',
+  contact_auto_clearances: 'אישורי שליחה של תשובות שיצאו לבד',
 };
 
 /**
@@ -1964,6 +1966,11 @@ export const EXTERNAL_RECORD_MAY_RETURN_NOTE =
   'אם המערכת עדיין מחזיקה את הרשומה ותשנה אותה, היא עלולה להגיע שוב בסריקה או בהתראה';
 
 /** The contact's name sits in some version of the owner's business description: told, never edited. */
+function topicNoticeSection(mentioned: boolean): string {
+  if (!mentioned) return '';
+  return `<p>השם מופיע בנושא מענה בוואטסאפ שהגדרת. נושאי המענה הם הטקסט שלך ואינם נמחקים — אם צריך, ערוך אותם בעצמך. <a href="/settings/whatsapp-contacts/topics">לנושאי המענה</a></p>`;
+}
+
 function descriptionNoticeSection(mentioned: boolean): string {
   if (!mentioned) return '';
   return `<p>השם מופיע בתיאור העסק שלך. אם צריך, ערוך אותו בעצמך. גרסאות קודמות של התיאור נשמרות כתיעוד ואינן נמחקות. <a href="/settings/description">לתיאור העסק</a></p>`;
@@ -2052,6 +2059,7 @@ export function renderErasure(model: ErasureViewModel): string {
      ${calendarEventsKeptSection(plan.calendarEventsKept, model.timeZone ?? null)}
      ${externalSystemsKeptSection(plan.externalSystemsKept)}
      ${descriptionNoticeSection(plan.descriptionMentionsContact)}
+     ${topicNoticeSection(plan.topicMentionsContact)}
      ${plan.filesNotDeleted.length > 0
        ? `<p class="error">${plan.filesNotDeleted.length} קבצים שנרשמו להפקה נמצאים מחוץ לתיקיית ההפקה שלה, ולכן לא יימחקו:</p><ul>${plan.filesNotDeleted.map((path) => `<li>${escLabel(path)}</li>`).join('')}</ul>`
        : ''}

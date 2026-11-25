@@ -19,6 +19,12 @@ import type { BossMessenger } from '../whatsapp/messenger.js';
 import { dispatchActionUpdates, renderActionUpdate } from './action-updates.js';
 import { createJob } from './jobs.js';
 import { bindPlanToJob } from './plan-store.js';
+import { appendAudit } from '../audit/log.js';
+import { CONTACT_REPLY_EXEMPTION_MARKER } from '../policy/contact-reply.js';
+import { saveCardContext } from '../whatsapp/card-context.js';
+import { createTopic } from '../whatsapp/contact-topics.js';
+import { addManagedContact } from '../business/settings-contacts.js';
+import { PersonEntry } from '../business/setup-package.js';
 
 const BUSINESS = 'test-business';
 const NOW = new Date();
@@ -330,5 +336,85 @@ describe('renderActionUpdate', () => {
 
   it('has no link line when there is no link', () => {
     expect(renderActionUpdate(action, null)).not.toContain('http');
+  });
+});
+
+describe('an auto reply to a WhatsApp contact', () => {
+  const DANA = '+972541112233';
+
+  beforeEach(async () => {
+    await resetDatabase();
+    bundle = await withBusiness(BUSINESS, (db) => installCharter(db, buildCharter()));
+  });
+
+  async function seedContactReply(options: { exempt: boolean; body: string }): Promise<string> {
+    const job = await withBusiness(BUSINESS, (db) => createJob(db, {
+      charterVersion: bundle.charterVersion,
+      provenance: 'unknown_external',
+      title: 'הודעת וואטסאפ מאיש קשר',
+    }));
+    const plan = Plan.parse({
+      goal: 'reply to a contact',
+      steps: [{
+        id: 'reply',
+        agent: 'comms.whatsapp',
+        intent: 'reply_to_sender',
+        toolName: 'wa.send_message',
+        input: { to: DANA, body: options.body, conversationId: 'CC-1' },
+        expectedActionClass: 'whatsapp.reply',
+      }],
+    });
+    const binding = await withBusiness(BUSINESS, (db) => bindPlanToJob(db, job.jobId, plan));
+    if (binding.status !== 'stored') throw new Error(`unexpected plan binding status ${binding.status}`);
+    await testDb().query(
+      `INSERT INTO job_step_results
+         (business_id, job_id, plan_hash, step_id, external_id, status, performed, completed_at)
+       VALUES ($1, $2, $3, 'reply', 'WA-1', 'completed', true, $4)`,
+      [BUSINESS, job.jobId, binding.planHash, NOW],
+    );
+    const topic = await withBusiness(BUSINESS, (db) =>
+      createTopic(db, { name: 'חשבוניות', description: 'מתי נשלחה', appliesTo: 'client', sources: ['uploaded_invoices'], autoReply: true, by: 'owner' }),
+    );
+    await withBusiness(BUSINESS, (db) =>
+      saveCardContext(db, { jobId: job.jobId, kind: 'question', topicId: topic.topicId, summary: 's', sourceNames: [], internalDocumentIds: [], auto: options.exempt }),
+    );
+    await withBusiness(BUSINESS, (db) =>
+      appendAudit(db, {
+        actor: 'comms.whatsapp', kind: 'intent_to_act', jobId: job.jobId, actionClass: 'whatsapp.reply',
+        charterVersion: bundle.charterVersion, provenance: 'unknown_external', inputHash: 'a'.repeat(64),
+        reason: options.exempt ? `risk explanation ${CONTACT_REPLY_EXEMPTION_MARKER}` : 'risk explanation',
+      }),
+    );
+    return job.jobId;
+  }
+
+  it('says she answered alone, to whom, the first 200 characters of the reply and the topic', async () => {
+    await withBusiness(BUSINESS, (db) => addManagedContact(db, PersonEntry.parse({ name: 'דנה כהן', role: 'לקוחה', phone: DANA, kind: 'client' })));
+    const body = `החשבונית\u202e נשלחה ב-12 בחודש. ${'א'.repeat(300)}`;
+    await seedContactReply({ exempt: true, body });
+    const sent: Sent[] = [];
+    await withBusiness(BUSINESS, (db) => dispatchActionUpdates(db, { now: NOW, sendAlert: recordingAlert(sent) }));
+    const stored = (await rows())[0]?.body ?? '';
+    expect(stored).toContain('ענתה לבד לדנה כהן: החשבונית נשלחה ב-12 בחודש.');
+    expect(stored).toContain('נושא המענה: חשבוניות');
+    expect(stored).not.toMatch(/\u202e/);
+    // The quoted reply stops at 200 characters of the cleaned body.
+    const quoted = stored.split('\n')[0]?.replace('ענתה לבד לדנה כהן: ', '') ?? '';
+    expect([...quoted.replace(/…$/, '')].length).toBe(200);
+    expect(sent[0]?.body).toContain('ענתה לבד לדנה כהן');
+  });
+
+  it('names the number when the contact is not one the owner saved', async () => {
+    await seedContactReply({ exempt: true, body: 'נשלחה אתמול' });
+    await withBusiness(BUSINESS, (db) => dispatchActionUpdates(db, { now: NOW }));
+    expect((await rows())[0]?.body).toContain(`ענתה לבד ל${DANA}: נשלחה אתמול`);
+  });
+
+  it('keeps the generic update when the gate wrote no auto-reply marker', async () => {
+    await seedContactReply({ exempt: false, body: 'נשלחה אתמול' });
+    await withBusiness(BUSINESS, (db) => dispatchActionUpdates(db, { now: NOW }));
+    const stored = (await rows())[0]?.body ?? '';
+    expect(stored).toContain('העוזרת ביצעה פעולה בעצמה');
+    expect(stored).not.toContain('ענתה לבד');
   });
 });
