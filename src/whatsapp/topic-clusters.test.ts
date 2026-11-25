@@ -61,6 +61,11 @@ describe('parseClusters', () => {
       expect(parseClusters(group(n, [0, 1, 2, 3, 4]), ctx(rows(5)))).toEqual([]);
     }
   });
+  it('H8 stems match across irregular whitespace', () => {
+    for (const n of ['מחיר  הקנייה', 'מחיר\nקנייה', 'מחיר\tקנייה']) {
+      expect(parseClusters(group(n, [0, 1, 2, 3, 4]), ctx(rows(5)))).toEqual([]);
+    }
+  });
   it('a rejected group does not consume its indexes', () => {
     const raw = {
       groups: [

@@ -65,7 +65,7 @@ export const H8_STEMS: readonly string[] = ['עלות', 'עלוי', 'רווח', 
 const NAME_PREFIXES = 'ולכבמהש';
 
 function touchesH8(text: string): boolean {
-  const t = stripBidiControls(text).normalize('NFKC').toLowerCase().replace(/s+/g, ' ');
+  const t = stripBidiControls(text).normalize('NFKC').toLowerCase().replace(/\s+/g, ' ');
   return H8_STEMS.some((stem) => t.includes(stem));
 }
 
