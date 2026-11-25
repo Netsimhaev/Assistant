@@ -32,12 +32,13 @@ import { loadClearance } from './auto-clearance.js';
 import { EXIT_REASONS } from './exit-checks.js';
 import { namedSource, type SourceItem, type Tier2Source } from './sources/types.js';
 import { CONTACT_AUTO_REASON } from './contact-card.js';
-import type { ContactFlowDeps } from './contact-flow.js';
+import { CONTACT_DRAFT_REASON, type ContactFlowDeps } from './contact-flow.js';
 import type { BusinessCharter } from '../domain/charter.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { Plan } from '../domain/plan.js';
 import type { ConnectionBinding } from '../domain/connection.js';
 import { loadJob } from '../orchestrator/jobs.js';
+import { saveDescription } from '../business/description-store.js';
 import { runPlan } from '../orchestrator/run-plan.js';
 import { AdapterRegistry } from '../orchestrator/adapters/registry.js';
 import { browserAdapter } from '../orchestrator/adapters/browser.js';
@@ -240,6 +241,14 @@ async function boundStepInput(jobId: string): Promise<{ id: string; input: Recor
   return step;
 }
 
+async function draftRuns(): Promise<number> {
+  const { rows } = await testDb().query<{ n: string }>(
+    `SELECT count(*)::text AS n FROM audit_log WHERE business_id = $1 AND kind = 'tool_call' AND reason LIKE $2`,
+    [BUSINESS, `${CONTACT_DRAFT_REASON}:%`],
+  );
+  return Number(rows[0]?.n ?? '0');
+}
+
 describe('the auto path', () => {
   it('a question with a grounded draft goes straight to execute: clearance, no approval, no holding, no researcher', async () => {
     const w = await world();
@@ -301,6 +310,37 @@ describe('the auto path', () => {
     expect(w.drafts[1]?.instruction).toBeUndefined();
     expect(w.researched).toBe(1);
     expect(sentTo(w, CONTACT)).toHaveLength(1);
+  });
+
+  it('the auto attempt does not carry the business description; the card-path draft does (final review I2)', async () => {
+    const w = await world();
+    await withBusiness(BUSINESS, (db) => saveDescription(db, { text: 'נגרייה בחיפה, עובדים עם קבלנים', createdBy: 'owner' }));
+    const flow = deps(w, {
+      draft: () => ({ status: 'drafted', body: 'החשבונית נשלחה ב-12/11 על סך 9,999 ש"ח', usedTier3: false, attachDocumentId: null }),
+    });
+    await door(w, flow, [msg(CONTACT, 'נשלחה כבר החשבונית?')]);
+    expect(w.drafts).toHaveLength(2);
+    expect(w.drafts[0]?.instruction).toBe('report_state');
+    expect(w.drafts[0]?.businessDescription).toBeUndefined();
+    expect(w.drafts[1]?.instruction).toBeUndefined();
+    expect(w.drafts[1]?.businessDescription).toBe('נגרייה בחיפה, עובדים עם קבלנים');
+  });
+
+  it('both billed drafts are counted when the auto attempt is ruled out after drafting (final review minor 5)', async () => {
+    const w = await world();
+    const flow = deps(w, {
+      draft: () => ({ status: 'drafted', body: 'החשבונית נשלחה ב-12/11 על סך 9,999 ש"ח', usedTier3: false, attachDocumentId: null }),
+    });
+    await door(w, flow, [msg(CONTACT, 'נשלחה כבר החשבונית?')]);
+    expect(w.drafts).toHaveLength(2);
+    expect(await draftRuns()).toBe(2);
+  });
+
+  it('a single auto draft counts one run', async () => {
+    const w = await world();
+    await door(w, deps(w), [msg(CONTACT, 'נשלחה כבר החשבונית?')]);
+    expect(w.drafts).toHaveLength(1);
+    expect(await draftRuns()).toBe(1);
   });
 
   it('an attachment that is not a tier-1/2 document fails the exit check: card', async () => {

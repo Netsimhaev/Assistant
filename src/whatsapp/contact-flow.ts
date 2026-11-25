@@ -377,7 +377,14 @@ async function research(db: BusinessDb, deps: ContactFlowDeps, group: Group): Pr
   }
 }
 
-/** One drafter run. A failure, a throw or a timeout is `failed` — never thrown. */
+/**
+ * One drafter run. A failure, a throw or a timeout is `failed` — never thrown.
+ * The auto attempt (`report_state`) runs WITHOUT the business description:
+ * its draft goes to the contact with no one reading it first, and the
+ * owner's free text about the business is background for drafts he reviews,
+ * not material to quote to strangers unseen. The profile (name, address)
+ * stays. The card path keeps the description.
+ */
 async function runDraft(
   db: BusinessDb,
   deps: ContactFlowDeps,
@@ -388,7 +395,7 @@ async function runDraft(
 ): Promise<ContactDraftOutcome> {
   try {
     const conversation = (await recentMessages(db, group.sender.key, 10)).map((m) => ({ direction: m.direction, body: m.body }));
-    const description = await descriptionFragment(db);
+    const description = instruction === 'report_state' ? {} : await descriptionFragment(db);
     const profile = await profileFragment(db);
     return await withDeadline(deps.draftTimeoutMs ?? DRAFT_TIMEOUT_MS, async (signal) =>
       deps.drafter({
@@ -494,7 +501,8 @@ async function holdingReply(db: BusinessDb, deps: ContactFlowDeps, group: Group)
   await sendHoldingReply(db, { gateway: deps.gateway, bundle: deps.bundle, now: deps.now() }, group.conversation.conversationId);
 }
 
-type AutoAttempt = { done: 'carded' | 'busy' } | { done: null; reason: string | null };
+/** `drafted`: a billed drafter call was made (the card path then counts its own second one). */
+type AutoAttempt = { done: 'carded' | 'busy' } | { done: null; reason: string | null; drafted: boolean };
 
 /**
  * The auto attempt, for a sender that passed the static gate. In order, and
@@ -516,16 +524,17 @@ async function tryAuto(
   reasons: readonly string[],
   contextBase: Omit<CardContext, 'jobId' | 'auto' | 'internalDocumentIds'>,
 ): Promise<AutoAttempt> {
-  if (group.sender.kind !== 'contact') return { done: null, reason: null };
+  if (group.sender.kind !== 'contact') return { done: null, reason: null, drafted: false };
   const contact = group.sender.contact;
   const managedKind = contact.kind;
-  if (managedKind === null) return { done: null, reason: null };
+  if (managedKind === null) return { done: null, reason: null, drafted: false };
   const gateReason = perMessageGateReason(managedKind, topic, classification);
-  if (gateReason !== null || topic === null) return { done: null, reason: gateReason ?? EXIT_REASONS.topic };
-  if (gathered.failed || gathered.ownershipViolation) return { done: null, reason: EXIT_REASONS.sources };
+  if (gateReason !== null || topic === null) return { done: null, reason: gateReason ?? EXIT_REASONS.topic, drafted: false };
+  if (gathered.failed || gathered.ownershipViolation) return { done: null, reason: EXIT_REASONS.sources, drafted: false };
 
   const attempt = await runDraft(db, deps, group, gathered.tier12, [], 'report_state');
-  if (attempt.status !== 'drafted') return { done: null, reason: null };
+  // A failed drafter call may still have been billed; count it like one.
+  if (attempt.status !== 'drafted') return { done: null, reason: null, drafted: true };
   const check = exitChecks({
     draft: attempt.body,
     attachDocumentId: attempt.attachDocumentId,
@@ -538,9 +547,9 @@ async function tryAuto(
     ownershipViolation: gathered.ownershipViolation,
     otherPeople: await loadOtherPeople(db, { key: group.sender.key, subjectKey: contact.subjectKey, email: contact.email }),
   });
-  if (!check.ok) return { done: null, reason: check.reason };
+  if (!check.ok) return { done: null, reason: check.reason, drafted: true };
   if (attempt.attachDocumentId !== null && (await loadAttachmentInfo(db, attempt.attachDocumentId)) === null) {
-    return { done: null, reason: EXIT_REASONS.attachment };
+    return { done: null, reason: EXIT_REASONS.attachment, drafted: true };
   }
   try {
     const raised = await raiseContactCard(db, {
@@ -669,10 +678,12 @@ async function processGroup(
   }
 
   const reasons = [base, ...group.notes, ...gathered.notes];
+  let autoDrafted = false;
   if (autoPossible) {
     const auto = await tryAuto(db, deps, group, classification, topic, gathered, reasons, contextBase);
     if (auto.done !== null) return auto.done;
     if (auto.reason !== null) reasons.push(auto.reason);
+    autoDrafted = auto.drafted;
     // Auto ruled out: the contact hears "בודקת ומעדכנת" now, before the
     // researcher and the second draft spend their time.
     await holdingReply(db, deps, group);
@@ -682,6 +693,10 @@ async function processGroup(
   // report-state instruction) when the first one was the auto attempt.
   const researched = await research(db, deps, group);
   reasons.push(...researched.notes);
+  // A second billed draft after the auto attempt drafted is a second run on
+  // the business cap. Zero messages: the per-contact message cap already
+  // counted this group's messages once.
+  if (autoDrafted) await recordDraftRun(db, deps.bundle, group.sender.key, 0);
   const draft = await runDraft(db, deps, group, gathered.tier12, researched.tier3, undefined);
   const sourcesHe = sourcesHeOf(gathered.tier12, researched.tier3.length > 0);
   const context = { ...contextBase, internalDocumentIds: researched.internalDocumentIds };

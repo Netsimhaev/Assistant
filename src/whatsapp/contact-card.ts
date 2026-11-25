@@ -285,9 +285,12 @@ async function failReplaced(db: BusinessDb, previous: PreviousCard | null): Prom
  * which `contactReplyCovers` requires), the clearance is written for the
  * EXACT input of the bound step - the bytes `executeStep` will hash, under
  * the step id that will run - and the job moves `plan -> execute`. No
- * approval, no owner notice, no holding reply. The clearance comes after the
- * take-over so a lost race never leaves a clearance on a job no conversation
- * points at.
+ * approval, no owner notice, no holding reply. The clearance comes BEFORE
+ * the take-over: a clearance on a job no conversation points at is inert (the
+ * gate requires the conversation `carded` on that job), while anything that
+ * throws after the take-over leaves the job failed with the conversation on
+ * it — which `contact-auto-reraise.ts` re-raises by its card context, and
+ * fails first if a crash left it in `plan`.
  */
 async function raiseAuto(db: BusinessDb, a: {
   conversation: ContactConversation;
@@ -309,7 +312,6 @@ async function raiseAuto(db: BusinessDb, a: {
   if (facts.actionClass !== 'whatsapp.reply') {
     throw new Error(`contact card: auto payload classified as ${String(facts.actionClass)}, not whatsapp.reply`);
   }
-  await takeOverConversation(db, a.conversation.conversationId, a.jobId, a.previous);
   await writeClearance(db, {
     jobId: a.jobId,
     stepId: step.id,
@@ -317,6 +319,7 @@ async function raiseAuto(db: BusinessDb, a: {
     conversationId: a.conversation.conversationId,
     topicId: a.topicId,
   });
+  await takeOverConversation(db, a.conversation.conversationId, a.jobId, a.previous);
   await transition(db, a.jobId, { to: 'execute', actor: 'orchestrator', reason: CONTACT_AUTO_REASON, expectFrom: 'plan' });
   await failReplaced(db, a.previous);
 }

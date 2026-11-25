@@ -15,6 +15,14 @@
  * Claim before send: a crash after the swap loses at most the owner's message
  * (the card is still on the dashboard) and never raises a second card.
  *
+ * **An auto job is recognised by its card context (`contact_card_context.auto`),
+ * never by a `job_steps` row.** `raiseAuto` takes the conversation over before
+ * the job moves `plan -> execute`; a transition that throws after the
+ * take-over fails the job without any `execute` row, and a crash there leaves
+ * it in `plan`. Both are this module's: a pass first fails auto jobs stuck in
+ * `intake`/`understand`/`plan` for more than 15 minutes (the ledger nudge T10
+ * sweep), then re-raises every failed one.
+ *
  * "ייתכן שההודעה כבר יצאה" when any step row is `unknown` or a failure code is
  * in `MAY_HAVE_SENT_CODES`: a timeout after the send was issued leaves the
  * message possibly delivered, and the owner must check before approving it again.
@@ -27,9 +35,10 @@ import type { NotifyTarget } from '../orchestrator/proposal-approval.js';
 import { MAY_HAVE_SENT_CODES } from '../domain/may-have-sent.js';
 import { CONTACT_REPLY_EXEMPTION_MARKER } from '../policy/contact-reply.js';
 import { loadPlanBody } from '../orchestrator/plan-store.js';
+import { PhaseMovedError, transition } from '../orchestrator/jobs.js';
 import { toOneLine } from '../util/bidi.js';
 import { loadCardContext } from './card-context.js';
-import { CONTACT_AUTO_REASON, ContactCardBusyError, presentContactCard, raiseContactCard } from './contact-card.js';
+import { ContactCardBusyError, presentContactCard, raiseContactCard } from './contact-card.js';
 import { loadConversation } from './contact-conversations.js';
 import { sendHoldingReply } from './holding-reply.js';
 import { loadTopic, setTopicAutoReply } from './contact-topics.js';
@@ -60,6 +69,35 @@ interface FailedAutoRow {
   may_have_sent: boolean;
 }
 
+/** How long an auto job may sit before `execute` before it counts as a crash mid-raise. */
+export const AUTO_STALLED_MINUTES = 15;
+export const AUTO_STALLED_REASON = 'contact_auto_stalled — the auto job never reached execute';
+
+/**
+ * Fails auto jobs left in `intake`/`understand`/`plan` past the window (a
+ * crash between the take-over and `plan -> execute`), conditionally: a job
+ * that moved meanwhile is skipped.
+ */
+async function failStalledAutoJobs(db: BusinessDb, now: Date): Promise<void> {
+  const { rows } = await db.query<{ job_id: string; phase: 'intake' | 'understand' | 'plan' }>(
+    `SELECT j.job_id, j.phase
+       FROM jobs j
+       JOIN contact_card_context x ON x.business_id = j.business_id AND x.job_id = j.job_id
+      WHERE j.business_id = $1
+        AND x.auto = true
+        AND j.phase IN ('intake', 'understand', 'plan')
+        AND j.updated_at < $2::timestamptz - make_interval(mins => $3)`,
+    [db.businessId, now, AUTO_STALLED_MINUTES],
+  );
+  for (const row of rows) {
+    try {
+      await transition(db, row.job_id, { to: 'failed', actor: 'orchestrator', reason: AUTO_STALLED_REASON, expectFrom: row.phase });
+    } catch (error) {
+      if (!(error instanceof PhaseMovedError)) throw error;
+    }
+  }
+}
+
 /** Card-less auto jobs that failed, whose conversation still points at them. */
 async function failedAutoJobs(db: BusinessDb): Promise<FailedAutoRow[]> {
   const { rows } = await db.query<FailedAutoRow>(
@@ -74,15 +112,14 @@ async function failedAutoJobs(db: BusinessDb): Promise<FailedAutoRow[]> {
       WHERE c.business_id = $1
         AND c.state = 'carded'
         AND j.phase = 'failed'
-        AND EXISTS (SELECT 1 FROM job_steps l
-                     WHERE l.business_id = j.business_id AND l.job_id = j.job_id
-                       AND l.to_phase = 'execute' AND l.reason = $3)
+        AND EXISTS (SELECT 1 FROM contact_card_context x
+                     WHERE x.business_id = j.business_id AND x.job_id = j.job_id AND x.auto = true)
         AND NOT EXISTS (SELECT 1 FROM approval_requests ar
                          WHERE ar.business_id = j.business_id AND ar.job_id = j.job_id)
         AND NOT EXISTS (SELECT 1 FROM job_step_results r
                          WHERE r.business_id = j.business_id AND r.job_id = j.job_id AND r.status = 'completed')
       ORDER BY c.opened_at`,
-    [db.businessId, MAY_HAVE_SENT_CODES, CONTACT_AUTO_REASON],
+    [db.businessId, MAY_HAVE_SENT_CODES],
   );
   return rows;
 }
@@ -96,6 +133,7 @@ function labelFromTitle(title: string | null, contactKey: string): string {
 
 export async function reraiseFailedAutoReplies(db: BusinessDb, deps: ReraiseDeps): Promise<ReraiseResult> {
   const result: ReraiseResult = { reraised: 0, skipped: 0 };
+  await failStalledAutoJobs(db, deps.now);
   for (const row of await failedAutoJobs(db)) {
     try {
       const stored = await loadPlanBody(db, row.job_id);

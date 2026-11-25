@@ -189,3 +189,98 @@ describe('a failed auto reply becomes a card, once', () => {
     expect(await approvals()).toHaveLength(1);
   });
 });
+
+/**
+ * A trigger that makes every job_steps INSERT into one of `phases` fail, so a
+ * transition throws after the conversation take-over. Dropped in `finally`:
+ * TRUNCATE does not remove it.
+ */
+async function withFailingTransitions(phases: string[], fn: () => Promise<void>): Promise<void> {
+  const list = phases.map((p) => `'${p}'`).join(',');
+  await testDb().query(
+    `CREATE OR REPLACE FUNCTION test_fail_transition() RETURNS trigger LANGUAGE plpgsql AS $$
+     BEGIN
+       IF NEW.to_phase IN (${list}) THEN RAISE EXCEPTION 'forced transition failure'; END IF;
+       RETURN NEW;
+     END $$`,
+  );
+  await testDb().query(
+    'CREATE TRIGGER test_fail_transition BEFORE INSERT ON job_steps FOR EACH ROW EXECUTE FUNCTION test_fail_transition()',
+  );
+  try {
+    await fn();
+  } finally {
+    await testDb().query('DROP TRIGGER IF EXISTS test_fail_transition ON job_steps');
+    await testDb().query('DROP FUNCTION IF EXISTS test_fail_transition()');
+  }
+}
+
+async function autoJobId(): Promise<string> {
+  const { rows } = await testDb().query<{ job_id: string }>(
+    'SELECT job_id FROM contact_card_context WHERE business_id = $1 AND auto = true',
+    [BUSINESS],
+  );
+  expect(rows).toHaveLength(1);
+  return rows[0]!.job_id;
+}
+
+async function phaseOf(jobId: string): Promise<string> {
+  const { rows } = await testDb().query<{ phase: string }>('SELECT phase FROM jobs WHERE business_id = $1 AND job_id = $2', [BUSINESS, jobId]);
+  return rows[0]!.phase;
+}
+
+describe('an auto job stranded after the take-over (final review I1)', () => {
+  it('re-raises an auto job whose plan -> execute threw after the conversation was taken over', async () => {
+    const h = await harness();
+    await withFailingTransitions(['execute'], async () => {
+      await expect(raiseAuto(h)).rejects.toThrow();
+    });
+    const jobId = await autoJobId();
+    // The take-over happened: the conversation is carded on the failed job,
+    // which never reached execute.
+    expect(await phaseOf(jobId)).toBe('failed');
+    expect((await conv(h))?.cardJobId).toBe(jobId);
+
+    expect(await reraise(h)).toEqual({ reraised: 1, skipped: 0 });
+    const rows = await approvals();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.detail).toContain(AUTO_FAILED_REASON);
+    expect((await conv(h))?.cardJobId).toBe(rows[0]?.job_id);
+  });
+
+  it('fails and re-raises an auto job left in plan for more than 15 minutes', async () => {
+    const h = await harness();
+    await withFailingTransitions(['execute', 'failed'], async () => {
+      await expect(raiseAuto(h)).rejects.toThrow();
+    });
+    const jobId = await autoJobId();
+    expect(await phaseOf(jobId)).toBe('plan');
+    await testDb().query(
+      `UPDATE jobs SET updated_at = now() - interval '16 minutes' WHERE business_id = $1 AND job_id = $2`,
+      [BUSINESS, jobId],
+    );
+
+    expect(await reraise(h)).toEqual({ reraised: 1, skipped: 0 });
+    expect(await phaseOf(jobId)).toBe('failed');
+    const rows = await approvals();
+    expect(rows).toHaveLength(1);
+    expect((await conv(h))?.cardJobId).toBe(rows[0]?.job_id);
+  });
+
+  it('leaves an auto job in plan for 5 minutes untouched', async () => {
+    const h = await harness();
+    await withFailingTransitions(['execute', 'failed'], async () => {
+      await expect(raiseAuto(h)).rejects.toThrow();
+    });
+    const jobId = await autoJobId();
+    await testDb().query(
+      `UPDATE jobs SET updated_at = now() - interval '5 minutes' WHERE business_id = $1 AND job_id = $2`,
+      [BUSINESS, jobId],
+    );
+
+    expect(await reraise(h)).toEqual({ reraised: 0, skipped: 0 });
+    expect(await phaseOf(jobId)).toBe('plan');
+    expect(await approvals()).toHaveLength(0);
+    expect((await conv(h))?.cardJobId).toBe(jobId);
+  });
+});
