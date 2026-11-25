@@ -83,6 +83,7 @@ export async function publicDocumentCandidates(db: BusinessDb): Promise<PublicDo
 
 export interface UnthemedDecision {
   decisionId: string;
+  decidedAt: Date;
   summary: string;
   sourceNames: string[];
   approved: boolean;
@@ -91,6 +92,7 @@ export interface UnthemedDecision {
 
 interface UnthemedRow {
   decision_id: string;
+  decided_at: Date;
   summary: string;
   source_names: string[] | null;
   approved: boolean;
@@ -115,6 +117,7 @@ export async function unthemedDecisions(db: BusinessDb, now: Date, limit = 200):
   );
   return rows.map((r) => ({
     decisionId: r.decision_id,
+    decidedAt: r.decided_at,
     summary: r.summary,
     sourceNames: r.source_names ?? [],
     approved: r.approved,

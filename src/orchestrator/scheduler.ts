@@ -50,6 +50,8 @@ import { runContactDrafter, type ContactDrafter } from '../sdk/contact-drafter.j
 import type { ContactFlowDeps } from '../whatsapp/contact-flow.js';
 import { HOLDING_NAME_FALLBACK, sendDueHoldingReplies } from '../whatsapp/holding-reply.js';
 import { contactHousekeeping } from '../whatsapp/contact-housekeeping.js';
+import { buildSuggestions } from '../whatsapp/suggestion-pass.js';
+import { runContactClusterer, type ContactClusterer } from '../sdk/contact-clusterer.js';
 import { reraiseFailedAutoReplies } from '../whatsapp/contact-auto-reraise.js';
 import { namedSource, type Tier2Source } from '../whatsapp/sources/types.js';
 import { runContactClassifier, type ContactClassifier } from '../sdk/contact-classifier.js';
@@ -962,6 +964,8 @@ export async function schedulerPass(
     contactDrafter?: ContactDrafter;
     /** Test seam; production leaves it unset and the contact flow uses the billed classifier (`refuseUnderTest` guards it). */
     contactClassifier?: ContactClassifier;
+    /** Test seam; production leaves it unset and the suggestion pass uses the billed clusterer (`refuseUnderTest` guards it). */
+    contactClusterer?: ContactClusterer;
     /** Test seam: replaces the contact flow's tier-2 sources. */
     contactSources?: Tier2Source[];
     /** Test seam: replaces the contact flow's calendar source. */
@@ -1397,6 +1401,19 @@ export async function schedulerPass(
       }));
     } catch (err) {
       console.error('scheduler: contact housekeeping failed', err instanceof Error ? err.message : err);
+    }
+    if (contactReraiseDeps !== null) {
+      const charterVersion = contactReraiseDeps.bundle.charterVersion;
+      try {
+        await stage((db) => buildSuggestions(db, {
+          clusterer: options.contactClusterer ?? runContactClusterer,
+          now: options.now ?? new Date(),
+          clusterRunsPerDay: config.contactClusterRunsPerDay,
+          charterVersion,
+        }));
+      } catch (err) {
+        console.error('scheduler: contact suggestions failed', err instanceof Error ? err.message : err);
+      }
     }
   }
 

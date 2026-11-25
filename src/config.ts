@@ -220,6 +220,8 @@ export const config = {
   // switch starts charging an existing installation on the day it upgrades —
   // which is exactly what `DOCUMENT_INBOX` did before it became a switch.
   curationRunsPerDay: positiveInt('CURATION_RUNS_PER_DAY', 20),
+  // Clusterer calls per day for new-topic suggestions (0 = off).
+  contactClusterRunsPerDay: positiveInt('CONTACT_CLUSTER_RUNS_PER_DAY', 2),
   // Curation of invoice/question mail, counted apart from document curation so
   // a busy mailbox cannot starve the document ceiling (or the reverse).
   mailCurationPerDay: positiveInt('MAIL_CURATION_PER_DAY', 100),
