@@ -10,7 +10,7 @@ import { canonicalHash } from '../util/canonical.js';
 import { listManagedContacts } from '../memory/managed-contacts.js';
 import type { ContactClusterer } from '../sdk/contact-clusterer.js';
 import { listTopics } from './contact-topics.js';
-import { insertSuggestion, shapeHashFor } from './contact-suggestions.js';
+import { decisionIdsCarriedByNewTopicSuggestions, insertSuggestion, shapeHashFor } from './contact-suggestions.js';
 import { autoReplyCandidates, publicDocumentCandidates, unthemedDecisions } from './learning-signals.js';
 import { NEW_TOPIC_MIN_DECISIONS, parseClusters } from './topic-clusters.js';
 
@@ -48,7 +48,7 @@ export async function buildSuggestions(
     const row = await insertSuggestion(
       db,
       'auto_reply',
-      { topicId: c.topic.topicId, right: c.right, counted: c.counted },
+      { topicId: c.topic.topicId, topicUpdatedAt: c.topic.updatedAt.toISOString(), right: c.right, counted: c.counted },
       shapeHashFor({ kind: 'auto_reply', topicId: c.topic.topicId, topicUpdatedAt: c.topic.updatedAt }),
     );
     if (row !== null) inserted++;
@@ -69,8 +69,14 @@ export async function buildSuggestions(
     const state = await clusterRunState(db);
     if (state.today < deps.clusterRunsPerDay) {
       const all = await unthemedDecisions(db, deps.now);
-      const rows = state.last === null ? all : all.filter((d) => d.decidedAt > (state.last as Date));
-      if (rows.length >= NEW_TOPIC_MIN_DECISIONS) {
+      // The gate: enough NEW decisions since the last run to be worth a billed call.
+      const fresh = state.last === null ? all : all.filter((d) => d.decidedAt > (state.last as Date));
+      // What is sent: every unthemed decision in the window — older ones too, so
+      // a theme that arrives slowly still reaches five — minus any decision a
+      // new-topic suggestion already carried (open, accepted or rejected).
+      const carried = await decisionIdsCarriedByNewTopicSuggestions(db);
+      const rows = all.filter((d) => !carried.has(d.decisionId));
+      if (fresh.length >= NEW_TOPIC_MIN_DECISIONS && rows.length >= NEW_TOPIC_MIN_DECISIONS) {
         // Written before the call: a billed call counts even when it fails.
         await appendAudit(db, {
           actor: 'comms.whatsapp',
@@ -81,7 +87,8 @@ export async function buildSuggestions(
           reason: `${CLUSTER_AUDIT_REASON} decisions=${rows.length}`,
         });
         clusterCalled = true;
-        const existingTopicNames = (await listTopics(db)).map((t) => t.name);
+        // Retired names too: a topic the owner retired is not re-proposed under its old name.
+        const existingTopicNames = (await listTopics(db, { includeRetired: true })).map((t) => t.name);
         const contactNames = (await listManagedContacts(db)).map((c) => c.name);
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), CLUSTER_DEADLINE_MS);

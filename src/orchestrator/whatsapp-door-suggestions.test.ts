@@ -18,6 +18,7 @@ import { raiseMailReply } from './mail-reply.js';
 import { presentMailCard } from './whatsapp-mail-card.js';
 import { saveInstruction } from '../governance/instructions.js';
 import {
+  cancelConfirmation,
   createConfirmation,
   loadConfirmation,
   markConfirmationDelivered,
@@ -27,10 +28,9 @@ import { listTopics } from '../whatsapp/contact-topics.js';
 import {
   insertSuggestion,
   loadSuggestion,
-  markSuggestionDelivered,
   shapeHashFor,
 } from '../whatsapp/contact-suggestions.js';
-import { SUGGESTION_APPLIED, SUGGESTION_REJECTED } from '../whatsapp/suggestion-whatsapp.js';
+import { SUGGESTION_APPLIED, SUGGESTION_REJECTED, deliverNextSuggestion } from '../whatsapp/suggestion-whatsapp.js';
 import { presentContactCard, raiseContactCard } from '../whatsapp/contact-card.js';
 import { openOrAppend } from '../whatsapp/contact-conversations.js';
 import { createJob, transition } from './jobs.js';
@@ -104,7 +104,9 @@ async function suggestion(name = 'משלוחים', delivered: Date | null = new 
     ),
   );
   if (s === null) throw new Error('not inserted');
-  if (delivered !== null) await withBusiness(BUSINESS, (db) => markSuggestionDelivered(db, s.suggestionId, delivered));
+  if (delivered !== null) {
+    await testDb().query(`UPDATE contact_suggestions SET delivered_at = $2 WHERE suggestion_id = $1`, [s.suggestionId, delivered]);
+  }
   return s.suggestionId;
 }
 
@@ -342,5 +344,39 @@ describe('a suggestion answered on WhatsApp', () => {
     expect(result.instructed).toBe(1);
     expect(await stateOf(id)).toBe('open');
     expect(await topicCount()).toBe(0);
+  });
+});
+
+describe('delivering a suggestion never blocks another open question (I1)', () => {
+  const deliver = () => withBusiness(BUSINESS, (db) => deliverNextSuggestion(db, { messenger, now: new Date() }));
+
+  it('waits while a delivered command confirmation is open, and delivers once it is answered', async () => {
+    const id = await suggestion('משלוחים', null);
+    const jobId = await heldConfirmation();
+    const before = gateway.sent.length;
+    expect(await deliver()).toBe(false);
+    expect(gateway.sent.length).toBe(before);
+    expect((await withBusiness(BUSINESS, (db) => loadSuggestion(db, id)))?.deliveredAt).toBeNull();
+
+    await withBusiness(BUSINESS, (db) => cancelConfirmation(db, jobId, 'owner'));
+    expect((await withBusiness(BUSINESS, (db) => loadConfirmation(db, jobId)))?.state).toBe('cancelled');
+    expect(await deliver()).toBe(true);
+    expect((await withBusiness(BUSINESS, (db) => loadSuggestion(db, id)))?.deliveredAt).toBeInstanceOf(Date);
+  });
+
+  it('waits while a contact card is open on WhatsApp', async () => {
+    const id = await suggestion('משלוחים', null);
+    await openContactCard();
+    const before = gateway.sent.length;
+    expect(await deliver()).toBe(false);
+    expect(gateway.sent.length).toBe(before);
+    expect((await withBusiness(BUSINESS, (db) => loadSuggestion(db, id)))?.deliveredAt).toBeNull();
+  });
+
+  it('waits while a mail card is open on WhatsApp', async () => {
+    const id = await suggestion('משלוחים', null);
+    await openMailCard();
+    expect(await deliver()).toBe(false);
+    expect((await withBusiness(BUSINESS, (db) => loadSuggestion(db, id)))?.deliveredAt).toBeNull();
   });
 });

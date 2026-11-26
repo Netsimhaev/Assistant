@@ -808,7 +808,11 @@ export const CONTACT_DOCUMENTS_ERASED_PREDICATE = `business_id = $1
  *   and stays.
  *
  * Erasing a rejected suggestion frees its shape hash, so the same shape could
- * be offered again — but the decisions that produced it are erased with it.
+ * be offered again. The decisions that fed it are erased with it ONLY when
+ * this erasure also takes the jobs behind them — the `decisionIds` closure
+ * above. A suggestion reached by its payload text or by the window anchor
+ * goes alone: its feeding decisions stay unless their jobs are in `jobIds`
+ * too, so the same shape can be clustered and offered again from them.
  *
  * Parameters, in both places: `$1` businessId, `$2` contactSuggestionIds.
  */

@@ -22,6 +22,12 @@ export interface NewTopicPayload {
 }
 export interface AutoReplyPayload {
   topicId: string;
+  /**
+   * The topic's `updated_at` (ISO) when the suggestion was made. A topic the
+   * owner edited since is a different topic from the one his decisions were
+   * about, so the executor treats a mismatch as stale.
+   */
+  topicUpdatedAt: string;
   right: number;
   counted: number;
 }
@@ -65,7 +71,7 @@ function toSuggestion(row: SuggestionRow): Suggestion {
 }
 
 export function normaliseName(name: string): string {
-  return stripBidiControls(name).trim().replace(/\s+/g, ' ').toLowerCase();
+  return stripBidiControls(name).normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
 export function shapeHashFor(
@@ -102,6 +108,21 @@ export async function insertSuggestion(
   return row === undefined ? null : toSuggestion(row);
 }
 
+/**
+ * Every decision id a new-topic suggestion ever carried, in any state. The
+ * pass never sends these to the clusterer again: an open one is already
+ * offered, an accepted one is a topic, and a rejected one the owner refused.
+ */
+export async function decisionIdsCarriedByNewTopicSuggestions(db: BusinessDb): Promise<Set<string>> {
+  const { rows } = await db.query<{ id: string }>(
+    `SELECT DISTINCT jsonb_array_elements_text(payload->'decisionIds') AS id
+       FROM contact_suggestions
+      WHERE business_id = $1 AND kind = 'new_topic' AND jsonb_typeof(payload->'decisionIds') = 'array'`,
+    [db.businessId],
+  );
+  return new Set(rows.map((r) => r.id));
+}
+
 export async function listOpenSuggestions(db: BusinessDb): Promise<Suggestion[]> {
   const { rows } = await db.query<SuggestionRow>(
     `SELECT ${COLUMNS} FROM contact_suggestions
@@ -120,11 +141,18 @@ export async function loadSuggestion(db: BusinessDb, suggestionId: string): Prom
   return row === undefined ? null : toSuggestion(row);
 }
 
-export async function markSuggestionDelivered(db: BusinessDb, suggestionId: string, at: Date): Promise<void> {
-  await db.query(
-    `UPDATE contact_suggestions SET delivered_at = $3 WHERE business_id = $1 AND suggestion_id = $2`,
-    [db.businessId, suggestionId, at],
+/**
+ * Stamps `delivered_at` with the DATABASE clock — the same clock every reader
+ * (`deliveredOpenSuggestions`, `openOnWhatsApp`) measures the window against —
+ * and only on a row still `open`. True when a row was stamped.
+ */
+export async function markSuggestionDelivered(db: BusinessDb, suggestionId: string): Promise<boolean> {
+  const { rowCount } = await db.query(
+    `UPDATE contact_suggestions SET delivered_at = now()
+      WHERE business_id = $1 AND suggestion_id = $2 AND state = 'open'`,
+    [db.businessId, suggestionId],
   );
+  return (rowCount ?? 0) > 0;
 }
 
 /** True only for the call that moved the row out of `open`. */

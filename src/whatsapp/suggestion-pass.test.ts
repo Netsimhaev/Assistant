@@ -3,7 +3,7 @@ import { ulid } from 'ulid';
 import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import type { ContactClusterer } from '../sdk/contact-clusterer.js';
-import { createTopic, updateTopic } from './contact-topics.js';
+import { createTopic, retireTopic, updateTopic } from './contact-topics.js';
 import { decideSuggestion, listOpenSuggestions } from './contact-suggestions.js';
 import { buildSuggestions } from './suggestion-pass.js';
 
@@ -152,5 +152,69 @@ describe('buildSuggestions: new topic', () => {
     await expect(run(throwing)).rejects.toThrow('boom');
     expect(calls).toBe(1);
     expect(await clusterAudits()).toBe(1);
+  });
+});
+
+describe('buildSuggestions: a slow theme (I2)', () => {
+  const THEME = 'מתי המשלוח מגיע';
+  const later = () => new Date(Date.now() + 2_000);
+  let seen: string[][] = [];
+  const themed: ContactClusterer = async (req) => {
+    calls++;
+    seen.push(req.summaries.map((x) => x.text));
+    const indexes = req.summaries.filter((x) => x.text === THEME).map((x) => x.index);
+    return { status: 'ok', raw: { groups: indexes.length > 0 ? [{ name: 'משלוחים', description: 'שאלות על משלוחים', indexes }] : [] } };
+  };
+  beforeEach(() => {
+    seen = [];
+  });
+  const runThemed = () =>
+    withBusiness(TEST_BUSINESS, (db) =>
+      buildSuggestions(db, { clusterer: themed, now: new Date(Date.now() + 10_000), clusterRunsPerDay: 9, charterVersion: 'v1' }),
+    );
+
+  it('clusters rows from before the last run together with the new ones', async () => {
+    for (let i = 0; i < 3; i++) await decision({ summary: THEME });
+    for (let i = 0; i < 2; i++) await decision({ summary: `אחר ${i}` });
+    expect((await runThemed()).inserted).toBe(0); // 3 of the theme — below 5
+    for (let i = 0; i < 3; i++) await decision({ summary: THEME, at: later() });
+    for (let i = 0; i < 2; i++) await decision({ summary: `עוד ${i}`, at: later() });
+    const out = await runThemed();
+    expect(out).toEqual({ inserted: 1, clusterCalled: true });
+    expect(seen[1]?.filter((t) => t === THEME)).toHaveLength(6);
+    const list = await open();
+    expect(list[0]).toMatchObject({ kind: 'new_topic', payload: { name: 'משלוחים' } });
+    expect((list[0]?.payload as { decisionIds: string[] }).decisionIds).toHaveLength(6);
+  });
+
+  it('never sends again the rows a suggestion already carried, even after it was rejected', async () => {
+    for (let i = 0; i < 5; i++) await decision({ summary: THEME });
+    expect((await runThemed()).inserted).toBe(1);
+    const s = (await open())[0]!;
+    await withBusiness(TEST_BUSINESS, (db) => decideSuggestion(db, s.suggestionId, 'rejected', 'owner'));
+    for (let i = 0; i < 5; i++) await decision({ summary: `אחר ${i}`, at: later() });
+    expect((await runThemed()).clusterCalled).toBe(true);
+    expect(seen[1]).toHaveLength(5);
+    expect(seen[1]).not.toContain(THEME);
+  });
+});
+
+describe('buildSuggestions: retired topic names (M5)', () => {
+  it('passes retired names to the clusterer and never re-proposes one', async () => {
+    const t = await withBusiness(TEST_BUSINESS, (db) =>
+      createTopic(db, { name: 'משלוחים', description: '', appliesTo: 'both', sources: [], autoReply: false, by: 'owner' }),
+    );
+    await withBusiness(TEST_BUSINESS, (db) => retireTopic(db, t.topicId, 'owner'));
+    let names: string[] = [];
+    const capture: ContactClusterer = async (req) => {
+      names = req.existingTopicNames;
+      return group(req);
+    };
+    for (let i = 0; i < 5; i++) await decision();
+    const out = await run(capture);
+    expect(out.clusterCalled).toBe(true);
+    expect(names).toContain('משלוחים');
+    expect(out.inserted).toBe(0);
+    expect(await open()).toHaveLength(0);
   });
 });

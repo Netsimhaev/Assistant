@@ -48,6 +48,8 @@ interface DocStateRow {
   source: string;
   status: string;
   public_for: string | null;
+  /** Assigned to a contact in `contact_documents` — that contact's invoice, never public. */
+  assigned: boolean;
 }
 
 /** True when the suggestion no longer fits the world it was made for. Positive checks only. */
@@ -61,15 +63,31 @@ export async function suggestionIsStale(db: BusinessDb, s: Suggestion): Promise<
     }
     case 'auto_reply': {
       const topic = await loadTopic(db, String(s.payload.topicId ?? ''));
-      return !(topic !== null && topic.retiredAt === null && topic.autoReply === false);
+      // The topic the owner's decisions were about: edited since → a different topic.
+      return !(
+        topic !== null &&
+        topic.retiredAt === null &&
+        topic.autoReply === false &&
+        typeof s.payload.topicUpdatedAt === 'string' &&
+        topic.updatedAt.toISOString() === s.payload.topicUpdatedAt
+      );
     }
     case 'public_document': {
       const { rows } = await db.query<DocStateRow>(
-        `SELECT source, status, public_for FROM documents WHERE business_id = $1 AND document_id = $2`,
+        `SELECT source, status, public_for,
+                EXISTS (SELECT 1 FROM contact_documents cd
+                         WHERE cd.business_id = documents.business_id AND cd.document_id = documents.document_id) AS assigned
+           FROM documents WHERE business_id = $1 AND document_id = $2`,
         [db.businessId, String(s.payload.documentId ?? '')],
       );
       const doc = rows[0];
-      return !(doc !== undefined && doc.source === 'instruction' && doc.status === 'extracted' && doc.public_for === null);
+      return !(
+        doc !== undefined &&
+        doc.source === 'instruction' &&
+        doc.status === 'extracted' &&
+        doc.public_for === null &&
+        doc.assigned === false
+      );
     }
   }
 }

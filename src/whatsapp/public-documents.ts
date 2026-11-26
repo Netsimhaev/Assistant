@@ -28,7 +28,9 @@ export async function setPublicFor(db: BusinessDb, documentId: string, value: Pu
 
 /**
  * The suggestion executor's write: sets `public_for` only on an owner-origin
- * document (`source = 'instruction'`), extracted, and not yet public — the
+ * document (`source = 'instruction'`), extracted, not yet public, and not
+ * assigned to any contact in `contact_documents` (a contact's invoice is
+ * theirs, never public) — the
  * same conditions `applySuggestion` checked, held again in the UPDATE itself
  * so a change between the check and the write cannot be overwritten. False
  * when no row changed; the caller throws so its claim rolls back.
@@ -42,7 +44,9 @@ export async function setPublicForSuggested(
   const { rowCount } = await db.query(
     `UPDATE documents SET public_for = $3
       WHERE business_id = $1 AND document_id = $2
-        AND source = 'instruction' AND status = 'extracted' AND public_for IS NULL`,
+        AND source = 'instruction' AND status = 'extracted' AND public_for IS NULL
+        AND NOT EXISTS (SELECT 1 FROM contact_documents cd
+                         WHERE cd.business_id = documents.business_id AND cd.document_id = documents.document_id)`,
     [db.businessId, documentId, value],
   );
   if ((rowCount ?? 0) === 0) return false;

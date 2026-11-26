@@ -12,7 +12,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { createTestOwner, loginWithSecondFactor, TEST_MASTER_KEY } from '../test/owner.js';
 import { createServer } from './server.js';
 import { insertSuggestion, shapeHashFor } from '../whatsapp/contact-suggestions.js';
-import { SUGGESTION_APPLIED } from '../whatsapp/suggestion-whatsapp.js';
+import { SUGGESTION_APPLIED, SUGGESTION_FAILED } from '../whatsapp/suggestion-whatsapp.js';
 import {
   AUTO_REPLY_MISSING_SIGNATURE,
   AUTO_REPLY_MISSING_TOGGLE,
@@ -175,6 +175,31 @@ describe('suggestions section', () => {
     expect(res.status).toBe(200);
     expect(await res.text()).toContain(SUGGESTION_APPLIED);
     expect(await topics(BUSINESS)).toBe(1);
+  });
+
+  it("says the new-topic count is the owner's decisions", async () => {
+    await seed(BUSINESS, 'h-count');
+    const { baseUrl, cookie } = await startPlain();
+    const text = await (await fetch(`${baseUrl}${CONTACT_WHATSAPP_SETTINGS_PATH}`, { headers: { cookie } })).text();
+    expect(text).toContain('5 הכרעות שלך');
+    expect(text).not.toContain('תשובות שאישרת)');
+  });
+
+  it('an accept whose effect throws shows SUGGESTION_FAILED, not a 500, and leaves it open', async () => {
+    // appliesTo the topic store refuses: the stale check passes, createTopic throws.
+    const s = await withBusiness(BUSINESS, (db) =>
+      insertSuggestion(db, 'new_topic', { ...payload, appliesTo: 'nobody' } as never, shapeHashFor({ kind: 'new_topic', name: 'h-throw' })),
+    );
+    const { baseUrl, cookie, sessionId } = await startPlain();
+    const res = await fetch(`${baseUrl}${CONTACT_WHATSAPP_SETTINGS_PATH}`, {
+      method: 'POST', headers: { cookie },
+      body: new URLSearchParams({ csrf: issueCsrfToken(sessionId), action: 'suggestion', suggestionId: s!.suggestionId, decision: 'accept' }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(SUGGESTION_FAILED);
+    expect(await topics(BUSINESS)).toBe(0);
+    const { rows } = await testDb().query(`SELECT state FROM contact_suggestions WHERE suggestion_id = $1`, [s!.suggestionId]);
+    expect(rows[0]?.state).toBe('open');
   });
 
   it('refuses a bad CSRF token and changes nothing', async () => {

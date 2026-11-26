@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, withBusiness, type BusinessDb } from '../db/pool.js';
 import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
-import { createTopic, listTopics, loadTopic, retireTopic, setTopicAutoReply } from './contact-topics.js';
+import { createTopic, listTopics, loadTopic, retireTopic, setTopicAutoReply, updateTopic } from './contact-topics.js';
 import { insertSuggestion, loadSuggestion, shapeHashFor } from './contact-suggestions.js';
 import { applySuggestion } from './suggestion-apply.js';
 import { setPublicForSuggested } from './public-documents.js';
@@ -40,7 +40,7 @@ async function autoReplySuggestion(topicId: string) {
     insertSuggestion(
       db,
       'auto_reply',
-      { topicId, right: 5, counted: 5 },
+      { topicId, topicUpdatedAt: t!.updatedAt.toISOString(), right: 5, counted: 5 },
       shapeHashFor({ kind: 'auto_reply', topicId, topicUpdatedAt: t!.updatedAt }),
     ),
   );
@@ -53,6 +53,14 @@ async function insertDocument(id: string, source = 'instruction', status = 'extr
     `INSERT INTO documents (business_id, document_id, sha256, original_name, media_type, byte_size, source, status, stored_path)
      VALUES ($1, $2, $3, 'מחירון.pdf', 'text/plain', 10, $4, $5, 'x/a')`,
     [TEST_BUSINESS, id, id.padEnd(64, '0'), source, status],
+  );
+}
+
+async function assignToContact(documentId: string): Promise<void> {
+  await testDb().query(
+    `INSERT INTO contact_documents (business_id, document_id, contact_key, kind, assigned_by)
+     VALUES ($1, $2, '972501110001', 'invoice', 'owner_upload')`,
+    [TEST_BUSINESS, documentId],
   );
 }
 
@@ -201,6 +209,24 @@ describe('applySuggestion: stale accept', () => {
     expect(await publicFor('DOC-B')).toBe('both');
   });
 
+  it('auto reply on a topic edited after the suggestion → stale, auto reply stays off (I4)', async () => {
+    const t = await topic();
+    const s = await autoReplySuggestion(t.topicId);
+    await testDb().query(`UPDATE contact_topics SET updated_at = updated_at - interval '1 minute' WHERE topic_id = $1`, [t.topicId]);
+    await inBiz((db) => updateTopic(db, t.topicId, { description: 'נושא אחר עכשיו' }, 'owner'));
+    expect(await inBiz((db) => applySuggestion(db, s.suggestionId, 'accept', 'owner'))).toBe('stale');
+    expect((await inBiz((db) => loadTopic(db, t.topicId)))?.autoReply).toBe(false);
+    expect((await inBiz((db) => loadSuggestion(db, s.suggestionId)))?.state).toBe('expired');
+  });
+
+  it("public document that is a contact's assigned invoice → stale, public_for untouched (I3)", async () => {
+    await insertDocument('DOC-A');
+    const s = await publicDocumentSuggestion('DOC-A');
+    await assignToContact('DOC-A');
+    expect(await inBiz((db) => applySuggestion(db, s.suggestionId, 'accept', 'owner'))).toBe('stale');
+    expect(await publicFor('DOC-A')).toBeNull();
+  });
+
   it('new topic whose name is already a live topic → stale, no second topic', async () => {
     const s = await newTopicSuggestion('משלוחים');
     await inBiz((db) =>
@@ -231,6 +257,13 @@ describe('setPublicForSuggested: conditional at write time', () => {
     await testDb().query(`UPDATE documents SET public_for = 'supplier' WHERE document_id = 'DOC-A'`);
     expect(await write('DOC-A')).toBe(false);
     expect(await publicFor('DOC-A')).toBe('supplier');
+  });
+
+  it("refuses a contact's assigned invoice (I3)", async () => {
+    await insertDocument('DOC-A');
+    await assignToContact('DOC-A');
+    expect(await write('DOC-A')).toBe(false);
+    expect(await publicFor('DOC-A')).toBeNull();
   });
 
   it('refuses a foreign or unextracted or missing document', async () => {

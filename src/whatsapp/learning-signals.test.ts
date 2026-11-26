@@ -211,6 +211,18 @@ describe('publicDocumentCandidates', () => {
     expect(await publicCandidates()).toEqual([]);
   });
 
+  it("never suggests a contact's assigned invoice, whoever assigned it (I3)", async () => {
+    await doc('DOC-A', 'instruction');
+    await doc('DOC-B', 'instruction');
+    await testDb().query(
+      `INSERT INTO contact_documents (business_id, document_id, contact_key, kind, assigned_by)
+       VALUES ($1, 'DOC-A', '972501110001', 'invoice', 'owner_upload')`,
+      [BUSINESS],
+    );
+    for (let i = 0; i < 3; i++) await decision({ docs: ['DOC-A', 'DOC-B'] });
+    expect((await publicCandidates()).map((c) => c.documentId)).toEqual(['DOC-B']);
+  });
+
   it('skips a document that is already public', async () => {
     await doc('DOC-A', 'instruction');
     await testDb().query(`UPDATE documents SET public_for = 'both' WHERE document_id = 'DOC-A'`);

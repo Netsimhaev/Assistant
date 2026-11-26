@@ -21,18 +21,20 @@ afterAll(async () => {
 const topicPayload = { name: 'משלוחים', description: 'd', appliesTo: 'both' as const, sources: ['public' as const], decisionIds: ['a'] };
 const topicShape = () => shapeHashFor({ kind: 'new_topic', name: 'משלוחים' });
 const w = <T>(fn: Parameters<typeof withBusiness<T>>[1]) => withBusiness(TEST_BUSINESS, fn);
+const setDeliveredAt = (id: string, at: Date) =>
+  testDb().query(`UPDATE contact_suggestions SET delivered_at = $2 WHERE suggestion_id = $1`, [id, at]);
 
 describe('contact suggestions store', () => {
   it('round-trips each kind', async () => {
     const a = await w((db) => insertSuggestion(db, 'new_topic', topicPayload, topicShape()));
     const b = await w((db) =>
-      insertSuggestion(db, 'auto_reply', { topicId: 't1', right: 5, counted: 5 }, shapeHashFor({ kind: 'auto_reply', topicId: 't1', topicUpdatedAt: new Date(0) })),
+      insertSuggestion(db, 'auto_reply', { topicId: 't1', topicUpdatedAt: new Date(0).toISOString(), right: 5, counted: 5 }, shapeHashFor({ kind: 'auto_reply', topicId: 't1', topicUpdatedAt: new Date(0) })),
     );
     const c = await w((db) =>
       insertSuggestion(db, 'public_document', { documentId: 'd1', appliesTo: 'client', approvals: 3 }, shapeHashFor({ kind: 'public_document', documentId: 'd1' })),
     );
     expect(a?.kind).toBe('new_topic');
-    expect(b?.payload).toEqual({ topicId: 't1', right: 5, counted: 5 });
+    expect(b?.payload).toEqual({ topicId: 't1', topicUpdatedAt: new Date(0).toISOString(), right: 5, counted: 5 });
     expect(c?.state).toBe('open');
     const open = await w((db) => listOpenSuggestions(db));
     expect(open.map((s) => s.kind)).toEqual(['new_topic', 'auto_reply', 'public_document']);
@@ -64,10 +66,10 @@ describe('contact suggestions store', () => {
     const decided = await mk('d');
     const inbound = new Date();
     const at = (ms: number) => new Date(inbound.getTime() + ms);
-    await w((db) => markSuggestionDelivered(db, good.suggestionId, at(-60_000)));
-    await w((db) => markSuggestionDelivered(db, late.suggestionId, at(60_000)));
-    await w((db) => markSuggestionDelivered(db, old.suggestionId, at(-3 * 3600_000)));
-    await w((db) => markSuggestionDelivered(db, decided.suggestionId, at(-60_000)));
+    await setDeliveredAt(good.suggestionId, at(-60_000));
+    await setDeliveredAt(late.suggestionId, at(60_000));
+    await setDeliveredAt(old.suggestionId, at(-3 * 3600_000));
+    await setDeliveredAt(decided.suggestionId, at(-60_000));
     await w((db) => decideSuggestion(db, decided.suggestionId, 'rejected', 'owner'));
     void undelivered;
     const got = await w((db) => deliveredOpenSuggestions(db, { inboundAt: inbound, windowMinutes: 30 }));
@@ -80,6 +82,28 @@ describe('contact suggestions store', () => {
     expect(await withBusiness('other-biz', (db) => listOpenSuggestions(db))).toEqual([]);
     const { rows } = await testDb().query('SELECT 1 FROM contact_suggestions');
     expect(rows).toHaveLength(1);
+  });
+
+  it('markSuggestionDelivered stamps the database clock, and only on an open row', async () => {
+    const mk = async (name: string) =>
+      (await w((db) => insertSuggestion(db, 'new_topic', { ...topicPayload, name }, shapeHashFor({ kind: 'new_topic', name }))))!;
+    const open = await mk('open');
+    const gone = await mk('gone');
+    await w((db) => decideSuggestion(db, gone.suggestionId, 'rejected', 'owner'));
+    expect(await w((db) => markSuggestionDelivered(db, open.suggestionId))).toBe(true);
+    expect(await w((db) => markSuggestionDelivered(db, gone.suggestionId))).toBe(false);
+    const { rows } = await testDb().query<{ id: string; delivered_at: Date | null; skew: number | null }>(
+      `SELECT suggestion_id AS id, delivered_at, abs(extract(epoch FROM now() - delivered_at)) AS skew
+         FROM contact_suggestions ORDER BY suggestion_id`,
+    );
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    expect(Number(byId.get(open.suggestionId)?.skew)).toBeLessThan(60);
+    expect(byId.get(gone.suggestionId)?.delivered_at).toBeNull();
+  });
+
+  it('normalises the topic name in the shape hash with NFKC', () => {
+    // U+FB01 (ﬁ ligature) folds to "fi" under NFKC.
+    expect(shapeHashFor({ kind: 'new_topic', name: 'ﬁles' })).toBe(shapeHashFor({ kind: 'new_topic', name: 'files' }));
   });
 
   it('normalises the topic name in the shape hash', () => {

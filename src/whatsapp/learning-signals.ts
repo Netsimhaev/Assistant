@@ -66,6 +66,9 @@ export async function publicDocumentCandidates(db: BusinessDb): Promise<PublicDo
       WHERE d.business_id = $1
         AND ${APPROVED_SQL}
         AND doc.source = 'instruction' AND doc.status = 'extracted' AND doc.public_for IS NULL
+        -- A document assigned to a contact (their invoice) is that contact's, never public.
+        AND NOT EXISTS (SELECT 1 FROM contact_documents cd
+                         WHERE cd.business_id = doc.business_id AND cd.document_id = doc.document_id)
       GROUP BY u.document_id
      HAVING count(DISTINCT d.job_id) >= $2
       ORDER BY u.document_id`,

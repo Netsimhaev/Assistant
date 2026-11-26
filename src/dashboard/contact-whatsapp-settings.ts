@@ -30,6 +30,7 @@ import {
   labelsFor,
   SUGGESTION_ALREADY,
   SUGGESTION_APPLIED,
+  SUGGESTION_FAILED,
   SUGGESTION_REJECTED,
   SUGGESTION_STALE,
 } from '../whatsapp/suggestion-whatsapp.js';
@@ -179,7 +180,7 @@ async function render(
     const labels = await labelsFor(db, sg);
     let detail: string;
     if (sg.kind === 'new_topic') {
-      detail = `${escLabel(sg.payload.name)} — ${escLabel(sg.payload.description)} (${escLabel(APPLIES_HE[sg.payload.appliesTo] ?? '')}, ${sg.payload.decisionIds.length} תשובות שאישרת)`;
+      detail = `${escLabel(sg.payload.name)} — ${escLabel(sg.payload.description)} (${escLabel(APPLIES_HE[sg.payload.appliesTo] ?? '')}, מבוסס על ${sg.payload.decisionIds.length} הכרעות שלך)`;
     } else if (sg.kind === 'auto_reply') {
       detail = `${escLabel(labels.topicName ?? '')} — הסכמת עם ${Number(sg.payload.right)} מתוך ${Number(sg.payload.counted)}`;
     } else {
@@ -252,7 +253,13 @@ export async function handleContactWhatsappPost(
     if (decision !== 'accept' && decision !== 'reject') {
       return render(res, 400, db, session, { error: 'בחירה לא תקינה.' });
     }
-    const outcome = await applySuggestion(db, found.suggestionId, decision, `dashboard:${session.username}`);
+    let outcome: ApplyOutcome;
+    try {
+      outcome = await applySuggestion(db, found.suggestionId, decision, `dashboard:${session.username}`);
+    } catch {
+      // The claim rolled back with the effect: the suggestion stays open. Same answer as WhatsApp.
+      return render(res, 200, db, session, { error: SUGGESTION_FAILED });
+    }
     return render(res, 200, db, session, { notice: OUTCOME_HE[outcome] });
   }
   if (action === 'auto_reply') {

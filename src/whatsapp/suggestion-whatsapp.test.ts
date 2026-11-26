@@ -77,7 +77,8 @@ describe('SUGGESTION_TEXT', () => {
     expect(text).not.toContain('‮');
     expect(text).toContain('משלוחים אל: x');
     expect(text).toContain('שורה שנייה');
-    expect(text).toContain('5');
+    expect(text).toContain('מבוסס על 5 הכרעות שלך.');
+    expect(text).not.toContain('תשובות שאישרת');
   });
 
   it('names the topic and the document by their labels', () => {
@@ -135,7 +136,7 @@ describe('deliverNextSuggestion', () => {
     );
     const topicRow = await inBiz((db) => loadTopic(db, t.topicId));
     const stale = await inBiz((db) =>
-      insertSuggestion(db, 'auto_reply', { topicId: t.topicId, right: 5, counted: 5 },
+      insertSuggestion(db, 'auto_reply', { topicId: t.topicId, topicUpdatedAt: topicRow!.updatedAt.toISOString(), right: 5, counted: 5 },
         shapeHashFor({ kind: 'auto_reply', topicId: t.topicId, topicUpdatedAt: topicRow!.updatedAt })),
     );
     await testDb().query(`UPDATE contact_topics SET retired_at = now() WHERE topic_id = $1`, [t.topicId]);
