@@ -8,7 +8,7 @@
 ## פקודות
 
 ```bash
-npm test          # vitest run — 6246 מבחנים ב-411 קבצים (6245 עוברים, 1 מדולג; נמדד 25/11 על בסיס ייעודי)
+npm test          # vitest run — 6374 מבחנים ב-421 קבצים (6373 עוברים, 1 מדולג; נמדד 26/11 על בסיס ייעודי)
 npm run typecheck # tsc --noEmit
 npm run build     # tsc
 npm run migrate   # מריץ מיגרציות על DATABASE_MIGRATE_URL (בעלי הטבלאות — לעולם לא חשבון זמן הריצה)
