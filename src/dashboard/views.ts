@@ -1689,6 +1689,7 @@ export const TABLE_LABELS: Record<string, string> = {
   contact_conversations: 'שיחות וואטסאפ עם אנשי קשר',
   contact_reply_decisions: 'הכרעות על תשובות לאנשי קשר',
   contact_documents: 'מסמכים ששויכו לאנשי קשר',
+  contact_suggestions: 'הצעות שהעוזרת הציעה לך מתוך ההחלטות שלך',
   contact_card_context: 'הקשר כרטיסים של הודעות מאנשי קשר',
   contact_auto_clearances: 'אישורי שליחה של תשובות שיצאו לבד',
 };

@@ -35,6 +35,7 @@ import {
   ACTION_UPDATES_ERASED_PREDICATE,
   CONTACT_CONVERSATIONS_ERASED_PREDICATE,
   CONTACT_DOCUMENTS_ERASED_PREDICATE,
+  CONTACT_SUGGESTIONS_ERASED_PREDICATE,
   CONTACT_REPLY_DECISIONS_ERASED_PREDICATE,
   CONTACT_CARD_CONTEXT_ERASED_PREDICATE,
   CONTACT_AUTO_CLEARANCES_ERASED_PREDICATE,
@@ -196,7 +197,7 @@ export async function executeErasure(
 
   const {
     jobIds, documentIds, memoryIds, digestIds, draftIds, mailIds, ledgerItemIds, ledgerRuleIds, productionIds,
-    colleagueIds, setupPackageMatched, externalEventIds,
+    colleagueIds, setupPackageMatched, externalEventIds, contactSuggestionIds,
   } = plan;
   const results: ErasureItem[] = [];
   await transaction(db, async (client) => {
@@ -392,6 +393,12 @@ export async function executeErasure(
       'contact_documents',
       `DELETE FROM contact_documents WHERE ${CONTACT_DOCUMENTS_ERASED_PREDICATE}`,
       [businessId, documentIds, contactPhoneKey(plan.anchor)],
+    );
+    // Package 2 (migration 086): suggestions, by their own ids — no foreign key.
+    await del(
+      'contact_suggestions',
+      `DELETE FROM contact_suggestions WHERE ${CONTACT_SUGGESTIONS_ERASED_PREDICATE}`,
+      [businessId, contactSuggestionIds],
     );
     await del(
       'contact_conversations',

@@ -2179,3 +2179,108 @@ describe('WhatsApp conversations with contacts (migration 083)', () => {
     expect(plan.refusals.map((r) => r.kind)).toContain('live_job');
   });
 });
+
+describe('WhatsApp contact suggestions (migration 086)', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  let shape = 0;
+  async function aSuggestion(
+    suggestionId: string,
+    kind: 'new_topic' | 'auto_reply' | 'public_document',
+    payload: Record<string, unknown>,
+    createdAt = '2026-06-01T10:00:00Z',
+  ): Promise<void> {
+    shape += 1;
+    await testDb().query(
+      `INSERT INTO contact_suggestions (business_id, suggestion_id, kind, payload, shape_hash, created_at)
+       VALUES ($1, $2, $3, $4::jsonb, $5, $6)`,
+      [BUSINESS, suggestionId, kind, JSON.stringify(payload), String(shape).padStart(64, '0'), createdAt],
+    );
+  }
+
+  function topic(name: string, description: string, decisionIds: string[]): Record<string, unknown> {
+    return { name, description, appliesTo: 'client', sources: [], decisionIds };
+  }
+
+  async function aDecision(decisionId: string, jobId: string, summary: string | null): Promise<void> {
+    await testDb().query(
+      `INSERT INTO contact_reply_decisions
+         (business_id, decision_id, conversation_id, job_id, approval_id, verdict, source_tiers, decided_at, summary)
+       VALUES ($1, $2, 'CC-x', $3, $4, 'right', ARRAY['tier2'], now(), $5)`,
+      [BUSINESS, decisionId, jobId, `AP-${decisionId}`, summary],
+    );
+  }
+
+  const left = async (): Promise<string[]> =>
+    (await testDb().query<{ id: string }>(
+      'SELECT suggestion_id AS id FROM contact_suggestions WHERE business_id = $1', [BUSINESS],
+    )).rows.map((r) => r.id).sort();
+
+  it('a contact anchor reaches a new-topic suggestion by its payload text (JSON-escaped too), and nothing else', async () => {
+    const quoted = 'דנה "הספקית" כהן';
+    await aSuggestion('SG-name', 'new_topic', topic(`שאלות של ${RONIT}`, 'תיאור', []));
+    await aSuggestion('SG-quoted', 'new_topic', topic('שאלות', `מה ש${quoted} שואלת`, []));
+    await aSuggestion('SG-other', 'new_topic', topic('מועדי אספקה', 'מתי מגיע', ['CRD-none']));
+    await aSuggestion('SG-auto', 'auto_reply', { topicId: 'TP-1', right: 5, counted: 5 });
+
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
+    expect(plan.contactSuggestionIds).toEqual(['SG-name']);
+    const quotedPlan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: quoted }));
+    expect(quotedPlan.contactSuggestionIds).toEqual(['SG-quoted']);
+    expect(plan.items.find((item) => item.table === 'contact_suggestions' && item.action === 'delete')?.count).toBe(1);
+
+    const outcome = await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
+    expect(outcome.deleted.find((item) => item.table === 'contact_suggestions')?.count).toBe(1);
+    expect(await left()).toEqual(['SG-auto', 'SG-other', 'SG-quoted']);
+  });
+
+  it('a new-topic suggestion whose decisions belong to an erased job goes with it; a kept job keeps its suggestion', async () => {
+    const erased = await bareJob('sg-erased');
+    const kept = await bareJob('sg-kept');
+    await aDecision('CRD-erased', erased, `בקשה של ${RONIT}`);
+    await aDecision('CRD-kept', kept, `בקשה של ${RONIT}`);
+    await aDecision('CRD-unrelated', await bareJob('sg-unrelated'), 'שאלה אחרת');
+    await aSuggestion('SG-erased', 'new_topic', topic('מחירון', 'מחירון שירותים', ['CRD-unrelated', 'CRD-erased']));
+    await aSuggestion('SG-kept', 'new_topic', topic('אספקה', 'מועדים', ['CRD-kept']));
+    await aSuggestion('SG-unrelated', 'new_topic', topic('שעות', 'שעות פתיחה', ['CRD-unrelated']));
+    await aSuggestion('SG-auto', 'auto_reply', { topicId: 'TP-1', right: 5, counted: 5 });
+    await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'job', itemId: kept, note: 'לשימור' }));
+
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: RONIT }));
+    expect(plan.jobIds).toContain(erased);
+    expect(plan.contactSuggestionIds).toEqual(['SG-erased']);
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
+    expect(await left()).toEqual(['SG-auto', 'SG-kept', 'SG-unrelated']);
+  });
+
+  it('a public-document suggestion goes with its erased document, and one on another document stays', async () => {
+    const erasedDoc = await aDocument();
+    const otherDoc = await aDocument();
+    await aSuggestion('SG-doc', 'public_document', { documentId: erasedDoc, appliesTo: 'both', approvals: 3 });
+    await aSuggestion('SG-doc-other', 'public_document', { documentId: otherDoc, appliesTo: 'both', approvals: 3 });
+    await aSuggestion('SG-auto', 'auto_reply', { topicId: 'TP-1', right: 5, counted: 5 });
+
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'document', documentId: erasedDoc }));
+    expect(plan.contactSuggestionIds).toEqual(['SG-doc']);
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
+    expect(await left()).toEqual(['SG-auto', 'SG-doc-other']);
+  });
+
+  it('a window anchor reaches a new-topic suggestion by created_at, and leaves auto-reply suggestions', async () => {
+    await aSuggestion('SG-in', 'new_topic', topic('מחירון', 'מחירון', []), '2026-06-01T10:00:00Z');
+    await aSuggestion('SG-out', 'new_topic', topic('שעות', 'שעות', []), '2026-06-03T10:00:00Z');
+    await aSuggestion('SG-auto-in', 'auto_reply', { topicId: 'TP-1', right: 5, counted: 5 }, '2026-06-01T11:00:00Z');
+    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, {
+      kind: 'window', fromIso: '2026-06-01T00:00:00.000Z', toIso: '2026-06-02T00:00:00.000Z',
+    }));
+    expect(plan.contactSuggestionIds).toEqual(['SG-in']);
+    await withBusiness(BUSINESS, (bdb) => executeErasure(bdb, plan));
+    expect(await left()).toEqual(['SG-auto-in', 'SG-out']);
+  });
+});

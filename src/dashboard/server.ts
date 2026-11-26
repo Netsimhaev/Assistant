@@ -2280,6 +2280,7 @@ function planFingerprint(plan: ErasurePlan): string {
       .map((e) => `${e.kind}\u0000${e.calendarId}\u0000${e.eventId}\u0000${e.start ?? ''}`)
       .sort(),
     externalEventIds: [...plan.externalEventIds].sort(),
+    contactSuggestionIds: [...plan.contactSuggestionIds].sort(),
     // Never deleted at the provider, but shown to the owner: a system that
     // joined between the preview and the confirm re-shows the preview.
     externalSystemsKept: [...plan.externalSystemsKept].sort(),

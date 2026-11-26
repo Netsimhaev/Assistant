@@ -176,14 +176,19 @@ describe('what an erasure leaves behind', () => {
    * `contact_topics` is the owner's own text and survives by name (see
    * `SURVIVES` and the `topicMentionsContact` test).
    *
-   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen, then twenty, then twenty-one, then twenty-two, then twenty-three, then twenty-five, then twenty-six, then twenty-seven" count is spec §5.1's own
+   * **A twenty-eighth: WhatsApp contacts phase 2, package 2 (migration 086)**
+   * — `contact_suggestions.payload`, a new-topic suggestion's name and
+   * description written from senders' summaries, seeded on a suggestion whose
+   * decision ids point at nothing, so only its own payload can bring it in.
+   *
+   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen, then twenty, then twenty-one, then twenty-two, then twenty-three, then twenty-five, then twenty-six, then twenty-seven, then twenty-eight" count is spec §5.1's own
    * original content-store enumeration, growing as new content-bearing
    * tables were added to it — it is a DIFFERENT number from "how many
-   * tables `countItems`/the executor each name today" (44 since migration 085 added `contact_card_context` and `contact_auto_clearances` to migration 083's `contact_conversations`, `contact_reply_decisions` and `contact_documents`; CLAUDE.md states
+   * tables `countItems`/the executor each name today" (45 since migration 086 added `contact_suggestions` to migration 085's `contact_card_context` and `contact_auto_clearances` and migration 083's `contact_conversations`, `contact_reply_decisions` and `contact_documents`; CLAUDE.md states
    * that figure, because it is the one a reader can grep `erasure-plan.ts`
    * and count directly). The two will not generally match: this file's
    * count tracks a design document's own enumeration of content-bearing
-   * stores, while the 44 also includes tables scrubbed as a consequence of
+   * stores, while the 45 also includes tables scrubbed as a consequence of
    * a kept-vs-erased JOB rather than discovered as a content store in their
    * own right (`jobs`, `job_steps`, `job_step_results`), and counts a table
    * once per table name regardless of how many `action`s `countItems` runs
@@ -823,7 +828,28 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS, decisionJob.jobId, `בקשה של ${PROBE}`],
     );
 
-    const plan = await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PROBE }));
+    // --- Migration 086: WhatsApp contacts phase 2 (suggestions). ----------
+    //
+    // A new-topic suggestion carries a name and description the clusterer
+    // wrote from senders' summaries — free text that can name a person. Its
+    // decision ids point at nothing here, so only its OWN payload brings it in.
+    await db.query(
+      `INSERT INTO contact_suggestions (business_id, suggestion_id, kind, payload, shape_hash)
+       VALUES ($1, 'SG-probe', 'new_topic', $2::jsonb, $3)`,
+      [
+        BUSINESS,
+        JSON.stringify({
+          name: `שאלות של ${PROBE}`,
+          description: 'שאלות על חשבוניות',
+          appliesTo: 'client',
+          sources: [],
+          decisionIds: ['CRD-none'],
+        }),
+        'b'.repeat(64),
+      ],
+    );
+
+    const plan =await withBusiness(BUSINESS, (bdb) => buildErasurePlan(bdb, { kind: 'contact', identifier: PROBE }));
     for (const table of ['external_reads', 'external_events', 'external_learning_jobs']) {
       expect(plan.items.find((item) => item.table === table && item.action === 'delete')?.count, table).toBe(1);
     }
@@ -834,6 +860,7 @@ describe('what an erasure leaves behind', () => {
       ['contact_documents', 1],
       ['contact_card_context', 1],
       ['contact_auto_clearances', 1],
+      ['contact_suggestions', 1],
     ] as const) {
       expect(plan.items.find((item) => item.table === table && item.action === 'delete')?.count, table).toBe(count);
     }
