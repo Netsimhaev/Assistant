@@ -31,6 +31,7 @@ export interface ContactTopic {
   sources: Tier2SourceName[];
   autoReply: boolean;
   retiredAt: Date | null;
+  updatedAt: Date;
 }
 
 interface TopicRow {
@@ -41,9 +42,10 @@ interface TopicRow {
   sources: string[];
   auto_reply: boolean;
   retired_at: Date | null;
+  updated_at: Date;
 }
 
-const COLUMNS = 'topic_id, name, description, applies_to, sources, auto_reply, retired_at';
+const COLUMNS = 'topic_id, name, description, applies_to, sources, auto_reply, retired_at, updated_at';
 
 function toTopic(row: TopicRow): ContactTopic {
   return {
@@ -54,6 +56,7 @@ function toTopic(row: TopicRow): ContactTopic {
     sources: row.sources.filter((s): s is Tier2SourceName => (TIER2_SOURCE_NAMES as readonly string[]).includes(s)),
     autoReply: row.auto_reply,
     retiredAt: row.retired_at,
+    updatedAt: row.updated_at,
   };
 }
 

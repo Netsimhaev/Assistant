@@ -411,6 +411,11 @@ export interface ErasurePlan {
   /** `external_events` rows to erase — see `EXTERNAL_EVENTS_ERASED_PREDICATE`. */
   externalEventIds: string[];
   /**
+   * `contact_suggestions` rows to erase, sorted — see
+   * `CONTACT_SUGGESTIONS_ERASED_PREDICATE`. Included in `planFingerprint`.
+   */
+  contactSuggestionIds: string[];
+  /**
    * The external systems that held an erased read or event, by their signed
    * label, cleaned to one line and sorted. A label that is not signed any
    * more, or that cleans to the empty string, falls back to the system id;
@@ -784,6 +789,34 @@ export const CONTACT_AUTO_CLEARANCES_ERASED_PREDICATE = 'business_id = $1 AND jo
  */
 export const CONTACT_DOCUMENTS_ERASED_PREDICATE = `business_id = $1
   AND (document_id = ANY ($2) OR ($3::text IS NOT NULL AND contact_key = $3))`;
+
+/**
+ * `contact_suggestions` (migration 086): what the assistant offered the owner,
+ * learned from his decisions on contact reply cards. Erased by its own id; the
+ * ids are gathered in discovery and closure:
+ *
+ * - a **new-topic** suggestion carries a name and description the clusterer
+ *   wrote from senders' summaries — free text that can name a person — so its
+ *   `payload` is a discovery source (`jsonbContentMatches`, contact anchor),
+ *   a window anchor reaches it by its own `created_at`, and it also goes when
+ *   any of its `decisionIds` is a `contact_reply_decisions` row of a job this
+ *   erasure destroys (the final `jobIds`, after kept jobs are subtracted — a
+ *   kept job keeps the suggestion it fed);
+ * - a **public-document** suggestion goes with its document (`documentId` in
+ *   the final `documentIds`);
+ * - an **auto-reply** suggestion holds a topic id and two counts — no person —
+ *   and stays.
+ *
+ * Erasing a rejected suggestion frees its shape hash, so the same shape could
+ * be offered again. The decisions that fed it are erased with it ONLY when
+ * this erasure also takes the jobs behind them — the `decisionIds` closure
+ * above. A suggestion reached by its payload text or by the window anchor
+ * goes alone: its feeding decisions stay unless their jobs are in `jobIds`
+ * too, so the same shape can be clustered and offered again from them.
+ *
+ * Parameters, in both places: `$1` businessId, `$2` contactSuggestionIds.
+ */
+export const CONTACT_SUGGESTIONS_ERASED_PREDICATE = 'business_id = $1 AND suggestion_id = ANY ($2)';
 
 // `contact_whatsapp_settings` (migration 083) is deliberately NOT wired: it
 // is the owner's accounting-lookup configuration (a system id, an operation
@@ -1445,6 +1478,7 @@ export async function buildErasurePlan(
   const productionIds = new Set<string>();
   const colleagueIds = new Set<string>();
   const externalEventIds = new Set<string>();
+  const contactSuggestionIds = new Set<string>();
   let setupPackageMatched = false;
 
   if (anchor.kind === 'contact') {
@@ -1654,6 +1688,16 @@ export async function buildErasurePlan(
       'job_id',
     )) jobIds.add(jobId);
 
+    // Package 2 (migration 086): a suggestion's own payload text — see
+    // `CONTACT_SUGGESTIONS_ERASED_PREDICATE`.
+    for (const suggestionId of await idsFrom(
+      db,
+      `SELECT suggestion_id FROM contact_suggestions
+        WHERE business_id = $1 AND ${jsonbContentMatches('payload', '$2')}`,
+      [businessId, pattern],
+      'suggestion_id',
+    )) contactSuggestionIds.add(suggestionId);
+
     // The documents assigned to the contact's number (invoices uploaded by the
     // owner, found in sent mail or in accounting) go through the existing
     // document path — rows, artifacts, readings and file.
@@ -1844,6 +1888,16 @@ export async function buildErasurePlan(
       [businessId, anchor.fromIso, anchor.toIso],
       'digest_id',
     )) digestIds.add(digestId);
+
+    // A new-topic suggestion by its own `created_at` (the auto-reply and
+    // public-document kinds hold no person — see the predicate's docblock).
+    for (const suggestionId of await idsFrom(
+      db,
+      `SELECT suggestion_id FROM contact_suggestions
+        WHERE business_id = $1 AND kind = 'new_topic' AND created_at >= $2 AND created_at < $3`,
+      [businessId, anchor.fromIso, anchor.toIso],
+      'suggestion_id',
+    )) contactSuggestionIds.add(suggestionId);
 
     // `created_at`: when the owner said it — the row's own instant, the
     // convention every other window predicate here keeps.
@@ -2220,6 +2274,35 @@ export async function buildErasurePlan(
   for (const id of keptJobList) noteFor('job', id);
   const jobList = [...jobIds].filter((id) => !keptJobs.has(id));
 
+  // Suggestions that go with what this erasure destroys, from the FINAL lists
+  // (kept jobs and documents already subtracted): a new-topic suggestion fed
+  // by a decision of an erased job, and a public-document suggestion on an
+  // erased document. See `CONTACT_SUGGESTIONS_ERASED_PREDICATE`.
+  if (jobList.length > 0) {
+    for (const suggestionId of await idsFrom(
+      db,
+      `SELECT s.suggestion_id FROM contact_suggestions s
+        WHERE s.business_id = $1 AND s.kind = 'new_topic'
+          AND jsonb_typeof(s.payload -> 'decisionIds') = 'array'
+          AND EXISTS (
+            SELECT 1 FROM contact_reply_decisions d
+             WHERE d.business_id = $1 AND d.job_id = ANY ($2)
+               AND (s.payload -> 'decisionIds') ? d.decision_id)`,
+      [businessId, jobList],
+      'suggestion_id',
+    )) contactSuggestionIds.add(suggestionId);
+  }
+  if (documentList.length > 0) {
+    for (const suggestionId of await idsFrom(
+      db,
+      `SELECT suggestion_id FROM contact_suggestions
+        WHERE business_id = $1 AND kind = 'public_document' AND payload ->> 'documentId' = ANY ($2)`,
+      [businessId, documentList],
+      'suggestion_id',
+    )) contactSuggestionIds.add(suggestionId);
+  }
+  const contactSuggestionList = [...contactSuggestionIds].sort();
+
   // Refusals.
   const refusals: ErasureRefusal[] = [];
 
@@ -2442,6 +2525,7 @@ export async function buildErasurePlan(
   const items = await countItems(
     db, anchor, jobList, documentList, memoryIds, digestList, draftList, mailList,
     ledgerItemList, ledgerRuleList, productionList, colleagueList, setupPackageMatched, externalEventList,
+    contactSuggestionList,
   );
 
   return {
@@ -2462,6 +2546,7 @@ export async function buildErasurePlan(
     filesNotDeleted,
     calendarEventsKept,
     externalEventIds: externalEventList,
+    contactSuggestionIds: contactSuggestionList,
     externalSystemsKept,
     descriptionMentionsContact,
     topicMentionsContact,
@@ -2493,6 +2578,7 @@ async function countItems(
   colleagueIds: string[],
   setupPackageMatched: boolean,
   externalEventIds: string[],
+  contactSuggestionIds: string[],
 ): Promise<ErasureItem[]> {
   const businessId = db.businessId;
   const one = async (
@@ -2557,6 +2643,12 @@ async function countItems(
       'delete',
       `SELECT count(*)::text AS n FROM contact_documents WHERE ${CONTACT_DOCUMENTS_ERASED_PREDICATE}`,
       [businessId, documentIds, contactPhoneKey(anchor)],
+    ),
+    await one(
+      'contact_suggestions',
+      'delete',
+      `SELECT count(*)::text AS n FROM contact_suggestions WHERE ${CONTACT_SUGGESTIONS_ERASED_PREDICATE}`,
+      [businessId, contactSuggestionIds],
     ),
     await one(
       'contact_conversations',

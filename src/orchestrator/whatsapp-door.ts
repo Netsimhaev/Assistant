@@ -158,6 +158,7 @@ import { runInstruction, type InstructionOutcome, type RunInstructionOptions } f
 import { linkWhatsAppMessage } from './jobs.js';
 import { handleMailCardMessage, isMailCardAction } from './whatsapp-mail-card.js';
 import { openOnWhatsApp } from './whatsapp-open.js';
+import { handleSuggestionMessage, isSuggestionAnswer } from '../whatsapp/suggestion-whatsapp.js';
 import {
   SEVERAL_OPEN_REFUSAL,
   handleDocumentCardMessage,
@@ -293,6 +294,12 @@ export interface DoorResult {
   contactFailed: number;
   /** The owner answered an open contact card ("שלח" / "נוסח: ..."). */
   contactCardReplies: number;
+  /**
+   * The owner answered a learned suggestion with "כן" or "לא" and it was
+   * applied or rejected (`suggestion-whatsapp.ts`). A refusal (several open,
+   * stale, already decided) counts under `refused`.
+   */
+  suggestionReplies: number;
 }
 
 /** Shown to the owner's own recording, quoted back verbatim, ahead of whatever happened next. */
@@ -521,6 +528,7 @@ type ProcessOutcome =
   | 'ledger'
   | 'documentCard'
   | 'contactCard'
+  | 'suggestion'
   | 'contactQueued'
   | 'skipped';
 
@@ -638,13 +646,14 @@ async function handleConfirmationMessage(input: {
     await settleMessage(ctx.db, storedId, state, jobId !== null ? { jobId } : {});
   };
 
-  const { mailCards: cards, questions, documentCards, contactCards } = open;
+  const { mailCards: cards, questions, documentCards, contactCards, suggestions } = open;
   const only = confirmations.length === 1 ? confirmations[0] : undefined;
   const reading = readings[0];
   if (
     only === undefined ||
     reading === undefined ||
-    cards.length + questions.length + documentCards.length + contactCards.length > 0
+    // A delivered learned suggestion counts too: "כן" cannot say which.
+    cards.length + questions.length + documentCards.length + contactCards.length + suggestions.length > 0
   ) {
     await reply(SEVERAL_OPEN_REFUSAL, 'failed', null);
     return 'refused';
@@ -837,6 +846,40 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     const confirmAnswer = await handleConfirmationMessage({ msg, storedId: stored.id, ctx });
     if (confirmAnswer !== 'passthrough') return confirmAnswer;
 
+    // A learned suggestion (`suggestion-whatsapp.ts`) is read next, and only
+    // when the confirmation reader passed: "כן"/"לא" are confirmation words,
+    // so with a confirmation open that reader takes the message and refuses
+    // (it counts suggestions). Typed text only, exactly "כן" or "לא", a
+    // suggestion delivered before this message and inside the window; with
+    // anything else open — or two suggestions — the answer is refused with
+    // SEVERAL_OPEN_REFUSAL and nothing applied. Before the bare ledger words.
+    if (msg.mediaKind === null && msg.body !== null && isSuggestionAnswer(msg.body) !== null) {
+      const openNow = await openOnWhatsApp(ctx.db, {
+        excludeMessageId: stored.id,
+        inboundAt: msg.providerTimestamp,
+        ...(ctx.questionWindowMinutes !== undefined
+          ? { windowMinutes: ctx.questionWindowMinutes }
+          : {}),
+      });
+      if (openNow.suggestions.length > 0) {
+        const handled = await handleSuggestionMessage(ctx.db, {
+          msg,
+          storedId: stored.id,
+          suggestions: openNow.suggestions,
+          othersOpen:
+            openNow.confirmations.length +
+            openNow.mailCards.length +
+            openNow.questions.length +
+            openNow.documentCards.length +
+            openNow.contactCards.length,
+          messenger: ctx.messenger,
+          by: principalActor(msg.senderNumber),
+        });
+        if (handled === 'decided') return 'suggestion';
+        if (handled !== 'passthrough') return handled;
+      }
+    }
+
     if (typedLedger !== null) {
       const ledger = await handleLedgerWhatsApp(ctx.db, { ...typedLedger, accept: 'bare' });
       if (ledger === 'applied') return 'ledger';
@@ -869,7 +912,11 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
           storedId: stored.id,
           cards: open.documentCards,
           othersOpen:
-            open.mailCards.length + open.questions.length + open.confirmations.length + open.contactCards.length,
+            open.mailCards.length +
+            open.questions.length +
+            open.confirmations.length +
+            open.contactCards.length +
+            open.suggestions.length,
           messenger: ctx.messenger,
           production: ctx.production,
           ...windowOverride,
@@ -933,7 +980,8 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
             openNow.mailCards.length +
             openNow.questions.length +
             openNow.confirmations.length +
-            openNow.documentCards.length,
+            openNow.documentCards.length +
+            openNow.suggestions.length,
         });
         if (handled === 'decided' || handled === 'replaced') return 'contactCard';
         if (handled !== 'passthrough') return handled;
@@ -1427,6 +1475,7 @@ export async function runWhatsAppDoor(db: BusinessDb, options: {
     contactCapped: 0,
     contactFailed: 0,
     contactCardReplies: 0,
+    suggestionReplies: 0,
   };
 
   const ctx: ProcessContext = {
@@ -1475,6 +1524,7 @@ export async function runWhatsAppDoor(db: BusinessDb, options: {
     else if (outcome === 'ledger') result.ledgerReplies += 1;
     else if (outcome === 'documentCard') result.documentCardReplies += 1;
     else if (outcome === 'contactCard') result.contactCardReplies += 1;
+    else if (outcome === 'suggestion') result.suggestionReplies += 1;
     // 'contactQueued' is counted below, once the contact flow ran.
     // 'skipped' — a redelivery, a race on the claim, or a failure before the
     // message was ever claimed — adds to none of the four buckets.

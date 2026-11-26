@@ -10,6 +10,7 @@ const topic: ContactTopic = {
   sources: ['sent_invoices'],
   autoReply: true,
   retiredAt: null,
+  updatedAt: new Date(0),
 };
 
 function base(over: Partial<ExitCheckInput> = {}): ExitCheckInput {

@@ -24,8 +24,31 @@ import {
   saveInvoiceSettings,
   type ExternalSenderSource,
 } from '../whatsapp/sources/invoice-settings.js';
+import { loadSuggestion, listOpenSuggestions, type Suggestion } from '../whatsapp/contact-suggestions.js';
+import { applySuggestion, type ApplyOutcome } from '../whatsapp/suggestion-apply.js';
+import {
+  labelsFor,
+  SUGGESTION_ALREADY,
+  SUGGESTION_APPLIED,
+  SUGGESTION_FAILED,
+  SUGGESTION_REJECTED,
+  SUGGESTION_STALE,
+} from '../whatsapp/suggestion-whatsapp.js';
 import { issueCsrfToken, verifyCsrfToken } from './csrf.js';
-import { escLabel, escapeHtml as esc, page, renderForbidden } from './views.js';
+import { escLabel, escapeHtml as esc, page, renderForbidden, renderNotFound } from './views.js';
+
+const SUGGESTION_KIND_HE: Record<Suggestion['kind'], string> = {
+  new_topic: 'נושא חדש',
+  auto_reply: 'מענה אוטומטי לנושא',
+  public_document: 'מסמך מותר לציטוט',
+};
+const APPLIES_HE: Record<string, string> = { client: 'לקוחות', supplier: 'ספקים', both: 'לקוחות וספקים' };
+const OUTCOME_HE: Record<ApplyOutcome, string> = {
+  applied: SUGGESTION_APPLIED,
+  rejected: SUGGESTION_REJECTED,
+  stale: SUGGESTION_STALE,
+  already: SUGGESTION_ALREADY,
+};
 
 export const CONTACT_WHATSAPP_SETTINGS_PATH = '/settings/whatsapp-contacts';
 
@@ -152,6 +175,30 @@ async function render(
     )
     .join('');
 
+  const suggestionItems: string[] = [];
+  for (const sg of await listOpenSuggestions(db)) {
+    const labels = await labelsFor(db, sg);
+    let detail: string;
+    if (sg.kind === 'new_topic') {
+      detail = `${escLabel(sg.payload.name)} — ${escLabel(sg.payload.description)} (${escLabel(APPLIES_HE[sg.payload.appliesTo] ?? '')}, מבוסס על ${sg.payload.decisionIds.length} הכרעות שלך)`;
+    } else if (sg.kind === 'auto_reply') {
+      detail = `${escLabel(labels.topicName ?? '')} — הסכמת עם ${Number(sg.payload.right)} מתוך ${Number(sg.payload.counted)}`;
+    } else {
+      detail = `${escLabel(labels.documentName ?? '')} (${escLabel(APPLIES_HE[sg.payload.appliesTo] ?? '')}) — נשענתי עליו ב-${Number(sg.payload.approvals)} תשובות שאישרת`;
+    }
+    const button = (decision: string, text: string): string => `<form method="post" action="${CONTACT_WHATSAPP_SETTINGS_PATH}" style="display:inline">
+  <input type="hidden" name="csrf" value="${csrf}">
+  <input type="hidden" name="action" value="suggestion">
+  <input type="hidden" name="suggestionId" value="${esc(sg.suggestionId)}">
+  <input type="hidden" name="decision" value="${decision}">
+  <button type="submit">${text}</button>
+</form>`;
+    suggestionItems.push(
+      `<li><strong>${esc(SUGGESTION_KIND_HE[sg.kind])}</strong>: ${detail} ${button('accept', 'אשר')} ${button('reject', 'דחה')}</li>`,
+    );
+  }
+  const suggestionsHtml = suggestionItems.length === 0 ? '' : `<h2>הצעות</h2>\n<ul>${suggestionItems.join('')}</ul>`;
+
   html(
     res,
     status,
@@ -162,6 +209,7 @@ async function render(
 <p>${esc(CONTACT_WHATSAPP_INTRO)}</p>
 ${message?.error === undefined ? '' : `<p class="error">${esc(message.error)}</p>`}
 ${message?.notice === undefined ? '' : `<p>${esc(message.notice)}</p>`}
+${suggestionsHtml}
 ${cards === '' ? `<p class="muted">${esc(CONTACT_WHATSAPP_NO_SYSTEMS)}</p>` : cards}
 <h2>מענה אוטומטי</h2>
 <form method="post" action="${CONTACT_WHATSAPP_SETTINGS_PATH}">
@@ -198,6 +246,22 @@ export async function handleContactWhatsappPost(
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
   const action = form.get('action') ?? 'invoice';
+  if (action === 'suggestion') {
+    const found = await loadSuggestion(db, form.get('suggestionId') ?? '');
+    if (found === null) return html(res, 404, renderNotFound());
+    const decision = form.get('decision');
+    if (decision !== 'accept' && decision !== 'reject') {
+      return render(res, 400, db, session, { error: 'בחירה לא תקינה.' });
+    }
+    let outcome: ApplyOutcome;
+    try {
+      outcome = await applySuggestion(db, found.suggestionId, decision, `dashboard:${session.username}`);
+    } catch {
+      // The claim rolled back with the effect: the suggestion stays open. Same answer as WhatsApp.
+      return render(res, 200, db, session, { error: SUGGESTION_FAILED });
+    }
+    return render(res, 200, db, session, { notice: OUTCOME_HE[outcome] });
+  }
   if (action === 'auto_reply') {
     await saveAutoReplyEnabled(db, form.get('enabled') === '1', session.username);
     return render(res, 200, db, session, { notice: CONTACT_WHATSAPP_SAVED });
